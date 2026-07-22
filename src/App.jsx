@@ -316,22 +316,13 @@ export function App() {
           onToggleContextRail={() => setContextRailOpen((prev) => !prev)}
         />
 
-        {contextRailOpen ? (
-          <div
-            className={`panel-resizer${isResizing ? " is-resizing" : ""}`}
-            onMouseDown={startResizing}
-            title="拖拽左右滑动调整右侧栏宽度"
-            aria-label="拖拽调整右侧栏宽度"
-          >
-            <span className="resizer-line" />
-          </div>
-        ) : null}
-
         <WorkflowContextRail
           run={run}
           mobileActive={mobileView === "evidence"}
           contextRailOpen={contextRailOpen}
           onToggleContextRail={() => setContextRailOpen((prev) => !prev)}
+          onMouseDownResizer={startResizing}
+          isResizing={isResizing}
         />
       </div>
 

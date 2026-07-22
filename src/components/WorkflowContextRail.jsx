@@ -114,31 +114,47 @@ const tabs = [
   { id: "project-state", label: "项目状态" },
 ];
 
-export function WorkflowContextRail({ run, activePaperId, readingStageIndex, mobileActive }) {
+export function WorkflowContextRail({
+  run,
+  mobileActive,
+  onMouseDownResizer,
+  isResizing,
+}) {
   const [activeTab, setActiveTab] = useState("evidence");
   const tabRefs = useRef([]);
-  const papers = workflowFixture.papers ?? [];
   const stages = workflowFixture.readingStages ?? [];
-  const resolvedPaperId = activePaperId ?? run?.activePaperId ?? run?.active_paper_id ?? (run?.selectedPaperIds ?? run?.selected_ids ?? [])[0] ?? papers[0]?.id;
-  const paper = papers.find((item) => item.id === resolvedPaperId) ?? papers[0];
-  const stageIndex = readingStageIndex ?? getStageIndex(run, stages);
-  const stage = String(run?.status ?? "").toLowerCase() === "reading" ? stages[stageIndex] : null;
+  const stage = String(run?.status ?? "").toLowerCase() === "reading" ? stages[getStageIndex(run, stages)] : null;
+  const paper = getActivePaper(run);
+  const tabs = [
+    { id: "evidence", label: "当前依据" },
+    { id: "state", label: "项目状态" },
+  ];
 
-  function handleTabKeyDown(event, index) {
+  const handleTabKeyDown = (event, index) => {
     let nextIndex = null;
     if (event.key === "ArrowRight") nextIndex = (index + 1) % tabs.length;
     if (event.key === "ArrowLeft") nextIndex = (index - 1 + tabs.length) % tabs.length;
     if (event.key === "Home") nextIndex = 0;
     if (event.key === "End") nextIndex = tabs.length - 1;
-    if (nextIndex === null) return;
-
-    event.preventDefault();
-    setActiveTab(tabs[nextIndex].id);
-    tabRefs.current[nextIndex]?.focus();
-  }
+    if (nextIndex !== null) {
+      event.preventDefault();
+      setActiveTab(tabs[nextIndex].id);
+      tabRefs.current[nextIndex]?.focus();
+    }
+  };
 
   return (
     <aside className={`context-rail workflow-context-rail${mobileActive ? " is-mobile-active" : ""}`} aria-label="运行上下文">
+      {onMouseDownResizer ? (
+        <div
+          className={`panel-resizer-handle${isResizing ? " is-resizing" : ""}`}
+          onMouseDown={onMouseDownResizer}
+          title="按住左右滑动拖拽调整右侧栏宽度"
+          aria-label="拖拽调整右侧栏宽度"
+        >
+          <span className="resizer-line" />
+        </div>
+      ) : null}
       <header className="workflow-context-header">
         <div>
           <span className="workflow-kicker">当前 Run</span>

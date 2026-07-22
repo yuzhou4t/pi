@@ -519,45 +519,49 @@ button:disabled {
   background: rgba(0, 0, 0, 0.07);
 }
 
-.panel-resizer {
-  position: relative;
-  z-index: 15;
+.panel-resizer-handle {
+  position: absolute;
+  left: -6px;
+  top: 0;
+  bottom: 0;
+  width: 12px;
+  z-index: 30;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 8px;
-  margin: 0 -4px;
   cursor: col-resize;
   user-select: none;
 }
 
-.panel-resizer::before {
+.panel-resizer-handle::before {
   position: absolute;
   top: 0;
   bottom: 0;
+  left: 5px;
   width: 2px;
   background: transparent;
   content: "";
   transition: background 0.18s ease;
 }
 
-.panel-resizer:hover::before,
-.panel-resizer.is-resizing::before {
+.panel-resizer-handle:hover::before,
+.panel-resizer-handle.is-resizing::before {
   background: rgba(15, 118, 110, 0.4);
 }
 
 .resizer-line {
-  width: 2px;
+  width: 3px;
   height: 24px;
-  border-radius: 1px;
-  background: rgba(0, 0, 0, 0.12);
-  transition: background 0.18s ease, height 0.18s ease;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.16);
+  transition: all 0.18s ease;
 }
 
-.panel-resizer:hover .resizer-line,
-.panel-resizer.is-resizing .resizer-line {
-  height: 40px;
+.panel-resizer-handle:hover .resizer-line,
+.panel-resizer-handle.is-resizing .resizer-line {
+  height: 48px;
   background: var(--teal-accent);
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.2);
 }
 
 .app-body.is-resizing-active {
@@ -2612,15 +2616,18 @@ button:disabled {
 }
 
 .workflow-workspace {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  row-gap: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
   padding: 0;
   overflow: hidden;
   background: var(--bg);
 }
 
 .workflow-run-header {
+  flex: 0 0 auto;
   position: relative;
   z-index: 2;
   padding: 13px 20px 12px;
@@ -2753,12 +2760,34 @@ button:disabled {
 }
 
 .workflow-stage {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
-  padding: 20px 22px 28px;
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+  animation: workflowStageFadeIn 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.workflow-candidate-review {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workflow-stage-heading {
+  padding: 18px 22px 10px;
+}
+
+.workflow-candidate-list {
+  flex: 1 1 auto;
   overflow-y: auto;
+  padding: 8px 22px 20px;
   scrollbar-color: #c9c5ba transparent;
   scrollbar-width: thin;
-  animation: workflowStageFadeIn 0.24s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 @keyframes workflowStageFadeIn {
@@ -2946,22 +2975,20 @@ button:disabled {
 }
 
 .workflow-stage-actions {
-  position: sticky;
-  z-index: 20;
-  bottom: 16px;
+  flex: 0 0 auto;
+  position: relative;
+  z-index: 10;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin: 24px auto 4px;
-  padding: 8px 12px 8px 20px;
+  margin: 0;
+  padding: 12px 20px;
   background: rgba(255, 255, 255, 0.94);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(215, 210, 198, 0.85);
-  border-radius: 40px;
-  box-shadow: 0 8px 28px rgba(42, 40, 34, 0.1), 0 2px 8px rgba(0, 0, 0, 0.03);
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  border-top: 1px solid rgba(215, 210, 198, 0.85);
+  box-shadow: 0 -4px 16px rgba(42, 40, 34, 0.04);
 }
 
 .workflow-stage-actions > p {
