@@ -121,9 +121,7 @@ function WorkflowHeader({ run, status }) {
             const stateClass = isComplete ? "is-complete" : isActive ? "is-active" : "is-pending";
             return (
               <li className={`workflow-step-item ${stateClass}`} key={step.id} aria-current={isActive ? "step" : undefined}>
-                <span className="workflow-step-num">
-                  {isComplete ? <Check size={11} weight="bold" aria-hidden="true" /> : index + 1}
-                </span>
+                <span className="workflow-step-dot" />
                 <span className="workflow-step-name">{step.label}</span>
               </li>
             );
