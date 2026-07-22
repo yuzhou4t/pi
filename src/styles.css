@@ -2596,7 +2596,20 @@ button:disabled {
   overflow-y: auto;
   scrollbar-color: #c9c5ba transparent;
   scrollbar-width: thin;
+  animation: workflowStageFadeIn 0.24s cubic-bezier(0.16, 1, 0.3, 1);
 }
+
+@keyframes workflowStageFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 
 .workflow-stage-heading {
   margin-bottom: 14px;
@@ -3259,21 +3272,24 @@ button:disabled {
 
 .workflow-diff-preview {
   display: grid;
-  gap: 3px;
-  margin-top: 5px;
+  gap: 4px;
+  margin-top: 6px;
 }
 
 .workflow-diff-preview code {
   display: block;
-  padding: 5px 7px;
-  color: #3f4f4c;
-  background: var(--surface-soft);
-  border-radius: 4px;
+  padding: 6px 9px;
+  color: #2b4742;
+  background: #f2f7f5;
+  border: 1px solid #d4e6e0;
+  border-radius: 5px;
   font-family: inherit;
   font-size: 8px;
-  line-height: 1.45;
-  white-space: normal;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
+
 
 .workflow-failure-toggle {
   margin-top: 10px;
@@ -4111,34 +4127,51 @@ button:disabled {
 
 .workflow-candidate-summary {
   display: grid;
-  gap: 8px;
+  gap: 9px;
   margin: 11px 0 0;
+  padding: 10px 12px;
+  background: rgba(246, 245, 241, 0.7);
+  border-radius: 7px;
+  border: 1px solid rgba(223, 220, 211, 0.55);
 }
 
 .workflow-candidate-summary > div {
   display: grid;
-  grid-template-columns: 90px minmax(0, 1fr);
+  grid-template-columns: 88px minmax(0, 1fr);
   gap: 10px;
   align-items: start;
 }
 
 .workflow-candidate-summary dt {
   color: var(--weak);
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 700;
-  line-height: 1.65;
+  line-height: 1.6;
+  letter-spacing: -0.01em;
 }
 
 .workflow-candidate-summary dd {
   margin: 0;
-  color: #46433d;
+  color: #423f39;
   font-size: 13px;
-  line-height: 1.65;
+  line-height: 1.6;
 }
 
-.workflow-candidate-summary .is-project-impact dt,
+.workflow-candidate-summary .is-project-impact {
+  padding-left: 8px;
+  border-left: 2.5px solid var(--accent);
+  background: rgba(15, 118, 110, 0.04);
+  border-radius: 0 5px 5px 0;
+  margin-left: -8px;
+}
+
+.workflow-candidate-summary .is-project-impact dt {
+  color: #0f766e;
+}
+
 .workflow-candidate-summary .is-project-impact dd {
-  color: #2c5d58;
+  color: #1a4d47;
+  font-weight: 500;
 }
 
 .workflow-abstract-copy,
