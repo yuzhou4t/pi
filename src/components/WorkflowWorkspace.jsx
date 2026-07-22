@@ -152,14 +152,16 @@ function WorkflowHeader({
           ) : null}
 
           {onOpenSkills ? (
-            <button className="compact-action topbar-skill-button" type="button" onClick={onOpenSkills}>
-              <Package size={15} weight="regular" aria-hidden="true" />
-              <span>技能</span>
-              <b>{installedSkillCount}</b>
+            <button className="header-meta-pill header-skill-pill" type="button" onClick={onOpenSkills}>
+              <Package size={13} weight="regular" aria-hidden="true" />
+              <span>技能 · {installedSkillCount}</span>
             </button>
           ) : null}
 
-          <span className="workflow-run-status">{STATUS_LABELS[status] ?? status}</span>
+          <span className="header-meta-pill header-status-pill">
+            <span className="status-dot" aria-hidden="true" />
+            <span>{STATUS_LABELS[status] ?? status}</span>
+          </span>
           <button
             className={`column-toggle-btn${!contextRailOpen ? " is-collapsed" : ""}`}
             type="button"

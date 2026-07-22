@@ -37,15 +37,15 @@ export function ProviderMenu({
       ) : null}
 
       <button
-        className="compact-action header-provider-pill"
+        className="header-meta-pill header-model-pill"
         type="button"
         aria-expanded={open}
         aria-haspopup="dialog"
         onClick={() => onOpenChange(!open)}
       >
-        <Cpu size={14} weight="regular" aria-hidden="true" />
+        <Sparkle size={13} weight="fill" aria-hidden="true" />
         <span>{activeProvider.name}</span>
-        <CaretDown size={12} weight="bold" aria-hidden="true" />
+        <CaretDown size={11} weight="bold" aria-hidden="true" />
       </button>
 
       {open ? (
