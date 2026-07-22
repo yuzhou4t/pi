@@ -221,31 +221,6 @@ export function App() {
 
   return (
     <div className="app-shell">
-      <TopBar
-        project={project}
-        providers={providers}
-        providerId={selectedProvider.id}
-        model={providerConfig.model}
-        providerOpen={providerOpen}
-        onProviderOpenChange={(open) => {
-          setProviderOpen(open);
-          if (open) {
-            setSettingsView(null);
-            setSkillCenterOpen(false);
-          }
-        }}
-        onProviderChange={selectProvider}
-        onModelChange={(model) => setProviderConfig((current) => ({ ...current, model }))}
-        onOpenSkills={() => {
-          setProviderOpen(false);
-          setSettingsView(null);
-          setSkillCenterOpen(true);
-        }}
-        installedSkillCount={installedSkillCount}
-        onExport={exportRun}
-        exportLabel="导出本轮"
-      />
-
       <div className="app-body">
         <ProjectRail
           projects={projects}
@@ -262,6 +237,25 @@ export function App() {
           mobileActive={mobileView === "projects"}
           activeRun={activeRun}
           onSelectRun={() => setMobileView("run")}
+          providers={providers}
+          providerId={selectedProvider.id}
+          model={providerConfig.model}
+          providerOpen={providerOpen}
+          onProviderOpenChange={(open) => {
+            setProviderOpen(open);
+            if (open) {
+              setSettingsView(null);
+              setSkillCenterOpen(false);
+            }
+          }}
+          onProviderChange={selectProvider}
+          onModelChange={(model) => setProviderConfig((current) => ({ ...current, model }))}
+          onOpenSkills={() => {
+            setProviderOpen(false);
+            setSettingsView(null);
+            setSkillCenterOpen(true);
+          }}
+          installedSkillCount={installedSkillCount}
         />
 
         <WorkflowWorkspace

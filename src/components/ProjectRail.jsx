@@ -3,8 +3,11 @@ import {
   FolderSimplePlus,
   GearSix,
   MagnifyingGlass,
+  Package,
   PlayCircle,
+  Sparkle,
 } from "@phosphor-icons/react";
+import { ProviderMenu } from "./ProviderMenu.jsx";
 
 export function ProjectRail({
   projects,
@@ -18,6 +21,15 @@ export function ProjectRail({
   mobileActive,
   activeRun,
   onSelectRun,
+  providers,
+  providerId,
+  model,
+  providerOpen,
+  onProviderOpenChange,
+  onProviderChange,
+  onModelChange,
+  onOpenSkills,
+  installedSkillCount,
 }) {
   const filteredProjects = projects.filter((project) =>
     `${project.name} ${project.state}`.toLowerCase().includes(query.trim().toLowerCase()),
@@ -25,14 +37,28 @@ export function ProjectRail({
 
   return (
     <aside className={`project-rail${mobileActive ? " is-mobile-active" : ""}`} aria-label="项目列表">
-      <div className="rail-heading">
-        <div>
-          <span className="eyebrow">工作区</span>
-          <h2>项目</h2>
+      <div className="sidebar-brand-header">
+        <div className="brand-lockup">
+          <span className="brand-icon">
+            <Sparkle size={16} weight="fill" aria-hidden="true" />
+          </span>
+          <span className="brand-name">Pi Agent</span>
         </div>
         <button className="icon-button" type="button" aria-label="添加本地项目" onClick={onAddProject}>
           <FolderSimplePlus size={18} weight="regular" aria-hidden="true" />
         </button>
+      </div>
+
+      <div className="sidebar-provider-wrap">
+        <ProviderMenu
+          open={providerOpen}
+          onOpenChange={onProviderOpenChange}
+          providers={providers}
+          providerId={providerId}
+          model={model}
+          onProviderChange={onProviderChange}
+          onModelChange={onModelChange}
+        />
       </div>
 
       <label className="search-field" htmlFor="project-search">
@@ -42,11 +68,12 @@ export function ProjectRail({
           type="search"
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
-          placeholder="搜索项目"
+          placeholder="搜索项目与 Run..."
         />
       </label>
 
       <div className="project-list">
+        <span className="eyebrow">项目与 Run</span>
         {filteredProjects.map((project) => {
           const selected = project.id === selectedId;
           return (
@@ -87,7 +114,16 @@ export function ProjectRail({
       </div>
 
       <div className="rail-capabilities">
-        <span className="eyebrow">偏好</span>
+        <span className="eyebrow">工具与设置</span>
+        <button className="capability-row" type="button" onClick={onOpenSkills}>
+          <Package size={17} weight="regular" aria-hidden="true" />
+          <span>
+            <strong>技能中心</strong>
+            <small>已启 {installedSkillCount} 个能力包</small>
+          </span>
+          <b>打开</b>
+        </button>
+
         <button
           id="settings-trigger"
           className={`capability-row${settingsOpen ? " is-active" : ""}`}
@@ -99,7 +135,7 @@ export function ProjectRail({
           <GearSix size={17} weight="regular" aria-hidden="true" />
           <span>
             <strong>设置</strong>
-            <small>模型、外观与本地数据</small>
+            <small>模型、外观与数据</small>
           </span>
           <b>打开</b>
         </button>
@@ -107,7 +143,7 @@ export function ProjectRail({
 
       <div className="rail-footnote">
         <span className="status-dot" aria-hidden="true" />
-        <span>本地原型 · 不读取真实项目</span>
+        <span>Pi Agent · 本地工作流播放器</span>
       </div>
     </aside>
   );
