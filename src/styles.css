@@ -1,25 +1,25 @@
 :root {
-  color: #23221f;
-  background: #ebe7de;
+  color: #2c2925;
+  background: #f5f2ea;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --bg: #ece8df;
-  --sidebar: #f4f2ea;
-  --rightbar: #f6f4ed;
+  --bg: #f5f2ea;
+  --sidebar: #f5f2ea;
+  --rightbar: #f5f2ea;
   --surface: #ffffff;
-  --surface-soft: #f8f6f0;
-  --text: #242320;
-  --muted: #5e5a52;
-  --weak: #807b71;
-  --border: #dcd7cb;
-  --border-strong: #c8c3b5;
+  --surface-soft: #fbf9f5;
+  --text: #2c2925;
+  --muted: #6f6b62;
+  --weak: #8c877d;
+  --border: rgba(220, 215, 204, 0.5);
+  --border-strong: rgba(200, 195, 182, 0.7);
   --accent: #0f766e;
   --accent-hover: #0b665f;
   --accent-pale: #eef7f4;
   --risk: #9a4638;
   --risk-pale: #fbf2ef;
-  --shadow: 0 4px 20px rgba(42, 40, 34, 0.06);
+  --shadow: 0 2px 10px rgba(42, 40, 34, 0.04);
 }
 
 * {
@@ -88,7 +88,7 @@ button:disabled {
   grid-template-columns: 232px minmax(0, 1fr) auto;
   align-items: center;
   height: 48px;
-  background: rgba(249, 248, 245, 0.97);
+  background: transparent;
   border-bottom: 1px solid var(--border);
 }
 
@@ -98,7 +98,7 @@ button:disabled {
   gap: 9px;
   height: 100%;
   padding: 0 16px;
-  border-right: 1px solid var(--border);
+  border-right: 0;
 }
 
 .brand-icon {
@@ -169,20 +169,22 @@ button:disabled {
 .compact-action,
 .primary-action {
   min-height: 30px;
-  padding: 0 10px;
-  border: 1px solid var(--border-strong);
-  border-radius: 6px;
-  font-size: 11px;
-  font-weight: 600;
+  padding: 0 12px;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 20px;
+  font-size: 11.5px;
+  font-weight: 500;
 }
 
 .compact-action {
-  background: var(--surface);
+  color: #555148;
+  background: rgba(0, 0, 0, 0.03);
 }
 
 .compact-action:hover {
-  border-color: #aaa69b;
-  background: #fbfaf7;
+  color: var(--text);
+  border-color: rgba(0, 0, 0, 0.12);
+  background: rgba(0, 0, 0, 0.06);
 }
 
 .primary-action {
@@ -399,8 +401,8 @@ button:disabled {
   grid-template-columns: 232px minmax(0, 1fr) 360px;
   height: calc(100dvh - 48px);
   min-height: 0;
-  gap: 10px;
-  padding: 10px;
+  gap: 12px;
+  padding: 0 12px 12px 12px;
   background: var(--bg);
 }
 
@@ -415,32 +417,28 @@ button:disabled {
   position: relative;
   display: flex;
   flex-direction: column;
-  background: var(--sidebar);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-  box-shadow: 0 1px 4px rgba(42, 40, 34, 0.03);
+  background: transparent;
+  border-right: 1px solid var(--border);
+  padding-right: 12px;
 }
 
 .workflow-workspace {
   min-width: 0;
   min-height: 0;
-  background: #fbfaf7;
-  border: 1px solid var(--border);
+  background: #fbf9f5;
+  border: 1px solid rgba(220, 215, 204, 0.6);
   border-radius: 14px;
   overflow: hidden;
-  box-shadow: 0 2px 10px rgba(42, 40, 34, 0.05);
+  box-shadow: 0 2px 12px rgba(42, 40, 34, 0.03);
 }
 
 .workflow-context-rail {
   position: relative;
   display: flex;
   flex-direction: column;
-  background: var(--rightbar);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-  box-shadow: 0 1px 4px rgba(42, 40, 34, 0.03);
+  background: transparent;
+  border-left: 1px solid var(--border);
+  padding-left: 12px;
 }
 
 .rail-heading {
@@ -4188,27 +4186,49 @@ button:disabled {
 
 .workflow-candidate-summary {
   display: grid;
-  gap: 9px;
-  margin: 11px 0 0;
-  padding: 10px 12px;
-  background: rgba(246, 245, 241, 0.7);
-  border-radius: 7px;
-  border: 1px solid rgba(223, 220, 211, 0.55);
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
 }
 
 .workflow-candidate-summary > div {
   display: grid;
-  grid-template-columns: 88px minmax(0, 1fr);
-  gap: 10px;
-  align-items: start;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 12px;
+  align-items: baseline;
 }
 
 .workflow-candidate-summary dt {
   color: var(--weak);
-  font-size: 11.5px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 600;
   line-height: 1.6;
-  letter-spacing: -0.01em;
+}
+
+.workflow-candidate-summary dd {
+  margin: 0;
+  color: #383531;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.workflow-candidate-summary .is-project-impact {
+  padding-left: 0;
+  border-left: 0;
+  background: transparent;
+  margin-left: 0;
+}
+
+.workflow-candidate-summary .is-project-impact dt {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.workflow-candidate-summary .is-project-impact dd {
+  color: #174d47;
+  font-weight: 500;
 }
 
 .workflow-candidate-summary dd {
