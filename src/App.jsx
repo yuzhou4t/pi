@@ -319,6 +319,25 @@ export function App() {
           onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
           contextRailOpen={contextRailOpen}
           onToggleContextRail={() => setContextRailOpen((prev) => !prev)}
+          providers={providers}
+          providerId={selectedProvider.id}
+          model={providerConfig.model}
+          providerOpen={providerOpen}
+          onProviderOpenChange={(open) => {
+            setProviderOpen(open);
+            if (open) {
+              setSettingsView(null);
+              setSkillCenterOpen(false);
+            }
+          }}
+          onProviderChange={selectProvider}
+          onModelChange={(model) => setProviderConfig((current) => ({ ...current, model }))}
+          onOpenSkills={() => {
+            setProviderOpen(false);
+            setSettingsView(null);
+            setSkillCenterOpen(true);
+          }}
+          installedSkillCount={installedSkillCount}
         />
 
         <WorkflowContextRail

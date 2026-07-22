@@ -12,6 +12,7 @@ import {
   Info,
   ListChecks,
   NotePencil,
+  Package,
   PaperPlaneTilt,
   Quotes,
   ShieldCheck,
@@ -20,6 +21,7 @@ import {
   XCircle,
 } from "@phosphor-icons/react";
 import { workflowFixture } from "../workflow/fixtures.js";
+import { ProviderMenu } from "./ProviderMenu.jsx";
 
 const STATUS_LABELS = {
   review_ready: "本周待审阅",
@@ -98,7 +100,23 @@ function getProposalPreview(proposal) {
   return preview ? [preview] : [];
 }
 
-function WorkflowHeader({ run, status, sidebarOpen, onToggleSidebar, contextRailOpen, onToggleContextRail }) {
+function WorkflowHeader({
+  run,
+  status,
+  sidebarOpen,
+  onToggleSidebar,
+  contextRailOpen,
+  onToggleContextRail,
+  providers,
+  providerId,
+  model,
+  providerOpen,
+  onProviderOpenChange,
+  onProviderChange,
+  onModelChange,
+  onOpenSkills,
+  installedSkillCount,
+}) {
   const activeStepIndex = findStepIndex(status);
 
   return (
@@ -120,8 +138,27 @@ function WorkflowHeader({ run, status, sidebarOpen, onToggleSidebar, contextRail
           </div>
         </div>
 
-        <div className="workflow-run-meta" aria-label="运行摘要">
-          <span>{run?.windowLabel ?? workflowFixture.scanSummary?.window ?? "本周"}</span>
+        <div className="workflow-run-meta" aria-label="模型与运行摘要">
+          {providers ? (
+            <ProviderMenu
+              open={providerOpen}
+              onOpenChange={onProviderOpenChange}
+              providers={providers}
+              providerId={providerId}
+              model={model}
+              onProviderChange={onProviderChange}
+              onModelChange={onModelChange}
+            />
+          ) : null}
+
+          {onOpenSkills ? (
+            <button className="compact-action topbar-skill-button" type="button" onClick={onOpenSkills}>
+              <Package size={15} weight="regular" aria-hidden="true" />
+              <span>技能</span>
+              <b>{installedSkillCount}</b>
+            </button>
+          ) : null}
+
           <span className="workflow-run-status">{STATUS_LABELS[status] ?? status}</span>
           <button
             className={`column-toggle-btn${!contextRailOpen ? " is-collapsed" : ""}`}
@@ -638,6 +675,15 @@ export function WorkflowWorkspace({
   onToggleSidebar,
   contextRailOpen,
   onToggleContextRail,
+  providers,
+  providerId,
+  model,
+  providerOpen,
+  onProviderOpenChange,
+  onProviderChange,
+  onModelChange,
+  onOpenSkills,
+  installedSkillCount,
 }) {
   const status = normalizeStatus(run?.status);
   const papers = workflowFixture.papers ?? [];
@@ -669,6 +715,15 @@ export function WorkflowWorkspace({
         onToggleSidebar={onToggleSidebar}
         contextRailOpen={contextRailOpen}
         onToggleContextRail={onToggleContextRail}
+        providers={providers}
+        providerId={providerId}
+        model={model}
+        providerOpen={providerOpen}
+        onProviderOpenChange={onProviderOpenChange}
+        onProviderChange={onProviderChange}
+        onModelChange={onModelChange}
+        onOpenSkills={onOpenSkills}
+        installedSkillCount={installedSkillCount}
       />
       {content}
     </main>

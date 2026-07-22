@@ -21,15 +21,6 @@ export function ProjectRail({
   mobileActive,
   activeRun,
   onSelectRun,
-  providers,
-  providerId,
-  model,
-  providerOpen,
-  onProviderOpenChange,
-  onProviderChange,
-  onModelChange,
-  onOpenSkills,
-  installedSkillCount,
 }) {
   const filteredProjects = projects.filter((project) =>
     `${project.name} ${project.state}`.toLowerCase().includes(query.trim().toLowerCase()),
@@ -47,18 +38,6 @@ export function ProjectRail({
         <button className="icon-button" type="button" aria-label="添加本地项目" onClick={onAddProject}>
           <FolderSimplePlus size={18} weight="regular" aria-hidden="true" />
         </button>
-      </div>
-
-      <div className="sidebar-provider-wrap">
-        <ProviderMenu
-          open={providerOpen}
-          onOpenChange={onProviderOpenChange}
-          providers={providers}
-          providerId={providerId}
-          model={model}
-          onProviderChange={onProviderChange}
-          onModelChange={onModelChange}
-        />
       </div>
 
       <label className="search-field" htmlFor="project-search">
@@ -114,16 +93,7 @@ export function ProjectRail({
       </div>
 
       <div className="rail-capabilities">
-        <span className="eyebrow">工具与设置</span>
-        <button className="capability-row" type="button" onClick={onOpenSkills}>
-          <Package size={17} weight="regular" aria-hidden="true" />
-          <span>
-            <strong>技能中心</strong>
-            <small>已启 {installedSkillCount} 个能力包</small>
-          </span>
-          <b>打开</b>
-        </button>
-
+        <span className="eyebrow">偏好</span>
         <button
           id="settings-trigger"
           className={`capability-row${settingsOpen ? " is-active" : ""}`}
@@ -135,7 +105,7 @@ export function ProjectRail({
           <GearSix size={17} weight="regular" aria-hidden="true" />
           <span>
             <strong>设置</strong>
-            <small>模型、外观与数据</small>
+            <small>模型、能力包与偏好</small>
           </span>
           <b>打开</b>
         </button>

@@ -5,6 +5,7 @@ import {
   Database,
   FolderSimple,
   GearSix,
+  Package,
   Palette,
   ShieldCheck,
   X,
@@ -13,6 +14,7 @@ import {
 const sections = [
   { id: "general", label: "常规", icon: GearSix },
   { id: "providers", label: "模型服务商", icon: Cpu },
+  { id: "skills", label: "技能中心", icon: Package },
   { id: "appearance", label: "外观", icon: Palette },
   { id: "data", label: "项目与数据", icon: Database },
   { id: "shortcuts", label: "快捷键", icon: Command },
@@ -29,7 +31,7 @@ function QuickSetting({ icon: Icon, label, detail, onClick }) {
   );
 }
 
-export function SettingsQuickPanel({ providerName, model, onOpenFull, onClose }) {
+export function SettingsQuickPanel({ providerName, model, onOpenFull, onOpenSkills, onClose }) {
   return (
     <div className="settings-popover-layer" role="presentation" onMouseDown={onClose}>
       <section
@@ -50,6 +52,7 @@ export function SettingsQuickPanel({ providerName, model, onOpenFull, onClose })
 
         <div className="quick-setting-list">
           <QuickSetting icon={Cpu} label="模型与服务商" detail={`${providerName} · ${model}`} onClick={() => onOpenFull("providers")} />
+          <QuickSetting icon={Package} label="技能中心" detail="管理 Agent 能力扩展包" onClick={onOpenSkills ?? (() => onOpenFull("skills"))} />
           <QuickSetting icon={Palette} label="外观" detail="浅色 · 紧凑界面" onClick={() => onOpenFull("appearance")} />
           <QuickSetting icon={FolderSimple} label="项目与本地数据" detail="仅保存在本机" onClick={() => onOpenFull("data")} />
         </div>
