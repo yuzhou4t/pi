@@ -178,6 +178,7 @@ function PaperTabs({ papers, activePaperId, onSetActivePaper }) {
 
 function CandidateReview({ run, papers, onTogglePaper, onPrepareGuides, onSkipRun }) {
   const selectedPaperIds = run?.selectedPaperIds ?? run?.selected_ids ?? [];
+  const selectedCount = selectedPaperIds.length;
   const [expandedEvidenceId, setExpandedEvidenceId] = useState(null);
 
   const toggleEvidence = (paperId) => {
@@ -186,79 +187,81 @@ function CandidateReview({ run, papers, onTogglePaper, onPrepareGuides, onSkipRu
 
   return (
     <section className="workflow-stage workflow-review-stage" aria-labelledby="review-title">
-      <header className="workflow-stage-heading">
-        <div>
-          <span className="workflow-stage-label">本周扫描完成</span>
-          <h2 id="review-title">选择本周要读的论文</h2>
-          <p>最多选择两篇；仅所选论文会下载 PDF 并进入后续处理。</p>
-          <p className="workflow-scan-summary">
-            扫描 <strong>{workflowFixture.scanSummary?.rawCount ?? 46}</strong> 条
-            <span aria-hidden="true"> · </span>
-            <strong>{workflowFixture.scanSummary?.topicMatchedCount ?? 18}</strong> 条主题相关
-            <span aria-hidden="true"> · </span>
-            <strong>{workflowFixture.scanSummary?.focusedCount ?? papers.length}</strong> 条重点候选
-          </p>
-        </div>
-      </header>
+      <div className="workflow-stage-scroll-area">
+        <header className="workflow-stage-heading">
+          <div>
+            <span className="workflow-stage-label">本周扫描完成</span>
+            <h2 id="review-title">选择本周要读的论文</h2>
+            <p>最多选择两篇；仅所选论文会下载 PDF 并进入后续处理。</p>
+            <p className="workflow-scan-summary">
+              扫描 <strong>{workflowFixture.scanSummary?.rawCount ?? 46}</strong> 条
+              <span aria-hidden="true"> · </span>
+              <strong>{workflowFixture.scanSummary?.topicMatchedCount ?? 18}</strong> 条主题相关
+              <span aria-hidden="true"> · </span>
+              <strong>{workflowFixture.scanSummary?.focusedCount ?? papers.length}</strong> 条重点候选
+            </p>
+          </div>
+        </header>
 
-      <div className="workflow-candidate-list">
-        {papers.map((paper, index) => {
-          const selected = selectedPaperIds.includes(paper.id);
-          const selectionFull = selectedPaperIds.length >= 2 && !selected;
-          const evidenceExpanded = expandedEvidenceId === paper.id;
-          return (
-            <article className={`workflow-candidate${selected ? " is-selected" : ""}`} key={paper.id}>
-              <label className="workflow-candidate-select">
-                <input
-                  type="checkbox"
-                  checked={selected}
-                  disabled={selectionFull}
-                  aria-label={`${selected ? "取消选择" : "选择"}${paper.title}`}
-                  onChange={() => onTogglePaper?.(paper.id)}
-                />
-                <span>{selected ? <Check size={13} weight="bold" aria-hidden="true" /> : index + 1}</span>
-              </label>
-              <div className="workflow-candidate-main">
-                <div className="workflow-candidate-title-row">
-                  <h3>{paper.title}</h3>
-                  <span className="workflow-recommendation-badge">{paper.recommendation}</span>
+        <div className="workflow-candidate-list">
+          {papers.map((paper, index) => {
+            const selected = selectedPaperIds.includes(paper.id);
+            const selectionFull = selectedCount >= 2 && !selected;
+            const evidenceExpanded = expandedEvidenceId === paper.id;
+            return (
+              <article className={`workflow-candidate${selected ? " is-selected" : ""}`} key={paper.id}>
+                <label className="workflow-candidate-select">
+                  <input
+                    type="checkbox"
+                    checked={selected}
+                    disabled={selectionFull}
+                    aria-label={`${selected ? "取消选择" : "选择"}${paper.title}`}
+                    onChange={() => onTogglePaper?.(paper.id)}
+                  />
+                  <span>{selected ? <Check size={13} weight="bold" aria-hidden="true" /> : index + 1}</span>
+                </label>
+                <div className="workflow-candidate-main">
+                  <div className="workflow-candidate-title-row">
+                    <h3>{paper.title}</h3>
+                    <span className="workflow-recommendation-badge">{paper.recommendation}</span>
+                  </div>
+                  <p className="workflow-authors">{Array.isArray(paper.authors) ? paper.authors.join("、") : paper.authors}</p>
+                  <dl className="workflow-candidate-summary">
+                    <div>
+                      <dt>论文讲什么</dt>
+                      <dd className="workflow-abstract-copy">{paper.abstract}</dd>
+                    </div>
+                    <div className="is-project-impact">
+                      <dt>对项目的作用</dt>
+                      <dd className="workflow-relevance-copy">{paper.relevance ?? paper.relevanceReason ?? paper.relevance_reason}</dd>
+                    </div>
+                  </dl>
+                  <button
+                    className="workflow-evidence-toggle"
+                    type="button"
+                    aria-expanded={evidenceExpanded}
+                    aria-controls={`${paper.id}-evidence`}
+                    onClick={() => toggleEvidence(paper.id)}
+                  >
+                    {evidenceExpanded ? "收起依据" : "查看依据"}
+                  </button>
+                  {evidenceExpanded ? (
+                    <div className="workflow-candidate-evidence" id={`${paper.id}-evidence`}>
+                      <div>
+                        <strong>热度依据</strong>
+                        <ul>{(paper.heatSignals ?? paper.heat_signals ?? []).map((signal, signalIndex) => <li key={`${paper.id}-signal-${signalIndex}`}>{formatSignal(signal)}</li>)}</ul>
+                      </div>
+                      <div>
+                        <strong>证据范围</strong>
+                        <p>{paper.evidenceScope ?? paper.evidence_scope ?? "仅依据题录与摘要，尚未阅读全文"}</p>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
-                <p className="workflow-authors">{Array.isArray(paper.authors) ? paper.authors.join("、") : paper.authors}</p>
-                <dl className="workflow-candidate-summary">
-                  <div>
-                    <dt>论文讲什么</dt>
-                    <dd className="workflow-abstract-copy">{paper.abstract}</dd>
-                  </div>
-                  <div className="is-project-impact">
-                    <dt>对项目的作用</dt>
-                    <dd className="workflow-relevance-copy">{paper.relevance ?? paper.relevanceReason ?? paper.relevance_reason}</dd>
-                  </div>
-                </dl>
-                <button
-                  className="workflow-evidence-toggle"
-                  type="button"
-                  aria-expanded={evidenceExpanded}
-                  aria-controls={`${paper.id}-evidence`}
-                  onClick={() => toggleEvidence(paper.id)}
-                >
-                  {evidenceExpanded ? "收起依据" : "查看依据"}
-                </button>
-                {evidenceExpanded ? (
-                  <div className="workflow-candidate-evidence" id={`${paper.id}-evidence`}>
-                    <div>
-                      <strong>热度依据</strong>
-                      <ul>{(paper.heatSignals ?? paper.heat_signals ?? []).map((signal, signalIndex) => <li key={`${paper.id}-signal-${signalIndex}`}>{formatSignal(signal)}</li>)}</ul>
-                    </div>
-                    <div>
-                      <strong>证据范围</strong>
-                      <p>{paper.evidenceScope ?? paper.evidence_scope ?? "仅依据题录与摘要，尚未阅读全文"}</p>
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            </article>
-          );
-        })}
+              </article>
+            );
+          })}
+        </div>
       </div>
 
       <footer className="workflow-stage-actions">
@@ -308,31 +311,33 @@ function GuideReady({ run, selectedPapers, activePaper, onSetActivePaper, onChoo
 
   return (
     <section className="workflow-stage workflow-guide-stage" aria-labelledby="guide-title">
-      <PaperTabs papers={selectedPapers} activePaperId={activePaper?.id} onSetActivePaper={onSetActivePaper} />
-      <header className="workflow-stage-heading workflow-paper-heading">
-        <div>
-          <span className="workflow-stage-label">五分钟导读</span>
-          <h2 id="guide-title">{activePaper?.title}</h2>
-          <p>{activePaper?.venue} · {activePaper?.publishedAt ?? activePaper?.published_at} · PDF 与 MinerU 文本仅保存在本次演示 Run</p>
+      <div className="workflow-stage-scroll-area">
+        <PaperTabs papers={selectedPapers} activePaperId={activePaper?.id} onSetActivePaper={onSetActivePaper} />
+        <header className="workflow-stage-heading workflow-paper-heading">
+          <div>
+            <span className="workflow-stage-label">五分钟导读</span>
+            <h2 id="guide-title">{activePaper?.title}</h2>
+            <p>{activePaper?.venue} · {activePaper?.publishedAt ?? activePaper?.published_at} · PDF 与 MinerU 文本仅保存在本次演示 Run</p>
+          </div>
+          <span className="workflow-evidence-badge"><ShieldCheck size={15} aria-hidden="true" />基于演示全文转换结果</span>
+        </header>
+
+        <div className="workflow-guide-grid">
+          {sections.map(([title, content]) => (
+            <article className="workflow-guide-section" key={title}>
+              <h3>{title}</h3>
+              {Array.isArray(content) ? <ul>{content.map((item) => <li key={item}>{item}</li>)}</ul> : <p>{content}</p>}
+            </article>
+          ))}
         </div>
-        <span className="workflow-evidence-badge"><ShieldCheck size={15} aria-hidden="true" />基于演示全文转换结果</span>
-      </header>
 
-      <div className="workflow-guide-grid">
-        {sections.map(([title, content]) => (
-          <article className="workflow-guide-section" key={title}>
-            <h3>{title}</h3>
-            {Array.isArray(content) ? <ul>{content.map((item) => <li key={item}>{item}</li>)}</ul> : <p>{content}</p>}
-          </article>
-        ))}
+        {questions.length > 0 ? (
+          <aside className="workflow-reading-questions">
+            <Quotes size={20} weight="fill" aria-hidden="true" />
+            <div><strong>进入精读最值得追问</strong><ol>{questions.map((question) => <li key={question}>{question}</li>)}</ol></div>
+          </aside>
+        ) : null}
       </div>
-
-      {questions.length > 0 ? (
-        <aside className="workflow-reading-questions">
-          <Quotes size={20} weight="fill" aria-hidden="true" />
-          <div><strong>进入精读最值得追问</strong><ol>{questions.map((question) => <li key={question}>{question}</li>)}</ol></div>
-        </aside>
-      ) : null}
 
       <footer className="workflow-stage-actions workflow-guide-actions">
         <p>{guideChoices[activePaper?.id] ? `已选择：${guideChoices[activePaper.id] === "read" ? "进入精读" : "只收藏导读"}` : "先决定这篇论文是否值得进入精读。"}</p>

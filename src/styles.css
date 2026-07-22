@@ -2773,11 +2773,18 @@ button:disabled {
   min-height: 0;
   height: 100%;
   padding: 0;
+  overflow: hidden;
+  animation: workflowStageFadeIn 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.workflow-stage-scroll-area {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
+  padding: 18px 22px 20px;
   scrollbar-color: #c9c5ba transparent;
   scrollbar-width: thin;
-  animation: workflowStageFadeIn 0.24s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .workflow-candidate-review {
@@ -2787,11 +2794,11 @@ button:disabled {
 }
 
 .workflow-stage-heading {
-  padding: 18px 22px 10px;
+  padding: 0 0 10px;
 }
 
 .workflow-candidate-list {
-  padding: 8px 22px 20px;
+  padding: 8px 0 20px;
 }
 
 @keyframes workflowStageFadeIn {
