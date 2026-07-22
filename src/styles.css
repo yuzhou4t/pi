@@ -425,7 +425,7 @@ button:disabled {
 .workflow-workspace {
   min-width: 0;
   min-height: 0;
-  background: #ffffff;
+  background: #fbfaf7;
   border: 1px solid var(--border);
   border-radius: 14px;
   overflow: hidden;
@@ -716,6 +716,19 @@ button:disabled {
   display: flex;
   flex: 0 0 auto;
   gap: 7px;
+}
+
+.workflow-candidate {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  padding: 16px 18px;
+  background: #ffffff;
+  border: 1px solid rgba(220, 215, 204, 0.8);
+  border-radius: 12px;
+  box-shadow: 0 2px 8px rgba(42, 40, 34, 0.04);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .restore-strip {
@@ -2489,8 +2502,8 @@ button:disabled {
   position: relative;
   z-index: 2;
   padding: 13px 20px 12px;
-  background: rgba(249, 248, 245, 0.98);
-  border-bottom: 1px solid var(--border);
+  background: transparent;
+  border-bottom: 1px solid rgba(220, 215, 204, 0.6);
 }
 
 .workflow-run-summary,
