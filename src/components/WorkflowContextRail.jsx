@@ -17,6 +17,12 @@ function getStageIndex(run, stages) {
   return index < 0 ? 0 : index;
 }
 
+function getActivePaper(run) {
+  const papers = workflowFixture.papers ?? [];
+  const activeId = run?.activePaperId ?? run?.active_paper_id ?? (run?.selectedPaperIds ?? run?.selected_ids ?? [])[0] ?? papers[0]?.id;
+  return papers.find((p) => p.id === activeId) ?? papers[0];
+}
+
 function EvidenceSection({ paper, stage }) {
   const evidence = (workflowFixture.evidence ?? [])
     .filter((item) => item.paperId === paper?.id)
