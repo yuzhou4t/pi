@@ -99,14 +99,19 @@ export function App() {
     setIsResizing(true);
     const startX = e.clientX;
     const startWidth = rightRailWidth;
+    let rafId = null;
 
     const onMouseMove = (moveEvent) => {
-      const deltaX = startX - moveEvent.clientX;
-      const nextWidth = Math.min(580, Math.max(220, startWidth + deltaX));
-      setRightRailWidth(nextWidth);
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        const deltaX = startX - moveEvent.clientX;
+        const nextWidth = Math.min(640, Math.max(200, startWidth + deltaX));
+        setRightRailWidth(nextWidth);
+      });
     };
 
     const onMouseUp = () => {
+      if (rafId) cancelAnimationFrame(rafId);
       setIsResizing(false);
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
