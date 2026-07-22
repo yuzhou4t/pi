@@ -1,7 +1,7 @@
 :root {
   color: #24221e;
   background: #faf9f5;
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans SC", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   --bg: #faf9f5;
@@ -10,16 +10,17 @@
   --surface: #ffffff;
   --surface-soft: #fcfbf8;
   --text: #24221e;
-  --muted: #6e6a60;
+  --muted: #6b675e;
   --weak: #8c877c;
-  --border: rgba(220, 216, 206, 0.5);
-  --border-strong: rgba(200, 196, 185, 0.7);
-  --accent: #0f766e;
-  --accent-hover: #0b665f;
-  --accent-pale: #eef7f4;
-  --risk: #9a4638;
-  --risk-pale: #fbf2ef;
-  --shadow: 0 2px 10px rgba(42, 40, 34, 0.04);
+  --border: rgba(220, 216, 206, 0.55);
+  --border-strong: rgba(195, 190, 178, 0.75);
+  --accent: #2c2925;
+  --accent-hover: #171614;
+  --accent-pale: #f2efe7;
+  --teal-accent: #0f766e;
+  --risk: #7c3a2d;
+  --risk-pale: #f7f3ee;
+  --shadow: 0 2px 12px rgba(42, 40, 34, 0.04);
 }
 
 * {
@@ -518,10 +519,50 @@ button:disabled {
   background: rgba(0, 0, 0, 0.07);
 }
 
-.column-toggle-btn.is-collapsed {
-  color: var(--accent);
-  background: var(--accent-pale);
-  border-color: rgba(15, 118, 110, 0.2);
+.panel-resizer {
+  position: relative;
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 8px;
+  margin: 0 -4px;
+  cursor: col-resize;
+  user-select: none;
+}
+
+.panel-resizer::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: transparent;
+  content: "";
+  transition: background 0.18s ease;
+}
+
+.panel-resizer:hover::before,
+.panel-resizer.is-resizing::before {
+  background: rgba(15, 118, 110, 0.4);
+}
+
+.resizer-line {
+  width: 2px;
+  height: 24px;
+  border-radius: 1px;
+  background: rgba(0, 0, 0, 0.12);
+  transition: background 0.18s ease, height 0.18s ease;
+}
+
+.panel-resizer:hover .resizer-line,
+.panel-resizer.is-resizing .resizer-line {
+  height: 40px;
+  background: var(--teal-accent);
+}
+
+.app-body.is-resizing-active {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .rail-heading {

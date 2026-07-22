@@ -89,8 +89,32 @@ function runToMarkdown(run) {
 export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [contextRailOpen, setContextRailOpen] = useState(true);
+  const [rightRailWidth, setRightRailWidth] = useState(360);
+  const [isResizing, setIsResizing] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState(projects[0].id);
   const [projectQuery, setProjectQuery] = useState("");
+
+  const startResizing = useCallback((e) => {
+    e.preventDefault();
+    setIsResizing(true);
+    const startX = e.clientX;
+    const startWidth = rightRailWidth;
+
+    const onMouseMove = (moveEvent) => {
+      const deltaX = startX - moveEvent.clientX;
+      const nextWidth = Math.min(580, Math.max(220, startWidth + deltaX));
+      setRightRailWidth(nextWidth);
+    };
+
+    const onMouseUp = () => {
+      setIsResizing(false);
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+  }, [rightRailWidth]);
   const [providerConfig, setProviderConfig] = usePersistentState("pi-agent-provider-v2", {
     providerId: "baseline",
     model: "强模型（演示）",
@@ -221,9 +245,14 @@ export function App() {
 
   const dispatchAction = (type, payload = {}) => dispatch({ type, ...payload });
 
+  const gridColumns = `${sidebarOpen ? 240 : 0}px minmax(0, 1fr) ${contextRailOpen ? rightRailWidth : 0}px`;
+
   return (
     <div className="app-shell">
-      <div className={`app-body${sidebarOpen ? "" : " no-sidebar"}${contextRailOpen ? "" : " no-context"}`}>
+      <div
+        className={`app-body${sidebarOpen ? "" : " no-sidebar"}${contextRailOpen ? "" : " no-context"}${isResizing ? " is-resizing-active" : ""}`}
+        style={{ gridTemplateColumns: gridColumns }}
+      >
         <ProjectRail
           projects={projects}
           selectedId={project.id}
@@ -286,6 +315,17 @@ export function App() {
           contextRailOpen={contextRailOpen}
           onToggleContextRail={() => setContextRailOpen((prev) => !prev)}
         />
+
+        {contextRailOpen ? (
+          <div
+            className={`panel-resizer${isResizing ? " is-resizing" : ""}`}
+            onMouseDown={startResizing}
+            title="拖拽左右滑动调整右侧栏宽度"
+            aria-label="拖拽调整右侧栏宽度"
+          >
+            <span className="resizer-line" />
+          </div>
+        ) : null}
 
         <WorkflowContextRail
           run={run}
