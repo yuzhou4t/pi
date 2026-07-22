@@ -2679,31 +2679,65 @@ button:disabled {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   padding-top: 2px;
 }
 
-.workflow-run-meta span {
+.workflow-run-status {
   display: inline-flex;
-  min-height: 26px;
+  height: 28px;
   align-items: center;
-  gap: 5px;
   padding: 0 10px;
-  color: var(--weak);
-  background: rgba(255, 255, 255, 0.8);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-size: 11px;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.03);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 20px;
+  font-size: 11.5px;
+  font-weight: 600;
   white-space: nowrap;
 }
 
-.workflow-run-meta span:nth-child(2) {
-  color: var(--accent);
-  background: var(--accent-pale);
-  border: 1px solid rgba(15, 118, 110, 0.22);
-  border-radius: 20px;
-  font-weight: 700;
-  padding: 0 11px;
+.header-provider-pill {
+  display: inline-flex;
+  height: 28px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 10px;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.03);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.header-provider-pill:hover {
+  background: rgba(0, 0, 0, 0.07);
+  color: var(--text);
+}
+
+.topbar-skill-button {
+  display: inline-flex;
+  height: 28px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 10px;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.03);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.topbar-skill-button:hover {
+  background: rgba(0, 0, 0, 0.07);
 }
 
 .workflow-step-flow {

@@ -37,18 +37,15 @@ export function ProviderMenu({
       ) : null}
 
       <button
-        className="provider-trigger"
+        className="compact-action header-provider-pill"
         type="button"
         aria-expanded={open}
         aria-haspopup="dialog"
         onClick={() => onOpenChange(!open)}
       >
-        <span className="provider-dot" aria-hidden="true" />
-        <span className="provider-trigger-copy">
-          <strong>{activeProvider.name}</strong>
-          <small>{model}</small>
-        </span>
-        <CaretDown size={14} weight="bold" aria-hidden="true" />
+        <Cpu size={14} weight="regular" aria-hidden="true" />
+        <span>{activeProvider.name}</span>
+        <CaretDown size={12} weight="bold" aria-hidden="true" />
       </button>
 
       {open ? (
