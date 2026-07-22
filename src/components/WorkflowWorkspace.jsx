@@ -113,17 +113,23 @@ function WorkflowHeader({ run, status }) {
         </div>
       </div>
 
-      <ol className="workflow-step-nav" aria-label="工作流步骤">
-        {WORKFLOW_STEPS.map((step, index) => {
-          const state = index < activeStepIndex ? "is-complete" : index === activeStepIndex ? "is-active" : "";
-          return (
-            <li className={state} key={step.id} aria-current={index === activeStepIndex ? "step" : undefined}>
-              <span className="workflow-step-index">{index < activeStepIndex ? <Check size={12} weight="bold" aria-hidden="true" /> : index + 1}</span>
-              <span className="workflow-step-label">{step.label}</span>
-            </li>
-          );
-        })}
-      </ol>
+      <nav className="workflow-step-flow" aria-label="工作流步骤">
+        <ol className="workflow-step-list">
+          {WORKFLOW_STEPS.map((step, index) => {
+            const isComplete = index < activeStepIndex;
+            const isActive = index === activeStepIndex;
+            const stateClass = isComplete ? "is-complete" : isActive ? "is-active" : "is-pending";
+            return (
+              <li className={`workflow-step-item ${stateClass}`} key={step.id} aria-current={isActive ? "step" : undefined}>
+                <span className="workflow-step-num">
+                  {isComplete ? <Check size={11} weight="bold" aria-hidden="true" /> : index + 1}
+                </span>
+                <span className="workflow-step-name">{step.label}</span>
+              </li>
+            );
+          })}
+        </ol>
+      </nav>
     </header>
   );
 }
