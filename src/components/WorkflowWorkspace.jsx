@@ -15,6 +15,7 @@ import {
   PaperPlaneTilt,
   Quotes,
   ShieldCheck,
+  SidebarSimple,
   WarningCircle,
   XCircle,
 } from "@phosphor-icons/react";
@@ -97,19 +98,40 @@ function getProposalPreview(proposal) {
   return preview ? [preview] : [];
 }
 
-function WorkflowHeader({ run, status }) {
+function WorkflowHeader({ run, status, sidebarOpen, onToggleSidebar, contextRailOpen, onToggleContextRail }) {
   const activeStepIndex = findStepIndex(status);
 
   return (
     <header className="workflow-run-header">
       <div className="workflow-run-summary">
-        <div>
-          <span className="workflow-kicker">{workflowFixture.project?.name ?? "Agent 工作流研究"}</span>
-          <h1>{workflowFixture.workflowName ?? "期刊追踪与精读"}</h1>
+        <div className="workflow-title-block">
+          <button
+            className={`column-toggle-btn${!sidebarOpen ? " is-collapsed" : ""}`}
+            type="button"
+            aria-label={sidebarOpen ? "收起左边栏" : "展开左边栏"}
+            title={sidebarOpen ? "收起左边栏" : "展开左边栏"}
+            onClick={onToggleSidebar}
+          >
+            <SidebarSimple size={18} weight="regular" />
+          </button>
+          <div>
+            <span className="workflow-kicker">{workflowFixture.project?.name ?? "Agent 工作流研究"}</span>
+            <h1>{workflowFixture.workflowName ?? "期刊追踪与精读"}</h1>
+          </div>
         </div>
+
         <div className="workflow-run-meta" aria-label="运行摘要">
           <span>{run?.windowLabel ?? workflowFixture.scanSummary?.window ?? "本周"}</span>
           <span className="workflow-run-status">{STATUS_LABELS[status] ?? status}</span>
+          <button
+            className={`column-toggle-btn${!contextRailOpen ? " is-collapsed" : ""}`}
+            type="button"
+            aria-label={contextRailOpen ? "收起右侧依据" : "展开右侧依据"}
+            title={contextRailOpen ? "收起右侧依据" : "展开右侧依据"}
+            onClick={onToggleContextRail}
+          >
+            <SidebarSimple size={18} weight="regular" style={{ transform: "scaleX(-1)" }} />
+          </button>
         </div>
       </div>
 
@@ -607,6 +629,10 @@ export function WorkflowWorkspace({
   onRetryFailed,
   onReset,
   mobileActive,
+  sidebarOpen,
+  onToggleSidebar,
+  contextRailOpen,
+  onToggleContextRail,
 }) {
   const status = normalizeStatus(run?.status);
   const papers = workflowFixture.papers ?? [];
@@ -631,7 +657,14 @@ export function WorkflowWorkspace({
 
   return (
     <main className={`workspace workflow-workspace${mobileActive ? " is-mobile-active" : ""}`}>
-      <WorkflowHeader run={run} status={status} />
+      <WorkflowHeader
+        run={run}
+        status={status}
+        sidebarOpen={sidebarOpen}
+        onToggleSidebar={onToggleSidebar}
+        contextRailOpen={contextRailOpen}
+        onToggleContextRail={onToggleContextRail}
+      />
       {content}
     </main>
   );

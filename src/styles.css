@@ -1,19 +1,19 @@
 :root {
-  color: #2c2925;
-  background: #f5f2ea;
+  color: #24221e;
+  background: #faf9f5;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --bg: #f5f2ea;
-  --sidebar: #f5f2ea;
-  --rightbar: #f5f2ea;
+  --bg: #faf9f5;
+  --sidebar: #f5f4ef;
+  --rightbar: #f5f4ef;
   --surface: #ffffff;
-  --surface-soft: #fbf9f5;
-  --text: #2c2925;
-  --muted: #6f6b62;
-  --weak: #8c877d;
-  --border: rgba(220, 215, 204, 0.5);
-  --border-strong: rgba(200, 195, 182, 0.7);
+  --surface-soft: #fcfbf8;
+  --text: #24221e;
+  --muted: #6e6a60;
+  --weak: #8c877c;
+  --border: rgba(220, 216, 206, 0.5);
+  --border-strong: rgba(200, 196, 185, 0.7);
   --accent: #0f766e;
   --accent-hover: #0b665f;
   --accent-pale: #eef7f4;
@@ -404,6 +404,19 @@ button:disabled {
   gap: 12px;
   padding: 12px;
   background: var(--bg);
+  transition: grid-template-columns 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.app-body.no-sidebar {
+  grid-template-columns: 0px minmax(0, 1fr) 350px;
+}
+
+.app-body.no-context {
+  grid-template-columns: 240px minmax(0, 1fr) 0px;
+}
+
+.app-body.no-sidebar.no-context {
+  grid-template-columns: 0px minmax(0, 1fr) 0px;
 }
 
 .project-rail,
@@ -411,6 +424,7 @@ button:disabled {
 .workspace {
   min-width: 0;
   min-height: 0;
+  transition: opacity 0.2s ease, transform 0.22s ease, margin 0.25s ease;
 }
 
 .project-rail {
@@ -420,6 +434,22 @@ button:disabled {
   background: transparent;
   border-right: 1px solid var(--border);
   padding-right: 12px;
+}
+
+.app-body.no-sidebar .project-rail {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-16px);
+  margin-right: -12px;
+  border-right: 0;
+}
+
+.app-body.no-context .workflow-context-rail {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(16px);
+  margin-left: -12px;
+  border-left: 0;
 }
 
 .sidebar-brand-header {
@@ -446,8 +476,8 @@ button:disabled {
 .workflow-workspace {
   min-width: 0;
   min-height: 0;
-  background: #fbf9f5;
-  border: 1px solid rgba(220, 215, 204, 0.6);
+  background: #fcfbf8;
+  border: 1px solid rgba(220, 216, 206, 0.6);
   border-radius: 14px;
   overflow: hidden;
   box-shadow: 0 2px 12px rgba(42, 40, 34, 0.03);
@@ -460,6 +490,38 @@ button:disabled {
   background: transparent;
   border-left: 1px solid var(--border);
   padding-left: 12px;
+}
+
+.workflow-title-block {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.column-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  color: #726e64;
+  background: rgba(0, 0, 0, 0.03);
+  border: 1px solid rgba(0, 0, 0, 0.05);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+
+.column-toggle-btn:hover {
+  color: #24221e;
+  background: rgba(0, 0, 0, 0.07);
+}
+
+.column-toggle-btn.is-collapsed {
+  color: var(--accent);
+  background: var(--accent-pale);
+  border-color: rgba(15, 118, 110, 0.2);
 }
 
 .rail-heading {

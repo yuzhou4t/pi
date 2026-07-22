@@ -87,6 +87,8 @@ function runToMarkdown(run) {
 }
 
 export function App() {
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [contextRailOpen, setContextRailOpen] = useState(true);
   const [selectedProjectId, setSelectedProjectId] = useState(projects[0].id);
   const [projectQuery, setProjectQuery] = useState("");
   const [providerConfig, setProviderConfig] = usePersistentState("pi-agent-provider-v2", {
@@ -221,7 +223,7 @@ export function App() {
 
   return (
     <div className="app-shell">
-      <div className="app-body">
+      <div className={`app-body${sidebarOpen ? "" : " no-sidebar"}${contextRailOpen ? "" : " no-context"}`}>
         <ProjectRail
           projects={projects}
           selectedId={project.id}
@@ -256,6 +258,8 @@ export function App() {
             setSkillCenterOpen(true);
           }}
           installedSkillCount={installedSkillCount}
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
         />
 
         <WorkflowWorkspace
@@ -277,11 +281,17 @@ export function App() {
             showToast("已重置为本周待审阅状态");
           }}
           mobileActive={mobileView === "run"}
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
+          contextRailOpen={contextRailOpen}
+          onToggleContextRail={() => setContextRailOpen((prev) => !prev)}
         />
 
         <WorkflowContextRail
           run={run}
           mobileActive={mobileView === "evidence"}
+          contextRailOpen={contextRailOpen}
+          onToggleContextRail={() => setContextRailOpen((prev) => !prev)}
         />
       </div>
 
