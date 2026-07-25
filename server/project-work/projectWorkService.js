@@ -702,6 +702,23 @@ export function createProjectWorkService({
       });
   }
 
+  async function beginRuntimeThinking(runtime) {
+    if (runtime.thinkingObserved) return;
+    runtime.thinkingObserved = true;
+    runtime.thinkingActive = true;
+    await appendEvent(runtime.conversationId, "agent.thinking", {
+      status: "active",
+    });
+  }
+
+  async function finishRuntimeThinking(runtime) {
+    if (!runtime.thinkingActive) return;
+    runtime.thinkingActive = false;
+    await appendEvent(runtime.conversationId, "agent.thinking", {
+      status: "finished",
+    });
+  }
+
   async function safeToolData(runtime, event) {
     const data = {
       callId: compactText(event.toolCallId, 160),
@@ -734,6 +751,8 @@ export function createProjectWorkService({
     const conversationId = runtime.conversationId;
     switch (event?.type) {
       case "agent_start":
+        await finishRuntimeThinking(runtime);
+        runtime.thinkingObserved = false;
         await updateConversation(conversationId, {
           status: "running",
           lastError: null,
@@ -741,11 +760,13 @@ export function createProjectWorkService({
         await appendEvent(conversationId, "agent.status", { status: "running" });
         break;
       case "agent_end":
+        await finishRuntimeThinking(runtime);
         await appendEvent(conversationId, "agent.turn_finished", {
           willRetry: event.willRetry === true,
         });
         break;
       case "agent_settled":
+        await finishRuntimeThinking(runtime);
         try {
           const changeSet = await refreshChangeSet(conversationId);
           const settledStatus = changeSet.files.length > 0
@@ -797,15 +818,17 @@ export function createProjectWorkService({
               256_000 - runtime.assistantText.length,
             );
           }
-        } else if (assistantEvent?.type?.startsWith("thinking_")) {
-          await appendEvent(conversationId, "agent.thinking", {
-            status: assistantEvent.type.endsWith("_end") ? "finished" : "active",
-          });
+        } else if (
+          assistantEvent?.type?.startsWith("thinking_")
+          && assistantEvent.type !== "thinking_end"
+        ) {
+          await beginRuntimeThinking(runtime);
         }
         break;
       }
       case "message_end":
         if (event.message?.role === "assistant" && runtime.activeAssistantId) {
+          await finishRuntimeThinking(runtime);
           const fullText = await sanitizeForConversation(
             conversationId,
             extractMessageText(event.message) || runtime.assistantText,
@@ -911,6 +934,8 @@ export function createProjectWorkService({
       turnIndex: 0,
       activeAssistantId: null,
       assistantText: "",
+      thinkingObserved: false,
+      thinkingActive: false,
       completion: null,
       host: null,
       unsubscribe: null,

@@ -327,6 +327,76 @@ test("a ready change event links to changes instead of matching read inside read
   });
 });
 
+test("settled activity is coalesced and collapsed above the final answer", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const events = [
+      { seq: 1, type: "message.created", status: "accepted" },
+      ...Array.from({ length: 35 }, (_, index) => ({
+        seq: index + 2,
+        type: "agent.thinking",
+        status: "active",
+      })),
+      { seq: 37, type: "agent.thinking", status: "finished" },
+      {
+        seq: 38,
+        type: "tool.completed",
+        toolName: "read",
+        path: "src/app.js",
+        status: "completed",
+      },
+    ];
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        messages: [
+          { id: "message-user", role: "user", content: "检查项目" },
+          { id: "message-assistant", role: "assistant", content: "这是本轮最终答案。" },
+        ],
+        events,
+      }),
+    }));
+
+    assert.match(html, /aria-expanded="false"/);
+    assert.match(html, /class="project-activity-body" hidden=""/);
+    assert.match(html, /已完成/);
+    assert.match(html, /2 项 · 查看过程/);
+    assert.equal((html.match(/思考完成/g) ?? []).length, 1);
+    assert.doesNotMatch(html, /agent\.thinking|37 条记录/);
+    assert.ok(
+      html.indexOf('aria-label="Pi Agent 活动"') < html.indexOf("这是本轮最终答案。"),
+      "completed activity should render before the final answer",
+    );
+  });
+});
+
+test("running activity stays expanded while historical thinking deltas are coalesced", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        status: "running",
+        turnStatus: "running",
+        messages: [{ id: "message-user", role: "user", content: "继续检查" }],
+        events: [
+          { seq: 1, type: "message.created", status: "accepted" },
+          ...Array.from({ length: 30 }, (_, index) => ({
+            seq: index + 2,
+            type: "agent.thinking",
+            status: "active",
+          })),
+        ],
+      }),
+    }));
+
+    assert.match(html, /Agent 正在工作/);
+    assert.match(html, /1 项实时进展/);
+    assert.match(html, /aria-expanded="true"/);
+    assert.doesNotMatch(html, /class="project-activity-body" hidden=""/);
+    assert.equal((html.match(/正在思考/g) ?? []).length, 1);
+    assert.doesNotMatch(html, /agent\.thinking|30 条记录/);
+  });
+});
+
 test("a limited large-project snapshot stays explicit in the activity timeline", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {

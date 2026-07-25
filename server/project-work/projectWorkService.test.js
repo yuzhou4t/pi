@@ -204,6 +204,87 @@ function createScratchSessionFactory() {
   return factory;
 }
 
+function createThinkingSessionFactory() {
+  const sessions = [];
+  const factory = async () => {
+    let subscriber = null;
+    const record = { prompts: [] };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt(prompt) {
+        record.prompts.push(prompt);
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({ type: "turn_start" });
+        subscriber?.({
+          type: "message_start",
+          message: { role: "assistant" },
+        });
+        subscriber?.({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "thinking_start",
+            contentIndex: 0,
+          },
+        });
+        for (let index = 0; index < 30; index += 1) {
+          subscriber?.({
+            type: "message_update",
+            assistantMessageEvent: {
+              type: "thinking_delta",
+              contentIndex: 0,
+              delta: `private-${index}`,
+            },
+          });
+        }
+        subscriber?.({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "thinking_end",
+            contentIndex: 0,
+            content: "private reasoning must not be persisted",
+          },
+        });
+        subscriber?.({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_delta",
+            contentIndex: 1,
+            delta: "最终答案",
+          },
+        });
+        subscriber?.({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "最终答案" }],
+            stopReason: "stop",
+          },
+        });
+        subscriber?.({ type: "turn_end" });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        subscriber?.({ type: "agent_settled" });
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
 async function eventually(read, predicate, message) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const value = await read();
@@ -212,6 +293,56 @@ async function eventually(read, predicate, message) {
   }
   assert.fail(message);
 }
+
+test("thinking deltas persist only one lifecycle pair per agent run", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-thinking-events-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createThinkingSessionFactory(),
+    idFactory: incrementalId("thinking"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "第一轮" });
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.messages.length === 2
+    ),
+    "first thinking turn did not settle",
+  );
+  await service.sendMessage(conversation.id, { text: "第二轮" });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.messages.length === 4
+    ),
+    "second thinking turn did not settle",
+  );
+
+  const thinkingEvents = settled.events.filter(
+    (event) => event.type === "agent.thinking",
+  );
+  assert.deepEqual(
+    thinkingEvents.map((event) => event.data.status),
+    ["active", "finished", "active", "finished"],
+  );
+  assert.equal(
+    JSON.stringify(thinkingEvents).includes("private reasoning"),
+    false,
+  );
+  assert.equal(JSON.stringify(thinkingEvents).includes("private-0"), false);
+  const completedEvents = settled.events.filter(
+    (event) => event.type === "message.completed",
+  );
+  assert.equal(completedEvents.length, 2);
+  assert.ok(thinkingEvents[1].seq < completedEvents[0].seq);
+  assert.ok(thinkingEvents[3].seq < completedEvents[1].seq);
+});
 
 test("create-mode picking accepts no name and public project data never leaks its path", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-project-create-"));

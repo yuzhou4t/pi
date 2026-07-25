@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -186,6 +187,9 @@ function eventTitle(event) {
   if (event.title) return event.title;
   const type = String(event.type || "");
   const tool = TOOL_LABELS[event.toolName] ?? event.toolName ?? "工具";
+  if (type === "agent.thinking") {
+    return event.status === "active" ? "正在思考" : "思考完成";
+  }
   if (type === "conversation.created") return "工作会话已创建";
   if (type === "message.created") return "任务已提交";
   if (type === "message.started") return "Agent 开始回复";
@@ -218,6 +222,11 @@ function boundedValue(value) {
 
 function eventDetail(event) {
   if (event.detail) return event.detail;
+  if (event.type === "agent.thinking") {
+    return event.status === "active"
+      ? "Pi 正在整理思路"
+      : "本轮思考已完成";
+  }
   if (event.path) return event.path;
   if (event.error?.message) return event.error.message;
   if (event.summary) return boundedValue(event.summary);
@@ -331,7 +340,7 @@ function ActivityEvent({ event, isLatest, onOpenArtifact }) {
       <summary>
         <span className="project-activity-dot" aria-hidden="true" />
         <span>{eventTitle(event)}</span>
-        <small>#{event.seq}</small>
+        <small>{event.type === "agent.thinking" ? "" : `#${event.seq}`}</small>
         <CaretDown size={12} aria-hidden="true" />
       </summary>
       <p>
@@ -351,23 +360,96 @@ function ActivityEvent({ event, isLatest, onOpenArtifact }) {
   );
 }
 
-function ActivityTimeline({ events, onOpenArtifact }) {
-  const visibleEvents = events
-    .filter((event) => !QUIET_EVENT_TYPES.has(event.type))
-    .slice(-100);
+function normalizeActivityEvents(events, running) {
+  const safeEvents = Array.isArray(events) ? events : [];
+  const latestMessageSeq = safeEvents.reduce((latest, event) => (
+    event.type === "message.created" && Number.isSafeInteger(event.seq)
+      ? Math.max(latest, event.seq)
+      : latest
+  ), 0);
+  const normalized = [];
+  let thinkingEvent = null;
+
+  for (const event of safeEvents) {
+    if (
+      QUIET_EVENT_TYPES.has(event.type)
+      || (latestMessageSeq > 0 && event.seq < latestMessageSeq)
+    ) {
+      continue;
+    }
+    if (event.type === "agent.thinking") {
+      if (!thinkingEvent) {
+        thinkingEvent = {
+          ...event,
+          activityKey: `thinking-${latestMessageSeq || event.seq}`,
+          status: event.status,
+        };
+        normalized.push(thinkingEvent);
+      } else if (event.status === "finished") {
+        thinkingEvent.status = "finished";
+      }
+      continue;
+    }
+    normalized.push(event);
+  }
+
+  if (thinkingEvent) {
+    thinkingEvent.status = running ? "active" : "finished";
+  }
+  return normalized.slice(-100);
+}
+
+function ActivityTimeline({
+  events,
+  running,
+  compact,
+  onOpenArtifact,
+}) {
+  const [expanded, setExpanded] = useState(!compact);
+  const visibleEvents = normalizeActivityEvents(events, running);
+
+  useEffect(() => {
+    setExpanded(!compact);
+  }, [compact]);
+
   if (visibleEvents.length === 0) return null;
   return (
-    <section className="project-activity" aria-label="Pi Agent 活动">
-      <header>
-        <span>活动</span>
-        <small>{visibleEvents.length} 条记录</small>
-      </header>
-      <div>
+    <section
+      className={[
+        "project-activity",
+        running ? "is-running" : "is-settled",
+        compact ? "is-compact" : "",
+        expanded ? "is-expanded" : "",
+      ].filter(Boolean).join(" ")}
+      aria-label="Pi Agent 活动"
+    >
+      <button
+        className="project-activity-toggle"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        {running ? (
+          <CircleNotch size={15} weight="bold" aria-hidden="true" />
+        ) : (
+          <CheckCircle size={15} weight="fill" aria-hidden="true" />
+        )}
+        <span>
+          <strong>{running ? "Agent 正在工作" : "已完成"}</strong>
+          <small>
+            {running
+              ? `${visibleEvents.length} 项实时进展`
+              : `${visibleEvents.length} 项 · 查看过程`}
+          </small>
+        </span>
+        <CaretDown size={13} aria-hidden="true" />
+      </button>
+      <div className="project-activity-body" hidden={!expanded}>
         {visibleEvents.map((event, index) => (
           <ActivityEvent
             event={event}
             isLatest={index === visibleEvents.length - 1}
-            key={event.seq}
+            key={event.activityKey ?? event.seq}
             onOpenArtifact={onOpenArtifact}
           />
         ))}
@@ -442,6 +524,26 @@ function ProjectAgentPane({
     || Boolean(limitedSnapshotEvent);
   const includedFiles = conversation.workspaceSnapshot?.includedFiles
     ?? limitedSnapshotEvent?.data?.snapshot?.includedFiles;
+  const lastAssistantMessageIndex = conversation.messages.reduce(
+    (latest, message, index) => (
+      message.role === "assistant" && messageText(message.content)
+        ? index
+        : latest
+    ),
+    -1,
+  );
+  const settledWithAnswer = !running && lastAssistantMessageIndex >= 0;
+  const processBlock = (compact) => (
+    <>
+      <PlanCard plan={conversation.plan} />
+      <ActivityTimeline
+        events={conversation.events}
+        running={running}
+        compact={compact}
+        onOpenArtifact={onOpenArtifact}
+      />
+    </>
+  );
 
   return (
     <div className="project-agent">
@@ -513,23 +615,26 @@ function ProjectAgentPane({
             </div>
           </section>
         ) : (
-          conversation.messages.map((message) => {
+          conversation.messages.map((message, index) => {
             const text = messageText(message.content);
             if (!text) return null;
             return (
-              <article
-                className={`project-agent-message is-${message.role} is-${message.kind}`}
-                key={message.id}
-              >
-                <small>{message.role === "user" ? "你" : "Pi Agent"}</small>
-                <div>{text}</div>
-              </article>
+              <Fragment key={message.id}>
+                {settledWithAnswer && index === lastAssistantMessageIndex
+                  ? processBlock(true)
+                  : null}
+                <article
+                  className={`project-agent-message is-${message.role} is-${message.kind}`}
+                >
+                  <small>{message.role === "user" ? "你" : "Pi Agent"}</small>
+                  <div>{text}</div>
+                </article>
+              </Fragment>
             );
           })
         )}
 
-        <PlanCard plan={conversation.plan} />
-        <ActivityTimeline events={conversation.events} onOpenArtifact={onOpenArtifact} />
+        {settledWithAnswer ? null : processBlock(!running)}
         <ActionError error={error ?? conversation.error} />
 
         {conversation.pendingChangeSet?.status && [
