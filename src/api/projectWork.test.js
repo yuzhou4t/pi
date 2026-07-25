@@ -20,6 +20,11 @@ test("conversation mapping preserves a ready, hash-bound change set", () => {
       project_id: "project-1",
       title: "修复设置页",
       status: "awaiting_confirmation",
+      workspace_snapshot: {
+        included_files: 7938,
+        included_bytes: 100663296,
+        truncated: true,
+      },
       activeChangeSet: {
         id: "change-set-1",
         status: "ready",
@@ -68,6 +73,11 @@ test("conversation mapping preserves a ready, hash-bound change set", () => {
   assert.deepEqual(mapped.events.map((event) => event.seq), [1, 2]);
   assert.equal(mapped.events[1].toolName, "read");
   assert.equal(mapped.events[1].path, "src/settings.css");
+  assert.deepEqual(mapped.workspaceSnapshot, {
+    includedFiles: 7938,
+    includedBytes: 100663296,
+    truncated: true,
+  });
 });
 
 test("string checks map across failed then passing runs while the command remains retryable", () => {

@@ -173,6 +173,7 @@ function eventTitle(event) {
   if (type === "message.started") return "Agent 开始回复";
   if (type === "message.completed") return "Agent 回复已完成";
   if (type === "agent.status") return "Agent 状态已更新";
+  if (type === "workspace.snapshot_limited") return "大型项目已按安全范围载入";
   if (/tool.*(?:start|call)|tool_call/.test(type)) {
     return TOOL_LABELS[event.toolName] ?? `调用 ${tool}`;
   }
@@ -402,6 +403,13 @@ function ProjectAgentPane({
   const status = activeStatus(conversation);
   const statusLabel = STATUS_LABELS[status] ?? status;
   const canSubmit = draft.trim() && !action;
+  const limitedSnapshotEvent = conversation.events.find(
+    (event) => event.type === "workspace.snapshot_limited",
+  );
+  const snapshotIsLimited = conversation.workspaceSnapshot?.truncated === true
+    || Boolean(limitedSnapshotEvent);
+  const includedFiles = conversation.workspaceSnapshot?.includedFiles
+    ?? limitedSnapshotEvent?.data?.snapshot?.includedFiles;
 
   return (
     <div className="project-agent">
@@ -440,6 +448,20 @@ function ProjectAgentPane({
       </header>
 
       <div className="project-agent-stream">
+        {snapshotIsLimited ? (
+          <section className="project-agent-decision" role="status">
+            <WarningCircle size={18} weight="fill" aria-hidden="true" />
+            <div>
+              <strong>当前会话使用受控项目快照</strong>
+              <p>
+                {Number.isSafeInteger(includedFiles)
+                  ? `大型项目已载入 ${includedFiles} 个可编辑文本文件。`
+                  : "大型项目已按安全范围载入。"}
+                Agent 不会把未载入范围当成已检查内容；需要完整检查时请绑定更具体的子文件夹。
+              </p>
+            </div>
+          </section>
+        ) : null}
         {conversation.messages.length === 0 ? (
           <section className="project-agent-welcome">
             <Code size={24} weight="regular" aria-hidden="true" />

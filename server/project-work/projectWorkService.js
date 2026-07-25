@@ -89,6 +89,9 @@ function publicConversationState(conversation, lastEventSeq) {
     verifications: (conversation.verifications ?? []).map((verification) => (
       structuredClone(verification)
     )),
+    workspaceSnapshot: conversation.workspaceSnapshot
+      ? structuredClone(conversation.workspaceSnapshot)
+      : null,
     lastError: conversation.lastError ? structuredClone(conversation.lastError) : null,
   };
 }
@@ -693,6 +696,20 @@ export function createProjectWorkService({
     const conversation = await conversationStore.get(conversationId);
     const paths = conversationPaths(conversationId);
     const project = await registry.get(conversation.projectId);
+    let workspaceSnapshot = conversation.workspaceSnapshot ?? null;
+    if (!workspaceSnapshot) {
+      const existingEvents = await conversationStore.readEvents(conversationId, {
+        afterSeq: 0,
+        limit: 1_000,
+      });
+      if (
+        existingEvents.events.some(
+          (event) => event.type === "workspace.snapshot_limited",
+        )
+      ) {
+        workspaceSnapshot = { truncated: true };
+      }
+    }
     const runtime = {
       conversationId,
       projectRoot: project.rootPath,
@@ -711,6 +728,7 @@ export function createProjectWorkService({
       sessionDir: paths.sessionDir,
       modelRef: conversation.modelRef,
       thinkingLevel: conversation.thinkingLevel,
+      workspaceSnapshot,
       onPlan: (plan) => recordPlan(conversationId, plan),
       onVerificationRequest: (request) => recordVerificationRequest(
         conversationId,
@@ -989,7 +1007,7 @@ export function createProjectWorkService({
     try {
       await mkdir(path.dirname(paths.directory), { recursive: true, mode: 0o700 });
       await mkdir(paths.directory, { recursive: false, mode: 0o700 });
-      await createFilteredProjectSnapshot({
+      const workspaceSnapshot = await createFilteredProjectSnapshot({
         projectRoot: project.rootPath,
         baseRoot: paths.baseRoot,
         workspaceRoot: paths.workspaceRoot,
@@ -1011,6 +1029,15 @@ export function createProjectWorkService({
         plan: null,
         activeChangeSet: null,
         verifications: [],
+        workspaceSnapshot: {
+          schemaVersion: 1,
+          rulesVersion: 1,
+          includedFiles: workspaceSnapshot.files,
+          includedBytes: workspaceSnapshot.bytes,
+          skippedBinaryFiles: workspaceSnapshot.skippedBinaryFiles,
+          skippedOversizedFiles: workspaceSnapshot.skippedOversizedFiles,
+          truncated: workspaceSnapshot.truncated,
+        },
         lastError: null,
         lastEventSeq: 0,
         createdAt,
@@ -1020,6 +1047,17 @@ export function createProjectWorkService({
         id: conversationId,
         projectId: project.id,
       });
+      if (workspaceSnapshot.truncated) {
+        await appendEvent(conversationId, "workspace.snapshot_limited", {
+          title: "大型项目已按安全范围载入",
+          summary: `已载入 ${workspaceSnapshot.files} 个可编辑文本文件；未载入的项目文件不会自动进入 Agent 工作区。`,
+          snapshot: {
+            includedFiles: workspaceSnapshot.files,
+            includedBytes: workspaceSnapshot.bytes,
+            truncated: true,
+          },
+        });
+      }
       return publicConversationSummary(conversation);
     } catch (error) {
       await rm(paths.directory, { recursive: true, force: true }).catch(() => undefined);
@@ -1062,6 +1100,14 @@ export function createProjectWorkService({
         filePath: item?.path,
         startLine: item?.startLine,
         endLine: item?.endLine,
+      }).catch((error) => {
+        if (error?.code !== "PROJECT_WORK_FILE_NOT_FOUND") throw error;
+        throw projectWorkError(
+          "PROJECT_WORK_CONTEXT_OUTSIDE_SNAPSHOT",
+          "所选文件未进入或已移出当前受控工作快照；请绑定更具体的项目文件夹后重试",
+          409,
+          true,
+        );
       });
       if (item.contentHash !== file.hash) {
         throw projectWorkError(

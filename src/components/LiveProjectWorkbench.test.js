@@ -259,6 +259,33 @@ test("a ready change event links to changes instead of matching read inside read
   });
 });
 
+test("a limited large-project snapshot stays explicit in the activity timeline", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        workspaceSnapshot: {
+          includedFiles: 7938,
+          includedBytes: 100_663_296,
+          truncated: true,
+        },
+        events: [{
+          seq: 2,
+          type: "workspace.snapshot_limited",
+          title: "大型项目已按安全范围载入",
+          detail: "已载入 7938 个可编辑文本文件；未载入的项目文件不会自动进入 Agent 工作区。",
+        }],
+      }),
+    }));
+
+    assert.match(html, /大型项目已按安全范围载入/);
+    assert.match(html, /已载入 7938 个可编辑文本文件/);
+    assert.match(html, /Agent 不会把未载入范围当成已检查内容/);
+    assert.match(html, /请绑定更具体的子文件夹/);
+    assert.doesNotMatch(html, /项目超出当前工作快照/);
+  });
+});
+
 test("adding file context only updates removable composer context until submit", async () => {
   const source = await readFile(COMPONENT_URL, "utf8");
   const addContextStart = source.indexOf("const addContext = useCallback");

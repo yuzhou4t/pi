@@ -51,6 +51,21 @@ const APP_GUIDANCE = [
   "Edits in this snapshot are proposals. Never claim that the live project changed before the app confirms an applied change set.",
 ].join("\n");
 
+function workspaceSnapshotGuidance(workspaceSnapshot) {
+  if (workspaceSnapshot?.truncated !== true) return "";
+  const includedFiles = Number.isSafeInteger(workspaceSnapshot.includedFiles)
+    ? workspaceSnapshot.includedFiles
+    : null;
+  return [
+    "The server reports that this large-project snapshot is incomplete.",
+    includedFiles === null
+      ? "It contains a bounded subset of editable text files."
+      : `It contains ${includedFiles} editable text files.`,
+    "Never claim that you inspected the entire project.",
+    "If a requested path is missing, explain that it may be outside the current snapshot and ask the user to bind a narrower project folder.",
+  ].join("\n");
+}
+
 function textResult(text, details) {
   return {
     content: [{ type: "text", text: String(text).slice(0, MAX_TOOL_OUTPUT_CHARS) }],
@@ -684,6 +699,7 @@ export function createPiSessionFactory({
     sessionDir,
     modelRef,
     thinkingLevel = "medium",
+    workspaceSnapshot,
     onPlan,
     onVerificationRequest,
   } = {}) => {
@@ -715,6 +731,10 @@ export function createPiSessionFactory({
       { projectTrusted: false },
     );
     const agentsFiles = await readSafeAgentsFiles(cwd);
+    const appendedGuidance = [
+      APP_GUIDANCE,
+      workspaceSnapshotGuidance(workspaceSnapshot),
+    ].filter(Boolean);
     const resourceLoader = new DefaultResourceLoader({
       cwd,
       agentDir,
@@ -725,14 +745,14 @@ export function createPiSessionFactory({
       noThemes: true,
       noContextFiles: true,
       systemPrompt: "",
-      appendSystemPrompt: [APP_GUIDANCE],
+      appendSystemPrompt: appendedGuidance,
       extensionsOverride: (base) => ({ ...base, extensions: [], errors: [] }),
       skillsOverride: () => ({ skills: [], diagnostics: [] }),
       promptsOverride: () => ({ prompts: [], diagnostics: [] }),
       themesOverride: () => ({ themes: [], diagnostics: [] }),
       agentsFilesOverride: () => ({ agentsFiles }),
       systemPromptOverride: () => undefined,
-      appendSystemPromptOverride: () => [APP_GUIDANCE],
+      appendSystemPromptOverride: () => appendedGuidance,
     });
     await resourceLoader.reload();
     const customTools = await createProjectWorkTools({

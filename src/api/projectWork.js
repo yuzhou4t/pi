@@ -175,6 +175,21 @@ function mapEvent(raw) {
   };
 }
 
+function mapWorkspaceSnapshot(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const includedFiles = Number(pick(raw, "included_files", "includedFiles"));
+  const includedBytes = Number(pick(raw, "included_bytes", "includedBytes"));
+  return {
+    includedFiles: Number.isSafeInteger(includedFiles) && includedFiles >= 0
+      ? includedFiles
+      : null,
+    includedBytes: Number.isSafeInteger(includedBytes) && includedBytes >= 0
+      ? includedBytes
+      : null,
+    truncated: pick(raw, "truncated", "truncated", false) === true,
+  };
+}
+
 function mapChangeFile(raw) {
   if (!raw || typeof raw !== "object") return null;
   const id = pick(raw, "file_id", "fileId", raw.id);
@@ -422,6 +437,9 @@ export function mapProjectWorkConversation(raw) {
     pendingChangeSet: changeSet,
     verificationCommand,
     verificationRuns,
+    workspaceSnapshot: mapWorkspaceSnapshot(
+      pick(source, "workspace_snapshot", "workspaceSnapshot"),
+    ),
     preview: pick(source, "preview", "preview"),
     compaction: pick(source, "compaction", "compaction"),
     error: pick(source, "last_error", "lastError"),

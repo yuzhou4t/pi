@@ -137,6 +137,59 @@ test("create-mode picking accepts no name and public project data never leaks it
   ).then((value) => value.includes(parentRoot)), true);
 });
 
+test("conversation snapshots ignore nested Python virtual environments", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-project-venv-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "private-project-root");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const virtualEnvironment = path.join(
+    projectRoot,
+    "benchmark-baselines",
+    "DeepScientist",
+    ".venv",
+    "lib",
+  );
+  const assetDirectory = path.join(
+    projectRoot,
+    "benchmark-baselines",
+    "DeepScientist",
+    "assets",
+    "readme",
+  );
+  await mkdir(virtualEnvironment, { recursive: true });
+  await mkdir(assetDirectory, { recursive: true });
+  await writeFile(path.join(projectRoot, "app.py"), "print('ready')\n", "utf8");
+  await writeFile(
+    path.join(virtualEnvironment, "_rust.abi3.so"),
+    Buffer.alloc((4 * 1024 * 1024) + 1),
+  );
+  await writeFile(
+    path.join(assetDirectory, "paper-output-1.png"),
+    Buffer.alloc((4 * 1024 * 1024) + 1),
+  );
+
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory(),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("venv"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  const tree = await service.getProjectTree(project.id, { depth: 5 });
+  const snapshot = await service.getConversation(conversation.id);
+
+  assert.equal(conversation.status, "idle");
+  assert.equal(snapshot.conversation.workspaceSnapshot.truncated, false);
+  assert.equal(snapshot.conversation.workspaceSnapshot.includedFiles, 1);
+  assert.equal(JSON.stringify(tree).includes(".venv"), false);
+});
+
 test("real project-work chain binds context and changes, applies by hash, and preserves verification attempts", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-project-chain-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
@@ -222,6 +275,27 @@ test("real project-work chain binds context and changes, applies by hash, and pr
   );
   assert.equal(sessionFactory.sessions[0].prompts.length, 0);
 
+  await writeFile(path.join(projectRoot, "created-after-snapshot.js"), "late\n");
+  const outsideSnapshotFile = await service.readProjectFile(project.id, {
+    filePath: "created-after-snapshot.js",
+  });
+  await assert.rejects(
+    service.sendMessage(conversation.id, {
+      text: "Read the newly added file.",
+      context: [{
+        path: "created-after-snapshot.js",
+        startLine: 1,
+        endLine: 1,
+        contentHash: outsideSnapshotFile.hash,
+      }],
+    }),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_CONTEXT_OUTSIDE_SNAPSHOT");
+      assert.equal(error.status, 409);
+      return true;
+    },
+  );
+
   await service.sendMessage(conversation.id, {
     text: "Update the implementation and prepare its verification.",
     context: [{
@@ -231,6 +305,10 @@ test("real project-work chain binds context and changes, applies by hash, and pr
       contentHash: file.hash,
     }],
   });
+  assert.equal(
+    sessionFactory.sessions[0].options.workspaceSnapshot.truncated,
+    false,
+  );
   const settled = await eventually(
     () => service.getConversation(conversation.id),
     (snapshot) => snapshot.conversation.status === "awaiting_confirmation",

@@ -30,7 +30,62 @@ const FILTERED_DIRECTORIES = new Set([
   ".agents",
   ".codex",
   ".pi-agent",
+  ".venv",
   "node_modules",
+  "venv",
+]);
+const SNAPSHOT_ONLY_DIRECTORIES = new Set([
+  ".cache",
+  ".mypy_cache",
+  ".next",
+  ".nuxt",
+  ".pytest_cache",
+  ".ruff_cache",
+  ".tox",
+  ".turbo",
+  ".worktrees",
+  "__pycache__",
+  "coverage",
+  "dist",
+]);
+const SNAPSHOT_BINARY_EXTENSIONS = new Set([
+  ".7z",
+  ".a",
+  ".avi",
+  ".bin",
+  ".bmp",
+  ".class",
+  ".dmg",
+  ".doc",
+  ".docx",
+  ".eot",
+  ".gif",
+  ".gz",
+  ".ico",
+  ".jar",
+  ".jpeg",
+  ".jpg",
+  ".mov",
+  ".mp3",
+  ".mp4",
+  ".o",
+  ".otf",
+  ".pdf",
+  ".png",
+  ".pyc",
+  ".so",
+  ".tar",
+  ".tif",
+  ".tiff",
+  ".ttf",
+  ".wav",
+  ".webm",
+  ".webp",
+  ".woff",
+  ".woff2",
+  ".xls",
+  ".xlsx",
+  ".zip",
 ]);
 
 export function sha256(value) {
@@ -286,7 +341,16 @@ export async function getProjectFileTree(root, {
 }
 
 function shouldSkipSnapshotPath(relativePath) {
-  return isFilteredProjectPath(relativePath);
+  if (isFilteredProjectPath(relativePath)) return true;
+  return relativePath
+    .split("/")
+    .some((segment) => SNAPSHOT_ONLY_DIRECTORIES.has(segment));
+}
+
+function isKnownSnapshotBinaryPath(relativePath) {
+  return SNAPSHOT_BINARY_EXTENSIONS.has(
+    path.posix.extname(relativePath).toLowerCase(),
+  );
 }
 
 async function copyTree({
@@ -295,12 +359,32 @@ async function copyTree({
   excludedRoot,
   limits,
 }) {
-  const counters = { files: 0, bytes: 0 };
+  const counters = {
+    files: 0,
+    bytes: 0,
+    truncated: false,
+    skippedBinaryFiles: 0,
+    skippedOversizedFiles: 0,
+  };
   const excluded = excludedRoot ? path.resolve(excludedRoot) : null;
+  const pendingDirectories = [{
+    sourceDirectory: sourceRoot,
+    relativeDirectory: "",
+  }];
+  let nextDirectoryIndex = 0;
+  await mkdir(destinationRoot, { recursive: true, mode: 0o700 });
 
-  async function visit(sourceDirectory, destinationDirectory, relativeDirectory) {
-    await mkdir(destinationDirectory, { recursive: true, mode: 0o700 });
+  while (nextDirectoryIndex < pendingDirectories.length) {
+    const {
+      sourceDirectory,
+      relativeDirectory,
+    } = pendingDirectories[nextDirectoryIndex];
+    nextDirectoryIndex += 1;
     const entries = await readdir(sourceDirectory, { withFileTypes: true });
+    entries.sort((left, right) => (
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+    ));
+    const childDirectories = [];
     for (const entry of entries) {
       const relativePath = [relativeDirectory, entry.name].filter(Boolean).join("/");
       if (shouldSkipSnapshotPath(relativePath)) continue;
@@ -313,37 +397,49 @@ async function copyTree({
       }
       const sourceStat = await lstat(sourcePath);
       if (sourceStat.isSymbolicLink()) continue;
-      const destinationPath = path.join(destinationDirectory, entry.name);
       if (sourceStat.isDirectory()) {
-        await visit(sourcePath, destinationPath, relativePath);
+        childDirectories.push({
+          sourceDirectory: sourcePath,
+          relativeDirectory: relativePath,
+        });
         continue;
       }
       if (!sourceStat.isFile()) continue;
-      if (sourceStat.size > MAX_SNAPSHOT_FILE_BYTES) {
-        throw projectWorkError(
-          "PROJECT_WORK_SNAPSHOT_FILE_TOO_LARGE",
-          `项目文件 ${relativePath} 超出工作快照限制`,
-          413,
-        );
+      if (
+        sourceStat.size > MAX_SNAPSHOT_FILE_BYTES
+        || isKnownSnapshotBinaryPath(relativePath)
+      ) {
+        if (sourceStat.size > MAX_SNAPSHOT_FILE_BYTES) {
+          counters.skippedOversizedFiles += 1;
+        } else {
+          counters.skippedBinaryFiles += 1;
+        }
+        continue;
       }
-      counters.files += 1;
-      counters.bytes += sourceStat.size;
-      if (counters.files > limits.maxFiles || counters.bytes > limits.maxBytes) {
-        throw projectWorkError(
-          "PROJECT_WORK_SNAPSHOT_TOO_LARGE",
-          "项目超出当前工作快照的文件数量或容量限制",
-          413,
-        );
+      if (
+        counters.files >= limits.maxFiles
+        || counters.bytes + sourceStat.size > limits.maxBytes
+      ) {
+        counters.truncated = true;
+        continue;
       }
       const content = await readFile(sourcePath);
+      if (isProbablyBinary(content)) {
+        counters.skippedBinaryFiles += 1;
+        continue;
+      }
+      const destinationPath = path.join(destinationRoot, ...relativePath.split("/"));
+      await mkdir(path.dirname(destinationPath), { recursive: true, mode: 0o700 });
       await writeFile(destinationPath, content, {
         flag: "wx",
         mode: sourceStat.mode & 0o777,
       });
+      counters.files += 1;
+      counters.bytes += content.length;
     }
+    pendingDirectories.push(...childDirectories);
   }
 
-  await visit(sourceRoot, destinationRoot, "");
   return counters;
 }
 

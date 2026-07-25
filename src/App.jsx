@@ -2057,7 +2057,7 @@ export function App() {
 
   const dispatchAction = (type, payload = {}) => dispatch({ type, ...payload });
 
-  const createWorkConversation = async (projectId) => {
+  const createWorkConversation = async (projectId, { throwOnError = false } = {}) => {
     if (!projectId) return null;
     setLiveProjectWork((current) => ({
       ...current,
@@ -2081,6 +2081,7 @@ export function App() {
         status: "error",
         error,
       }));
+      if (throwOnError) throw error;
       showToast(error.message || "无法新建工作会话", "warning");
       return null;
     }
@@ -2131,10 +2132,16 @@ export function App() {
         ...nextProject,
         conversationCount: nextProject.conversationCount ?? 0,
       };
-      const conversationId = await createWorkConversation(projectRecord.id);
-      if (!conversationId) throw new Error("项目已绑定，但工作会话创建失败");
-      showToast("已绑定本地项目并创建工作会话");
-      return;
+      try {
+        await createWorkConversation(projectRecord.id, { throwOnError: true });
+        showToast("已绑定本地项目并创建工作会话");
+        return;
+      } catch (error) {
+        await loadLiveProjectWork({
+          preferredProjectId: projectRecord.id,
+        }).catch(() => undefined);
+        throw error;
+      }
     }
     const projectRecord = {
       ...nextProject,
