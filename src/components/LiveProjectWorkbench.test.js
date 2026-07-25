@@ -101,6 +101,24 @@ test("live project workbench renders the honest empty states without starting wo
   });
 });
 
+test("live project workbench renders an immediate preparation state for a new conversation", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      {
+        project,
+        conversation: null,
+        preparingConversation: true,
+      },
+    ));
+
+    assert.match(html, /正在准备新工作会话/);
+    assert.match(html, /创建会话/);
+    assert.match(html, /马上就可以输入任务/);
+    assert.doesNotMatch(html, /还没有会话/);
+  });
+});
+
 test("a ready change set exposes its exact diff and hash-bound apply control", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {

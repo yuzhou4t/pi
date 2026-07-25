@@ -1,6 +1,7 @@
 import { Fragment } from "react";
 import {
   BookOpenText,
+  CircleNotch,
   Code,
   FolderSimplePlus,
   GearSix,
@@ -19,6 +20,8 @@ export function ProjectRail({
   selectedConversationId = null,
   onSelectConversation,
   onNewConversation,
+  creatingConversationProjectIds = [],
+  preparingConversationProjectId = null,
   workspaceKind = "project_work",
   onWorkspaceKindChange,
   query,
@@ -34,6 +37,7 @@ export function ProjectRail({
   onMouseDownResizer,
   isResizing,
 }) {
+  const creatingProjectIds = new Set(creatingConversationProjectIds);
   const normalizedQuery = query.trim().toLowerCase();
   const matchesQuery = (value) => String(value ?? "").toLowerCase().includes(normalizedQuery);
   const filteredProjects = projects.filter((project) => {
@@ -106,6 +110,7 @@ export function ProjectRail({
         </div>
         {filteredProjects.map((project) => {
           const selected = project.id === selectedId;
+          const creatingConversation = creatingProjectIds.has(project.id);
           const projectMatches = matchesQuery(`${project.name} ${project.state} ${project.rootLabel}`);
           const projectConversations = conversations.filter((conversation) => (
             conversation.projectId === project.id
@@ -145,16 +150,34 @@ export function ProjectRail({
                     className="icon-button"
                     type="button"
                     onClick={() => onNewConversation(project.id)}
+                    disabled={creatingConversation}
+                    aria-busy={creatingConversation}
                     aria-label={`在 ${project.name} 中新建会话`}
-                    title="新建会话"
+                    title={creatingConversation ? "正在创建工作会话" : "新建会话"}
                   >
-                    <Plus size={15} weight="bold" aria-hidden="true" />
+                    {creatingConversation
+                      ? <CircleNotch className="spin" size={15} weight="bold" aria-hidden="true" />
+                      : <Plus size={15} weight="bold" aria-hidden="true" />}
                   </button>
                 ) : null}
               </div>
               {selected ? (
                 <div className="project-children">
                   <div className="project-conversation-list">
+                    {creatingConversation ? (
+                      <button
+                        className={`project-conversation-row${preparingConversationProjectId === project.id ? " is-active" : ""}`}
+                        type="button"
+                        disabled
+                        aria-live="polite"
+                      >
+                        <CircleNotch className="spin" size={16} weight="bold" aria-hidden="true" />
+                        <span>
+                          <strong>新工作会话</strong>
+                          <small>正在创建会话…</small>
+                        </span>
+                      </button>
+                    ) : null}
                     {projectConversations.map((conversation) => {
                       const conversationSelected = conversation.id === selectedConversationId;
                       const ConversationIcon = conversation.kind === "paper_reading"
@@ -180,7 +203,7 @@ export function ProjectRail({
                         </button>
                       );
                     })}
-                    {projectConversations.length === 0 ? (
+                    {projectConversations.length === 0 && !creatingConversation ? (
                       <p className="project-child-empty">还没有会话</p>
                     ) : null}
                   </div>

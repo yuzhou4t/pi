@@ -519,6 +519,7 @@ export async function recomputeChangeSet({
   conversationId,
   baseRoot,
   workspaceRoot,
+  allowDeletes = true,
 } = {}) {
   const [baseFiles, workspaceFiles] = await Promise.all([
     collectSnapshotFiles(baseRoot),
@@ -529,6 +530,10 @@ export async function recomputeChangeSet({
   for (const relativePath of paths) {
     const before = baseFiles.get(relativePath);
     const after = workspaceFiles.get(relativePath);
+    // Sparse overlays do not expose a delete tool. A base-only entry can be
+    // left behind if a process stops between capturing the base and publishing
+    // the proposed file, so it must never become a deletion proposal.
+    if (before && !after && !allowDeletes) continue;
     if (before && after && before.buffer.equals(after.buffer)) continue;
     const beforeBuffer = before?.buffer ?? Buffer.alloc(0);
     const afterBuffer = after?.buffer ?? Buffer.alloc(0);

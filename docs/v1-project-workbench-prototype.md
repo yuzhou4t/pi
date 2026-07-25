@@ -73,7 +73,7 @@ ProjectWorkPhase = ready | planned | working | review | applied | completed
 - `ChangeSet` 保存逐文件操作、diff、选择状态、`baseHash`、`afterHash` 和确认状态。
 - 项目工作会话拥有独立的服务端 JSON 状态、单调 JSONL 事件流和 Pi JSONL 会话树；浏览器只保存当前工作类型、项目、会话与最后工件偏好。
 
-显式发送后 Pi 在过滤快照中工作。工件与模型切换不推进状态；模型选择只在下一次显式发送时应用。Pi turn 完成后服务端先重算并持久化 ChangeSet，再进入 `awaiting_confirmation`。只有右侧精确确认可以写回真实项目。
+创建空会话只保存轻量会话元数据，不扫描或复制项目。显式发送后，Pi 通过真实项目的受控只读视图与会话级稀疏审阅层工作。工件与模型切换不推进状态；模型选择只在下一次显式发送时应用。Pi turn 完成后服务端先重算并持久化 ChangeSet，再进入 `awaiting_confirmation`。只有右侧精确确认可以写回真实项目。
 
 ## 5. 确认语义
 
@@ -81,8 +81,8 @@ ProjectWorkPhase = ready | planned | working | review | applied | completed
 - 用户可逐文件选择或取消，确认按钮明确写为“确认应用所选修改”。
 - 确认前展示目标文件、操作类型、完整 diff、目标版本、`baseHash` 与 `afterHash`。
 - 未选择文件时不能确认；取消后仍停留在 `review`，不会出现成功结果。
-- “应用”会在服务端再次重算 change-set，并核对 change-set hash、逐文件 base/after hash、真实项目当前内容和工作快照内容；确认后原子写回所选文件并读回核验。它不会 stage、commit 或 push。
-- 一次确认后保留审阅快照；最终摘要必须能回到 Diff、预览和运行证据。
+- “应用”会在服务端再次重算 change-set，并核对 change-set hash、逐文件 base/after hash、真实项目当前内容和稀疏审阅层内容；确认后原子写回所选文件并读回核验。它不会 stage、commit 或 push。
+- 一次确认后保留未应用的审阅内容；最终摘要必须能回到 Diff、预览和运行证据。
 
 ## 6. 桌面端合同
 
@@ -105,7 +105,7 @@ ProjectWorkPhase = ready | planned | working | review | applied | completed
 
 - 项目工作使用独立的 `@earendil-works/pi-coding-agent` SDK 宿主，保留 Pi 的持久会话、事件、steer、abort、compact、retry 与 compaction；不把完整 CLI 或 Bash 工具暴露给浏览器。
 - Pi 只获得服务端实现的 contained `read/edit/write/grep/find/ls`、`update_plan` 和 `request_verification`。工具先 canonicalize 相对路径并拒绝符号链接、过滤目录和越界访问。
-- Agent 修改发生在过滤工作快照；对 `.git`、`.env*`、`node_modules`、缓存和 Pi Agent 自身数据不做快照。不同会话可以独立探索，但同一真实项目的最终写回按项目串行。
-- 验证不是自由终端。Pi 只能建议 allowlist 中的 Node/package-manager 检查，用户在右栏看到命令与解析后的 package script 后显式点击；每次在由已确认 base 复制的一次性快照中运行并保留独立 attempt。
+- Agent 读取真实项目的安全实时视图，修改只进入会话级稀疏审阅层；`.git`、`.env*`、`node_modules`、缓存和 Pi Agent 自身数据始终不可访问。不同会话可以独立探索，但同一真实项目的最终写回按项目串行。
+- 验证不是自由终端。Pi 只能建议 allowlist 中的 Node/package-manager 检查，用户在右栏看到命令与解析后的 package script 后显式点击；只有此时才从已确认的真实项目物化一次性副本，并保留独立 attempt。
 - 验证进程仍继承当前 macOS 用户权限，不等同于容器或 OS 安全沙箱；界面明确显示这一点。依赖没有安装在确认版本快照中时，验证会如实失败，不会静默改到真实项目或自动安装。
 - 自动登记和启动本地预览服务、图片预览、Monaco、PTY、Git/worktree、多 Agent 与远程机器仍是后续能力。

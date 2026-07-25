@@ -21,6 +21,7 @@ test("conversation mapping preserves a ready, hash-bound change set", () => {
       title: "修复设置页",
       status: "awaiting_confirmation",
       workspace_snapshot: {
+        mode: "sparse_overlay",
         included_files: 7938,
         included_bytes: 100663296,
         truncated: true,
@@ -74,6 +75,7 @@ test("conversation mapping preserves a ready, hash-bound change set", () => {
   assert.equal(mapped.events[1].toolName, "read");
   assert.equal(mapped.events[1].path, "src/settings.css");
   assert.deepEqual(mapped.workspaceSnapshot, {
+    mode: "sparse_overlay",
     includedFiles: 7938,
     includedBytes: 100663296,
     truncated: true,
@@ -247,4 +249,33 @@ test("file mapping preserves bounded line coordinates and content hash", async (
   assert.equal(file.totalLines, 24);
   assert.equal(file.truncated, true);
   assert.equal(file.binary, false);
+});
+
+test("conversation file reads use the sparse overlay endpoint", async () => {
+  const calls = [];
+  const file = await fetchProjectWorkFile({
+    projectId: "project-ignored",
+    conversationId: "conversation/with spaces",
+    path: "src/generated file.js",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        path: "src/generated file.js",
+        content: "export const generated = true;\n",
+        hash: "sha256:overlay",
+        startLine: 1,
+        endLine: 2,
+        totalLines: 2,
+        byteLength: 31,
+      });
+    },
+  });
+
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/conversations/conversation%2Fwith%20spaces/file?path=src%2Fgenerated+file.js",
+  );
+  assert.equal(calls[0].options.method, "GET");
+  assert.equal(file.contentHash, "sha256:overlay");
+  assert.match(file.content, /generated = true/);
 });

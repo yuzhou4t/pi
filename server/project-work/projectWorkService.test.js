@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import {
+  access,
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   realpath,
+  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -35,6 +38,7 @@ function modelCatalog() {
 
 function createFakeSessionFactory({
   changedContent = "export const version = 2;\n",
+  additionalChanges = [],
 } = {}) {
   const sessions = [];
   const factory = async (options) => {
@@ -61,11 +65,32 @@ function createFakeSessionFactory({
             { id: "verify", text: "等待验证", status: "pending" },
           ],
         });
-        await writeFile(
-          path.join(options.workspaceRoot, "app.js"),
-          changedContent,
-          "utf8",
-        );
+        const baseFile = path.join(options.baseRoot, "app.js");
+        try {
+          await access(baseFile);
+        } catch {
+          await writeFile(
+            baseFile,
+            await readFile(path.join(options.projectRoot, "app.js")),
+          );
+        }
+        await writeFile(path.join(options.workspaceRoot, "app.js"), changedContent, "utf8");
+        for (const change of additionalChanges) {
+          const basePath = path.join(options.baseRoot, change.path);
+          try {
+            await access(basePath);
+          } catch {
+            await writeFile(
+              basePath,
+              await readFile(path.join(options.projectRoot, change.path)),
+            );
+          }
+          await writeFile(
+            path.join(options.workspaceRoot, change.path),
+            change.content,
+            "utf8",
+          );
+        }
         await options.onVerificationRequest({
           file: "node",
           args: ["--test"],
@@ -137,7 +162,128 @@ test("create-mode picking accepts no name and public project data never leaks it
   ).then((value) => value.includes(parentRoot)), true);
 });
 
-test("conversation snapshots ignore nested Python virtual environments", async (t) => {
+test("creating empty conversations performs no project snapshot or copy", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-project-empty-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "export const ready = true;\n");
+  let snapshotCalls = 0;
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory(),
+    snapshotter: async () => {
+      snapshotCalls += 1;
+      throw new Error("empty conversations must not create a snapshot");
+    },
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("empty"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversations = await Promise.all([
+    service.createConversation(project.id),
+    service.createConversation(project.id),
+  ]);
+
+  assert.equal(snapshotCalls, 0);
+  for (const conversation of conversations) {
+    const directory = path.join(storageRoot, "conversations", conversation.id);
+    assert.deepEqual(await readdir(path.join(directory, "base")), []);
+    assert.deepEqual(await readdir(path.join(directory, "workspace")), []);
+    const current = await service.getConversation(conversation.id);
+    assert.equal(current.conversation.workspaceSnapshot.mode, "sparse_overlay");
+    assert.equal(current.conversation.workspaceSnapshot.includedFiles, 0);
+  }
+});
+
+test("conversation file reads prefer overlay content and can open overlay-only files", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-conversation-file-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "private-project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "export const source = 'live';\n");
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory(),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("conversation-file"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  const overlayRoot = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+    "workspace",
+  );
+  await mkdir(path.join(overlayRoot, "src"));
+  await writeFile(path.join(overlayRoot, "app.js"), "export const source = 'overlay';\n");
+  await writeFile(
+    path.join(overlayRoot, "src", "generated.js"),
+    "export const generated = true;\n",
+  );
+
+  const modified = await service.readConversationFile(conversation.id, {
+    filePath: "app.js",
+  });
+  const created = await service.readConversationFile(conversation.id, {
+    filePath: "src/generated.js",
+  });
+  const live = await service.readProjectFile(project.id, {
+    filePath: "app.js",
+  });
+
+  assert.match(modified.content, /source = 'overlay'/);
+  assert.match(created.content, /generated = true/);
+  assert.notEqual(modified.hash, live.hash);
+  assert.equal(JSON.stringify({ modified, created }).includes(projectRoot), false);
+  assert.equal(JSON.stringify({ modified, created }).includes(storageRoot), false);
+});
+
+test("a replaced bound root is rejected before a live-overlay conversation starts", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-project-replaced-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const movedRoot = path.join(temporaryRoot, "project-original");
+  await mkdir(projectRoot);
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createFakeSessionFactory(),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("replaced"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  await rename(projectRoot, movedRoot);
+  await mkdir(projectRoot);
+
+  await assert.rejects(
+    service.createConversation(project.id),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_ROOT_CHANGED");
+      assert.equal(error.status, 409);
+      return true;
+    },
+  );
+});
+
+test("empty review overlays still filter unsafe project paths", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-project-venv-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const projectRoot = path.join(temporaryRoot, "private-project-root");
@@ -186,8 +332,100 @@ test("conversation snapshots ignore nested Python virtual environments", async (
 
   assert.equal(conversation.status, "idle");
   assert.equal(snapshot.conversation.workspaceSnapshot.truncated, false);
-  assert.equal(snapshot.conversation.workspaceSnapshot.includedFiles, 1);
+  assert.equal(snapshot.conversation.workspaceSnapshot.includedFiles, 0);
+  assert.equal(snapshot.conversation.workspaceSnapshot.mode, "sparse_overlay");
   assert.equal(JSON.stringify(tree).includes(".venv"), false);
+});
+
+test("verification never runs from a truncated or skipped project materialization", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-verification-incomplete-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  const source = "export const version = 1;\n";
+  await writeFile(path.join(projectRoot, "app.js"), source);
+  const reports = [
+    {
+      files: 1,
+      bytes: source.length,
+      truncated: true,
+      skippedBinaryFiles: 0,
+      skippedOversizedFiles: 0,
+    },
+    {
+      files: 1,
+      bytes: source.length,
+      truncated: false,
+      skippedBinaryFiles: 1,
+      skippedOversizedFiles: 0,
+    },
+    {
+      files: 1,
+      bytes: source.length,
+      truncated: false,
+      skippedBinaryFiles: 0,
+      skippedOversizedFiles: 1,
+    },
+  ];
+  let runnerCalls = 0;
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({ changedContent: source }),
+    snapshotter: async ({ baseRoot, workspaceRoot }) => {
+      await Promise.all([
+        mkdir(baseRoot, { recursive: true }),
+        mkdir(workspaceRoot, { recursive: true }),
+      ]);
+      return reports.shift();
+    },
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async () => {
+      runnerCalls += 1;
+      return {
+        exitCode: 0,
+        durationMs: 1,
+        stdout: "must not run",
+        stderr: "",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+      };
+    },
+    idFactory: incrementalId("incomplete"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, {
+    text: "Prepare a verification request without changing the file.",
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.verifications.some((item) => item.status === "requested")
+    ),
+    "verification request was not prepared",
+  );
+  const request = settled.conversation.verifications.find(
+    (item) => item.status === "requested",
+  );
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const completed = await service.runVerification(conversation.id, {
+      requestId: request.id,
+    });
+    assert.equal(completed.status, "failed");
+    assert.equal(completed.exitCode, null);
+    assert.match(completed.output, /无法完整物化项目，未运行验证/);
+  }
+  assert.equal(runnerCalls, 0);
+  assert.equal(reports.length, 0);
 });
 
 test("real project-work chain binds context and changes, applies by hash, and preserves verification attempts", async (t) => {
@@ -263,7 +501,7 @@ test("real project-work chain binds context and changes, applies by hash, and pr
         path: "app.js",
         startLine: 1,
         endLine: 1,
-        contentHash: "sha256:stale",
+        contentHash: `${file.hash}-stale`,
       }],
     }),
     (error) => {
@@ -276,38 +514,27 @@ test("real project-work chain binds context and changes, applies by hash, and pr
   assert.equal(sessionFactory.sessions[0].prompts.length, 0);
 
   await writeFile(path.join(projectRoot, "created-after-snapshot.js"), "late\n");
-  const outsideSnapshotFile = await service.readProjectFile(project.id, {
+  const liveContextFile = await service.readProjectFile(project.id, {
     filePath: "created-after-snapshot.js",
   });
-  await assert.rejects(
-    service.sendMessage(conversation.id, {
-      text: "Read the newly added file.",
-      context: [{
-        path: "created-after-snapshot.js",
-        startLine: 1,
-        endLine: 1,
-        contentHash: outsideSnapshotFile.hash,
-      }],
-    }),
-    (error) => {
-      assert.equal(error.code, "PROJECT_WORK_CONTEXT_OUTSIDE_SNAPSHOT");
-      assert.equal(error.status, 409);
-      return true;
-    },
-  );
-
   await service.sendMessage(conversation.id, {
     text: "Update the implementation and prepare its verification.",
     context: [{
-      path: "app.js",
+      path: "created-after-snapshot.js",
       startLine: 1,
       endLine: 1,
-      contentHash: file.hash,
+      contentHash: liveContextFile.hash,
     }],
   });
+  assert.match(sessionFactory.sessions[0].prompts[0], /created-after-snapshot\.js/);
+  assert.match(sessionFactory.sessions[0].prompts[0], /late/);
   assert.equal(
     sessionFactory.sessions[0].options.workspaceSnapshot.truncated,
     false,
+  );
+  assert.equal(
+    sessionFactory.sessions[0].options.workspaceSnapshot.mode,
+    "sparse_overlay",
   );
   const settled = await eventually(
     () => service.getConversation(conversation.id),
@@ -365,6 +592,13 @@ test("real project-work chain binds context and changes, applies by hash, and pr
     await readFile(path.join(projectRoot, "app.js"), "utf8"),
     "export const version = 2;\n",
   );
+  const privateConversationRoot = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+  );
+  await assert.rejects(access(path.join(privateConversationRoot, "base", "app.js")));
+  await assert.rejects(access(path.join(privateConversationRoot, "workspace", "app.js")));
 
   const requestedVerification = settled.conversation.verifications.find(
     (item) => item.status === "requested",
@@ -399,4 +633,90 @@ test("real project-work chain binds context and changes, applies by hash, and pr
     history.map((item) => item.status),
     ["requested", "passed", "failed"],
   );
+});
+
+test("partial apply keeps unselected files reviewable and blocks verification", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-project-partial-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "app v1\n", "utf8");
+  await writeFile(path.join(projectRoot, "other.js"), "other v1\n", "utf8");
+
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createFakeSessionFactory({
+      changedContent: "app v2\n",
+      additionalChanges: [{
+        path: "other.js",
+        content: "other v2\n",
+      }],
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("partial"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, { text: "修改两个文件" });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "awaiting_confirmation",
+    "two-file change set did not become reviewable",
+  );
+  const initial = settled.conversation.activeChangeSet;
+  assert.equal(initial.files.length, 2);
+  const appFile = initial.files.find((file) => file.path === "app.js");
+
+  const partial = await service.applyChangeSet(conversation.id, {
+    changeSetId: initial.id,
+    changeSetHash: initial.hash,
+    files: [{
+      fileId: appFile.id,
+      baseHash: appFile.baseHash,
+      afterHash: appFile.afterHash,
+    }],
+  });
+  assert.equal(partial.appliedChangeSet.status, "partially_applied");
+  assert.equal(partial.remainingChangeSet.status, "ready");
+  assert.deepEqual(
+    partial.remainingChangeSet.files.map((file) => file.path),
+    ["other.js"],
+  );
+  assert.equal(await readFile(path.join(projectRoot, "app.js"), "utf8"), "app v2\n");
+  assert.equal(await readFile(path.join(projectRoot, "other.js"), "utf8"), "other v1\n");
+
+  const afterPartial = await service.getConversation(conversation.id);
+  assert.equal(afterPartial.conversation.status, "awaiting_confirmation");
+  assert.equal(afterPartial.conversation.activeChangeSet.status, "ready");
+  assert.deepEqual(
+    afterPartial.conversation.activeChangeSet.files.map((file) => file.path),
+    ["other.js"],
+  );
+  const verification = afterPartial.conversation.verifications.find(
+    (item) => item.status === "requested",
+  );
+  await assert.rejects(
+    service.runVerification(conversation.id, { requestId: verification.id }),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_CHANGES_NOT_APPLIED");
+      return true;
+    },
+  );
+
+  const remaining = afterPartial.conversation.activeChangeSet;
+  const otherFile = remaining.files[0];
+  const completed = await service.applyChangeSet(conversation.id, {
+    changeSetId: remaining.id,
+    changeSetHash: remaining.hash,
+    files: [{
+      fileId: otherFile.id,
+      baseHash: otherFile.baseHash,
+      afterHash: otherFile.afterHash,
+    }],
+  });
+  assert.equal(completed.remainingChangeSet.status, "clean");
+  assert.equal(await readFile(path.join(projectRoot, "other.js"), "utf8"), "other v2\n");
 });

@@ -113,17 +113,28 @@ export function createProjectRegistry({
         400,
       );
     }
-    return canonicalRoot;
+    return {
+      canonicalRoot,
+      device: rootStat.dev,
+      inode: rootStat.ino,
+    };
   }
 
   async function register({ rootPath, name } = {}) {
-    const canonicalRoot = await inspectRoot(rootPath);
+    const inspectedRoot = await inspectRoot(rootPath);
+    const { canonicalRoot } = inspectedRoot;
     return withWriteLock(async () => {
       const registry = await load();
       const existing = registry.projects.find((project) => project.rootPath === canonicalRoot);
       if (existing) {
-        if (name) {
+        if (
+          name
+          || existing.rootDevice !== inspectedRoot.device
+          || existing.rootInode !== inspectedRoot.inode
+        ) {
           existing.name = compactName(name, existing.name);
+          existing.rootDevice = inspectedRoot.device;
+          existing.rootInode = inspectedRoot.inode;
           existing.updatedAt = now().toISOString();
           await writeJsonAtomic(registryPath, registry);
         }
@@ -136,6 +147,8 @@ export function createProjectRegistry({
         name: compactName(name, rootLabel),
         rootLabel,
         rootPath: canonicalRoot,
+        rootDevice: inspectedRoot.device,
+        rootInode: inspectedRoot.inode,
         createdAt,
         updatedAt: createdAt,
       };
@@ -151,6 +164,38 @@ export function createProjectRegistry({
     const project = registry.projects.find((item) => item.id === id);
     if (!project) {
       throw projectWorkError("PROJECT_WORK_PROJECT_NOT_FOUND", "项目不存在", 404);
+    }
+    const inspectedRoot = await inspectRoot(project.rootPath);
+    if (
+      inspectedRoot.canonicalRoot !== project.rootPath
+      || (
+        project.rootDevice !== undefined
+        && project.rootInode !== undefined
+        && (
+          inspectedRoot.device !== project.rootDevice
+          || inspectedRoot.inode !== project.rootInode
+        )
+      )
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_ROOT_CHANGED",
+        "项目文件夹已被替换，请重新绑定",
+        409,
+        true,
+      );
+    }
+    if (project.rootDevice === undefined || project.rootInode === undefined) {
+      await withWriteLock(async () => {
+        const latest = await load();
+        const stored = latest.projects.find((item) => item.id === id);
+        if (!stored) return;
+        stored.rootDevice = inspectedRoot.device;
+        stored.rootInode = inspectedRoot.inode;
+        stored.updatedAt = now().toISOString();
+        await writeJsonAtomic(registryPath, latest);
+      });
+      project.rootDevice = inspectedRoot.device;
+      project.rootInode = inspectedRoot.inode;
     }
     return structuredClone(project);
   }

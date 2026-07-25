@@ -18,6 +18,12 @@ import { ReadingWorkbench } from "./components/ReadingWorkbench.jsx";
 import { fetchCandidateSummaries, fetchModelProviders, mergeCandidateSummaries } from "./api/candidateSummaries.js";
 import { projectWorkApi } from "./api/projectWork.js";
 import {
+  createProjectConversationLock,
+  hydrateCreatedConversation,
+  insertCreatedConversation,
+  upsertLiveProject,
+} from "./project-work/liveProjectWorkState.js";
+import {
   commitZoteroProposal,
   createObsidianPreview,
   createProjectStatePreview,
@@ -470,7 +476,15 @@ export function App() {
   );
   const projectWorkLoadRef = useRef(0);
   const activeConversationIdRef = useRef(activeConversationId);
+  const selectedProjectIdRef = useRef(selectedProjectId);
+  const projectConversationCreationLockRef = useRef(null);
+  const preparingConversationSelectionRef = useRef(null);
+  const [creatingConversationProjectIds, setCreatingConversationProjectIds] = useState([]);
+  const [preparingConversationSelection, setPreparingConversationSelection] = useState(null);
   const toastTimer = useRef(null);
+  if (!projectConversationCreationLockRef.current) {
+    projectConversationCreationLockRef.current = createProjectConversationLock();
+  }
   const [run, dispatch] = usePersistentReducer(runReducer, createInitialRunState, {
     validate: isPersistedRunStateValid,
   });
@@ -670,10 +684,16 @@ export function App() {
     });
   }, [setProjectWorkProviderConfig]);
 
+  const clearPreparingConversationSelection = useCallback(() => {
+    preparingConversationSelectionRef.current = null;
+    setPreparingConversationSelection(null);
+  }, []);
+
   const loadLiveProjectWork = useCallback(async ({
     preferredProjectId,
     preferredConversationId,
   } = {}) => {
+    clearPreparingConversationSelection();
     const requestId = projectWorkLoadRef.current + 1;
     projectWorkLoadRef.current = requestId;
     activeConversationIdRef.current = "";
@@ -707,6 +727,7 @@ export function App() {
         conversation,
         error: null,
       });
+      selectedProjectIdRef.current = projectId;
       setSelectedProjectId(projectId);
       activeConversationIdRef.current = conversationId;
       setActiveConversationId(conversationId);
@@ -722,13 +743,19 @@ export function App() {
       }));
       return null;
     }
-  }, [setActiveConversationId, syncProjectWorkModel]);
+  }, [
+    clearPreparingConversationSelection,
+    setActiveConversationId,
+    syncProjectWorkModel,
+  ]);
 
   const selectLiveProject = useCallback(async (projectId, preferredConversationId) => {
+    clearPreparingConversationSelection();
     const requestId = projectWorkLoadRef.current + 1;
     projectWorkLoadRef.current = requestId;
     activeConversationIdRef.current = "";
     setActiveConversationId("");
+    selectedProjectIdRef.current = projectId;
     setSelectedProjectId(projectId);
     setLiveProjectWork((current) => ({
       ...current,
@@ -768,10 +795,15 @@ export function App() {
       }));
       return null;
     }
-  }, [setActiveConversationId, syncProjectWorkModel]);
+  }, [
+    clearPreparingConversationSelection,
+    setActiveConversationId,
+    syncProjectWorkModel,
+  ]);
 
   const selectLiveConversation = useCallback(async (conversationId) => {
     if (!conversationId) return null;
+    clearPreparingConversationSelection();
     const requestId = projectWorkLoadRef.current + 1;
     projectWorkLoadRef.current = requestId;
     activeConversationIdRef.current = conversationId;
@@ -803,6 +835,7 @@ export function App() {
         conversation,
         error: null,
       }));
+      selectedProjectIdRef.current = conversation.projectId;
       setSelectedProjectId(conversation.projectId);
       activeConversationIdRef.current = conversation.id;
       setActiveConversationId(conversation.id);
@@ -818,7 +851,11 @@ export function App() {
       }));
       return null;
     }
-  }, [setActiveConversationId, syncProjectWorkModel]);
+  }, [
+    clearPreparingConversationSelection,
+    setActiveConversationId,
+    syncProjectWorkModel,
+  ]);
 
   const updateLiveConversation = useCallback((conversation) => {
     if (
@@ -837,6 +874,7 @@ export function App() {
         providerId: conversation.providerId,
         modelId: conversation.modelId,
         thinkingLevel: conversation.thinkingLevel,
+        lastEventSeq: conversation.lastEventSeq,
         updatedAt: conversation.updatedAt,
       };
       const existing = current.conversations.some((item) => item.id === conversation.id);
@@ -857,6 +895,10 @@ export function App() {
   useEffect(() => {
     activeConversationIdRef.current = activeConversationId;
   }, [activeConversationId]);
+
+  useEffect(() => {
+    selectedProjectIdRef.current = selectedProjectId;
+  }, [selectedProjectId]);
 
   useEffect(() => {
     if (workspaceKind !== "project_work") return;
@@ -2057,40 +2099,89 @@ export function App() {
 
   const dispatchAction = (type, payload = {}) => dispatch({ type, ...payload });
 
-  const createWorkConversation = async (projectId, { throwOnError = false } = {}) => {
-    if (!projectId) return null;
+  const focusCreatingWorkConversation = (projectId) => {
+    const pendingSelection = { projectId };
+    preparingConversationSelectionRef.current = pendingSelection;
+    setPreparingConversationSelection(pendingSelection);
+    setCreatingConversationProjectIds((current) => (
+      current.includes(projectId) ? current : [...current, projectId]
+    ));
+    projectWorkLoadRef.current += 1;
+    selectedProjectIdRef.current = projectId;
+    setSelectedProjectId(projectId);
+    activeConversationIdRef.current = "";
+    setActiveConversationId("");
     setLiveProjectWork((current) => ({
       ...current,
-      status: "loading",
+      status: "ready",
+      conversation: null,
       error: null,
     }));
-    try {
-      const created = await projectWorkApi.createConversation({
-        projectId,
-        providerId: selectedProjectWorkProvider?.id,
-        modelId: selectedProjectWorkModel || undefined,
-      });
-      await loadLiveProjectWork({
-        preferredProjectId: projectId,
-        preferredConversationId: created.id,
-      });
-      return created.id;
-    } catch (error) {
-      setLiveProjectWork((current) => ({
-        ...current,
-        status: "error",
-        error,
-      }));
-      if (throwOnError) throw error;
-      showToast(error.message || "无法新建工作会话", "warning");
-      return null;
-    }
+    setMobileView("agent");
+  };
+
+  const createWorkConversation = (projectId) => {
+    if (!projectId) return Promise.resolve(null);
+    return projectConversationCreationLockRef.current.run(projectId, async () => {
+      try {
+        const created = await projectWorkApi.createConversation({
+          projectId,
+          providerId: selectedProjectWorkProvider?.id,
+          modelId: selectedProjectWorkModel || undefined,
+        });
+        const projectStillSelected = selectedProjectIdRef.current === projectId;
+        const shouldActivate = projectStillSelected
+          && preparingConversationSelectionRef.current?.projectId === projectId;
+        setLiveProjectWork((current) => insertCreatedConversation(current, created, {
+          activate: shouldActivate,
+          include: projectStillSelected,
+        }));
+        if (shouldActivate) {
+          preparingConversationSelectionRef.current = null;
+          setPreparingConversationSelection(null);
+          activeConversationIdRef.current = created.id;
+          setActiveConversationId(created.id);
+          syncProjectWorkModel(created);
+        }
+
+        projectWorkApi.fetchConversation({
+          conversationId: created.id,
+        }).then((conversation) => {
+          setLiveProjectWork((current) => hydrateCreatedConversation(current, conversation));
+          if (activeConversationIdRef.current === conversation.id) {
+            syncProjectWorkModel(conversation);
+          }
+        }).catch((error) => {
+          if (activeConversationIdRef.current === created.id) {
+            showToast(error.message || "会话已创建，详情暂时无法载入", "warning");
+          }
+        });
+        return created.id;
+      } catch (error) {
+        if (preparingConversationSelectionRef.current?.projectId === projectId) {
+          preparingConversationSelectionRef.current = null;
+          setPreparingConversationSelection(null);
+        }
+        setLiveProjectWork((current) => ({
+          ...current,
+          status: "ready",
+          error,
+        }));
+        showToast(error.message || "无法新建工作会话", "warning");
+        return null;
+      } finally {
+        setCreatingConversationProjectIds((current) => (
+          current.filter((id) => id !== projectId)
+        ));
+      }
+    }, () => focusCreatingWorkConversation(projectId));
   };
 
   const selectWorkspaceKind = (nextKind) => {
     if (!["project_work", "paper_reading"].includes(nextKind) || nextKind === workspaceKind) {
       return;
     }
+    clearPreparingConversationSelection();
     setWorkspaceKind(nextKind);
     setProjectQuery("");
     const savedSelection = workspaceSelection?.[nextKind];
@@ -2132,16 +2223,12 @@ export function App() {
         ...nextProject,
         conversationCount: nextProject.conversationCount ?? 0,
       };
-      try {
-        await createWorkConversation(projectRecord.id, { throwOnError: true });
-        showToast("已绑定本地项目并创建工作会话");
-        return;
-      } catch (error) {
-        await loadLiveProjectWork({
-          preferredProjectId: projectRecord.id,
-        }).catch(() => undefined);
-        throw error;
-      }
+      setLiveProjectWork((current) => upsertLiveProject(current, projectRecord));
+      createWorkConversation(projectRecord.id).then((conversationId) => {
+        if (conversationId) showToast("工作会话已准备好");
+      });
+      showToast("项目已绑定，正在创建工作会话");
+      return;
     }
     const projectRecord = {
       ...nextProject,
@@ -2244,6 +2331,10 @@ export function App() {
               return;
             }
             if (projectId === selectedProjectId) return;
+            if (creatingConversationProjectIds.includes(projectId)) {
+              focusCreatingWorkConversation(projectId);
+              return;
+            }
             const savedConversationId = workspaceSelection?.project_work?.projectId === projectId
               ? workspaceSelection.project_work.conversationId
               : undefined;
@@ -2271,6 +2362,8 @@ export function App() {
             setMobileView("run");
             showToast("请先从本周 Run 选择一篇已解析论文", "warning");
           }}
+          creatingConversationProjectIds={creatingConversationProjectIds}
+          preparingConversationProjectId={preparingConversationSelection?.projectId ?? null}
           onNewConversation={(projectId) => {
             if (workspaceKind === "project_work") {
               createWorkConversation(projectId).then((conversationId) => {
@@ -2343,6 +2436,9 @@ export function App() {
             key={activeProjectWorkState?.id ?? project.id ?? "empty-project-workbench"}
             project={project}
             conversation={activeProjectWorkState}
+            preparingConversation={
+              preparingConversationSelection?.projectId === project.id
+            }
             providers={projectWorkProviders}
             providerId={selectedProjectWorkProvider?.id}
             modelId={selectedProjectWorkModel}

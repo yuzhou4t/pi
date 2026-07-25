@@ -898,6 +898,22 @@ export function createApiServer({
         return;
       }
 
+      const conversationFileMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/file$/,
+      );
+      if (conversationFileMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(conversationFileMatch[1]);
+        const file = await projectWorkService.readConversationFile(conversationId, {
+          filePath: url.searchParams.get("path"),
+          startLine: Number(url.searchParams.get("start_line") ?? 1),
+          endLine: url.searchParams.has("end_line")
+            ? Number(url.searchParams.get("end_line"))
+            : undefined,
+        });
+        sendJson(response, 200, file, origin);
+        return;
+      }
+
       const conversationMatch = url.pathname.match(
         /^\/api\/v1\/project-work\/conversations\/([^/]+)$/,
       );

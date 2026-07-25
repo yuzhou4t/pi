@@ -27,6 +27,7 @@ import {
   isFilteredProjectPath,
   normalizeProjectPath,
   readSafeAgentsFiles,
+  sha256,
 } from "./workspace.js";
 
 const TOOL_NAMES = [
@@ -44,11 +45,12 @@ const MAX_SEARCH_BYTES = 8 * 1024 * 1024;
 const MAX_SEARCH_FILES = 2_000;
 const MAX_TOOL_OUTPUT_CHARS = 64_000;
 const APP_GUIDANCE = [
-  "You are working in an isolated review snapshot, not the user's live project.",
-  "Use only the provided contained file tools. They cannot access paths outside this snapshot.",
+  "You are working through a contained review overlay for the user's project.",
+  "Reads use the latest safe project files unless a proposed overlay file exists.",
+  "Use only the provided contained file tools. They cannot access paths outside the project and review overlay.",
   "Keep the public plan current with update_plan.",
   "Use request_verification to propose a bounded verification command; it never runs until the user explicitly starts it.",
-  "Edits in this snapshot are proposals. Never claim that the live project changed before the app confirms an applied change set.",
+  "Edits are written only to the review overlay. Never claim that the live project changed before the app confirms an applied change set.",
 ].join("\n");
 
 function workspaceSnapshotGuidance(workspaceSnapshot) {
@@ -81,6 +83,7 @@ function isInside(root, target) {
 async function resolveContainedPath(root, rawPath, {
   allowRoot = false,
   allowMissingLeaf = false,
+  returnMissing = false,
   createParents = false,
   expectedKind,
 } = {}) {
@@ -103,6 +106,14 @@ async function resolveContainedPath(root, rawPath, {
       if (createParents && !isLeaf) {
         await mkdir(current, { mode: 0o700 });
         continue;
+      }
+      if (returnMissing) {
+        return {
+          normalized,
+          target: current,
+          stat: null,
+          missing: true,
+        };
       }
       if (allowMissingLeaf && isLeaf) {
         return { normalized, target: current, stat: null };
@@ -134,21 +145,95 @@ async function resolveContainedPath(root, rawPath, {
   return { normalized: "", target: root, stat: rootStat };
 }
 
-async function readBoundedText(root, rawPath) {
-  const resolved = await resolveContainedPath(root, rawPath, {
+async function canonicalOverlayRoots({
+  projectRoot,
+  baseRoot,
+  workspaceRoot,
+}) {
+  const [project, base, workspace] = await Promise.all([
+    realpath(projectRoot),
+    realpath(baseRoot),
+    realpath(workspaceRoot),
+  ]);
+  return { project, base, workspace };
+}
+
+async function inspectOverlayPath(roots, rawPath, {
+  allowRoot = false,
+  allowMissing = false,
+  expectedKind,
+} = {}) {
+  const normalized = normalizeProjectPath(String(rawPath ?? ""), {
+    allowEmpty: allowRoot,
+  });
+  if (normalized && isFilteredProjectPath(normalized)) {
+    throw new Error("Path is outside the filtered project workspace");
+  }
+  const options = {
+    allowRoot,
+    returnMissing: true,
+  };
+  const [project, base, workspace] = await Promise.all([
+    resolveContainedPath(roots.project, normalized, options),
+    resolveContainedPath(roots.base, normalized, options),
+    resolveContainedPath(roots.workspace, normalized, options),
+  ]);
+  let selected = null;
+  let source = null;
+  if (workspace.stat) {
+    selected = workspace;
+    source = "workspace";
+  } else if (project.stat) {
+    selected = project;
+    source = "project";
+  }
+  if (!selected) {
+    if (allowMissing) {
+      return {
+        normalized,
+        project,
+        base,
+        workspace,
+        selected: null,
+        source: null,
+      };
+    }
+    throw new Error(`Path not found: ${normalized}`);
+  }
+  if (expectedKind === "file" && !selected.stat.isFile()) {
+    throw new Error(`Not a file: ${normalized}`);
+  }
+  if (expectedKind === "directory" && !selected.stat.isDirectory()) {
+    throw new Error(`Not a directory: ${normalized || "."}`);
+  }
+  return {
+    normalized,
+    project,
+    base,
+    workspace,
+    selected,
+    source,
+  };
+}
+
+async function readBoundedText(roots, rawPath) {
+  const resolved = await inspectOverlayPath(roots, rawPath, {
     expectedKind: "file",
   });
-  if (resolved.stat.size > MAX_TOOL_FILE_BYTES) {
+  const selected = resolved.selected;
+  if (selected.stat.size > MAX_TOOL_FILE_BYTES) {
     throw new Error("File exceeds the contained tool size limit");
   }
-  const buffer = await readFile(resolved.target);
+  const buffer = await readFile(selected.target);
   if (buffer.subarray(0, Math.min(buffer.length, 8_192)).includes(0)) {
     throw new Error("Binary files are not supported by this tool");
   }
   return {
     ...resolved,
+    buffer,
+    hash: sha256(buffer),
     content: buffer.toString("utf8"),
-    mode: resolved.stat.mode & 0o777,
+    mode: selected.stat.mode & 0o777,
   };
 }
 
@@ -195,6 +280,139 @@ async function atomicScratchWrite(root, rawPath, content, mode = 0o600) {
   return resolved.normalized;
 }
 
+async function captureBaseBeforeFirstWrite(roots, rawPath, {
+  expectedProjectSource,
+} = {}) {
+  const inspected = await inspectOverlayPath(roots, rawPath, {
+    allowMissing: true,
+  });
+  if (inspected.workspace.stat) {
+    if (expectedProjectSource) {
+      throw new Error("Project file changed while the review edit was being prepared");
+    }
+    return inspected;
+  }
+  if (!inspected.project.stat) {
+    if (expectedProjectSource) {
+      throw new Error("Project file changed while the review edit was being prepared");
+    }
+    // With no published workspace file, a base-only file is an interrupted
+    // capture rather than an active proposal. Drop it before creating a new
+    // file so the change is correctly reviewed as a create.
+    if (inspected.base.stat?.isFile()) {
+      await unlink(inspected.base.target);
+    }
+    return inspected;
+  }
+  if (!inspected.project.stat.isFile()) {
+    throw new Error(`Not a file: ${inspected.normalized}`);
+  }
+  if (inspected.project.stat.size > MAX_TOOL_FILE_BYTES) {
+    throw new Error("File exceeds the contained tool size limit");
+  }
+  const buffer = await readFile(inspected.project.target);
+  if (buffer.subarray(0, Math.min(buffer.length, 8_192)).includes(0)) {
+    throw new Error("Binary files are not supported by this tool");
+  }
+  if (
+    expectedProjectSource
+    && (
+      expectedProjectSource.hash !== sha256(buffer)
+      || !buffer.equals(expectedProjectSource.buffer)
+    )
+  ) {
+    throw new Error("Project file changed while the review edit was being prepared");
+  }
+  // Re-capture even when a base-only file exists. Since no workspace file was
+  // published, that base can only be a remnant of an interrupted first write.
+  await atomicScratchWrite(
+    roots.base,
+    inspected.normalized,
+    expectedProjectSource?.buffer ?? buffer,
+    inspected.project.stat.mode & 0o777,
+  );
+  return inspected;
+}
+
+async function writeOverlayText(roots, rawPath, content, mode = 0o600, options) {
+  const normalized = normalizeProjectPath(String(rawPath ?? ""));
+  if (isFilteredProjectPath(normalized)) {
+    throw new Error("Path is outside the filtered project workspace");
+  }
+  const inspected = await captureBaseBeforeFirstWrite(roots, normalized, options);
+  if (inspected.workspace.stat && !inspected.workspace.stat.isFile()) {
+    throw new Error(`Not a file: ${normalized}`);
+  }
+  // Always validate the live path too, even when an overlay file already exists.
+  if (inspected.project.stat && !inspected.project.stat.isFile()) {
+    throw new Error(`Not a file: ${normalized}`);
+  }
+  return atomicScratchWrite(roots.workspace, normalized, content, mode);
+}
+
+async function readDirectoryEntries(root, normalized) {
+  const resolved = await resolveContainedPath(root, normalized, {
+    allowRoot: true,
+    returnMissing: true,
+  });
+  if (!resolved.stat) return new Map();
+  if (!resolved.stat.isDirectory()) return new Map();
+  const entries = await readdir(resolved.target, { withFileTypes: true });
+  const result = new Map();
+  for (const entry of entries) {
+    const relativePath = [normalized, entry.name].filter(Boolean).join("/");
+    if (isFilteredProjectPath(relativePath)) continue;
+    const target = path.join(resolved.target, entry.name);
+    const stat = await lstat(target);
+    if (stat.isSymbolicLink()) continue;
+    if (!stat.isDirectory() && !stat.isFile()) continue;
+    result.set(entry.name, {
+      name: entry.name,
+      relativePath,
+      target,
+      stat,
+      type: stat.isDirectory() ? "directory" : "file",
+    });
+  }
+  return result;
+}
+
+async function listOverlayDirectoryEntries(roots, rawPath = "") {
+  const directory = await inspectOverlayPath(roots, rawPath, {
+    allowRoot: true,
+    expectedKind: "directory",
+  });
+  const [projectEntries, baseEntries, workspaceEntries] = await Promise.all([
+    directory.project.stat?.isDirectory()
+      ? readDirectoryEntries(roots.project, directory.normalized)
+      : new Map(),
+    directory.base.stat?.isDirectory()
+      ? readDirectoryEntries(roots.base, directory.normalized)
+      : new Map(),
+    directory.workspace.stat?.isDirectory()
+      ? readDirectoryEntries(roots.workspace, directory.normalized)
+      : new Map(),
+  ]);
+  const names = [...new Set([
+    ...projectEntries.keys(),
+    ...workspaceEntries.keys(),
+  ])].sort((left, right) => left.localeCompare(right));
+  const entries = [];
+  for (const name of names) {
+    const workspace = workspaceEntries.get(name);
+    if (workspace) {
+      entries.push(workspace);
+      continue;
+    }
+    const project = projectEntries.get(name);
+    if (project) entries.push(project);
+  }
+  return {
+    normalized: directory.normalized,
+    entries,
+  };
+}
+
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -237,7 +455,7 @@ function globExpression(pattern) {
   return new RegExp(`${source}$`);
 }
 
-async function walkContainedFiles(root, start, visitor, {
+async function walkOverlayFiles(roots, startPath, visitor, {
   maxFiles = MAX_SEARCH_FILES,
   maxBytes = MAX_SEARCH_BYTES,
 } = {}) {
@@ -245,29 +463,23 @@ async function walkContainedFiles(root, start, visitor, {
   let bytes = 0;
   let stopped = false;
 
-  async function visit(directoryPath, relativeDirectory) {
-    const entries = await readdir(directoryPath, { withFileTypes: true });
-    entries.sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
+  async function visit(relativeDirectory) {
+    const directory = await listOverlayDirectoryEntries(roots, relativeDirectory);
+    for (const entry of directory.entries) {
       if (stopped) return;
-      const relativePath = [relativeDirectory, entry.name].filter(Boolean).join("/");
-      if (isFilteredProjectPath(relativePath)) continue;
-      const targetPath = path.join(directoryPath, entry.name);
-      const targetStat = await lstat(targetPath);
-      if (targetStat.isSymbolicLink()) continue;
-      if (targetStat.isDirectory()) {
-        await visit(targetPath, relativePath);
-      } else if (targetStat.isFile()) {
+      if (entry.type === "directory") {
+        await visit(entry.relativePath);
+      } else {
         files += 1;
-        bytes += targetStat.size;
+        bytes += entry.stat.size;
         if (files > maxFiles || bytes > maxBytes) {
           stopped = true;
           return;
         }
         if (await visitor({
-          relativePath,
-          targetPath,
-          stat: targetStat,
+          relativePath: entry.relativePath,
+          targetPath: entry.target,
+          stat: entry.stat,
         }) === false) {
           stopped = true;
           return;
@@ -276,15 +488,15 @@ async function walkContainedFiles(root, start, visitor, {
     }
   }
 
-  await visit(start.target, start.normalized);
+  await visit(startPath);
   return { files, bytes, truncated: stopped };
 }
 
-function createReadTool(root) {
+function createReadTool(roots) {
   return defineTool({
     name: "read",
     label: "read",
-    description: "Read a text file inside the isolated project snapshot.",
+    description: "Read a text file from the contained project view and review overlay.",
     promptSnippet: "Read a contained project text file",
     parameters: Type.Object({
       path: Type.String(),
@@ -292,7 +504,7 @@ function createReadTool(root) {
       limit: Type.Optional(Type.Number()),
     }),
     async execute(_toolCallId, { path: filePath, offset, limit }) {
-      const file = await readBoundedText(root, filePath);
+      const file = await readBoundedText(roots, filePath);
       const lines = file.content.split(/\r\n|\n|\r/);
       const start = Number.isInteger(offset) && offset > 0 ? offset - 1 : 0;
       const count = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 1_000) : 500;
@@ -311,11 +523,11 @@ function createReadTool(root) {
   });
 }
 
-function createWriteTool(root) {
+function createWriteTool(roots) {
   return defineTool({
     name: "write",
     label: "write",
-    description: "Write a text file inside the isolated project snapshot.",
+    description: "Write a proposed text file only inside the private review overlay.",
     promptSnippet: "Write a contained project text file",
     executionMode: "sequential",
     parameters: Type.Object({
@@ -323,7 +535,7 @@ function createWriteTool(root) {
       content: Type.String(),
     }),
     async execute(_toolCallId, { path: filePath, content }) {
-      const normalized = await atomicScratchWrite(root, filePath, content);
+      const normalized = await writeOverlayText(roots, filePath, content);
       return textResult(`Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${normalized}`, {
         path: normalized,
       });
@@ -331,11 +543,11 @@ function createWriteTool(root) {
   });
 }
 
-function createEditTool(root) {
+function createEditTool(roots) {
   return defineTool({
     name: "edit",
     label: "edit",
-    description: "Apply exact text replacements to one file inside the isolated project snapshot.",
+    description: "Apply exact text replacements only inside the private review overlay.",
     promptSnippet: "Edit a contained project text file",
     executionMode: "sequential",
     parameters: Type.Object({
@@ -346,7 +558,7 @@ function createEditTool(root) {
       }), { minItems: 1, maxItems: 32 }),
     }),
     async execute(_toolCallId, { path: filePath, edits }) {
-      const file = await readBoundedText(root, filePath);
+      const file = await readBoundedText(roots, filePath);
       const replacements = edits.map((edit) => {
         if (!edit.oldText) throw new Error("oldText cannot be empty");
         const first = file.content.indexOf(edit.oldText);
@@ -365,7 +577,20 @@ function createEditTool(root) {
       for (const replacement of [...replacements].reverse()) {
         next = `${next.slice(0, replacement.start)}${replacement.newText}${next.slice(replacement.end)}`;
       }
-      await atomicScratchWrite(root, file.normalized, next, file.mode);
+      await writeOverlayText(
+        roots,
+        file.normalized,
+        next,
+        file.mode,
+        file.source === "project"
+          ? {
+              expectedProjectSource: {
+                buffer: file.buffer,
+                hash: file.hash,
+              },
+            }
+          : undefined,
+      );
       const patch = createTwoFilesPatch(
         `a/${file.normalized}`,
         `b/${file.normalized}`,
@@ -383,30 +608,22 @@ function createEditTool(root) {
   });
 }
 
-function createLsTool(root) {
+function createLsTool(roots) {
   return defineTool({
     name: "ls",
     label: "ls",
-    description: "List a directory inside the isolated project snapshot.",
+    description: "List a directory from the contained project view and review overlay.",
     promptSnippet: "List a contained project directory",
     parameters: Type.Object({
       path: Type.Optional(Type.String()),
       limit: Type.Optional(Type.Number()),
     }),
     async execute(_toolCallId, { path: directoryPath = "", limit }) {
-      const directory = await resolveContainedPath(root, directoryPath, {
-        allowRoot: true,
-        expectedKind: "directory",
-      });
+      const directory = await listOverlayDirectoryEntries(roots, directoryPath);
       const maxEntries = Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 500) : 500;
-      const entries = await readdir(directory.target, { withFileTypes: true });
       const visible = [];
-      for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-        const relativePath = [directory.normalized, entry.name].filter(Boolean).join("/");
-        if (isFilteredProjectPath(relativePath)) continue;
-        const entryStat = await lstat(path.join(directory.target, entry.name));
-        if (entryStat.isSymbolicLink()) continue;
-        visible.push(`${entry.name}${entryStat.isDirectory() ? "/" : ""}`);
+      for (const entry of directory.entries) {
+        visible.push(`${entry.name}${entry.type === "directory" ? "/" : ""}`);
         if (visible.length >= maxEntries) break;
       }
       return textResult(visible.join("\n") || "(empty directory)", {
@@ -417,7 +634,7 @@ function createLsTool(root) {
   });
 }
 
-function createFindTool(root) {
+function createFindTool(roots) {
   return defineTool({
     name: "find",
     label: "find",
@@ -429,14 +646,14 @@ function createFindTool(root) {
       limit: Type.Optional(Type.Number()),
     }),
     async execute(_toolCallId, { pattern, path: directoryPath = "", limit }) {
-      const directory = await resolveContainedPath(root, directoryPath, {
+      const directory = await inspectOverlayPath(roots, directoryPath, {
         allowRoot: true,
         expectedKind: "directory",
       });
       const expression = globExpression(pattern);
       const maxResults = Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 500) : 200;
       const matches = [];
-      const walked = await walkContainedFiles(root, directory, ({ relativePath }) => {
+      const walked = await walkOverlayFiles(roots, directory.normalized, ({ relativePath }) => {
         const relativeToStart = directory.normalized
           ? path.posix.relative(directory.normalized, relativePath)
           : relativePath;
@@ -453,7 +670,7 @@ function createFindTool(root) {
   });
 }
 
-function createGrepTool(root) {
+function createGrepTool(roots) {
   return defineTool({
     name: "grep",
     label: "grep",
@@ -477,7 +694,7 @@ function createGrepTool(root) {
       context = 0,
       limit,
     }) {
-      const resolved = await resolveContainedPath(root, searchPath, {
+      const resolved = await inspectOverlayPath(roots, searchPath, {
         allowRoot: true,
       });
       const expression = boundedSearchExpression(pattern, { literal, ignoreCase });
@@ -509,14 +726,18 @@ function createGrepTool(root) {
       }
 
       let walked;
-      if (resolved.stat?.isFile()) {
+      if (resolved.selected.stat.isFile()) {
         walked = {
-          truncated: (await searchFile(resolved.target, resolved.normalized, resolved.stat.size)) === false,
+          truncated: (await searchFile(
+            resolved.selected.target,
+            resolved.normalized,
+            resolved.selected.stat.size,
+          )) === false,
         };
-      } else if (resolved.stat?.isDirectory()) {
-        walked = await walkContainedFiles(
-          root,
-          resolved,
+      } else if (resolved.selected.stat.isDirectory()) {
+        walked = await walkOverlayFiles(
+          roots,
+          resolved.normalized,
           ({ targetPath, relativePath, stat }) => searchFile(
             targetPath,
             relativePath,
@@ -553,12 +774,82 @@ function normalizePlan(plan, explanation) {
   };
 }
 
+export async function readProjectWorkOverlayTextFile({
+  projectRoot,
+  baseRoot,
+  workspaceRoot,
+  filePath,
+  startLine = 1,
+  endLine,
+} = {}) {
+  let file;
+  try {
+    const roots = await canonicalOverlayRoots({
+      projectRoot,
+      baseRoot,
+      workspaceRoot,
+    });
+    file = await readBoundedText(roots, filePath);
+  } catch (error) {
+    const message = String(error?.message ?? "");
+    if (message.startsWith("Path not found:")) {
+      throw projectWorkError("PROJECT_WORK_FILE_NOT_FOUND", "项目文件不存在", 404);
+    }
+    if (message === "File exceeds the contained tool size limit") {
+      throw projectWorkError(
+        "PROJECT_WORK_FILE_TOO_LARGE",
+        "文件过大，不能在当前查看器中打开",
+        413,
+      );
+    }
+    if (message === "Binary files are not supported by this tool") {
+      throw projectWorkError(
+        "PROJECT_WORK_FILE_BINARY",
+        "当前文件不是可直接查看的文本文件",
+        415,
+      );
+    }
+    if (message === "Path is outside the filtered project workspace") {
+      throw projectWorkError(
+        "PROJECT_WORK_PATH_FILTERED",
+        "该路径不在项目工作区的可访问范围内",
+        403,
+      );
+    }
+    throw projectWorkError(
+      "PROJECT_WORK_FILE_UNSAFE",
+      "项目路径不是可安全访问的普通文件",
+      409,
+    );
+  }
+  const lines = file.content.split(/\r\n|\n|\r/);
+  const normalizedStart = Number.isInteger(startLine) && startLine > 0 ? startLine : 1;
+  const normalizedEnd = Number.isInteger(endLine) && endLine >= normalizedStart
+    ? Math.min(endLine, lines.length)
+    : Math.min(normalizedStart + 399, lines.length);
+  return {
+    path: file.normalized,
+    byteLength: file.buffer.length,
+    hash: sha256(file.buffer),
+    content: lines.slice(normalizedStart - 1, normalizedEnd).join("\n"),
+    startLine: normalizedStart,
+    endLine: normalizedEnd,
+    totalLines: lines.length,
+  };
+}
+
 export async function createProjectWorkTools({
+  projectRoot,
+  baseRoot,
   workspaceRoot,
   onPlan,
   onVerificationRequest,
 } = {}) {
-  const root = await realpath(workspaceRoot);
+  const roots = await canonicalOverlayRoots({
+    projectRoot,
+    baseRoot,
+    workspaceRoot,
+  });
   const updatePlan = defineTool({
     name: "update_plan",
     label: "update_plan",
@@ -604,12 +895,12 @@ export async function createProjectWorkTools({
   });
 
   return [
-    createReadTool(root),
-    createEditTool(root),
-    createWriteTool(root),
-    createGrepTool(root),
-    createFindTool(root),
-    createLsTool(root),
+    createReadTool(roots),
+    createEditTool(roots),
+    createWriteTool(roots),
+    createGrepTool(roots),
+    createFindTool(roots),
+    createLsTool(roots),
     updatePlan,
     requestVerification,
   ];
@@ -695,6 +986,8 @@ export function createPiSessionFactory({
   }
 
   const factory = async ({
+    projectRoot,
+    baseRoot,
     workspaceRoot,
     sessionDir,
     modelRef,
@@ -719,7 +1012,7 @@ export function createPiSessionFactory({
     if (path.resolve(sessionManager.getCwd()) !== path.resolve(cwd)) {
       throw projectWorkError(
         "PROJECT_WORK_SESSION_INVALID",
-        "Pi 会话工作目录与隔离快照不一致",
+        "Pi 会话工作目录与私有审阅层不一致",
         500,
       );
     }
@@ -730,7 +1023,7 @@ export function createPiSessionFactory({
       },
       { projectTrusted: false },
     );
-    const agentsFiles = await readSafeAgentsFiles(cwd);
+    const agentsFiles = await readSafeAgentsFiles(projectRoot);
     const appendedGuidance = [
       APP_GUIDANCE,
       workspaceSnapshotGuidance(workspaceSnapshot),
@@ -756,6 +1049,8 @@ export function createPiSessionFactory({
     });
     await resourceLoader.reload();
     const customTools = await createProjectWorkTools({
+      projectRoot,
+      baseRoot,
       workspaceRoot: cwd,
       onPlan,
       onVerificationRequest,

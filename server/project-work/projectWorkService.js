@@ -15,7 +15,10 @@ import {
   projectWorkError,
   safeProjectWorkError,
 } from "./errors.js";
-import { createPiSessionFactory } from "./piSessionHost.js";
+import {
+  createPiSessionFactory,
+  readProjectWorkOverlayTextFile,
+} from "./piSessionHost.js";
 import { createMacOSProjectPicker } from "./macosProjectPicker.js";
 import { createProjectRegistry, publicProject } from "./projectRegistry.js";
 import { createVerificationRunner } from "./verificationRunner.js";
@@ -252,7 +255,11 @@ function normalizeVerificationRequest(request) {
   };
 }
 
-async function resolvePackageScript(workspaceRoot, command) {
+async function resolvePackageScript({
+  projectRoot,
+  baseRoot,
+  workspaceRoot,
+}, command) {
   if (!["npm", "pnpm", "yarn"].includes(command.file)) return null;
   const scriptName = command.args[0] === "run"
     ? command.args[1]
@@ -260,12 +267,19 @@ async function resolvePackageScript(workspaceRoot, command) {
       ? "test"
       : null;
   if (!scriptName) return null;
-  const packageDirectory = command.cwd
-    ? path.resolve(workspaceRoot, ...command.cwd.split("/"))
-    : workspaceRoot;
+  const packagePath = [
+    command.cwd,
+    "package.json",
+  ].filter(Boolean).join("/");
   try {
     const packageJson = JSON.parse(
-      await readFile(path.join(packageDirectory, "package.json"), "utf8"),
+      (await readProjectWorkOverlayTextFile({
+        projectRoot,
+        baseRoot,
+        workspaceRoot,
+        filePath: packagePath,
+        endLine: Number.MAX_SAFE_INTEGER,
+      })).content,
     );
     const script = packageJson?.scripts?.[scriptName];
     return typeof script === "string" ? script.slice(0, 2_000) : null;
@@ -344,6 +358,7 @@ function defaultStorageRoot() {
 export function createProjectWorkService({
   storageRoot = defaultStorageRoot(),
   sessionFactory,
+  snapshotter = createFilteredProjectSnapshot,
   picker = createMacOSProjectPicker(),
   runner = createVerificationRunner(),
   now = () => new Date(),
@@ -351,6 +366,7 @@ export function createProjectWorkService({
 } = {}) {
   const configuredStorageRoot = path.resolve(storageRoot);
   const effectiveSessionFactory = sessionFactory ?? createPiSessionFactory();
+  const createSnapshot = snapshotter;
   const registry = createProjectRegistry({
     storageRoot: configuredStorageRoot,
     now,
@@ -454,8 +470,15 @@ export function createProjectWorkService({
       sanitizeForConversation(conversationId, check)
     )));
     const createdAt = timestamp();
+    const conversation = await conversationStore.get(conversationId);
+    const project = await registry.get(conversation.projectId);
+    const paths = conversationPaths(conversationId);
     const resolvedScript = await resolvePackageScript(
-      conversationPaths(conversationId).workspaceRoot,
+      {
+        projectRoot: project.rootPath,
+        baseRoot: paths.baseRoot,
+        workspaceRoot: paths.workspaceRoot,
+      },
       normalized.command,
     );
     const verification = {
@@ -484,12 +507,14 @@ export function createProjectWorkService({
   }
 
   async function refreshChangeSet(conversationId) {
+    const conversation = await conversationStore.get(conversationId);
     const paths = conversationPaths(conversationId);
     const changeSet = {
       ...await recomputeChangeSet({
         conversationId,
         baseRoot: paths.baseRoot,
         workspaceRoot: paths.workspaceRoot,
+        allowDeletes: conversation.workspaceSnapshot?.mode !== "sparse_overlay",
       }),
       createdAt: timestamp(),
       appliedAt: null,
@@ -724,6 +749,8 @@ export function createProjectWorkService({
     };
     runtime.host = await effectiveSessionFactory({
       conversationId,
+      projectRoot: project.rootPath,
+      baseRoot: paths.baseRoot,
       workspaceRoot: paths.workspaceRoot,
       sessionDir: paths.sessionDir,
       modelRef: conversation.modelRef,
@@ -1007,13 +1034,11 @@ export function createProjectWorkService({
     try {
       await mkdir(path.dirname(paths.directory), { recursive: true, mode: 0o700 });
       await mkdir(paths.directory, { recursive: false, mode: 0o700 });
-      const workspaceSnapshot = await createFilteredProjectSnapshot({
-        projectRoot: project.rootPath,
-        baseRoot: paths.baseRoot,
-        workspaceRoot: paths.workspaceRoot,
-        storageRoot: configuredStorageRoot,
-      });
-      await mkdir(paths.sessionDir, { recursive: true, mode: 0o700 });
+      await Promise.all([
+        mkdir(paths.baseRoot, { recursive: false, mode: 0o700 }),
+        mkdir(paths.workspaceRoot, { recursive: false, mode: 0o700 }),
+        mkdir(paths.sessionDir, { recursive: false, mode: 0o700 }),
+      ]);
       const createdAt = timestamp();
       const conversation = await conversationStore.create({
         schemaVersion: 1,
@@ -1031,12 +1056,13 @@ export function createProjectWorkService({
         verifications: [],
         workspaceSnapshot: {
           schemaVersion: 1,
-          rulesVersion: 1,
-          includedFiles: workspaceSnapshot.files,
-          includedBytes: workspaceSnapshot.bytes,
-          skippedBinaryFiles: workspaceSnapshot.skippedBinaryFiles,
-          skippedOversizedFiles: workspaceSnapshot.skippedOversizedFiles,
-          truncated: workspaceSnapshot.truncated,
+          rulesVersion: 2,
+          mode: "sparse_overlay",
+          includedFiles: 0,
+          includedBytes: 0,
+          skippedBinaryFiles: 0,
+          skippedOversizedFiles: 0,
+          truncated: false,
         },
         lastError: null,
         lastEventSeq: 0,
@@ -1047,17 +1073,6 @@ export function createProjectWorkService({
         id: conversationId,
         projectId: project.id,
       });
-      if (workspaceSnapshot.truncated) {
-        await appendEvent(conversationId, "workspace.snapshot_limited", {
-          title: "大型项目已按安全范围载入",
-          summary: `已载入 ${workspaceSnapshot.files} 个可编辑文本文件；未载入的项目文件不会自动进入 Agent 工作区。`,
-          snapshot: {
-            includedFiles: workspaceSnapshot.files,
-            includedBytes: workspaceSnapshot.bytes,
-            truncated: true,
-          },
-        });
-      }
       return publicConversationSummary(conversation);
     } catch (error) {
       await rm(paths.directory, { recursive: true, force: true }).catch(() => undefined);
@@ -1085,7 +1100,9 @@ export function createProjectWorkService({
         400,
       );
     }
-    const { workspaceRoot } = conversationPaths(conversationId);
+    const conversation = await conversationStore.get(conversationId);
+    const project = await registry.get(conversation.projectId);
+    const paths = conversationPaths(conversationId);
     const sections = [];
     let totalCharacters = 0;
     for (const item of context) {
@@ -1096,7 +1113,10 @@ export function createProjectWorkService({
           400,
         );
       }
-      const file = await readProjectTextFile(workspaceRoot, {
+      const file = await readProjectWorkOverlayTextFile({
+        projectRoot: project.rootPath,
+        baseRoot: paths.baseRoot,
+        workspaceRoot: paths.workspaceRoot,
         filePath: item?.path,
         startLine: item?.startLine,
         endLine: item?.endLine,
@@ -1104,7 +1124,7 @@ export function createProjectWorkService({
         if (error?.code !== "PROJECT_WORK_FILE_NOT_FOUND") throw error;
         throw projectWorkError(
           "PROJECT_WORK_CONTEXT_OUTSIDE_SNAPSHOT",
-          "所选文件未进入或已移出当前受控工作快照；请绑定更具体的项目文件夹后重试",
+          "所选文件当前不可用，请重新选择文件上下文",
           409,
           true,
         );
@@ -1312,13 +1332,26 @@ export function createProjectWorkService({
     return readProjectTextFile(project.rootPath, options);
   }
 
+  async function readConversationFile(conversationId, options = {}) {
+    assertActive();
+    const conversation = await conversationStore.get(conversationId);
+    const project = await registry.get(conversation.projectId);
+    const paths = conversationPaths(conversationId);
+    return readProjectWorkOverlayTextFile({
+      ...options,
+      projectRoot: project.rootPath,
+      baseRoot: paths.baseRoot,
+      workspaceRoot: paths.workspaceRoot,
+    });
+  }
+
   async function getChangeSet(conversationId) {
     assertActive();
     const conversation = await conversationStore.get(conversationId);
     if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
       throw projectWorkError(
         "PROJECT_WORK_CONVERSATION_BUSY",
-        "Agent 正在修改工作快照，请稍后再审阅更改",
+        "Agent 正在准备修改，请稍后再审阅更改",
         409,
       );
     }
@@ -1336,6 +1369,24 @@ export function createProjectWorkService({
     });
   }
 
+  async function clearAppliedSparseOverlay(paths, appliedFiles) {
+    await Promise.all(appliedFiles.flatMap((file) => (
+      [paths.baseRoot, paths.workspaceRoot].map(async (root) => {
+        const normalized = normalizeProjectPath(file.path);
+        const target = path.resolve(root, ...normalized.split("/"));
+        const relative = path.relative(root, target);
+        if (relative.startsWith("..") || path.isAbsolute(relative)) {
+          throw projectWorkError(
+            "PROJECT_WORK_PATH_OUT_OF_SCOPE",
+            "路径必须位于项目文件夹内",
+            400,
+          );
+        }
+        await rm(target, { force: true });
+      })
+    )));
+  }
+
   async function applyChangeSet(conversationId, {
     changeSetId,
     changeSetHash,
@@ -1348,7 +1399,7 @@ export function createProjectWorkService({
       if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
         throw projectWorkError(
           "PROJECT_WORK_CONVERSATION_BUSY",
-          "Agent 正在修改工作快照，请稍后再应用更改",
+          "Agent 正在准备修改，请稍后再应用更改",
           409,
         );
       }
@@ -1358,6 +1409,7 @@ export function createProjectWorkService({
         conversationId,
         baseRoot: paths.baseRoot,
         workspaceRoot: paths.workspaceRoot,
+        allowDeletes: conversation.workspaceSnapshot?.mode !== "sparse_overlay",
       });
       if (current.id !== changeSetId || current.hash !== changeSetHash) {
         throw projectWorkError(
@@ -1374,6 +1426,9 @@ export function createProjectWorkService({
         changeSet: current,
         selectedFiles: files,
       });
+      if (conversation.workspaceSnapshot?.mode === "sparse_overlay") {
+        await clearAppliedSparseOverlay(paths, appliedFiles);
+      }
       const appliedIds = new Set(appliedFiles.map((file) => file.fileId));
       const appliedAt = timestamp();
       const appliedChangeSet = {
@@ -1387,20 +1442,30 @@ export function createProjectWorkService({
         })),
         appliedAt,
       };
+      const remainingChangeSet = {
+        ...await recomputeChangeSet({
+          conversationId,
+          baseRoot: paths.baseRoot,
+          workspaceRoot: paths.workspaceRoot,
+          allowDeletes: conversation.workspaceSnapshot?.mode !== "sparse_overlay",
+        }),
+        createdAt: timestamp(),
+        appliedAt: null,
+      };
+      const hasRemainingChanges = remainingChangeSet.status === "ready";
       await updateConversation(conversationId, {
-        activeChangeSet: appliedChangeSet,
-        status: "applied",
+        activeChangeSet: hasRemainingChanges
+          ? remainingChangeSet
+          : appliedChangeSet,
+        status: hasRemainingChanges
+          ? "awaiting_confirmation"
+          : "applied",
       });
       await appendEvent(conversationId, "change_set.applied", {
         id: current.id,
         hash: current.hash,
         status: appliedChangeSet.status,
         files: appliedFiles,
-      });
-      const remainingChangeSet = await recomputeChangeSet({
-        conversationId,
-        baseRoot: paths.baseRoot,
-        workspaceRoot: paths.workspaceRoot,
       });
       return { appliedChangeSet, remainingChangeSet };
     });
@@ -1438,7 +1503,7 @@ export function createProjectWorkService({
     }
     if (
       conversation.activeChangeSet
-      && !["clean", "applied", "partially_applied"].includes(
+      && !["clean", "applied"].includes(
         conversation.activeChangeSet.status,
       )
     ) {
@@ -1448,6 +1513,7 @@ export function createProjectWorkService({
         409,
       );
     }
+    const project = await registry.get(conversation.projectId);
     const paths = conversationPaths(conversationId);
     const controller = new AbortController();
     verificationControllers.set(conversationId, controller);
@@ -1481,14 +1547,30 @@ export function createProjectWorkService({
     });
     let result;
     try {
-      await createFilteredProjectSnapshot({
-        projectRoot: paths.baseRoot,
+      const materialized = await createSnapshot({
+        projectRoot: project.rootPath,
         baseRoot: verificationBaseRoot,
         workspaceRoot: verificationWorkspaceRoot,
         storageRoot: configuredStorageRoot,
       });
+      if (
+        materialized?.truncated === true
+        || (materialized?.skippedBinaryFiles ?? 0) > 0
+        || (materialized?.skippedOversizedFiles ?? 0) > 0
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_VERIFICATION_SNAPSHOT_INCOMPLETE",
+          "无法完整物化项目，未运行验证",
+          409,
+          true,
+        );
+      }
       const resolvedScript = await resolvePackageScript(
-        verificationWorkspaceRoot,
+        {
+          projectRoot: verificationWorkspaceRoot,
+          baseRoot: verificationBaseRoot,
+          workspaceRoot: verificationWorkspaceRoot,
+        },
         verification.command,
       );
       if ((resolvedScript ?? null) !== (verification.resolvedScript ?? null)) {
@@ -1626,6 +1708,7 @@ export function createProjectWorkService({
     listProjects,
     listVerifications,
     pickProjectRoot,
+    readConversationFile,
     readProjectFile,
     registerProject,
     removeProject,

@@ -9,7 +9,7 @@ Pi Agent 是一个以长期项目为中心的本地 Agent 工作空间：项目�
 - 简体中文、桌面优先的三栏工作空间已经完成；左上先选择 `正常工作` 或 `论文精读`，两类工作分别恢复自己的项目、会话和审阅状态。
 - `正常工作` 已接入真实本地纵向链路：macOS 文件夹选择与创建、服务端安全项目标签、Pi SDK 持久会话、公开计划和工具活动、只读文件、服务端重算 Diff、哈希绑定确认写回，以及保留每次尝试的有界验证记录。
 - 项目工作会话以 Agent 为中栏且默认占满可用宽度，右侧按需打开 `文件 / 更改 / 预览 / 运行`。页面打开、项目或会话切换、模型切换、工件切换都不会调用模型；只有显式发送才启动 Pi，会话内 steer、abort 和 compact 使用 Pi 原生能力。
-- Agent 只操作每个会话的过滤工作快照；浏览器永远不接收真实绝对路径。所选修改写回前会再次核对 change-set hash 和逐文件 base/after hash，同一项目的写回串行执行并做读回校验。验证在一次性确认版本快照中运行，不提供自由终端；界面会展示最终命令、解析到的项目脚本和当前本机权限边界。
+- Agent 通过真实项目的受控只读视图和每个会话的稀疏审阅层工作；浏览器永远不接收真实绝对路径。所选修改写回前会再次核对 change-set hash 和逐文件 base/after hash，同一项目的写回串行执行并做读回校验。验证只在用户显式启动时物化一次性项目副本，不提供自由终端；界面会展示最终命令、解析到的项目脚本和当前本机权限边界。
 - 第一个闭环是「周期监测 → 候选筛选 → 五分钟导读 → 用户选择的分阶段精读 → Zotero/Obsidian 归档 → 项目状态更新建议」。
 - 前端 fixture 展示 5 篇候选，其中 2 篇可走完整演示闭环；真实 Run 只允许全文解析完成的候选进入逐篇决定，单轮最多选择 2 篇。
 - 第一条本地模型纵向切片已经接通：浏览器通过同源 `/api` 调用回环 Node.js 服务，为候选生成“论文讲什么 / 对项目的作用”。服务商菜单现在真实对应 `GPT · Codex 订阅` 与 `DeepSeek API`。
@@ -49,7 +49,7 @@ npm run dev -- --host 127.0.0.1 --port 4173
 
 `npm run dev:api` 默认读取 `.env.local`。论文语义步骤的 GPT 通道继续使用已登录的 Codex 订阅，DeepSeek 读取 `PI_DEEPSEEK_API_KEY`；项目工作会话直接读取 Pi 本机已配置且可用的模型目录，不读取或复制 Pi/Codex 凭据。MinerU Cloud 读取 `PI_MINERU_API_TOKEN`。Zotero Desktop 默认只通过 `http://127.0.0.1:23119` 连接本机，必要时可用 `PI_ZOTERO_BASE_URL` 覆盖。所有密钥只放在未跟踪的 `.env.local`，不要写入前端、聊天或 Git。
 
-项目工作会话数据默认保存在 macOS `Application Support/Pi Agent/project-work`，可通过服务端环境变量 `PI_PROJECT_WORK_STORAGE_ROOT` 覆盖。该目录保存安全项目注册、会话状态、事件流、过滤快照与 Pi JSONL 会话；不会进入浏览器或 Git。
+项目工作会话数据默认保存在 macOS `Application Support/Pi Agent/project-work`，可通过服务端环境变量 `PI_PROJECT_WORK_STORAGE_ROOT` 覆盖。该目录保存安全项目注册、会话状态、事件流、稀疏审阅层与 Pi JSONL 会话；不会进入浏览器或 Git。创建空会话只写轻量元数据，不扫描或复制整个项目。
 
 要启用 MinerU，在 `.env.local` 增加 `PI_MINERU_API_TOKEN=你的_Token` 后重启本地 API。已经完成 PDF 下载但停在 `not_configured` 的 Run 不必重新扫描来源，页面会显示“重新准备全文”，点击后使用已缓存的 5 篇 PDF 继续提交。
 

@@ -186,3 +186,31 @@ test("left rail shows the selected work type, nested conversations, and one proj
     assert.doesNotMatch(html, /后台运行/);
   });
 });
+
+test("left rail shows one disabled pending conversation while a project is being prepared", async () => {
+  await withViteModule("/src/components/ProjectRail.jsx", ({ ProjectRail }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectRail, {
+      projects: [{
+        id: "project-1",
+        name: "Pi Agent 产品设计",
+        state: "0 个会话",
+        updated: "刚刚",
+      }],
+      selectedId: "project-1",
+      conversations: [],
+      selectedConversationId: null,
+      creatingConversationProjectIds: ["project-1"],
+      preparingConversationProjectId: "project-1",
+      workspaceKind: "project_work",
+      query: "",
+      onQueryChange() {},
+      onNewConversation() {},
+      onAddProject() {},
+    }));
+
+    assert.match(html, /新工作会话/);
+    assert.match(html, /正在创建会话/);
+    assert.match(html, /aria-busy="true"/);
+    assert.doesNotMatch(html, /还没有会话/);
+  });
+});

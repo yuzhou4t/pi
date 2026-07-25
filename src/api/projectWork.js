@@ -180,6 +180,7 @@ function mapWorkspaceSnapshot(raw) {
   const includedFiles = Number(pick(raw, "included_files", "includedFiles"));
   const includedBytes = Number(pick(raw, "included_bytes", "includedBytes"));
   return {
+    mode: pick(raw, "mode", "mode", null),
     includedFiles: Number.isSafeInteger(includedFiles) && includedFiles >= 0
       ? includedFiles
       : null,
@@ -718,15 +719,23 @@ export async function fetchProjectWorkTree({
 
 export async function fetchProjectWorkFile({
   projectId,
+  conversationId,
   path,
   signal,
   fetchImpl,
 } = {}) {
-  requiredId(projectId, "projectId");
+  if (conversationId) {
+    requiredId(conversationId, "conversationId");
+  } else {
+    requiredId(projectId, "projectId");
+  }
   requiredId(path, "path");
   const query = new URLSearchParams({ path });
+  const scope = conversationId
+    ? `conversations/${encodeURIComponent(conversationId)}`
+    : `projects/${encodeURIComponent(projectId)}`;
   const payload = await requestJson(
-    `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/file?${query.toString()}`,
+    `${PROJECT_WORK_API_ROOT}/${scope}/file?${query.toString()}`,
     { signal, fetchImpl },
   );
   const content = typeof payload?.content === "string" ? payload.content : "";

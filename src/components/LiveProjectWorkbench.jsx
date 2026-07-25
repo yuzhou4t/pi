@@ -358,23 +358,30 @@ function ActivityTimeline({ events, onOpenArtifact }) {
   );
 }
 
-function EmptyConversationPane({ project }) {
+function EmptyConversationPane({ project, preparing = false }) {
   return (
     <div className="project-agent">
       <header className="project-agent-header">
         <div>
           <span>项目 Agent</span>
-          <strong>尚未开始</strong>
+          <strong>{preparing ? "正在创建" : "尚未开始"}</strong>
         </div>
-        <span className="project-agent-status is-ready"><span aria-hidden="true" />等待会话</span>
+        <span className="project-agent-status is-ready">
+          <span aria-hidden="true" />
+          {preparing ? "创建会话" : "等待会话"}
+        </span>
       </header>
       <div className="project-agent-stream">
         <section className="project-agent-welcome">
-          <Code size={24} weight="regular" aria-hidden="true" />
+          {preparing
+            ? <CircleNotch className="spin" size={24} weight="regular" aria-hidden="true" />
+            : <Code size={24} weight="regular" aria-hidden="true" />}
           <div>
-            <h2>绑定项目 / 新建会话后开始</h2>
+            <h2>{preparing ? "正在准备新工作会话" : "绑定项目 / 新建会话后开始"}</h2>
             <p>
-              {project
+              {preparing
+                ? "Pi Agent 正在创建轻量会话，马上就可以输入任务。"
+                : project
                 ? `在“${project.name}”中新建一个会话，Pi Agent 才会读取项目并开始工作。`
                 : "先在左侧绑定本地项目，再新建一个正常工作会话。"}
             </p>
@@ -579,6 +586,7 @@ function ProjectAgentPane({
 
 function FileArtifact({
   project,
+  conversationId,
   api,
   selectedPath,
   requestedPath,
@@ -626,7 +634,7 @@ function FileArtifact({
   }, [api, project?.id, reportError]);
 
   const loadFile = useCallback(async (path) => {
-    if (!project?.id || !path) return;
+    if ((!conversationId && !project?.id) || !path) return;
     setActivePath(path);
     if (fileCache[path]) return;
     fileAbort.current?.abort();
@@ -636,7 +644,9 @@ function FileArtifact({
     setError(null);
     try {
       const file = await api.fetchFile({
-        projectId: project.id,
+        ...(conversationId
+          ? { conversationId }
+          : { projectId: project.id }),
         path,
         signal: controller.signal,
       });
@@ -646,7 +656,7 @@ function FileArtifact({
     } finally {
       if (fileAbort.current === controller) setLoadingFile(false);
     }
-  }, [api, fileCache, project?.id, reportError]);
+  }, [api, conversationId, fileCache, project?.id, reportError]);
 
   useEffect(() => {
     loadedDirectories.current = new Set();
@@ -658,7 +668,7 @@ function FileArtifact({
     setError(null);
     loadDirectory("");
     return () => fileAbort.current?.abort();
-  }, [loadDirectory, project?.id]);
+  }, [conversationId, loadDirectory, project?.id]);
 
   useEffect(() => {
     if (!requestedPath) return;
@@ -1135,6 +1145,7 @@ function ArtifactPane({
             <FileArtifact
               key={`${project?.id ?? "project"}:${conversation.pendingChangeSet?.id ?? "base"}:${conversation.pendingChangeSet?.status ?? "clean"}`}
               project={project}
+              conversationId={conversation.id}
               api={api}
               requestedPath={requestedFilePath}
               onRequestedPathHandled={onRequestedFilePathHandled}
@@ -1169,6 +1180,7 @@ function ArtifactPane({
 export function LiveProjectWorkbench({
   project = null,
   conversation = null,
+  preparingConversation = false,
   providers = [],
   providerId = "",
   modelId = "",
@@ -1422,7 +1434,12 @@ export function LiveProjectWorkbench({
         closedTitle="新建会话后可打开项目工件"
         title={headerTitle}
         headerActions={headerActions}
-        agent={<EmptyConversationPane project={project} />}
+        agent={(
+          <EmptyConversationPane
+            project={project}
+            preparing={preparingConversation}
+          />
+        )}
         artifact={null}
       />
     );

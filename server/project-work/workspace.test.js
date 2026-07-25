@@ -11,7 +11,10 @@ import {
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createFilteredProjectSnapshot } from "./workspace.js";
+import {
+  createFilteredProjectSnapshot,
+  recomputeChangeSet,
+} from "./workspace.js";
 
 async function listSnapshotFiles(root, relativeDirectory = "") {
   const directory = path.join(root, relativeDirectory);
@@ -81,4 +84,29 @@ test("large project snapshots stay usable by collecting shallow text files first
   await assert.rejects(access(path.join(workspaceRoot, ".worktrees", "copy", "ignored.js")));
   await assert.rejects(access(path.join(workspaceRoot, "preview.png")));
   await assert.rejects(access(path.join(workspaceRoot, "alpha", "src", "deep", "later.js")));
+});
+
+test("a sparse base-only crash remnant never becomes a delete proposal", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-workspace-sparse-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const baseRoot = path.join(temporaryRoot, "base");
+  const workspaceRoot = path.join(temporaryRoot, "workspace");
+  await Promise.all([mkdir(baseRoot), mkdir(workspaceRoot)]);
+  await writeFile(path.join(baseRoot, "app.js"), "captured before crash\n");
+
+  const sparse = await recomputeChangeSet({
+    conversationId: "conversation-sparse",
+    baseRoot,
+    workspaceRoot,
+    allowDeletes: false,
+  });
+  const legacy = await recomputeChangeSet({
+    conversationId: "conversation-legacy",
+    baseRoot,
+    workspaceRoot,
+  });
+
+  assert.equal(sparse.status, "clean");
+  assert.deepEqual(sparse.files, []);
+  assert.equal(legacy.files[0].operation, "delete");
 });
