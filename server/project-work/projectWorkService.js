@@ -44,6 +44,7 @@ const THINKING_LEVELS = new Set([
 const SAFE_VERIFICATION_FILES = new Set(["npm", "pnpm", "yarn", "bun", "node"]);
 const PACKAGE_COMMANDS = new Set(["test", "run", "lint", "check", "typecheck"]);
 const DEFAULT_CONVERSATION_TITLE = "新工作会话";
+const STANDALONE_ROOT_LABEL = "未连接文件夹";
 const BUSY_CONVERSATION_STATUSES = new Set([
   "running",
   "compacting",
@@ -81,10 +82,37 @@ function conversationTitleFromMessage(value) {
     .slice(0, 48) || DEFAULT_CONVERSATION_TITLE;
 }
 
+function conversationWorkspaceKind(conversation) {
+  if (
+    conversation?.workspaceKind === "scratch"
+    && conversation.projectId === null
+  ) {
+    return "scratch";
+  }
+  if (
+    (conversation?.workspaceKind === "bound_project" || !conversation?.workspaceKind)
+    && typeof conversation?.projectId === "string"
+    && conversation.projectId
+  ) {
+    return "bound_project";
+  }
+  throw projectWorkError(
+    "PROJECT_WORK_CONVERSATION_SCOPE_INVALID",
+    "工作会话的工作区范围无效",
+    500,
+  );
+}
+
 function publicConversationSummary(conversation) {
+  const workspaceKind = conversationWorkspaceKind(conversation);
   return {
     id: conversation.id,
     projectId: conversation.projectId,
+    workspaceKind,
+    scope: workspaceKind === "scratch" ? "standalone" : "project",
+    rootLabel: workspaceKind === "scratch"
+      ? STANDALONE_ROOT_LABEL
+      : conversation.rootLabel ?? null,
     title: conversation.title,
     status: conversation.status,
     providerId: conversation.providerId ?? null,
@@ -432,7 +460,20 @@ export function createProjectWorkService({
   }
 
   function assertConversationProject(conversation, projectId) {
-    if (conversation.projectId !== projectId) {
+    if (
+      conversationWorkspaceKind(conversation) !== "bound_project"
+      || conversation.projectId !== projectId
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_CONVERSATION_NOT_FOUND",
+        "工作会话不存在",
+        404,
+      );
+    }
+  }
+
+  function assertStandaloneConversation(conversation) {
+    if (conversationWorkspaceKind(conversation) !== "scratch") {
       throw projectWorkError(
         "PROJECT_WORK_CONVERSATION_NOT_FOUND",
         "工作会话不存在",
@@ -466,7 +507,55 @@ export function createProjectWorkService({
       directory,
       baseRoot: path.join(directory, "base"),
       workspaceRoot: path.join(directory, "workspace"),
+      scratchRoot: path.join(directory, "scratch"),
       sessionDir: path.join(directory, "pi-sessions"),
+    };
+  }
+
+  async function resolveConversationWorkspace(conversation) {
+    const workspaceKind = conversationWorkspaceKind(conversation);
+    if (workspaceKind === "bound_project") {
+      const project = await registry.get(conversation.projectId);
+      return {
+        workspaceKind,
+        projectRoot: project.rootPath,
+        rootLabel: conversation.rootLabel ?? project.rootLabel,
+        lockKey: `project:${project.id}`,
+      };
+    }
+    const paths = conversationPaths(conversation.id);
+    let canonicalRoot;
+    let canonicalDirectory;
+    let rootStat;
+    try {
+      [canonicalRoot, canonicalDirectory, rootStat] = await Promise.all([
+        realpath(paths.scratchRoot),
+        realpath(paths.directory),
+        lstat(paths.scratchRoot),
+      ]);
+    } catch {
+      throw projectWorkError(
+        "PROJECT_WORK_SCRATCH_UNAVAILABLE",
+        "独立对话的私有工作区不可用",
+        500,
+      );
+    }
+    if (
+      path.dirname(canonicalRoot) !== canonicalDirectory
+      || !rootStat.isDirectory()
+      || rootStat.isSymbolicLink()
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_SCRATCH_UNAVAILABLE",
+        "独立对话的私有工作区不可用",
+        500,
+      );
+    }
+    return {
+      workspaceKind,
+      projectRoot: canonicalRoot,
+      rootLabel: STANDALONE_ROOT_LABEL,
+      lockKey: `conversation:${conversation.id}`,
     };
   }
 
@@ -486,13 +575,17 @@ export function createProjectWorkService({
   async function sanitizeForConversation(conversationId, value) {
     let text = String(value ?? "");
     const conversation = await conversationStore.get(conversationId);
-    const project = await registry.get(conversation.projectId);
+    const workspace = await resolveConversationWorkspace(conversation);
     const paths = conversationPaths(conversationId);
     for (const [target, replacement] of [
       [paths.workspaceRoot, "<workspace>"],
       [paths.baseRoot, "<workspace>"],
+      [paths.scratchRoot, "<workspace>"],
       [paths.directory, "<workspace>"],
-      [project.rootPath, "<project>"],
+      [
+        workspace.projectRoot,
+        workspace.workspaceKind === "scratch" ? "<workspace>" : "<project>",
+      ],
       [configuredStorageRoot, "<workspace>"],
       [process.cwd(), "<app>"],
       [tmpdir(), "<tmp>"],
@@ -542,11 +635,11 @@ export function createProjectWorkService({
     )));
     const createdAt = timestamp();
     const conversation = await conversationStore.get(conversationId);
-    const project = await registry.get(conversation.projectId);
+    const workspace = await resolveConversationWorkspace(conversation);
     const paths = conversationPaths(conversationId);
     const resolvedScript = await resolvePackageScript(
       {
-        projectRoot: project.rootPath,
+        projectRoot: workspace.projectRoot,
         baseRoot: paths.baseRoot,
         workspaceRoot: paths.workspaceRoot,
       },
@@ -795,7 +888,7 @@ export function createProjectWorkService({
     if (current) return current;
     const conversation = await conversationStore.get(conversationId);
     const paths = conversationPaths(conversationId);
-    const project = await registry.get(conversation.projectId);
+    const workspace = await resolveConversationWorkspace(conversation);
     let workspaceSnapshot = conversation.workspaceSnapshot ?? null;
     if (!workspaceSnapshot) {
       const existingEvents = await conversationStore.readEvents(conversationId, {
@@ -812,7 +905,7 @@ export function createProjectWorkService({
     }
     const runtime = {
       conversationId,
-      projectRoot: project.rootPath,
+      projectRoot: workspace.projectRoot,
       workspaceRoot: paths.workspaceRoot,
       eventQueue: Promise.resolve(),
       turnIndex: 0,
@@ -824,13 +917,14 @@ export function createProjectWorkService({
     };
     runtime.host = await effectiveSessionFactory({
       conversationId,
-      projectRoot: project.rootPath,
+      projectRoot: workspace.projectRoot,
       baseRoot: paths.baseRoot,
       workspaceRoot: paths.workspaceRoot,
       sessionDir: paths.sessionDir,
       modelRef: conversation.modelRef,
       thinkingLevel: conversation.thinkingLevel,
       workspaceSnapshot,
+      workspaceKind: workspace.workspaceKind,
       onPlan: (plan) => recordPlan(conversationId, plan),
       onVerificationRequest: (request) => recordVerificationRequest(
         conversationId,
@@ -1083,14 +1177,18 @@ export function createProjectWorkService({
     ));
   }
 
-  async function createConversation(projectId, {
+  async function createConversationRecord({
+    projectId,
+    workspaceKind,
+    rootLabel,
+    validateModel = true,
+  }, {
     title,
     providerId,
     modelId,
     thinkingLevel = "medium",
   } = {}) {
     assertActive();
-    const project = await registry.get(projectId);
     if (!THINKING_LEVELS.has(thinkingLevel)) {
       throw projectWorkError(
         "PROJECT_WORK_THINKING_LEVEL_INVALID",
@@ -1098,15 +1196,22 @@ export function createProjectWorkService({
         400,
       );
     }
-    const catalog = typeof effectiveSessionFactory.listModels === "function"
+    const requestedProviderId = compactText(providerId, 120) || null;
+    const requestedModelId = compactText(modelId, 200) || null;
+    const catalog = validateModel && typeof effectiveSessionFactory.listModels === "function"
       ? await effectiveSessionFactory.listModels()
       : null;
     const selectedModel = catalog
-      ? selectModel(catalog, { providerId, modelId })
+      ? selectModel(catalog, {
+          providerId: requestedProviderId,
+          modelId: requestedModelId,
+        })
       : {
-          providerId: compactText(providerId, 120) || null,
-          modelId: compactText(modelId, 200) || null,
-          modelRef: providerId && modelId ? `${providerId}/${modelId}` : modelId || null,
+          providerId: requestedProviderId,
+          modelId: requestedModelId,
+          modelRef: requestedProviderId && requestedModelId
+            ? `${requestedProviderId}/${requestedModelId}`
+            : requestedModelId,
         };
     const conversationId = `conversation-${idFactory()}`;
     const paths = conversationPaths(conversationId);
@@ -1117,12 +1222,17 @@ export function createProjectWorkService({
         mkdir(paths.baseRoot, { recursive: false, mode: 0o700 }),
         mkdir(paths.workspaceRoot, { recursive: false, mode: 0o700 }),
         mkdir(paths.sessionDir, { recursive: false, mode: 0o700 }),
+        ...(workspaceKind === "scratch"
+          ? [mkdir(paths.scratchRoot, { recursive: false, mode: 0o700 })]
+          : []),
       ]);
       const createdAt = timestamp();
       const conversation = await conversationStore.create({
         schemaVersion: 1,
         id: conversationId,
-        projectId: project.id,
+        projectId,
+        workspaceKind,
+        rootLabel,
         title: compactText(title, 160, DEFAULT_CONVERSATION_TITLE),
         status: "idle",
         providerId: selectedModel.providerId,
@@ -1136,7 +1246,7 @@ export function createProjectWorkService({
         workspaceSnapshot: {
           schemaVersion: 1,
           rulesVersion: 2,
-          mode: "sparse_overlay",
+          mode: workspaceKind === "scratch" ? "scratch" : "sparse_overlay",
           includedFiles: 0,
           includedBytes: 0,
           skippedBinaryFiles: 0,
@@ -1150,7 +1260,8 @@ export function createProjectWorkService({
       });
       await appendEvent(conversationId, "conversation.created", {
         id: conversationId,
-        projectId: project.id,
+        projectId,
+        workspaceKind,
       });
       return publicConversationSummary(conversation);
     } catch (error) {
@@ -1159,10 +1270,35 @@ export function createProjectWorkService({
     }
   }
 
+  async function createConversation(projectId, options = {}) {
+    assertActive();
+    const project = await registry.get(projectId);
+    return createConversationRecord({
+      projectId: project.id,
+      workspaceKind: "bound_project",
+      rootLabel: project.rootLabel,
+    }, options);
+  }
+
+  async function createStandaloneConversation(options = {}) {
+    assertActive();
+    return createConversationRecord({
+      projectId: null,
+      workspaceKind: "scratch",
+      rootLabel: STANDALONE_ROOT_LABEL,
+      validateModel: false,
+    }, options);
+  }
+
   async function listConversations(projectId) {
     assertActive();
     await registry.get(projectId);
     return (await conversationStore.list(projectId)).map(publicConversationSummary);
+  }
+
+  async function listStandaloneConversations() {
+    assertActive();
+    return (await conversationStore.list(null)).map(publicConversationSummary);
   }
 
   async function getConversation(conversationId, options = {}) {
@@ -1180,7 +1316,7 @@ export function createProjectWorkService({
       );
     }
     const conversation = await conversationStore.get(conversationId);
-    const project = await registry.get(conversation.projectId);
+    const workspace = await resolveConversationWorkspace(conversation);
     const paths = conversationPaths(conversationId);
     const sections = [];
     let totalCharacters = 0;
@@ -1193,7 +1329,7 @@ export function createProjectWorkService({
         );
       }
       const file = await readProjectWorkOverlayTextFile({
-        projectRoot: project.rootPath,
+        projectRoot: workspace.projectRoot,
         baseRoot: paths.baseRoot,
         workspaceRoot: paths.workspaceRoot,
         filePath: item?.path,
@@ -1424,14 +1560,21 @@ export function createProjectWorkService({
   async function readConversationFile(conversationId, options = {}) {
     assertActive();
     const conversation = await conversationStore.get(conversationId);
-    const project = await registry.get(conversation.projectId);
+    const workspace = await resolveConversationWorkspace(conversation);
     const paths = conversationPaths(conversationId);
     return readProjectWorkOverlayTextFile({
       ...options,
-      projectRoot: project.rootPath,
+      projectRoot: workspace.projectRoot,
       baseRoot: paths.baseRoot,
       workspaceRoot: paths.workspaceRoot,
     });
+  }
+
+  async function getConversationTree(conversationId, options = {}) {
+    assertActive();
+    const conversation = await conversationStore.get(conversationId);
+    const workspace = await resolveConversationWorkspace(conversation);
+    return getProjectFileTree(workspace.projectRoot, options);
   }
 
   async function getChangeSet(conversationId) {
@@ -1484,7 +1627,8 @@ export function createProjectWorkService({
     assertActive();
     assertConversationNotDeleting(conversationId);
     const initial = await conversationStore.get(conversationId);
-    return withApplyLock(`project:${initial.projectId}`, async () => {
+    const initialWorkspace = await resolveConversationWorkspace(initial);
+    return withApplyLock(initialWorkspace.lockKey, async () => {
       assertConversationNotDeleting(conversationId);
       const conversation = await conversationStore.get(conversationId);
       if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
@@ -1494,7 +1638,7 @@ export function createProjectWorkService({
           409,
         );
       }
-      const project = await registry.get(conversation.projectId);
+      const workspace = await resolveConversationWorkspace(conversation);
       const paths = conversationPaths(conversationId);
       const current = await recomputeChangeSet({
         conversationId,
@@ -1511,13 +1655,13 @@ export function createProjectWorkService({
         );
       }
       const appliedFiles = await applySelectedChangeSet({
-        projectRoot: project.rootPath,
+        projectRoot: workspace.projectRoot,
         baseRoot: paths.baseRoot,
         workspaceRoot: paths.workspaceRoot,
         changeSet: current,
         selectedFiles: files,
       });
-      if (conversation.workspaceSnapshot?.mode === "sparse_overlay") {
+      if (["sparse_overlay", "scratch"].includes(conversation.workspaceSnapshot?.mode)) {
         await clearAppliedSparseOverlay(paths, appliedFiles);
       }
       const appliedIds = new Set(appliedFiles.map((file) => file.fileId));
@@ -1605,7 +1749,7 @@ export function createProjectWorkService({
         409,
       );
     }
-    const project = await registry.get(conversation.projectId);
+    const workspace = await resolveConversationWorkspace(conversation);
     assertConversationNotDeleting(conversationId);
     const paths = conversationPaths(conversationId);
     const controller = new AbortController();
@@ -1641,7 +1785,7 @@ export function createProjectWorkService({
     let result;
     try {
       const materialized = await createSnapshot({
-        projectRoot: project.rootPath,
+        projectRoot: workspace.projectRoot,
         baseRoot: verificationBaseRoot,
         workspaceRoot: verificationWorkspaceRoot,
         storageRoot: configuredStorageRoot,
@@ -1740,14 +1884,21 @@ export function createProjectWorkService({
     return completed;
   }
 
-  async function removeConversation(projectId, conversationId) {
-    assertActive();
-    const project = await registry.getMetadata(projectId);
+  async function removeScopedConversation({
+    projectId,
+    workspaceKind,
+  }, conversationId) {
     const conversation = await conversationStore.get(conversationId);
-    assertConversationProject(conversation, project.id);
+    if (workspaceKind === "scratch") {
+      assertStandaloneConversation(conversation);
+    } else {
+      assertConversationProject(conversation, projectId);
+    }
     assertConversationNotDeleting(conversationId);
     assertConversationDeletable(conversation);
-    const lockKey = `project:${project.id}`;
+    const lockKey = workspaceKind === "scratch"
+      ? `conversation:${conversationId}`
+      : `project:${projectId}`;
     if (applyQueues.has(lockKey)) {
       throw projectWorkError(
         "PROJECT_WORK_CONVERSATION_DELETE_BUSY",
@@ -1761,21 +1912,31 @@ export function createProjectWorkService({
     try {
       return await withApplyLock(lockKey, async () => {
         const current = await conversationStore.get(conversationId);
-        assertConversationProject(current, project.id);
+        if (workspaceKind === "scratch") {
+          assertStandaloneConversation(current);
+        } else {
+          assertConversationProject(current, projectId);
+        }
         assertConversationDeletable(current);
         const runtime = runtimes.get(conversationId);
         if (runtime?.eventQueue) await runtime.eventQueue;
         const latest = await conversationStore.get(conversationId);
-        assertConversationProject(latest, project.id);
+        if (workspaceKind === "scratch") {
+          assertStandaloneConversation(latest);
+        } else {
+          assertConversationProject(latest, projectId);
+        }
         assertConversationDeletable(latest);
         runtime?.unsubscribe?.();
         runtime?.host?.dispose?.();
         runtimes.delete(conversationId);
         await conversationStore.remove(conversationId);
-        const conversationCount = (await conversationStore.list(project.id)).length;
+        const conversationCount = (
+          await conversationStore.list(workspaceKind === "scratch" ? null : projectId)
+        ).length;
         return {
           id: conversationId,
-          projectId: project.id,
+          projectId: workspaceKind === "scratch" ? null : projectId,
           removed: true,
           conversationCount,
         };
@@ -1783,6 +1944,23 @@ export function createProjectWorkService({
     } finally {
       deletingConversations.delete(conversationId);
     }
+  }
+
+  async function removeConversation(projectId, conversationId) {
+    assertActive();
+    const project = await registry.getMetadata(projectId);
+    return removeScopedConversation({
+      projectId: project.id,
+      workspaceKind: "bound_project",
+    }, conversationId);
+  }
+
+  async function removeStandaloneConversation(conversationId) {
+    assertActive();
+    return removeScopedConversation({
+      projectId: null,
+      workspaceKind: "scratch",
+    }, conversationId);
   }
 
   async function renameConversation(projectId, conversationId, { title } = {}) {
@@ -1793,6 +1971,18 @@ export function createProjectWorkService({
     const conversation = await conversationStore.get(conversationId);
     assertConversationProject(conversation, project.id);
     assertConversationNotDeleting(conversationId);
+    const updated = await updateConversation(conversationId, {
+      title: normalizedTitle,
+    });
+    return publicConversationSummary(updated);
+  }
+
+  async function renameStandaloneConversation(conversationId, { title } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const normalizedTitle = conversationTitle(title);
+    const conversation = await conversationStore.get(conversationId);
+    assertStandaloneConversation(conversation);
     const updated = await updateConversation(conversationId, {
       title: normalizedTitle,
     });
@@ -1851,13 +2041,16 @@ export function createProjectWorkService({
     applyChangeSet,
     compactConversation,
     createConversation,
+    createStandaloneConversation,
     dispose,
     getChangeSet,
     getConversation,
+    getConversationTree,
     getProjectTree,
     listConversations,
     listModels,
     listProjects,
+    listStandaloneConversations,
     listVerifications,
     pickProjectRoot,
     readConversationFile,
@@ -1865,7 +2058,9 @@ export function createProjectWorkService({
     registerProject,
     removeConversation,
     removeProject,
+    removeStandaloneConversation,
     renameConversation,
+    renameStandaloneConversation,
     runVerification,
     sendMessage,
     steerConversation,

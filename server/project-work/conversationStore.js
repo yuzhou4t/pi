@@ -204,7 +204,10 @@ export function createConversationStore({ storageRoot } = {}) {
         }),
     );
     return conversations
-      .filter((conversation) => conversation && (!projectId || conversation.projectId === projectId))
+      .filter((conversation) => (
+        conversation
+        && (projectId === undefined || conversation.projectId === projectId)
+      ))
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 

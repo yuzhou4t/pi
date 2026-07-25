@@ -100,7 +100,7 @@ test("live project workbench renders the honest empty states without starting wo
       { project, conversation: null },
     ));
 
-    assert.match(noConversationHtml, /绑定项目 \/ 新建会话后开始/);
+    assert.match(noConversationHtml, /新建对话或绑定项目后开始/);
     assert.match(noConversationHtml, /等待会话/);
     assert.match(noConversationHtml, /新建会话后可打开项目工件/);
 
@@ -117,6 +117,38 @@ test("live project workbench renders the honest empty states without starting wo
     assert.doesNotMatch(emptyConversationHtml, /aria-label="项目工件"/);
     assert.doesNotMatch(emptyConversationHtml, /MinerU|Zotero|Obsidian|阅读镜头/);
   });
+});
+
+test("standalone workbench states that it cannot read a local folder", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const standalone = conversation({
+      projectId: null,
+      workspaceKind: "scratch",
+      scope: "standalone",
+      rootLabel: "未连接文件夹",
+      title: "整理需求",
+    });
+    const html = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      { project: null, conversation: standalone },
+    ));
+
+    assert.match(html, /独立对话/);
+    assert.match(html, /未连接本地文件夹/);
+    assert.match(html, /私有草稿区/);
+    assert.match(html, /只有显式发送才开始工作/);
+    assert.doesNotMatch(html, /真实项目上下文|读取当前项目/);
+  });
+});
+
+test("file artifact reads standalone trees from the conversation route", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  const fileArtifactStart = source.indexOf("function FileArtifact");
+  const fileArtifactEnd = source.indexOf("function ChangeArtifact", fileArtifactStart);
+  const implementation = source.slice(fileArtifactStart, fileArtifactEnd);
+
+  assert.match(implementation, /api\.fetchTree\(\{[\s\S]*conversationId/);
+  assert.doesNotMatch(implementation, /fetchTree\(\{ projectId: project\.id/);
 });
 
 test("live project workbench renders an immediate preparation state for a new conversation", async () => {

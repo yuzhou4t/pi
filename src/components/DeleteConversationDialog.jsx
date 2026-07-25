@@ -27,6 +27,9 @@ export function DeleteConversationDialog({
 
   if (!conversation) return null;
   const pendingChangeFileCount = Number(conversation.pendingChangeFileCount) || 0;
+  const standalone = conversation.projectId === null
+    || conversation.scope === "standalone"
+    || conversation.workspaceKind === "scratch";
   const confirmationDisabled = conversation.checking
     || conversation.deleteBlocked
     || Boolean(conversation.checkError);
@@ -64,7 +67,9 @@ export function DeleteConversationDialog({
             <Trash size={19} weight="regular" aria-hidden="true" />
           </span>
           <div>
-            <h2 id="conversation-delete-title">删除工作会话？</h2>
+            <h2 id="conversation-delete-title">
+              {standalone ? "删除独立对话？" : "删除工作会话？"}
+            </h2>
             <p id="conversation-delete-description">
               “{conversation.title || "未命名会话"}”的对话、计划、运行记录和未应用修改草稿将被删除。
             </p>
@@ -78,7 +83,9 @@ export function DeleteConversationDialog({
               <br />
             </>
           ) : null}
-          此操作不可恢复，但不会删除项目文件夹，也不会回滚已经确认写入的修改。
+          {standalone
+            ? "此操作不可恢复。这个对话的私有草稿区会随这个对话一起删除，不会影响任何已绑定项目。"
+            : "此操作不可恢复，但不会删除项目文件夹，也不会回滚已经确认写入的修改。"}
         </p>
         {conversation.checking ? (
           <p className="conversation-delete-checking" role="status">

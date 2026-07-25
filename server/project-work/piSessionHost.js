@@ -52,6 +52,14 @@ const APP_GUIDANCE = [
   "Use request_verification to propose a bounded verification command; it never runs until the user explicitly starts it.",
   "Edits are written only to the review overlay. Never claim that the live project changed before the app confirms an applied change set.",
 ].join("\n");
+const STANDALONE_GUIDANCE = [
+  "This conversation is not connected to any user folder or project.",
+  "You can access only this conversation's private scratch workspace through the provided contained file tools.",
+  "Do not claim that you inspected, changed, or can discover files elsewhere on the user's computer.",
+  "Keep the public plan current with update_plan.",
+  "Use request_verification to propose a bounded verification command; it never runs until the user explicitly starts it.",
+  "Edits remain proposed in the private review overlay until the user confirms them; confirmation saves them only inside this conversation's private scratch workspace.",
+].join("\n");
 
 function workspaceSnapshotGuidance(workspaceSnapshot) {
   if (workspaceSnapshot?.truncated !== true) return "";
@@ -993,6 +1001,7 @@ export function createPiSessionFactory({
     modelRef,
     thinkingLevel = "medium",
     workspaceSnapshot,
+    workspaceKind = "bound_project",
     onPlan,
     onVerificationRequest,
   } = {}) => {
@@ -1023,9 +1032,11 @@ export function createPiSessionFactory({
       },
       { projectTrusted: false },
     );
-    const agentsFiles = await readSafeAgentsFiles(projectRoot);
+    const agentsFiles = workspaceKind === "scratch"
+      ? []
+      : await readSafeAgentsFiles(projectRoot);
     const appendedGuidance = [
-      APP_GUIDANCE,
+      workspaceKind === "scratch" ? STANDALONE_GUIDANCE : APP_GUIDANCE,
       workspaceSnapshotGuidance(workspaceSnapshot),
     ].filter(Boolean);
     const resourceLoader = new DefaultResourceLoader({

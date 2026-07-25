@@ -376,12 +376,12 @@ function ActivityTimeline({ events, onOpenArtifact }) {
   );
 }
 
-function EmptyConversationPane({ project, preparing = false }) {
+function EmptyConversationPane({ project, preparing = false, standalone = false }) {
   return (
     <div className="project-agent">
       <header className="project-agent-header">
         <div>
-          <span>项目 Agent</span>
+          <span>{standalone ? "Pi Agent" : "项目 Agent"}</span>
           <strong>{preparing ? "正在创建" : "尚未开始"}</strong>
         </div>
         <span className="project-agent-status is-ready">
@@ -395,13 +395,19 @@ function EmptyConversationPane({ project, preparing = false }) {
             ? <CircleNotch className="spin" size={24} weight="regular" aria-hidden="true" />
             : <Code size={24} weight="regular" aria-hidden="true" />}
           <div>
-            <h2>{preparing ? "正在准备新工作会话" : "绑定项目 / 新建会话后开始"}</h2>
+            <h2>
+              {preparing
+                ? "正在准备新工作会话"
+                : "新建对话或绑定项目后开始"}
+            </h2>
             <p>
               {preparing
-                ? "Pi Agent 正在创建轻量会话，马上就可以输入任务。"
+                ? standalone
+                  ? "Pi Agent 正在创建独立对话，不需要选择文件夹。"
+                  : "Pi Agent 正在创建轻量会话，马上就可以输入任务。"
                 : project
                 ? `在“${project.name}”中新建一个会话，Pi Agent 才会读取项目并开始工作。`
-                : "先在左侧绑定本地项目，再新建一个正常工作会话。"}
+                : "可以直接新建独立对话，也可以先绑定本地项目再开始工作。"}
             </p>
           </div>
         </section>
@@ -423,6 +429,7 @@ function ProjectAgentPane({
   action,
   error,
   modelLabel,
+  standalone = false,
 }) {
   const running = isConversationRunning(conversation);
   const status = activeStatus(conversation);
@@ -440,7 +447,7 @@ function ProjectAgentPane({
     <div className="project-agent">
       <header className="project-agent-header">
         <div>
-          <span>项目 Agent</span>
+          <span>{standalone ? "Pi Agent" : "项目 Agent"}</span>
           <strong>{statusLabel}</strong>
         </div>
         <div className="live-project-session-actions">
@@ -473,7 +480,7 @@ function ProjectAgentPane({
       </header>
 
       <div className="project-agent-stream">
-        {snapshotIsLimited ? (
+        {!standalone && snapshotIsLimited ? (
           <section className="project-agent-decision" role="status">
             <WarningCircle size={18} weight="fill" aria-hidden="true" />
             <div>
@@ -492,12 +499,17 @@ function ProjectAgentPane({
             <Code size={24} weight="regular" aria-hidden="true" />
             <div>
               <h2>从一个明确任务开始</h2>
-              <p>Pi 会读取当前项目、公开实际工具活动，并把修改留到右侧等待确认。</p>
+              <p>
+                {standalone
+                  ? "当前对话未连接本地文件夹。Pi 只能访问这个对话的私有草稿区，并公开实际工具活动。"
+                  : "Pi 会读取当前项目、公开实际工具活动，并把修改留到右侧等待确认。"}
+              </p>
             </div>
             <div className="project-agent-scope">
-              <span>真实项目上下文</span>
+              <span>{standalone ? "未连接本地文件夹" : "真实项目上下文"}</span>
+              {standalone ? <span>私有草稿区</span> : null}
               <span>修改先审阅</span>
-              <span>命令显式运行</span>
+              {!standalone ? <span>命令显式运行</span> : null}
             </div>
           </section>
         ) : (
@@ -530,7 +542,11 @@ function ProjectAgentPane({
           <section className="project-agent-decision">
             <GitDiff size={18} aria-hidden="true" />
             <div>
-              <strong>修改已经准备好，尚未写入项目</strong>
+              <strong>
+                {standalone
+                  ? "修改已经准备好，尚未保存到私有草稿区"
+                  : "修改已经准备好，尚未写入项目"}
+              </strong>
               <p>请在右侧核对每个文件、基础哈希和目标哈希，再应用所选修改。</p>
             </div>
             <button
@@ -571,17 +587,23 @@ function ProjectAgentPane({
           </>
         ) : null}
         <label>
-          <span className="sr-only">给项目 Agent 的消息</span>
+          <span className="sr-only">给 Agent 的消息</span>
           <textarea
             value={draft}
             disabled={action === "abort" || action === "compact"}
             onChange={(event) => onDraftChange(event.target.value)}
-            placeholder={running ? "补充方向，会作为 steer 发送给当前 Agent" : "描述希望 Pi 完成的项目任务"}
+            placeholder={running
+              ? "补充方向，会作为 steer 发送给当前 Agent"
+              : standalone
+                ? "描述希望 Pi 完成的任务"
+                : "描述希望 Pi 完成的项目任务"}
           />
         </label>
         <footer>
           <div>
-            <span className="project-composer-model">{modelLabel || "跟随项目默认模型"}</span>
+            <span className="project-composer-model">
+              {modelLabel || (standalone ? "跟随默认模型" : "跟随项目默认模型")}
+            </span>
             <small>{running ? "发送会调整当前 Agent 的方向" : "只有显式发送才开始工作"}</small>
           </div>
           <button
@@ -603,8 +625,8 @@ function ProjectAgentPane({
 }
 
 function FileArtifact({
-  project,
   conversationId,
+  standalone = false,
   api,
   selectedPath,
   requestedPath,
@@ -628,11 +650,11 @@ function FileArtifact({
   }, [onError]);
 
   const loadDirectory = useCallback(async (path = "") => {
-    if (!project?.id || loadedDirectories.current.has(path)) return;
+    if (!conversationId || loadedDirectories.current.has(path)) return;
     setLoadingTree(true);
     setError(null);
     try {
-      const tree = await api.fetchTree({ projectId: project.id, path });
+      const tree = await api.fetchTree({ conversationId, path });
       loadedDirectories.current.add(path);
       setEntries((current) => {
         const byPath = new Map(current.map((entry) => [entry.path, entry]));
@@ -649,10 +671,10 @@ function FileArtifact({
     } finally {
       setLoadingTree(false);
     }
-  }, [api, project?.id, reportError]);
+  }, [api, conversationId, reportError]);
 
   const loadFile = useCallback(async (path) => {
-    if ((!conversationId && !project?.id) || !path) return;
+    if (!conversationId || !path) return;
     setActivePath(path);
     if (fileCache[path]) return;
     fileAbort.current?.abort();
@@ -662,9 +684,7 @@ function FileArtifact({
     setError(null);
     try {
       const file = await api.fetchFile({
-        ...(conversationId
-          ? { conversationId }
-          : { projectId: project.id }),
+        conversationId,
         path,
         signal: controller.signal,
       });
@@ -674,7 +694,7 @@ function FileArtifact({
     } finally {
       if (fileAbort.current === controller) setLoadingFile(false);
     }
-  }, [api, conversationId, fileCache, project?.id, reportError]);
+  }, [api, conversationId, fileCache, reportError]);
 
   useEffect(() => {
     loadedDirectories.current = new Set();
@@ -686,7 +706,7 @@ function FileArtifact({
     setError(null);
     loadDirectory("");
     return () => fileAbort.current?.abort();
-  }, [conversationId, loadDirectory, project?.id]);
+  }, [conversationId, loadDirectory]);
 
   useEffect(() => {
     if (!requestedPath) return;
@@ -704,10 +724,14 @@ function FileArtifact({
 
   return (
     <div className="project-file-artifact">
-      <aside aria-label="项目文件">
+      <aside aria-label={standalone ? "私有草稿文件" : "项目文件"}>
         <header>
           <Files size={15} aria-hidden="true" />
-          {loadingTree ? "正在读取项目" : "项目文件"}
+          {loadingTree
+            ? "正在读取文件"
+            : standalone
+              ? "私有草稿文件"
+              : "项目文件"}
         </header>
         {visibleEntries.map((entry) => (
           <button
@@ -736,7 +760,11 @@ function FileArtifact({
           </button>
         ))}
         {!loadingTree && visibleEntries.length === 0 ? (
-          <p className="live-project-inline-empty">项目中没有可显示的文件。</p>
+          <p className="live-project-inline-empty">
+            {standalone
+              ? "私有草稿区中还没有文件。"
+              : "项目中没有可显示的文件。"}
+          </p>
         ) : null}
       </aside>
       <section className="project-code-viewer">
@@ -771,7 +799,7 @@ function FileArtifact({
         {error ? (
           <div className="project-run-empty" role="alert">
             <WarningCircle size={24} aria-hidden="true" />
-            <h3>无法读取项目文件</h3>
+            <h3>{standalone ? "无法读取草稿文件" : "无法读取项目文件"}</h3>
             <p>{error.message}</p>
           </div>
         ) : selectedFile?.binary ? (
@@ -1121,7 +1149,6 @@ function RunArtifact({
 }
 
 function ArtifactPane({
-  project,
   conversation,
   api,
   activeArtifactId,
@@ -1140,6 +1167,9 @@ function ArtifactPane({
   onError,
 }) {
   const changeCount = conversation.pendingChangeSet?.files?.length ?? 0;
+  const standalone = conversation.scope === "standalone"
+    || conversation.workspaceKind === "scratch"
+    || conversation.projectId === null;
   return (
     <>
       <nav className="reading-artifact-tabs project-artifact-tabs" role="tablist" aria-label="项目工件">
@@ -1161,9 +1191,9 @@ function ArtifactPane({
         <div className="reading-artifact-panel project-artifact-panel">
           {activeArtifactId === "files" ? (
             <FileArtifact
-              key={`${project?.id ?? "project"}:${conversation.pendingChangeSet?.id ?? "base"}:${conversation.pendingChangeSet?.status ?? "clean"}`}
-              project={project}
+              key={`${conversation.id}:${conversation.pendingChangeSet?.id ?? "base"}:${conversation.pendingChangeSet?.status ?? "clean"}`}
               conversationId={conversation.id}
+              standalone={standalone}
               api={api}
               requestedPath={requestedFilePath}
               onRequestedPathHandled={onRequestedFilePathHandled}
@@ -1420,6 +1450,9 @@ export function LiveProjectWorkbench({
     ?? providers.find((provider) => provider.available)
     ?? providers[0];
   const activeModelId = modelId || snapshot?.modelId || activeProvider?.models?.[0] || "";
+  const standalone = snapshot?.scope === "standalone"
+    || snapshot?.workspaceKind === "scratch"
+    || snapshot?.projectId === null;
   const headerTitle = (
     <div className="workflow-title-block">
       <button
@@ -1432,7 +1465,9 @@ export function LiveProjectWorkbench({
         <SidebarSimple size={18} weight="regular" />
       </button>
       <div>
-        <span className="workflow-kicker">{project?.name ?? snapshot?.rootLabel ?? "正常工作"}</span>
+        <span className="workflow-kicker">
+          {standalone ? "独立对话" : project?.name ?? snapshot?.rootLabel ?? "正常工作"}
+        </span>
         <h1>{snapshot?.title ?? "项目工作"}</h1>
       </div>
     </div>
@@ -1473,6 +1508,7 @@ export function LiveProjectWorkbench({
           <EmptyConversationPane
             project={project}
             preparing={preparingConversation}
+            standalone={!project}
           />
         )}
         artifact={null}
@@ -1512,11 +1548,11 @@ export function LiveProjectWorkbench({
           action={action}
           error={actionError}
           modelLabel={activeModelId}
+          standalone={standalone}
         />
       )}
       artifact={(
         <ArtifactPane
-          project={project}
           conversation={snapshot}
           api={api}
           activeArtifactId={activeArtifactId}

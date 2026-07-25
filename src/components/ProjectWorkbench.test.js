@@ -190,6 +190,43 @@ test("left rail shows the selected work type, nested conversations, and one proj
   });
 });
 
+test("normal work rail exposes first-class standalone conversations before projects", async () => {
+  await withViteModule("/src/components/ProjectRail.jsx", ({ ProjectRail }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectRail, {
+      projects: [{
+        id: "project-1",
+        name: "Pi Agent",
+        state: "1 个会话",
+        updated: "今天",
+      }],
+      selectedId: "",
+      conversations: [{
+        id: "standalone-1",
+        projectId: null,
+        kind: "project_work",
+        title: "整理需求",
+        subtitle: "正常工作 · 未连接文件夹",
+      }],
+      selectedConversationId: "standalone-1",
+      workspaceKind: "project_work",
+      query: "",
+      onQueryChange() {},
+      onNewStandaloneConversation() {},
+      onSelectConversation() {},
+      onDeleteConversation() {},
+      onRenameConversation() {},
+      onAddProject() {},
+    }));
+
+    assert.match(html, /新建对话/);
+    assert.match(html, /无需选择文件夹/);
+    assert.match(html, /独立对话/);
+    assert.match(html, /整理需求/);
+    assert.match(html, /未连接文件夹/);
+    assert.ok(html.indexOf("独立对话") < html.indexOf("工作项目"));
+  });
+});
+
 test("paper reading conversations do not expose project-work deletion actions", async () => {
   await withViteModule("/src/components/ProjectRail.jsx", ({ ProjectRail }) => {
     const html = renderToStaticMarkup(React.createElement(ProjectRail, {

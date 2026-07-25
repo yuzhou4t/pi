@@ -153,6 +153,57 @@ function createBlockingSessionFactory() {
   return factory;
 }
 
+function createScratchSessionFactory() {
+  const sessions = [];
+  const factory = async (options) => {
+    let subscriber = null;
+    const record = {
+      options,
+      prompts: [],
+    };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt(prompt) {
+        record.prompts.push(prompt);
+        await options.onPlan({
+          explanation: "先整理需求，再生成草稿。",
+          steps: [
+            { id: "plan", text: "整理需求", status: "completed" },
+            { id: "draft", text: "生成草稿", status: "completed" },
+          ],
+        });
+        await writeFile(
+          path.join(options.workspaceRoot, "draft.md"),
+          "# 独立对话草稿\n",
+          "utf8",
+        );
+        subscriber?.({ type: "agent_settled" });
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModelsCalls = 0;
+  factory.listModels = async () => {
+    factory.listModelsCalls += 1;
+    return modelCatalog();
+  };
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
 async function eventually(read, predicate, message) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const value = await read();
@@ -237,6 +288,147 @@ test("creating empty conversations performs no project snapshot or copy", async 
     assert.equal(current.conversation.workspaceSnapshot.mode, "sparse_overlay");
     assert.equal(current.conversation.workspaceSnapshot.includedFiles, 0);
   }
+  const legacyStatePath = path.join(
+    storageRoot,
+    "conversations",
+    conversations[0].id,
+    "conversation.json",
+  );
+  const legacyState = JSON.parse(await readFile(legacyStatePath, "utf8"));
+  delete legacyState.workspaceKind;
+  delete legacyState.rootLabel;
+  await writeFile(legacyStatePath, `${JSON.stringify(legacyState, null, 2)}\n`, "utf8");
+  const restoredLegacy = await service.getConversation(conversations[0].id);
+  assert.equal(restoredLegacy.conversation.workspaceKind, "bound_project");
+  assert.equal(restoredLegacy.conversation.scope, "project");
+});
+
+test("standalone conversations stay projectless, start lazily, and commit only to their private scratch root", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-standalone-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "bound-project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "keep.txt"), "bound project\n", "utf8");
+  let pickerCalls = 0;
+  let snapshotCalls = 0;
+  const sessionFactory = createScratchSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    snapshotter: async () => {
+      snapshotCalls += 1;
+      throw new Error("standalone creation must not materialize a snapshot");
+    },
+    picker: async () => {
+      pickerCalls += 1;
+      return { rootPath: projectRoot };
+    },
+    idFactory: incrementalId("standalone"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const bound = await service.createConversation(project.id);
+  const modelListCallsBeforeStandalone = sessionFactory.listModelsCalls;
+  const standalone = await service.createStandaloneConversation({
+    title: "无文件夹任务",
+  });
+
+  assert.equal(pickerCalls, 1);
+  assert.equal(snapshotCalls, 0);
+  assert.equal(sessionFactory.sessions.length, 0);
+  assert.equal(sessionFactory.listModelsCalls, modelListCallsBeforeStandalone);
+  assert.equal(standalone.projectId, null);
+  assert.equal(standalone.workspaceKind, "scratch");
+  assert.equal(standalone.scope, "standalone");
+  assert.equal(standalone.rootLabel, "未连接文件夹");
+  assert.equal(JSON.stringify(standalone).includes(storageRoot), false);
+  assert.deepEqual(
+    (await service.listStandaloneConversations()).map((item) => item.id),
+    [standalone.id],
+  );
+  assert.deepEqual(
+    (await service.listConversations(project.id)).map((item) => item.id),
+    [bound.id],
+  );
+
+  const conversationDirectory = path.join(
+    storageRoot,
+    "conversations",
+    standalone.id,
+  );
+  const scratchRoot = path.join(conversationDirectory, "scratch");
+  assert.deepEqual(await readdir(scratchRoot), []);
+  assert.deepEqual(await readdir(path.join(conversationDirectory, "base")), []);
+  assert.deepEqual(await readdir(path.join(conversationDirectory, "workspace")), []);
+
+  await service.sendMessage(standalone.id, { text: "生成一个草稿文件" });
+  const settled = await eventually(
+    () => service.getConversation(standalone.id),
+    (snapshot) => snapshot.conversation.status === "awaiting_confirmation",
+    "standalone scratch change did not become reviewable",
+  );
+  assert.equal(sessionFactory.sessions.length, 1);
+  assert.equal(sessionFactory.sessions[0].options.workspaceKind, "scratch");
+  assert.equal(sessionFactory.sessions[0].options.projectRoot, await realpath(scratchRoot));
+  assert.equal(settled.conversation.workspaceSnapshot.mode, "scratch");
+  assert.equal(settled.conversation.activeChangeSet.files.length, 1);
+  assert.equal(settled.conversation.activeChangeSet.files[0].path, "draft.md");
+  await assert.rejects(access(path.join(scratchRoot, "draft.md")), { code: "ENOENT" });
+  assert.equal(await readFile(path.join(projectRoot, "keep.txt"), "utf8"), "bound project\n");
+
+  const changeSet = settled.conversation.activeChangeSet;
+  const changedFile = changeSet.files[0];
+  await service.applyChangeSet(standalone.id, {
+    changeSetId: changeSet.id,
+    changeSetHash: changeSet.hash,
+    files: [{
+      fileId: changedFile.id,
+      baseHash: changedFile.baseHash,
+      afterHash: changedFile.afterHash,
+    }],
+  });
+  assert.equal(
+    await readFile(path.join(scratchRoot, "draft.md"), "utf8"),
+    "# 独立对话草稿\n",
+  );
+  assert.equal(await readFile(path.join(projectRoot, "keep.txt"), "utf8"), "bound project\n");
+  const tree = await service.getConversationTree(standalone.id);
+  assert.equal(JSON.stringify(tree).includes("draft.md"), true);
+  assert.equal(JSON.stringify(tree).includes(storageRoot), false);
+  const boundTree = await service.getConversationTree(bound.id);
+  assert.equal(JSON.stringify(boundTree).includes("keep.txt"), true);
+
+  await assert.rejects(
+    service.removeConversation(project.id, standalone.id),
+    (error) => error?.code === "PROJECT_WORK_CONVERSATION_NOT_FOUND",
+  );
+  await assert.rejects(
+    service.removeStandaloneConversation(bound.id),
+    (error) => error?.code === "PROJECT_WORK_CONVERSATION_NOT_FOUND",
+  );
+  await assert.rejects(
+    service.renameConversation(project.id, standalone.id, { title: "不应成功" }),
+    (error) => error?.code === "PROJECT_WORK_CONVERSATION_NOT_FOUND",
+  );
+  await assert.rejects(
+    service.renameStandaloneConversation(bound.id, { title: "不应成功" }),
+    (error) => error?.code === "PROJECT_WORK_CONVERSATION_NOT_FOUND",
+  );
+  const renamed = await service.renameStandaloneConversation(standalone.id, {
+    title: "独立任务草稿",
+  });
+  assert.equal(renamed.title, "独立任务草稿");
+  const removed = await service.removeStandaloneConversation(standalone.id);
+  assert.deepEqual(removed, {
+    id: standalone.id,
+    projectId: null,
+    removed: true,
+    conversationCount: 0,
+  });
+  await assert.rejects(access(conversationDirectory), { code: "ENOENT" });
 });
 
 test("conversation file reads prefer overlay content and can open overlay-only files", async (t) => {

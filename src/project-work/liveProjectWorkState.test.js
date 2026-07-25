@@ -9,6 +9,7 @@ import {
   isProjectWorkConversationDeleteBlocked,
   mergeFreshConversationSnapshot,
   removeLiveConversation,
+  replaceProjectConversationSlice,
   renameLiveConversation,
   upsertLiveProject,
 } from "./liveProjectWorkState.js";
@@ -114,6 +115,53 @@ test("created conversation is visible without taking over a newer selection", ()
   });
   assert.equal(hydrated.conversation.id, "conversation-old");
   assert.equal(hydrated.conversations[0].messages.length, 1);
+});
+
+test("reloading one project keeps standalone conversations and replaces only that project slice", () => {
+  const current = state({
+    conversations: [{
+      id: "standalone-1",
+      projectId: null,
+      title: "独立任务",
+    }, {
+      id: "project-old",
+      projectId: "project-1",
+      title: "旧项目会话",
+    }, {
+      id: "other-project",
+      projectId: "project-2",
+      title: "其他项目会话",
+    }],
+  });
+
+  const next = replaceProjectConversationSlice(current, "project-1", [{
+    id: "project-new",
+    projectId: "project-1",
+    title: "最新项目会话",
+  }]);
+
+  assert.deepEqual(next.conversations.map((item) => item.id), [
+    "standalone-1",
+    "other-project",
+    "project-new",
+  ]);
+});
+
+test("standalone creation and removal do not change any project conversation count", () => {
+  const created = insertCreatedConversation(state(), {
+    id: "standalone-new",
+    projectId: null,
+    workspaceKind: "scratch",
+    scope: "standalone",
+    title: "新工作会话",
+  }, { activate: true });
+
+  assert.equal(created.projects[0].conversationCount, 1);
+  assert.equal(created.conversation.id, "standalone-new");
+
+  const removed = removeLiveConversation(created, "standalone-new");
+  assert.equal(removed.projects[0].conversationCount, 1);
+  assert.equal(removed.conversation, null);
 });
 
 test("conversation created for a background project only updates its project count", () => {

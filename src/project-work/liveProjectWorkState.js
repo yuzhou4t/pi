@@ -142,6 +142,16 @@ export function hydrateCreatedConversation(state, conversation) {
   };
 }
 
+export function replaceProjectConversationSlice(state, projectId, conversations) {
+  return {
+    ...state,
+    conversations: [
+      ...state.conversations.filter((item) => item.projectId !== projectId),
+      ...conversations,
+    ],
+  };
+}
+
 export function adjacentConversationAfterRemoval(
   conversations,
   conversationId,

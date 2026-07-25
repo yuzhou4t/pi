@@ -483,6 +483,123 @@ test("project-work conversation menu routes stay project-scoped and return safe 
   assert.match(preflight.headers.get("access-control-allow-methods"), /\bPATCH\b/);
 });
 
+test("standalone project-work conversation routes use the global scope and return safe data", async (t) => {
+  const calls = [];
+  const summary = {
+    id: "conversation-standalone",
+    projectId: null,
+    workspaceKind: "scratch",
+    scope: "standalone",
+    rootLabel: "未连接文件夹",
+    title: "独立任务",
+    status: "idle",
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+    thinkingLevel: "medium",
+    pendingChangeFileCount: 0,
+    lastEventSeq: 0,
+    createdAt: "2026-07-25T00:00:00.000Z",
+    updatedAt: "2026-07-25T00:00:00.000Z",
+  };
+  const projectWorkService = {
+    listStandaloneConversations: async () => {
+      calls.push({ action: "list" });
+      return [{ ...summary, rootPath: "/private/must-not-leak" }];
+    },
+    createStandaloneConversation: async ({ title }) => {
+      calls.push({ action: "create", title });
+      return { ...summary, title };
+    },
+    renameStandaloneConversation: async (conversationId, { title }) => {
+      calls.push({ action: "rename", conversationId, title });
+      return { ...summary, id: conversationId, title };
+    },
+    removeStandaloneConversation: async (conversationId) => {
+      calls.push({ action: "delete", conversationId });
+      return {
+        id: conversationId,
+        projectId: null,
+        removed: true,
+        conversationCount: 0,
+        rootPath: "/private/must-not-leak",
+      };
+    },
+    getConversationTree: async (conversationId, options) => {
+      calls.push({ action: "tree", conversationId, options });
+      return {
+        schemaVersion: 1,
+        directory: options.directory,
+        entries: [{ name: "draft.md", path: "draft.md", type: "file" }],
+      };
+    },
+  };
+  const server = await startTestServer({}, candidateSummaryService, projectWorkService);
+  t.after(server.close);
+  const collection = `${server.baseUrl}/api/v1/project-work/conversations`;
+  const headers = {
+    "content-type": "application/json",
+    origin: "http://127.0.0.1:4173",
+  };
+
+  const listResponse = await fetch(collection);
+  const listPayload = await listResponse.json();
+  assert.equal(listResponse.status, 200);
+  assert.deepEqual(listPayload.conversations, [summary]);
+  assert.equal(JSON.stringify(listPayload).includes("must-not-leak"), false);
+
+  const createResponse = await fetch(collection, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ title: "马上开始" }),
+  });
+  assert.equal(createResponse.status, 201);
+  assert.equal((await createResponse.json()).title, "马上开始");
+
+  const item = `${collection}/conversation-standalone`;
+  const renameResponse = await fetch(item, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ title: "新的独立任务" }),
+  });
+  assert.equal(renameResponse.status, 200);
+  assert.equal((await renameResponse.json()).conversation.title, "新的独立任务");
+
+  const treeResponse = await fetch(`${item}/tree?path=notes&depth=2`);
+  const treePayload = await treeResponse.json();
+  assert.equal(treeResponse.status, 200);
+  assert.equal(treePayload.entries[0].path, "draft.md");
+
+  const deleteResponse = await fetch(item, {
+    method: "DELETE",
+    headers: { origin: "http://127.0.0.1:4173" },
+  });
+  const deletePayload = await deleteResponse.json();
+  assert.equal(deleteResponse.status, 200);
+  assert.deepEqual(deletePayload, {
+    schemaVersion: 1,
+    projectId: null,
+    conversationId: "conversation-standalone",
+    removed: true,
+    conversationCount: 0,
+  });
+  assert.equal(JSON.stringify(deletePayload).includes("must-not-leak"), false);
+  assert.deepEqual(calls, [
+    { action: "list" },
+    { action: "create", title: "马上开始" },
+    {
+      action: "rename",
+      conversationId: "conversation-standalone",
+      title: "新的独立任务",
+    },
+    {
+      action: "tree",
+      conversationId: "conversation-standalone",
+      options: { directory: "notes", depth: 2 },
+    },
+    { action: "delete", conversationId: "conversation-standalone" },
+  ]);
+});
+
 test("candidate summaries use the server project-state source", async (t) => {
   let receivedPayload = null;
   const summaryService = {

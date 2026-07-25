@@ -424,12 +424,26 @@ export function mapProjectWorkConversation(raw) {
   const planSteps = Array.isArray(rawPlan)
     ? rawPlan
     : asArray(rawPlan?.steps);
+  const projectId = pick(source, "project_id", "projectId");
+  const standalone = projectId === null;
   return {
     id,
-    projectId: pick(source, "project_id", "projectId"),
+    projectId,
     kind: pick(source, "kind", "kind", "project_work"),
     title: pick(source, "title", "title", "新会话"),
-    rootLabel: pick(source, "root_label", "rootLabel", "本地项目"),
+    rootLabel: pick(
+      source,
+      "root_label",
+      "rootLabel",
+      standalone ? "未连接文件夹" : "本地项目",
+    ),
+    workspaceKind: pick(
+      source,
+      "workspace_kind",
+      "workspaceKind",
+      standalone ? "scratch" : "bound_project",
+    ),
+    scope: pick(source, "scope", "scope", standalone ? "standalone" : "project"),
     providerId: pick(source, "provider_id", "providerId"),
     modelId: pick(source, "model_id", "modelId"),
     thinkingLevel: pick(source, "thinking_level", "thinkingLevel"),
@@ -539,6 +553,25 @@ export async function createProjectWorkConversation({
   return mapProjectWorkConversation(payload);
 }
 
+export async function createStandaloneProjectWorkConversation({
+  providerId,
+  modelId,
+  signal,
+  fetchImpl,
+} = {}) {
+  const payload = await requestJson(`${PROJECT_WORK_API_ROOT}/conversations`, {
+    method: "POST",
+    body: {
+      schema_version: 1,
+      ...(providerId ? { provider_id: providerId } : {}),
+      ...(modelId ? { model_id: modelId } : {}),
+    },
+    signal,
+    fetchImpl,
+  });
+  return mapProjectWorkConversation(payload);
+}
+
 export async function listProjectWorkConversations({
   projectId,
   signal,
@@ -554,16 +587,33 @@ export async function listProjectWorkConversations({
   ));
 }
 
+export async function listStandaloneProjectWorkConversations({
+  signal,
+  fetchImpl,
+} = {}) {
+  const payload = await requestJson(`${PROJECT_WORK_API_ROOT}/conversations`, {
+    signal,
+    fetchImpl,
+  });
+  return asArray(payload?.conversations).map((conversation) => (
+    mapProjectWorkConversation({ conversation })
+  ));
+}
+
 export async function deleteProjectWorkConversation({
   projectId,
   conversationId,
   signal,
   fetchImpl,
 } = {}) {
-  requiredId(projectId, "projectId");
+  const standalone = projectId === null;
+  if (!standalone) requiredId(projectId, "projectId");
   requiredId(conversationId, "conversationId");
+  const path = standalone
+    ? `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}`
+    : `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/conversations/${encodeURIComponent(conversationId)}`;
   const payload = await requestJson(
-    `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/conversations/${encodeURIComponent(conversationId)}`,
+    path,
     { method: "DELETE", signal, fetchImpl },
   );
   const count = Number(payload?.conversationCount ?? payload?.conversation_count);
@@ -582,7 +632,8 @@ export async function renameProjectWorkConversation({
   signal,
   fetchImpl,
 } = {}) {
-  requiredId(projectId, "projectId");
+  const standalone = projectId === null;
+  if (!standalone) requiredId(projectId, "projectId");
   requiredId(conversationId, "conversationId");
   const normalizedTitle = typeof title === "string"
     ? title.trim().replace(/\s+/g, " ")
@@ -590,8 +641,11 @@ export async function renameProjectWorkConversation({
   if (!normalizedTitle || normalizedTitle.length > 80) {
     throw new TypeError("title 必须是 1–80 个字符");
   }
+  const path = standalone
+    ? `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}`
+    : `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/conversations/${encodeURIComponent(conversationId)}`;
   const payload = await requestJson(
-    `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/conversations/${encodeURIComponent(conversationId)}`,
+    path,
     {
       method: "PATCH",
       body: {
@@ -756,18 +810,26 @@ export async function compactProjectWorkConversation({
 
 export async function fetchProjectWorkTree({
   projectId,
+  conversationId,
   path = "",
   cursor,
   signal,
   fetchImpl,
 } = {}) {
-  requiredId(projectId, "projectId");
+  if (conversationId) {
+    requiredId(conversationId, "conversationId");
+  } else {
+    requiredId(projectId, "projectId");
+  }
   const query = new URLSearchParams();
   if (path) query.set("path", path);
   if (cursor) query.set("cursor", cursor);
   const suffix = query.size > 0 ? `?${query.toString()}` : "";
+  const scope = conversationId
+    ? `conversations/${encodeURIComponent(conversationId)}`
+    : `projects/${encodeURIComponent(projectId)}`;
   const payload = await requestJson(
-    `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/tree${suffix}`,
+    `${PROJECT_WORK_API_ROOT}/${scope}/tree${suffix}`,
     { signal, fetchImpl },
   );
   const returnedPath = pick(payload, "path", "path", path);
@@ -898,9 +960,11 @@ export const projectWorkApi = {
   registerProject: registerProjectWorkProject,
   removeProject: removeProjectWorkProject,
   createConversation: createProjectWorkConversation,
+  createStandaloneConversation: createStandaloneProjectWorkConversation,
   deleteConversation: deleteProjectWorkConversation,
   renameConversation: renameProjectWorkConversation,
   listConversations: listProjectWorkConversations,
+  listStandaloneConversations: listStandaloneProjectWorkConversations,
   fetchConversation: fetchProjectWorkConversation,
   sendMessage: sendProjectWorkMessage,
   steerConversation: steerProjectWorkConversation,

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createStandaloneProjectWorkConversation,
   deleteProjectWorkConversation,
   fetchProjectWorkFile,
   fetchProjectWorkTree,
+  listStandaloneProjectWorkConversations,
   mapProjectWorkConversation,
   renameProjectWorkConversation,
 } from "./projectWork.js";
@@ -83,6 +85,77 @@ test("conversation mapping preserves a ready, hash-bound change set", () => {
     includedBytes: 100663296,
     truncated: true,
   });
+});
+
+test("standalone conversation mapping preserves its explicit scratch scope", () => {
+  const mapped = mapProjectWorkConversation({
+    conversation: {
+      id: "standalone-1",
+      project_id: null,
+      workspace_kind: "scratch",
+      scope: "standalone",
+      root_label: "未连接文件夹",
+      title: "新工作会话",
+      status: "idle",
+    },
+  });
+
+  assert.equal(mapped.projectId, null);
+  assert.equal(mapped.workspaceKind, "scratch");
+  assert.equal(mapped.scope, "standalone");
+  assert.equal(mapped.rootLabel, "未连接文件夹");
+});
+
+test("standalone conversations use global list and create routes", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return jsonResponse({
+      conversations: [{
+        id: "standalone-1",
+        project_id: null,
+        workspace_kind: "scratch",
+        scope: "standalone",
+        root_label: "未连接文件夹",
+        title: "独立工作",
+        status: "idle",
+      }],
+    });
+  };
+
+  const listed = await listStandaloneProjectWorkConversations({ fetchImpl });
+  assert.equal(calls[0].url, "/api/v1/project-work/conversations");
+  assert.equal(calls[0].options.method, "GET");
+  assert.equal(listed[0].projectId, null);
+
+  calls.length = 0;
+  const created = await createStandaloneProjectWorkConversation({
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        conversation: {
+          id: "standalone-2",
+          project_id: null,
+          workspace_kind: "scratch",
+          scope: "standalone",
+          root_label: "未连接文件夹",
+          title: "新工作会话",
+          status: "idle",
+        },
+      });
+    },
+  });
+
+  assert.equal(calls[0].url, "/api/v1/project-work/conversations");
+  assert.equal(calls[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
+    provider_id: "deepseek",
+    model_id: "deepseek-v4-flash",
+  });
+  assert.equal(created.scope, "standalone");
 });
 
 test("string checks map across failed then passing runs while the command remains retryable", () => {
@@ -217,6 +290,24 @@ test("tree mapping flattens nested folders with stable paths and depths", async 
   });
 });
 
+test("standalone file tree uses the conversation-scoped endpoint", async () => {
+  const calls = [];
+  await fetchProjectWorkTree({
+    conversationId: "standalone/with spaces",
+    path: "drafts",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({ path: "drafts", entries: [] });
+    },
+  });
+
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/conversations/standalone%2Fwith%20spaces/tree?path=drafts",
+  );
+  assert.equal(calls[0].options.method, "GET");
+});
+
 test("file mapping preserves bounded line coordinates and content hash", async () => {
   const calls = [];
   const file = await fetchProjectWorkFile({
@@ -312,6 +403,56 @@ test("conversation deletion uses the project-scoped endpoint and preserves the r
     removed: true,
     conversationCount: 2,
   });
+});
+
+test("standalone conversation rename and deletion use global conversation routes", async () => {
+  const calls = [];
+  const renamed = await renameProjectWorkConversation({
+    projectId: null,
+    conversationId: "standalone-1",
+    title: " 独立   任务 ",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        conversation: {
+          id: "standalone-1",
+          project_id: null,
+          workspace_kind: "scratch",
+          scope: "standalone",
+          root_label: "未连接文件夹",
+          title: "独立 任务",
+        },
+      });
+    },
+  });
+
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/conversations/standalone-1",
+  );
+  assert.equal(calls[0].options.method, "PATCH");
+  assert.equal(renamed.title, "独立 任务");
+
+  calls.length = 0;
+  const deleted = await deleteProjectWorkConversation({
+    projectId: null,
+    conversationId: "standalone-1",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        conversation_id: "standalone-1",
+        project_id: null,
+        removed: true,
+      });
+    },
+  });
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/conversations/standalone-1",
+  );
+  assert.equal(calls[0].options.method, "DELETE");
+  assert.equal(deleted.projectId, null);
+  assert.equal(deleted.removed, true);
 });
 
 test("conversation rename normalizes the title and uses the project-scoped endpoint", async () => {

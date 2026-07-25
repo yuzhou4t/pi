@@ -70,7 +70,7 @@ export function RenameConversationDialog({
           </span>
           <div>
             <h2 id="conversation-rename-title">重命名工作会话</h2>
-            <p>使用清晰的名称区分同一项目中的不同任务。</p>
+            <p>使用清晰的名称区分不同任务。</p>
           </div>
         </header>
 

@@ -661,6 +661,26 @@ function sendProjectWorkError(response, error, origin) {
   );
 }
 
+function publicProjectWorkConversationSummary(value) {
+  const conversation = value?.conversation ?? value;
+  return {
+    id: conversation?.id ?? null,
+    projectId: conversation?.projectId ?? null,
+    workspaceKind: conversation?.workspaceKind ?? null,
+    scope: conversation?.scope ?? null,
+    rootLabel: conversation?.rootLabel ?? null,
+    title: conversation?.title ?? "",
+    status: conversation?.status ?? "idle",
+    providerId: conversation?.providerId ?? null,
+    modelId: conversation?.modelId ?? null,
+    thinkingLevel: conversation?.thinkingLevel ?? "medium",
+    pendingChangeFileCount: conversation?.pendingChangeFileCount ?? 0,
+    lastEventSeq: conversation?.lastEventSeq ?? 0,
+    createdAt: conversation?.createdAt ?? null,
+    updatedAt: conversation?.updatedAt ?? null,
+  };
+}
+
 async function sendPdf(request, response, pdf, origin) {
   const etag = `"${pdf.sha256}"`;
   const ifRange = request.headers["if-range"];
@@ -799,6 +819,40 @@ export function createApiServer({
         return;
       }
 
+      if (
+        request.method === "GET"
+        && url.pathname === "/api/v1/project-work/conversations"
+      ) {
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          conversations: (
+            await projectWorkService.listStandaloneConversations()
+          ).map(publicProjectWorkConversationSummary),
+        }, origin);
+        return;
+      }
+
+      if (
+        request.method === "POST"
+        && url.pathname === "/api/v1/project-work/conversations"
+      ) {
+        requireProjectWorkMutationOrigin(origin);
+        const payload = await readProjectWorkJson(request);
+        const conversation = await projectWorkService.createStandaloneConversation({
+          title: payload.title,
+          providerId: payload.provider_id,
+          modelId: payload.model_id,
+          thinkingLevel: payload.thinking_level,
+        });
+        sendJson(
+          response,
+          201,
+          publicProjectWorkConversationSummary(conversation),
+          origin,
+        );
+        return;
+      }
+
       if (request.method === "POST" && url.pathname === "/api/v1/project-work/project-roots/pick") {
         requireProjectWorkMutationOrigin(origin);
         const payload = await readProjectWorkJson(request);
@@ -851,7 +905,7 @@ export function createApiServer({
         const conversations = await projectWorkService.listConversations(projectId);
         sendJson(response, 200, {
           schemaVersion: 1,
-          conversations: conversations.map((item) => item?.conversation ?? item),
+          conversations: conversations.map(publicProjectWorkConversationSummary),
         }, origin);
         return;
       }
@@ -865,7 +919,12 @@ export function createApiServer({
           modelId: payload.model_id,
           thinkingLevel: payload.thinking_level,
         });
-        sendJson(response, 201, result, origin);
+        sendJson(
+          response,
+          201,
+          publicProjectWorkConversationSummary(result),
+          origin,
+        );
         return;
       }
 
@@ -884,7 +943,7 @@ export function createApiServer({
         );
         sendJson(response, 200, {
           schemaVersion: 1,
-          conversation,
+          conversation: publicProjectWorkConversationSummary(conversation),
         }, origin);
         return;
       }
@@ -951,9 +1010,51 @@ export function createApiServer({
         return;
       }
 
+      const conversationTreeMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/tree$/,
+      );
+      if (conversationTreeMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(conversationTreeMatch[1]);
+        const tree = await projectWorkService.getConversationTree(conversationId, {
+          directory: url.searchParams.get("path") ?? "",
+          depth: Number(url.searchParams.get("depth") ?? 3),
+        });
+        sendJson(response, 200, tree, origin);
+        return;
+      }
+
       const conversationMatch = url.pathname.match(
         /^\/api\/v1\/project-work\/conversations\/([^/]+)$/,
       );
+      if (conversationMatch && request.method === "PATCH") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(conversationMatch[1]);
+        const payload = await readProjectWorkJson(request);
+        const conversation = await projectWorkService.renameStandaloneConversation(
+          conversationId,
+          { title: payload.title },
+        );
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          conversation: publicProjectWorkConversationSummary(conversation),
+        }, origin);
+        return;
+      }
+      if (conversationMatch && request.method === "DELETE") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(conversationMatch[1]);
+        const result = await projectWorkService.removeStandaloneConversation(
+          conversationId,
+        );
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          projectId: null,
+          conversationId: result.id,
+          removed: result.removed === true,
+          conversationCount: result.conversationCount,
+        }, origin);
+        return;
+      }
       if (conversationMatch && request.method === "GET") {
         const conversationId = decodeProjectWorkSegment(conversationMatch[1]);
         const result = await projectWorkService.getConversation(conversationId, {

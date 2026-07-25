@@ -410,6 +410,64 @@ button:disabled {
   overflow-y: auto;
 }
 
+.standalone-new-button {
+  display: flex;
+  width: calc(100% - 16px);
+  min-height: 48px;
+  align-items: center;
+  gap: 9px;
+  margin: 0 8px 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--teal-border);
+  border-radius: 7px;
+  text-align: left;
+}
+
+.standalone-new-button:hover:not(:disabled) {
+  background: var(--teal-tint);
+  border-color: var(--teal-accent);
+}
+
+.standalone-new-button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.standalone-new-button > svg {
+  flex: 0 0 auto;
+  color: var(--teal-accent);
+}
+
+.standalone-new-button > span {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.standalone-new-button strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.standalone-new-button small {
+  color: var(--weak);
+  font-size: 10.5px;
+}
+
+.standalone-conversations {
+  margin: 0 8px 9px;
+  padding: 0 0 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.standalone-conversations > .project-list-heading {
+  min-height: 27px;
+  padding: 0 4px 3px;
+}
+
 .project-row {
   position: relative;
   display: flex;

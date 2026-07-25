@@ -57,6 +57,30 @@ test("delete conversation dialog stays absent without a target", async () => {
   );
 });
 
+test("standalone deletion names the private draft scope without implying a bound project", async () => {
+  await withViteModule(
+    "/src/components/DeleteConversationDialog.jsx",
+    ({ DeleteConversationDialog }) => {
+      const html = renderToStaticMarkup(React.createElement(DeleteConversationDialog, {
+        conversation: {
+          id: "standalone-1",
+          projectId: null,
+          scope: "standalone",
+          workspaceKind: "scratch",
+          title: "整理需求",
+          pendingChangeFileCount: 1,
+        },
+        onClose() {},
+        onConfirm() {},
+      }));
+
+      assert.match(html, /私有草稿区/);
+      assert.match(html, /随这个对话一起删除/);
+      assert.doesNotMatch(html, /不会删除项目文件夹|不会回滚已经确认写入/);
+    },
+  );
+});
+
 test("delete confirmation stays disabled while preflight is pending or the latest session is busy", async () => {
   await withViteModule(
     "/src/components/DeleteConversationDialog.jsx",
