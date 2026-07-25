@@ -1,30 +1,52 @@
 import { Fragment } from "react";
 import {
+  BookOpenText,
+  Code,
   FolderSimplePlus,
   GearSix,
   MagnifyingGlass,
-  Package,
   PlayCircle,
+  Plus,
   Sparkle,
+  X,
 } from "@phosphor-icons/react";
-import { ProviderMenu } from "./ProviderMenu.jsx";
 
 export function ProjectRail({
   projects,
   selectedId,
   onSelect,
+  conversations = [],
+  selectedConversationId = null,
+  onSelectConversation,
+  onNewConversation,
+  workspaceKind = "project_work",
+  onWorkspaceKindChange,
   query,
   onQueryChange,
   onAddProject,
+  onRemoveProject,
   onOpenSettings,
   settingsOpen,
   mobileActive,
   activeRun,
   onSelectRun,
+  selectedRunId = null,
+  onMouseDownResizer,
+  isResizing,
 }) {
-  const filteredProjects = projects.filter((project) =>
-    `${project.name} ${project.state}`.toLowerCase().includes(query.trim().toLowerCase()),
-  );
+  const normalizedQuery = query.trim().toLowerCase();
+  const matchesQuery = (value) => String(value ?? "").toLowerCase().includes(normalizedQuery);
+  const filteredProjects = projects.filter((project) => {
+    if (!normalizedQuery) return true;
+    const projectMatches = matchesQuery(`${project.name} ${project.state} ${project.rootLabel}`);
+    const conversationMatches = conversations.some(
+      (conversation) => conversation.projectId === project.id
+        && matchesQuery(`${conversation.title} ${conversation.subtitle} ${conversation.kind}`),
+    );
+    const runMatches = project.id === selectedId
+      && matchesQuery(`${activeRun?.name} ${activeRun?.title} ${activeRun?.statusLabel}`);
+    return projectMatches || conversationMatches || runMatches;
+  });
 
   return (
     <aside className={`project-rail${mobileActive ? " is-mobile-active" : ""}`} aria-label="项目列表">
@@ -35,10 +57,28 @@ export function ProjectRail({
           </span>
           <span className="brand-name">Pi Agent</span>
         </div>
-        <button className="icon-button" type="button" aria-label="添加本地项目" onClick={onAddProject}>
-          <FolderSimplePlus size={18} weight="regular" aria-hidden="true" />
-        </button>
       </div>
+
+      <nav className="workspace-kind-switch" aria-label="工作类型">
+        <button
+          className={workspaceKind === "project_work" ? "is-active" : ""}
+          type="button"
+          aria-pressed={workspaceKind === "project_work"}
+          onClick={() => onWorkspaceKindChange?.("project_work")}
+        >
+          <Code size={15} weight={workspaceKind === "project_work" ? "fill" : "regular"} aria-hidden="true" />
+          正常工作
+        </button>
+        <button
+          className={workspaceKind === "paper_reading" ? "is-active" : ""}
+          type="button"
+          aria-pressed={workspaceKind === "paper_reading"}
+          onClick={() => onWorkspaceKindChange?.("paper_reading")}
+        >
+          <BookOpenText size={15} weight={workspaceKind === "paper_reading" ? "fill" : "regular"} aria-hidden="true" />
+          论文精读
+        </button>
+      </nav>
 
       <label className="search-field" htmlFor="project-search">
         <MagnifyingGlass size={15} weight="regular" aria-hidden="true" />
@@ -47,42 +87,119 @@ export function ProjectRail({
           type="search"
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
-          placeholder="搜索项目与 Run..."
+          placeholder="搜索项目和会话..."
         />
       </label>
 
       <div className="project-list">
-        <span className="eyebrow">项目与 Run</span>
+        <div className="project-list-heading">
+          <span className="eyebrow">{workspaceKind === "paper_reading" ? "研读项目" : "工作项目"}</span>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label={`向${workspaceKind === "paper_reading" ? "论文精读" : "正常工作"}添加项目`}
+            title="添加项目"
+            onClick={onAddProject}
+          >
+            <FolderSimplePlus size={17} weight="regular" aria-hidden="true" />
+          </button>
+        </div>
         {filteredProjects.map((project) => {
           const selected = project.id === selectedId;
+          const projectMatches = matchesQuery(`${project.name} ${project.state} ${project.rootLabel}`);
+          const projectConversations = conversations.filter((conversation) => (
+            conversation.projectId === project.id
+            && (!normalizedQuery || projectMatches || matchesQuery(
+              `${conversation.title} ${conversation.subtitle} ${conversation.kind}`,
+            ))
+          ));
           return (
             <Fragment key={project.id}>
-              <button
+              <div
                 className={`project-row${selected ? " is-selected" : ""}`}
-                type="button"
-                aria-current={selected ? "page" : undefined}
-                onClick={() => onSelect(project.id)}
               >
-                <span className="project-row-copy">
+                <button
+                  className="project-row-copy"
+                  type="button"
+                  aria-current={selected ? "page" : undefined}
+                  aria-expanded={selected}
+                  onClick={() => onSelect(project.id)}
+                >
                   <strong>{project.name}</strong>
                   <small>{project.state}</small>
-                </span>
-                <time>{project.updated}</time>
-              </button>
-              {selected && activeRun ? (
-                <button
-                  className="capability-row is-active"
-                  type="button"
-                  aria-label={`打开运行：${activeRun.name ?? activeRun.title ?? "期刊追踪与精读"}`}
-                  onClick={() => onSelectRun?.(activeRun.id)}
-                >
-                  <PlayCircle size={17} weight="regular" aria-hidden="true" />
-                  <span>
-                    <strong>{activeRun.name ?? activeRun.title ?? "期刊追踪与精读"}</strong>
-                    <small>当前 Run</small>
-                  </span>
-                  <b>{activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}</b>
                 </button>
+                <time>{project.updated}</time>
+                {onRemoveProject && project.removable ? (
+                  <button
+                    className="icon-button project-remove-button"
+                    type="button"
+                    onClick={() => onRemoveProject(project.id)}
+                    aria-label={`从当前类型移除 ${project.name}`}
+                    title="从列表移除，不删除本地文件"
+                  >
+                    <X size={14} weight="regular" aria-hidden="true" />
+                  </button>
+                ) : null}
+                {onNewConversation ? (
+                  <button
+                    className="icon-button"
+                    type="button"
+                    onClick={() => onNewConversation(project.id)}
+                    aria-label={`在 ${project.name} 中新建会话`}
+                    title="新建会话"
+                  >
+                    <Plus size={15} weight="bold" aria-hidden="true" />
+                  </button>
+                ) : null}
+              </div>
+              {selected ? (
+                <div className="project-children">
+                  <div className="project-conversation-list">
+                    {projectConversations.map((conversation) => {
+                      const conversationSelected = conversation.id === selectedConversationId;
+                      const ConversationIcon = conversation.kind === "paper_reading"
+                        ? BookOpenText
+                        : Code;
+                      return (
+                        <button
+                          key={conversation.id}
+                          className={`project-conversation-row${conversationSelected ? " is-active" : ""}`}
+                          type="button"
+                          aria-current={conversationSelected ? "page" : undefined}
+                          onClick={() => onSelectConversation?.(conversation.id)}
+                        >
+                          <ConversationIcon
+                            size={16}
+                            weight={conversationSelected ? "fill" : "regular"}
+                            aria-hidden="true"
+                          />
+                          <span>
+                            <strong>{conversation.title}</strong>
+                            <small>{conversation.subtitle}</small>
+                          </span>
+                        </button>
+                      );
+                    })}
+                    {projectConversations.length === 0 ? (
+                      <p className="project-child-empty">还没有会话</p>
+                    ) : null}
+                  </div>
+
+                  {activeRun ? (
+                    <button
+                      className={`capability-row project-run-row${selectedRunId === activeRun.id ? " is-active" : ""}`}
+                      type="button"
+                      aria-label={`打开本周追踪：${activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}`}
+                      onClick={() => onSelectRun?.(activeRun.id)}
+                    >
+                      <PlayCircle size={17} weight="regular" aria-hidden="true" />
+                      <span>
+                        <strong>本周追踪</strong>
+                        <small>{activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}</small>
+                      </span>
+                    </button>
+                  ) : null}
+                </div>
               ) : null}
             </Fragment>
           );
@@ -92,29 +209,37 @@ export function ProjectRail({
         ) : null}
       </div>
 
-      <div className="rail-capabilities">
-        <span className="eyebrow">偏好</span>
+      <div className="rail-footer">
+        <div className="rail-footnote">
+          <span className="status-dot" aria-hidden="true" />
+          <span>Pi Agent · 本地工作流播放器</span>
+        </div>
         <button
           id="settings-trigger"
-          className={`capability-row${settingsOpen ? " is-active" : ""}`}
+          className={`settings-row${settingsOpen ? " is-active" : ""}`}
           type="button"
           aria-haspopup="dialog"
           aria-expanded={settingsOpen}
           onClick={onOpenSettings}
         >
-          <GearSix size={17} weight="regular" aria-hidden="true" />
+          <GearSix size={18} weight="regular" aria-hidden="true" />
           <span>
             <strong>设置</strong>
             <small>模型、能力包与偏好</small>
           </span>
-          <b>打开</b>
         </button>
       </div>
 
-      <div className="rail-footnote">
-        <span className="status-dot" aria-hidden="true" />
-        <span>Pi Agent · 本地工作流播放器</span>
-      </div>
+      {onMouseDownResizer ? (
+        <div
+          className={`panel-resizer-handle${isResizing ? " is-resizing" : ""}`}
+          onMouseDown={onMouseDownResizer}
+          title="按住左右拖拽调整左侧栏宽度"
+          aria-label="拖拽调整左侧栏宽度"
+        >
+          <span className="resizer-line" />
+        </div>
+      ) : null}
     </aside>
   );
 }

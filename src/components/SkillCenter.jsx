@@ -103,7 +103,7 @@ export function SkillCenter({ catalog, skillState, installingId, onInstall, onTo
               <span><Package size={25} weight="regular" aria-hidden="true" /></span>
               <h3>首个工作流已确认</h3>
               <p>“期刊追踪与精读”会先作为完整工作流验证，内部能力暂不作为市场条目展示。</p>
-              <small>当前不会预装、推荐或模拟可下载能力包。</small>
+              <small>当前不会预装或推荐可下载能力包。</small>
             </div>
           ) : null}
           {catalog.length > 0 && visibleSkills.length === 0 ? <p className="empty-note skill-empty">没有匹配的技能</p> : null}

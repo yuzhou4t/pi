@@ -1,33 +1,27 @@
 export const providers = [
   {
-    id: "baseline",
-    name: "强模型基线",
-    hint: "交互演示",
-    status: "当前基线",
-    models: ["强模型（演示）"],
+    id: "codex-subscription",
+    name: "GPT · Codex 订阅",
+    hint: "使用本机 Codex 登录状态",
+    available: false,
+    status: "checking",
+    reasonCode: "CATALOG_LOADING",
+    models: ["account-default"],
   },
   {
-    id: "openai-compatible",
-    name: "OpenAI 兼容",
-    hint: "自定义服务地址",
-    status: "未配置",
-    models: ["自定义模型"],
-  },
-  {
-    id: "openrouter",
-    name: "OpenRouter",
-    hint: "统一模型入口",
-    status: "未配置",
-    models: ["自动选择"],
-  },
-  {
-    id: "ollama",
-    name: "Ollama",
-    hint: "本机模型",
-    status: "未连接",
-    models: ["本地模型"],
+    id: "deepseek",
+    name: "DeepSeek API",
+    hint: "使用本机服务端 API 配置",
+    available: false,
+    status: "checking",
+    reasonCode: "CATALOG_LOADING",
+    models: ["deepseek-v4-pro", "deepseek-v4-flash"],
   },
 ];
+
+export function getModelDisplayName(modelId) {
+  return modelId === "account-default" ? "账户默认模型" : modelId;
+}
 
 // 先保留 Skill 中心的结构，不预设任何能力。
 // 等主用途和高频动作确定后，再从真实需求中添加第一个 Skill。

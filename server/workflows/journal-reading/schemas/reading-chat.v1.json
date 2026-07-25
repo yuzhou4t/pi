@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "paper_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "answer": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 3000
+    },
+    "citations": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "properties": {
+          "reference_id": {
+            "type": "string",
+            "pattern": "^reference-[1-8]$"
+          },
+          "support": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 300
+          }
+        },
+        "required": [
+          "reference_id",
+          "support"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "paper_id",
+    "answer",
+    "citations"
+  ],
+  "additionalProperties": false
+}

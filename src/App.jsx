@@ -1,22 +1,50 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ChatText,
+  Files,
   FolderSimple,
   ListChecks,
   Package,
   PlayCircle,
 } from "@phosphor-icons/react";
+import { BindProjectDialog } from "./components/BindProjectDialog.jsx";
 import { ProjectRail } from "./components/ProjectRail.jsx";
+import { LiveProjectWorkbench } from "./components/LiveProjectWorkbench.jsx";
 import { SettingsDialog, SettingsQuickPanel } from "./components/SettingsPanel.jsx";
 import { SkillCenter } from "./components/SkillCenter.jsx";
-import { TopBar } from "./components/TopBar.jsx";
 import { WorkflowContextRail } from "./components/WorkflowContextRail.jsx";
 import { WorkflowWorkspace } from "./components/WorkflowWorkspace.jsx";
-import { providers, skillCatalog } from "./data.js";
+import { ReadingWorkbench } from "./components/ReadingWorkbench.jsx";
+import { fetchCandidateSummaries, fetchModelProviders, mergeCandidateSummaries } from "./api/candidateSummaries.js";
+import { projectWorkApi } from "./api/projectWork.js";
+import {
+  commitZoteroProposal,
+  createObsidianPreview,
+  createProjectStatePreview,
+  createZoteroProposal,
+  fetchObsidianPreview,
+  fetchProjectContext,
+  fetchJournalPaperGuide,
+  journalGuideNeedsRefresh,
+  fetchJournalRun,
+  fetchJournalRuns,
+  fetchProjectStatePreview,
+  fetchZoteroProposal,
+  fetchZoteroTargets,
+  restartJournalReadingFromGuide,
+  resumeJournalRun,
+  saveJournalPaperDecisions,
+  selectZoteroCommitOperations,
+  startJournalGuides,
+  startJournalRun,
+} from "./api/journalRuns.js";
+import { getModelDisplayName, providers, skillCatalog } from "./data.js";
 import { usePersistentReducer } from "./hooks/usePersistentReducer.js";
 import { usePersistentState } from "./hooks/usePersistentState.js";
 import { workflowFixture } from "./workflow/fixtures.js";
 import {
   createInitialRunState,
+  isPersistedRunStateValid,
   RUN_ACTIONS,
   RUN_STATUS,
   runReducer,
@@ -26,22 +54,81 @@ const runStatusLabels = {
   [RUN_STATUS.REVIEW_READY]: "本周待审阅",
   [RUN_STATUS.PREPARING_GUIDES]: "正在准备导读",
   [RUN_STATUS.GUIDE_READY]: "导读待决定",
-  [RUN_STATUS.READING]: "分阶段精读",
+  [RUN_STATUS.READING]: "论文研读",
+  [RUN_STATUS.DRAFT_READY]: "阅读成果待归档",
   [RUN_STATUS.AWAITING_APPROVAL]: "等待写入确认",
-  [RUN_STATUS.COMMITTING]: "正在模拟写入",
+  [RUN_STATUS.COMMITTING]: "正在写入",
   [RUN_STATUS.PARTIAL]: "部分写入失败",
+  [RUN_STATUS.MANUAL_ACTION_REQUIRED]: "需在 Zotero 手工处理",
+  [RUN_STATUS.READING_READY]: "旧版 Run · 待重新检查",
   [RUN_STATUS.COMPLETED]: "本轮已完成",
   [RUN_STATUS.COMPLETED_NO_WRITE]: "本轮无写入",
 };
 
-const projects = [
+const journalRunStatusLabels = {
+  scanning: "正在扫描来源",
+  ranking: "正在筛选候选",
+  preparing_documents: "正在准备全文",
+  review_ready: "真实候选待审阅",
+  preparing_guides: "正在生成导读",
+  guide_ready: "真实导读待决定",
+  reading: "正在分阶段精读",
+  draft_ready: "阅读成果待归档",
+  awaiting_approval: "归档精确预览待核对",
+  committing: "正在写入 Zotero",
+  partial: "部分 Zotero 写入失败",
+  manual_action_required: "需在 Zotero 手工处理",
+  reading_ready: "旧版 Run · 待重新检查",
+  completed: "本轮已完成",
+  failed: "运行失败",
+};
+
+const BASE_PROJECTS = [
   {
     id: workflowFixture.project.id,
     name: workflowFixture.project.name,
-    state: "期刊追踪与精读 · 演示",
+    state: "2 个会话 · 1 个追踪",
+    rootLabel: workflowFixture.project.rootLabel,
     updated: "本周",
+    workspaceKinds: ["project_work", "paper_reading"],
+    seeded: true,
+  },
+  {
+    id: "pi-agent-frontend",
+    name: "Pi Agent 前端",
+    state: "1 个会话",
+    rootLabel: "Pi Agent 前端",
+    updated: "昨天",
+    workspaceKinds: ["project_work"],
+    seeded: true,
   },
 ];
+
+function createLiveProjectWorkState() {
+  return {
+    status: "loading",
+    projects: [],
+    conversations: [],
+    conversation: null,
+    error: null,
+  };
+}
+
+function projectWorkConversationLabel(status) {
+  return {
+    idle: "等待任务",
+    running: "正在工作",
+    compacting: "正在整理上下文",
+    awaiting_confirmation: "修改待审阅",
+    applied: "修改已应用",
+    verifying: "正在验证",
+    completed: "本轮已完成",
+    failed: "本轮失败",
+    interrupted: "运行已中断",
+    aborted: "已停止",
+    error: "需要处理",
+  }[status] ?? status ?? "等待任务";
+}
 
 function createInitialSkillState() {
   return Object.fromEntries(
@@ -50,6 +137,207 @@ function createInitialSkillState() {
       { installed: skill.defaultInstalled, enabled: skill.defaultEnabled },
     ]),
   );
+}
+
+function mergeProviderCatalog(catalogProviders) {
+  return providers.map((definition) => {
+    const catalogProvider = catalogProviders.find((item) => item.id === definition.id);
+    const catalogModels = catalogProvider?.models.filter((model) => definition.models.includes(model)) ?? [];
+    const models = catalogModels.length > 0 ? catalogModels : definition.models;
+    return {
+      ...definition,
+      available: Boolean(catalogProvider?.available && catalogModels.length > 0),
+      status: catalogProvider?.status ?? "unavailable",
+      reasonCode: catalogProvider?.reasonCode ?? "PROVIDER_NOT_REPORTED",
+      models,
+    };
+  });
+}
+
+function normalizeProviderConfig(config, catalogProviders, defaultProviderId) {
+  const configuredProvider = catalogProviders.find(
+    (item) => item.id === config?.providerId && item.available,
+  );
+  const provider = configuredProvider
+    ?? catalogProviders.find((item) => item.id === defaultProviderId && item.available)
+    ?? catalogProviders.find((item) => item.available)
+    ?? catalogProviders[0];
+  const model = provider?.models.includes(config?.model) ? config.model : provider?.models[0] ?? "";
+  return { providerId: provider?.id ?? "", model };
+}
+
+function createLoadingSummaryState() {
+  return {
+    status: "loading",
+    source: "fixture",
+    providerId: null,
+    modelId: null,
+    items: [],
+    error: null,
+    errorCode: null,
+    retryable: false,
+  };
+}
+
+function createIdleSummaryState() {
+  return { ...createLoadingSummaryState(), status: "idle" };
+}
+
+function createRestoringJournalRunState() {
+  return {
+    status: "restoring",
+    run: null,
+    error: null,
+  };
+}
+
+function createIdleZoteroUiState() {
+  return {
+    runId: null,
+    targetStatus: "idle",
+    targets: [],
+    selectedTargetId: "",
+    proposalPending: false,
+    commitPending: false,
+    error: null,
+  };
+}
+
+function createIdleObsidianUiState(runId = null) {
+  return {
+    runId,
+    status: "idle",
+    preview: null,
+    error: null,
+  };
+}
+
+function createIdleProjectStateUiState(runId = null) {
+  return {
+    runId,
+    status: "idle",
+    preview: null,
+    error: null,
+  };
+}
+
+function readingAgentActionRevision(reading) {
+  const proposals = reading?.agentActions?.proposals ?? [];
+  return proposals
+    .map((proposal) => [
+      proposal.proposalId,
+      proposal.status,
+      proposal.contentHash,
+      proposal.committedAt,
+      proposal.updatedAt,
+    ].join(":"))
+    .sort()
+    .join("|");
+}
+
+function runAgentActionRevision(run) {
+  return Object.entries(run?.readings?.papers ?? {})
+    .map(([paperId, reading]) => [
+      paperId,
+      reading.agentActions?.status ?? "",
+      reading.agentActions?.updatedAt ?? "",
+      readingAgentActionRevision(reading),
+    ].join(":"))
+    .sort()
+    .join("|");
+}
+
+function createLoadingProjectContextState() {
+  return {
+    status: "loading",
+    data: null,
+    error: null,
+    errorCode: null,
+  };
+}
+
+function journalRunStateFromRun(run) {
+  if ([
+    "review_ready",
+    "guide_ready",
+    "reading",
+    "draft_ready",
+    "awaiting_approval",
+    "partial",
+    "manual_action_required",
+    "reading_ready",
+    "completed",
+    "completed_no_write",
+  ].includes(run.status)) {
+    return { status: "ready", run, error: null };
+  }
+  if (run.status === "failed") {
+    return {
+      status: "failed",
+      run,
+      error: run.pausedReason ?? "本轮扫描失败，可重新运行。",
+    };
+  }
+  return { status: "running", run, error: null };
+}
+
+function mergeZoteroProposal(run, proposal) {
+  return {
+    ...run,
+    zotero: {
+      ...run.zotero,
+      target: proposal.target,
+      decisions: proposal.decisions,
+      proposalId: proposal.proposalId,
+      proposalHash: proposal.proposalHash,
+      proposals: proposal.proposals,
+    },
+  };
+}
+
+function createIdleGuideState(runId = null) {
+  return {
+    runId,
+    status: "idle",
+    byPaperId: {},
+    errorsByPaperId: {},
+    error: null,
+  };
+}
+
+function liveRunBinding(run) {
+  const candidatePaperIds = run.candidates.map((paper) => paper.id);
+  const selectablePaperIds = run.candidates
+    .filter((paper) => paper.mineruStatus === "ready")
+    .map((paper) => paper.id);
+  const requestedPaperIds = run.guides?.requestedPaperIds ?? [];
+  const preparedGuideIds = requestedPaperIds.filter(
+    (paperId) => run.guides?.papers?.[paperId]?.status === "ready",
+  );
+  const failedMessages = requestedPaperIds
+    .map((paperId) => run.guides?.papers?.[paperId]?.error?.message)
+    .filter(Boolean);
+  return {
+    type: RUN_ACTIONS.BIND_LIVE_RUN,
+    runId: run.id,
+    workflowId: "journal-reading-v1",
+    candidatePaperIds,
+    selectablePaperIds,
+    requestedPaperIds,
+    preparedGuideIds,
+    guideStatus: run.guides?.status ?? "not_started",
+    serverStatus: run.status,
+    guideChoices: run.paperDecisions ?? run.zotero?.decisions ?? {},
+    readings: run.readings,
+    restartRevision: run.readingRestart?.revision ?? null,
+    proposals: run.zotero?.proposals ?? [],
+    zoteroProposalId: run.zotero?.proposalId ?? null,
+    zoteroProposalHash: run.zotero?.proposalHash ?? null,
+    zoteroTarget: run.zotero?.target ?? null,
+    zoteroError: run.zotero?.error ?? null,
+    pausedReason: run.pausedReason,
+    error: failedMessages.join("；") || null,
+  };
 }
 
 function runToMarkdown(run) {
@@ -61,7 +349,6 @@ function runToMarkdown(run) {
     `> Run：${run.runId}  `,
     `> 状态：${runStatusLabels[run.status] ?? run.status}  `,
     `> 扫描窗口：${workflowFixture.scanSummary.window}  `,
-    "> 数据说明：交互演示数据，未扫描网络，也未写入真实 Zotero、Obsidian 或项目文件。",
     "",
     "## 本轮所选论文",
     "",
@@ -88,41 +375,73 @@ function runToMarkdown(run) {
 
 export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [contextRailOpen, setContextRailOpen] = useState(true);
+  const [contextRailOpen, setContextRailOpen] = useState(false);
+  const [leftRailWidth, setLeftRailWidth] = useState(240);
   const [rightRailWidth, setRightRailWidth] = useState(360);
-  const [isResizing, setIsResizing] = useState(false);
-  const [selectedProjectId, setSelectedProjectId] = useState(projects[0].id);
+  const [resizingSide, setResizingSide] = useState(null);
+  const [selectedProjectId, setSelectedProjectId] = useState(BASE_PROJECTS[0].id);
+  const [workspaceKind, setWorkspaceKind] = usePersistentState(
+    "pi-agent-workspace-kind-v1",
+    "project_work",
+  );
+  const [registeredProjects, setRegisteredProjects] = usePersistentState(
+    "pi-agent-registered-projects-v1",
+    [],
+  );
+  const [workspaceSelection, setWorkspaceSelection] = usePersistentState(
+    "pi-agent-workspace-selection-v1",
+    {
+      project_work: {
+        projectId: "",
+        conversationId: "",
+      },
+      paper_reading: {
+        projectId: workflowFixture.project.id,
+        conversationId: "workflow-run",
+      },
+    },
+  );
   const [projectQuery, setProjectQuery] = useState("");
+  const isResizing = resizingSide !== null;
 
-  const startResizing = useCallback((e) => {
+  const startResizing = useCallback((side) => (e) => {
     e.preventDefault();
-    setIsResizing(true);
+    setResizingSide(side);
     const startX = e.clientX;
-    const startWidth = rightRailWidth;
+    const startWidth = side === "left" ? leftRailWidth : rightRailWidth;
     let rafId = null;
 
     const onMouseMove = (moveEvent) => {
       if (rafId) cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(() => {
-        const deltaX = startX - moveEvent.clientX;
-        const nextWidth = Math.min(640, Math.max(200, startWidth + deltaX));
-        setRightRailWidth(nextWidth);
+        const deltaX = side === "left" ? moveEvent.clientX - startX : startX - moveEvent.clientX;
+        const nextWidth = side === "left"
+          ? Math.min(360, Math.max(200, startWidth + deltaX))
+          : Math.min(640, Math.max(200, startWidth + deltaX));
+        if (side === "left") setLeftRailWidth(nextWidth);
+        else setRightRailWidth(nextWidth);
       });
     };
 
     const onMouseUp = () => {
       if (rafId) cancelAnimationFrame(rafId);
-      setIsResizing(false);
+      setResizingSide(null);
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
 
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
-  }, [rightRailWidth]);
-  const [providerConfig, setProviderConfig] = usePersistentState("pi-agent-provider-v2", {
-    providerId: "baseline",
-    model: "强模型（演示）",
+  }, [leftRailWidth, rightRailWidth]);
+  const [providerConfig, setProviderConfig] = usePersistentState("pi-agent-provider-v3", {
+    providerId: "",
+    model: "",
+  });
+  const [providerCatalog, setProviderCatalog] = useState({
+    status: "loading",
+    mode: null,
+    providers,
+    error: null,
   });
   const [providerOpen, setProviderOpen] = useState(false);
   const [skillState, setSkillState] = usePersistentState("pi-agent-skills-v2", createInitialSkillState());
@@ -130,43 +449,1500 @@ export function App() {
   const [installingSkillId, setInstallingSkillId] = useState(null);
   const [settingsView, setSettingsView] = useState(null);
   const [settingsSection, setSettingsSection] = useState("general");
-  const [mobileView, setMobileView] = useState("run");
+  const [mobileView, setMobileView] = useState("agent");
   const [toast, setToast] = useState(null);
+  const [bindProjectOpen, setBindProjectOpen] = useState(false);
+  const [activeConversationId, setActiveConversationId] = usePersistentState(
+    "pi-agent-active-conversation-v1",
+    "",
+  );
+  const [liveProjectWork, setLiveProjectWork] = useState(createLiveProjectWorkState);
+  const [projectWorkModelCatalog, setProjectWorkModelCatalog] = useState({
+    status: "loading",
+    providers: [],
+    defaultProviderId: "",
+    defaultModelId: "",
+    error: null,
+  });
+  const [projectWorkProviderConfig, setProjectWorkProviderConfig] = usePersistentState(
+    "pi-agent-project-work-provider-v1",
+    { providerId: "", model: "" },
+  );
+  const projectWorkLoadRef = useRef(0);
+  const activeConversationIdRef = useRef(activeConversationId);
   const toastTimer = useRef(null);
-  const [run, dispatch] = usePersistentReducer(runReducer, createInitialRunState);
+  const [run, dispatch] = usePersistentReducer(runReducer, createInitialRunState, {
+    validate: isPersistedRunStateValid,
+  });
+  const [candidateSummaryState, setCandidateSummaryState] = useState(createIdleSummaryState);
+  const candidateRequestController = useRef(null);
+  const [journalRunState, setJournalRunState] = useState(createRestoringJournalRunState);
+  const journalStartController = useRef(null);
+  const journalRestoreController = useRef(null);
+  const journalGuideController = useRef(null);
+  const journalDecisionController = useRef(null);
+  const journalRestartController = useRef(null);
+  const zoteroTargetsController = useRef(null);
+  const zoteroActionController = useRef(null);
+  const projectContextController = useRef(null);
+  const [guideState, setGuideState] = useState(createIdleGuideState);
+  const [zoteroUiState, setZoteroUiState] = useState(createIdleZoteroUiState);
+  const [obsidianUiState, setObsidianUiState] = useState(createIdleObsidianUiState);
+  const [projectStateUiState, setProjectStateUiState] = useState(
+    createIdleProjectStateUiState,
+  );
+  const [projectContextState, setProjectContextState] = useState(
+    createLoadingProjectContextState,
+  );
+  const [readerTarget, setReaderTarget] = useState(null);
+  const [readerContext, setReaderContext] = useState(null);
+  const [readerSelectionState, setReaderSelectionState] = useState({
+    reference: null,
+    error: null,
+  });
+  const [contextRailView, setContextRailView] = useState("evidence");
+  const autoOpenedReaderKeyRef = useRef(null);
 
-  const project = projects.find((item) => item.id === selectedProjectId) ?? projects[0];
-  const selectedProvider = providers.find((item) => item.id === providerConfig.providerId) ?? providers[0];
+  const registeredProjectItems = useMemo(() => (
+    Array.isArray(registeredProjects)
+      ? registeredProjects.filter((item) => (
+        item
+        && typeof item.id === "string"
+        && typeof item.name === "string"
+        && typeof item.rootLabel === "string"
+        && Array.isArray(item.workspaceKinds)
+      ))
+      : []
+  ), [registeredProjects]);
+  const allProjects = useMemo(() => {
+    const registeredIds = new Set(registeredProjectItems.map((item) => item.id));
+    return [
+      ...BASE_PROJECTS.filter((item) => !registeredIds.has(item.id)),
+      ...registeredProjectItems,
+    ];
+  }, [registeredProjectItems]);
+  const paperProjectItems = useMemo(() => allProjects
+    .filter((item) => item.workspaceKinds.includes("paper_reading"))
+    .map((item) => {
+    const baseConversationCount = item.id === workflowFixture.project.id ? 1 : 0;
+    const trackingCopy = item.id === workflowFixture.project.id
+      ? " · 1 个追踪"
+      : "";
+    return {
+      ...item,
+      state: `${baseConversationCount} 个会话${trackingCopy}`,
+      removable: !item.seeded,
+    };
+  }), [allProjects]);
+  const liveProjectItems = useMemo(() => liveProjectWork.projects.map((item) => ({
+    ...item,
+    workspaceKinds: ["project_work"],
+    state: `${item.conversationCount ?? 0} 个会话`,
+    updated: item.updatedAt ? "本机" : "刚刚",
+    removable: true,
+  })), [liveProjectWork.projects]);
+  const projectItems = workspaceKind === "project_work"
+    ? liveProjectItems
+    : paperProjectItems;
+  const project = projectItems.find((item) => item.id === selectedProjectId)
+    ?? projectItems[0]
+    ?? {
+      id: "",
+      name: workspaceKind === "project_work" ? "尚未绑定项目" : "论文精读",
+      rootLabel: "",
+      state: "0 个会话",
+      updated: "",
+    };
+  const catalogProviders = providerCatalog.providers;
+  const selectedProvider = catalogProviders.find(
+    (item) => item.id === providerConfig.providerId && item.available,
+  ) ?? catalogProviders.find((item) => item.available) ?? catalogProviders[0];
+  const selectedModel = selectedProvider?.models.includes(providerConfig.model)
+    ? providerConfig.model
+    : selectedProvider?.models[0] ?? "";
+  const projectWorkProviders = projectWorkModelCatalog.providers.map((provider) => ({
+    id: provider.id,
+    name: provider.name,
+    available: true,
+    authLabel: "由 Pi 本机配置提供",
+    description: "Pi SDK 可用模型",
+    models: provider.models.map((model) => model.id),
+  }));
+  const selectedProjectWorkProvider = projectWorkProviders.find(
+    (item) => item.id === projectWorkProviderConfig.providerId,
+  ) ?? projectWorkProviders.find(
+    (item) => item.id === projectWorkModelCatalog.defaultProviderId,
+  ) ?? projectWorkProviders[0];
+  const selectedProjectWorkModel = selectedProjectWorkProvider?.models.includes(
+    projectWorkProviderConfig.model,
+  )
+    ? projectWorkProviderConfig.model
+    : selectedProjectWorkProvider?.id === projectWorkModelCatalog.defaultProviderId
+      && selectedProjectWorkProvider?.models.includes(projectWorkModelCatalog.defaultModelId)
+      ? projectWorkModelCatalog.defaultModelId
+      : selectedProjectWorkProvider?.models[0] ?? "";
   const installedSkillCount = useMemo(
     () => skillCatalog.filter((skill) => skillState[skill.id]?.installed).length,
     [skillState],
   );
   const activeRun = useMemo(() => ({
-    id: run.runId,
+    id: journalRunState.run?.id ?? run.runId,
     name: workflowFixture.workflowName,
-    statusLabel: runStatusLabels[run.status] ?? run.status,
-  }), [run.runId, run.status]);
+    statusLabel: journalRunState.status === "restoring"
+      ? "正在恢复上次 Run"
+      : journalRunState.status === "starting"
+      ? "正在启动扫描"
+      : journalRunState.status === "error"
+        ? "扫描状态读取失败"
+        : journalRunStatusLabels[journalRunState.run?.status]
+          ?? runStatusLabels[run.status]
+          ?? run.status,
+  }), [journalRunState.run?.id, journalRunState.run?.status, journalRunState.status, run.runId, run.status]);
+  const liveJournalPapers = journalRunState.run?.candidates;
+  const obsidianAgentActionRevision = runAgentActionRevision(journalRunState.run);
+  const workflowPapers = useMemo(() => (
+    liveJournalPapers?.length > 0
+      ? liveJournalPapers
+      : mergeCandidateSummaries(workflowFixture.papers, candidateSummaryState.items)
+  ), [candidateSummaryState.items, liveJournalPapers]);
+  const selectedReaderPapers = workflowPapers.filter(
+    (paper) => (run.selectedPaperIds ?? []).includes(paper.id),
+  );
+  const readerPaper = readerTarget
+    ? workflowPapers.find(
+        (paper) => paper.id === readerTarget.paperId
+          && paper.isDemo === false
+          && paper.mineruStatus === "ready",
+      ) ?? null
+    : null;
+  const paperConversationId = readerPaper ? `paper:${readerPaper.id}` : "paper-reading-entry";
+  const activeProjectWorkState = liveProjectWork.conversation;
+  const projectWorkMode = workspaceKind === "project_work";
+  const readingMode = Boolean(readerPaper) && activeConversationId === paperConversationId;
+  const workflowMode = !projectWorkMode && !readingMode;
+  const readerGuide = readerPaper ? (guideState.byPaperId?.[readerPaper.id] ?? null) : null;
+  const readerPeerPapers = readerTarget?.purpose === "close-reading"
+    ? selectedReaderPapers.filter((paper) => run.guideChoices?.[paper.id] === "read")
+    : selectedReaderPapers;
+  const liveZoteroDecisionsReady = run.source === "live"
+    && [
+      RUN_STATUS.DRAFT_READY,
+      RUN_STATUS.MANUAL_ACTION_REQUIRED,
+      RUN_STATUS.PARTIAL,
+    ].includes(run.status)
+    && run.preparedGuideIds.length > 0
+    && run.preparedGuideIds.every((paperId) => ["collect", "read"].includes(run.guideChoices[paperId]));
+  const paperConversations = useMemo(() => [
+    {
+      id: paperConversationId,
+      projectId: workflowFixture.project.id,
+      kind: "paper_reading",
+      title: readerPaper ? `精读 · ${readerPaper.shortTitle ?? readerPaper.title}` : "选择论文开始精读",
+      subtitle: readerPaper ? "论文精读 · 位置与对话已保存" : "从本周追踪创建精读会话",
+    },
+  ], [
+    paperConversationId,
+    readerPaper,
+  ]);
+  const liveProjectWorkConversations = useMemo(
+    () => liveProjectWork.conversations.map((conversation) => ({
+      id: conversation.id,
+      projectId: conversation.projectId,
+      kind: "project_work",
+      title: conversation.title,
+      subtitle: `正常工作 · ${projectWorkConversationLabel(conversation.status)}`,
+    })),
+    [liveProjectWork.conversations],
+  );
+  const conversations = workspaceKind === "project_work"
+    ? liveProjectWorkConversations
+    : paperConversations;
+  const visibleConversations = useMemo(
+    () => conversations.filter((conversation) => conversation.kind === workspaceKind),
+    [conversations, workspaceKind],
+  );
+
+  const syncProjectWorkModel = useCallback((conversation) => {
+    if (!conversation?.providerId || !conversation?.modelId) return;
+    setProjectWorkProviderConfig({
+      providerId: conversation.providerId,
+      model: conversation.modelId,
+    });
+  }, [setProjectWorkProviderConfig]);
+
+  const loadLiveProjectWork = useCallback(async ({
+    preferredProjectId,
+    preferredConversationId,
+  } = {}) => {
+    const requestId = projectWorkLoadRef.current + 1;
+    projectWorkLoadRef.current = requestId;
+    activeConversationIdRef.current = "";
+    setLiveProjectWork((current) => ({
+      ...current,
+      status: "loading",
+      conversation: null,
+      error: null,
+    }));
+    try {
+      const projects = await projectWorkApi.listProjects();
+      const projectId = projects.some((item) => item.id === preferredProjectId)
+        ? preferredProjectId
+        : projects[0]?.id ?? "";
+      const nextConversations = projectId
+        ? await projectWorkApi.listConversations({ projectId })
+        : [];
+      const conversationId = nextConversations.some(
+        (item) => item.id === preferredConversationId,
+      )
+        ? preferredConversationId
+        : nextConversations[0]?.id ?? "";
+      const conversation = conversationId
+        ? await projectWorkApi.fetchConversation({ conversationId })
+        : null;
+      if (projectWorkLoadRef.current !== requestId) return null;
+      setLiveProjectWork({
+        status: "ready",
+        projects,
+        conversations: nextConversations,
+        conversation,
+        error: null,
+      });
+      setSelectedProjectId(projectId);
+      activeConversationIdRef.current = conversationId;
+      setActiveConversationId(conversationId);
+      syncProjectWorkModel(conversation);
+      setMobileView("agent");
+      return conversation;
+    } catch (error) {
+      if (projectWorkLoadRef.current !== requestId) return null;
+      setLiveProjectWork((current) => ({
+        ...current,
+        status: "error",
+        error,
+      }));
+      return null;
+    }
+  }, [setActiveConversationId, syncProjectWorkModel]);
+
+  const selectLiveProject = useCallback(async (projectId, preferredConversationId) => {
+    const requestId = projectWorkLoadRef.current + 1;
+    projectWorkLoadRef.current = requestId;
+    activeConversationIdRef.current = "";
+    setActiveConversationId("");
+    setSelectedProjectId(projectId);
+    setLiveProjectWork((current) => ({
+      ...current,
+      status: "loading",
+      conversations: [],
+      conversation: null,
+      error: null,
+    }));
+    try {
+      const nextConversations = await projectWorkApi.listConversations({ projectId });
+      const conversationId = nextConversations.some(
+        (item) => item.id === preferredConversationId,
+      )
+        ? preferredConversationId
+        : nextConversations[0]?.id ?? "";
+      const conversation = conversationId
+        ? await projectWorkApi.fetchConversation({ conversationId })
+        : null;
+      if (projectWorkLoadRef.current !== requestId) return null;
+      setLiveProjectWork((current) => ({
+        ...current,
+        status: "ready",
+        conversations: nextConversations,
+        conversation,
+        error: null,
+      }));
+      activeConversationIdRef.current = conversationId;
+      setActiveConversationId(conversationId);
+      syncProjectWorkModel(conversation);
+      return conversation;
+    } catch (error) {
+      if (projectWorkLoadRef.current !== requestId) return null;
+      setLiveProjectWork((current) => ({
+        ...current,
+        status: "error",
+        error,
+      }));
+      return null;
+    }
+  }, [setActiveConversationId, syncProjectWorkModel]);
+
+  const selectLiveConversation = useCallback(async (conversationId) => {
+    if (!conversationId) return null;
+    const requestId = projectWorkLoadRef.current + 1;
+    projectWorkLoadRef.current = requestId;
+    activeConversationIdRef.current = conversationId;
+    setActiveConversationId(conversationId);
+    setLiveProjectWork((current) => ({
+      ...current,
+      status: "loading",
+      conversation: null,
+      error: null,
+    }));
+    try {
+      const conversation = await projectWorkApi.fetchConversation({ conversationId });
+      if (projectWorkLoadRef.current !== requestId) return null;
+      setLiveProjectWork((current) => ({
+        ...current,
+        status: "ready",
+        conversations: current.conversations.map((item) => (
+          item.id === conversation.id
+            ? {
+                ...item,
+                title: conversation.title,
+                status: conversation.status,
+                providerId: conversation.providerId,
+                modelId: conversation.modelId,
+                updatedAt: conversation.updatedAt,
+              }
+            : item
+        )),
+        conversation,
+        error: null,
+      }));
+      setSelectedProjectId(conversation.projectId);
+      activeConversationIdRef.current = conversation.id;
+      setActiveConversationId(conversation.id);
+      syncProjectWorkModel(conversation);
+      setMobileView("agent");
+      return conversation;
+    } catch (error) {
+      if (projectWorkLoadRef.current !== requestId) return null;
+      setLiveProjectWork((current) => ({
+        ...current,
+        status: "error",
+        error,
+      }));
+      return null;
+    }
+  }, [setActiveConversationId, syncProjectWorkModel]);
+
+  const updateLiveConversation = useCallback((conversation) => {
+    if (
+      !conversation?.id
+      || activeConversationIdRef.current !== conversation.id
+    ) {
+      return;
+    }
+    syncProjectWorkModel(conversation);
+    setLiveProjectWork((current) => {
+      const summary = {
+        id: conversation.id,
+        projectId: conversation.projectId,
+        title: conversation.title,
+        status: conversation.status,
+        providerId: conversation.providerId,
+        modelId: conversation.modelId,
+        thinkingLevel: conversation.thinkingLevel,
+        updatedAt: conversation.updatedAt,
+      };
+      const existing = current.conversations.some((item) => item.id === conversation.id);
+      return {
+        ...current,
+        status: "ready",
+        conversations: existing
+          ? current.conversations.map((item) => (
+              item.id === conversation.id ? { ...item, ...summary } : item
+            ))
+          : [summary, ...current.conversations],
+        conversation,
+        error: null,
+      };
+    });
+  }, [syncProjectWorkModel]);
+
+  useEffect(() => {
+    activeConversationIdRef.current = activeConversationId;
+  }, [activeConversationId]);
+
+  useEffect(() => {
+    if (workspaceKind !== "project_work") return;
+    const savedSelection = workspaceSelection?.project_work;
+    loadLiveProjectWork({
+      preferredProjectId: savedSelection?.projectId,
+      preferredConversationId: savedSelection?.conversationId,
+    });
+  }, [
+    loadLiveProjectWork,
+    workspaceKind,
+  ]);
+
+  useEffect(() => {
+    const selectionMatchesKind = workspaceKind === "project_work"
+      ? projectWorkMode
+      : !projectWorkMode;
+    if (
+      !selectionMatchesKind
+      || (workspaceKind === "project_work" && liveProjectWork.status !== "ready")
+    ) {
+      return;
+    }
+    setWorkspaceSelection((current) => ({
+      ...(current && typeof current === "object" ? current : {}),
+      [workspaceKind]: {
+        projectId: selectedProjectId,
+        conversationId: activeConversationId,
+      },
+    }));
+  }, [
+    activeConversationId,
+    projectWorkMode,
+    selectedProjectId,
+    setWorkspaceSelection,
+    liveProjectWork.status,
+    workspaceKind,
+  ]);
+
+  useEffect(() => {
+    if (!String(activeConversationId).startsWith("paper:") || readerPaper) return;
+    setActiveConversationId("workflow-run");
+    setMobileView("run");
+  }, [activeConversationId, readerPaper, setActiveConversationId]);
 
   const showToast = useCallback((message, tone = "success") => {
     window.clearTimeout(toastTimer.current);
     setToast({ message, tone });
     toastTimer.current = window.setTimeout(() => setToast(null), 2600);
   }, []);
+  const handleProjectWorkError = useCallback((error) => {
+    showToast(error?.message || "项目工作操作没有完成", "warning");
+  }, [showToast]);
+
+  const loadProjectContext = useCallback(() => {
+    projectContextController.current?.abort();
+    const controller = new AbortController();
+    projectContextController.current = controller;
+    setProjectContextState(createLoadingProjectContextState());
+    fetchProjectContext({ signal: controller.signal }).then((data) => {
+      setProjectContextState({
+        status: "ready",
+        data,
+        error: null,
+        errorCode: null,
+      });
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      setProjectContextState({
+        status: "error",
+        data: null,
+        error: error.message,
+        errorCode: error.code ?? "PROJECT_CONTEXT_READ_FAILED",
+      });
+    }).finally(() => {
+      if (projectContextController.current === controller) {
+        projectContextController.current = null;
+      }
+    });
+  }, []);
+
+  const syncJournalRun = useCallback((nextRun) => {
+    setJournalRunState(journalRunStateFromRun(nextRun));
+    dispatch(liveRunBinding(nextRun));
+    setObsidianUiState((current) => (
+      current.runId === nextRun.id
+        ? current
+        : createIdleObsidianUiState(nextRun.id)
+    ));
+    setProjectStateUiState((current) => (
+      current.runId === nextRun.id
+        ? current
+        : createIdleProjectStateUiState(nextRun.id)
+    ));
+    setGuideState((current) => (
+      current.runId === nextRun.id
+        ? { ...current, status: nextRun.guides?.status ?? "not_started" }
+        : {
+            ...createIdleGuideState(nextRun.id),
+            status: nextRun.guides?.status ?? "not_started",
+          }
+    ));
+  }, [dispatch]);
+
+  const restoreJournalRuns = useCallback(async () => {
+    journalRestoreController.current?.abort();
+    const controller = new AbortController();
+    journalRestoreController.current = controller;
+    setJournalRunState((current) => ({
+      status: "restoring",
+      run: current.run,
+      error: null,
+    }));
+    try {
+      const runs = await fetchJournalRuns({ signal: controller.signal });
+      if (runs.length > 0) {
+        syncJournalRun(runs[0]);
+      } else {
+        setJournalRunState({ status: "idle", run: null, error: null });
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      setJournalRunState((current) => ({
+        status: "error",
+        run: current.run,
+        error: error.message,
+      }));
+    } finally {
+      if (journalRestoreController.current === controller) {
+        journalRestoreController.current = null;
+      }
+    }
+  }, [syncJournalRun]);
+
+  const loadZoteroTargets = useCallback(async (runId, preferredTargetId = null) => {
+    zoteroTargetsController.current?.abort();
+    const controller = new AbortController();
+    zoteroTargetsController.current = controller;
+    setZoteroUiState((current) => ({
+      ...current,
+      runId,
+      targetStatus: "loading",
+      targets: [],
+      selectedTargetId: "",
+      error: null,
+    }));
+    try {
+      const result = await fetchZoteroTargets({ signal: controller.signal });
+      const selectedTarget = result.targets.find(
+        (target) => target.id === preferredTargetId,
+      ) ?? result.targets.find((target) => target.id === result.selectedTargetId);
+      const selectedTargetId = selectedTarget?.editable && selectedTarget.filesEditable
+        ? selectedTarget.id
+        : "";
+      setZoteroUiState((current) => current.runId === runId
+        ? {
+            ...current,
+            targetStatus: "ready",
+            targets: result.targets,
+            selectedTargetId,
+            error: null,
+          }
+        : current);
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      setZoteroUiState((current) => current.runId === runId
+        ? {
+            ...current,
+            targetStatus: "error",
+            targets: [],
+            selectedTargetId: "",
+            error: error.message,
+          }
+        : current);
+    } finally {
+      if (zoteroTargetsController.current === controller) {
+        zoteroTargetsController.current = null;
+      }
+    }
+  }, []);
 
   useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
   useEffect(() => {
-    if (run.status === RUN_STATUS.PREPARING_GUIDES) {
+    const controller = new AbortController();
+    fetchModelProviders({ signal: controller.signal }).then((catalog) => {
+      const nextProviders = mergeProviderCatalog(catalog.providers);
+      setProviderCatalog({
+        status: "ready",
+        mode: catalog.mode,
+        providers: nextProviders,
+        error: null,
+      });
+      setProviderConfig((current) => normalizeProviderConfig(current, nextProviders, catalog.defaultProviderId));
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      setProviderCatalog({
+        status: "error",
+        mode: null,
+        providers: mergeProviderCatalog([]),
+        error: error.message,
+      });
+    });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    projectWorkApi.listModels({ signal: controller.signal }).then((catalog) => {
+      setProjectWorkModelCatalog({
+        status: "ready",
+        providers: catalog.providers,
+        defaultProviderId: catalog.defaultProviderId,
+        defaultModelId: catalog.defaultModelId,
+        error: null,
+      });
+      setProjectWorkProviderConfig((current) => {
+        const currentProvider = catalog.providers.find(
+          (provider) => provider.id === current?.providerId,
+        );
+        if (
+          currentProvider
+          && currentProvider.models.some((model) => model.id === current?.model)
+        ) {
+          return current;
+        }
+        return {
+          providerId: catalog.defaultProviderId ?? catalog.providers[0]?.id ?? "",
+          model: catalog.defaultModelId
+            ?? catalog.providers[0]?.models[0]?.id
+            ?? "",
+        };
+      });
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      setProjectWorkModelCatalog({
+        status: "error",
+        providers: [],
+        defaultProviderId: "",
+        defaultModelId: "",
+        error: error.message,
+      });
+    });
+    return () => controller.abort();
+  }, [setProjectWorkProviderConfig]);
+
+  useEffect(() => () => {
+    candidateRequestController.current?.abort();
+    journalStartController.current?.abort();
+    journalRestoreController.current?.abort();
+    journalGuideController.current?.abort();
+    journalDecisionController.current?.abort();
+    journalRestartController.current?.abort();
+    zoteroTargetsController.current?.abort();
+    zoteroActionController.current?.abort();
+    projectContextController.current?.abort();
+  }, []);
+
+  useEffect(() => {
+    loadProjectContext();
+    window.addEventListener("focus", loadProjectContext);
+    return () => window.removeEventListener("focus", loadProjectContext);
+  }, [loadProjectContext]);
+
+  useEffect(() => {
+    if (!liveZoteroDecisionsReady) return;
+    void loadZoteroTargets(run.runId, run.zoteroTarget?.id);
+  }, [liveZoteroDecisionsReady, loadZoteroTargets, run.runId, run.zoteroTarget?.id]);
+
+  useEffect(() => {
+    const runId = journalRunState.run?.id;
+    const proposalHash = journalRunState.run?.obsidian?.proposalHash;
+    if (!runId || !proposalHash) return undefined;
+    const controller = new AbortController();
+    setObsidianUiState({
+      runId,
+      status: "loading",
+      preview: null,
+      error: null,
+    });
+    fetchObsidianPreview(runId, { signal: controller.signal }).then((preview) => {
+      setObsidianUiState({
+        runId,
+        status: "ready",
+        preview,
+        error: null,
+      });
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      setObsidianUiState({
+        runId,
+        status: "error",
+        preview: null,
+        error: error.message,
+      });
+    });
+    return () => controller.abort();
+  }, [
+    obsidianAgentActionRevision,
+    journalRunState.run?.id,
+    journalRunState.run?.obsidian?.proposalHash,
+  ]);
+
+  useEffect(() => {
+    const runId = journalRunState.run?.id;
+    const proposalHash = journalRunState.run?.projectState?.proposalHash;
+    if (!runId || !proposalHash) return undefined;
+    const controller = new AbortController();
+    setProjectStateUiState({
+      runId,
+      status: "loading",
+      preview: null,
+      error: null,
+    });
+    fetchProjectStatePreview(runId, { signal: controller.signal }).then((preview) => {
+      setProjectStateUiState({
+        runId,
+        status: "ready",
+        preview,
+        error: null,
+      });
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      setProjectStateUiState({
+        runId,
+        status: "error",
+        preview: null,
+        error: error.message,
+      });
+    });
+    return () => controller.abort();
+  }, [
+    journalRunState.run?.id,
+    journalRunState.run?.projectState?.proposalHash,
+  ]);
+
+  useEffect(() => {
+    void restoreJournalRuns();
+    return () => journalRestoreController.current?.abort();
+  }, [restoreJournalRuns]);
+
+  useEffect(() => {
+    const runId = journalRunState.run?.id;
+    const localGuidePreparing = (
+      run.source === "live"
+      && run.runId === runId
+      && run.status === RUN_STATUS.PREPARING_GUIDES
+    );
+    if (
+      !runId
+      || (!localGuidePreparing && [
+        "review_ready",
+        "guide_ready",
+        "reading",
+        "draft_ready",
+        "awaiting_approval",
+        "partial",
+        "manual_action_required",
+        "reading_ready",
+        "completed",
+        "completed_no_write",
+        "failed",
+      ].includes(journalRunState.run.status))
+    ) return undefined;
+
+    const controller = new AbortController();
+    let requestActive = false;
+    const poll = async () => {
+      if (requestActive) return;
+      requestActive = true;
+      try {
+        const nextRun = await fetchJournalRun(runId, { signal: controller.signal });
+        syncJournalRun(nextRun);
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setJournalRunState((current) => ({
+          status: "error",
+          run: current.run,
+          error: error.message,
+        }));
+      } finally {
+        requestActive = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 1800);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [
+    journalRunState.run?.id,
+    journalRunState.run?.status,
+    run.runId,
+    run.source,
+    run.status,
+    syncJournalRun,
+  ]);
+
+  const zoteroProposalRestoreKey = [
+    journalRunState.run?.id,
+    journalRunState.run?.zotero?.proposalId,
+    journalRunState.run?.status,
+  ].join(":");
+
+  useEffect(() => {
+    const currentRun = journalRunState.run;
+    if (
+      !currentRun?.id
+      || !currentRun.zotero?.proposalId
+      || currentRun.zotero.proposals?.length > 0
+      || ![
+        "awaiting_approval",
+        "partial",
+        "manual_action_required",
+        "reading_ready",
+      ].includes(currentRun.status)
+    ) return undefined;
+    const controller = new AbortController();
+    fetchZoteroProposal(currentRun.id, { signal: controller.signal })
+      .then((proposal) => syncJournalRun(mergeZoteroProposal(currentRun, proposal)))
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        setZoteroUiState((state) => ({
+          ...state,
+          runId: currentRun.id,
+          error: error.message,
+        }));
+      });
+    return () => controller.abort();
+  }, [syncJournalRun, zoteroProposalRestoreKey]);
+
+  const readyGuideKey = useMemo(() => {
+    const liveRun = journalRunState.run;
+    if (!liveRun?.id) return "";
+    return JSON.stringify((liveRun.guides?.requestedPaperIds ?? [])
+      .filter((paperId) => liveRun.guides?.papers?.[paperId]?.status === "ready")
+      .sort()
+      .map((paperId) => ({
+        paperId,
+        documentRevision: liveRun.guides?.papers?.[paperId]?.documentRevision ?? null,
+        promptVersion: liveRun.guides?.papers?.[paperId]?.promptVersion ?? null,
+        inputHash: liveRun.guides?.papers?.[paperId]?.inputHash ?? null,
+      })));
+  }, [journalRunState.run]);
+
+  useEffect(() => {
+    const runId = journalRunState.run?.id;
+    const readyGuides = readyGuideKey ? JSON.parse(readyGuideKey) : [];
+    if (!runId || readyGuides.length === 0) return undefined;
+    const refreshIds = readyGuides
+      .filter((guideReference) => journalGuideNeedsRefresh(
+        guideState.byPaperId[guideReference.paperId],
+        guideReference,
+      ))
+      .map(({ paperId }) => paperId);
+    if (refreshIds.length === 0) return undefined;
+    const controller = new AbortController();
+    Promise.allSettled(refreshIds.map(async (paperId) => ({
+      paperId,
+      guide: await fetchJournalPaperGuide(runId, paperId, { signal: controller.signal }),
+    }))).then((results) => {
+      if (controller.signal.aborted) return;
+      setGuideState((current) => {
+        if (current.runId !== runId) return current;
+        const byPaperId = { ...current.byPaperId };
+        const errorsByPaperId = { ...current.errorsByPaperId };
+        results.forEach((result, index) => {
+          const paperId = refreshIds[index];
+          if (result.status === "fulfilled") {
+            byPaperId[paperId] = result.value.guide;
+            delete errorsByPaperId[paperId];
+          } else {
+            errorsByPaperId[paperId] = result.reason?.message ?? "无法读取五分钟导读";
+          }
+        });
+        return {
+          ...current,
+          byPaperId,
+          errorsByPaperId,
+          error: Object.keys(errorsByPaperId).length > 0 ? "部分导读暂时无法读取" : null,
+        };
+      });
+    });
+    return () => controller.abort();
+  }, [guideState.byPaperId, journalRunState.run?.id, readyGuideKey]);
+
+  const generateCandidateSummaries = useCallback(() => {
+    if (run.status !== RUN_STATUS.REVIEW_READY) return;
+    if (providerCatalog.status === "error" || !selectedProvider?.available || !selectedModel) {
+      setCandidateSummaryState({
+        ...createLoadingSummaryState(),
+        status: "fallback",
+        error: providerCatalog.error ?? "当前没有可用的模型服务商",
+        errorCode: "MODEL_PROVIDER_UNAVAILABLE",
+      });
+      return;
+    }
+
+    candidateRequestController.current?.abort();
+    const controller = new AbortController();
+    candidateRequestController.current = controller;
+    setCandidateSummaryState(createLoadingSummaryState());
+    fetchCandidateSummaries({
+      runId: run.runId,
+      papers: workflowFixture.papers.slice(0, 5),
+      providerId: selectedProvider.id,
+      modelId: selectedModel,
+      signal: controller.signal,
+    }).then((result) => {
+      setCandidateSummaryState({
+        status: "ready",
+        source: result.source === "coalesced" ? "model" : result.source,
+        providerId: result.providerId,
+        modelId: getModelDisplayName(result.modelId),
+        items: result.items,
+        error: null,
+        errorCode: null,
+        retryable: false,
+      });
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      setCandidateSummaryState({
+        status: "fallback",
+        source: "fixture",
+        providerId: selectedProvider.id,
+        modelId: null,
+        items: [],
+        error: error.message,
+        errorCode: error.code ?? null,
+        retryable: Boolean(error.retryable),
+      });
+    }).finally(() => {
+      if (candidateRequestController.current === controller) candidateRequestController.current = null;
+    });
+  }, [
+    providerCatalog.error,
+    providerCatalog.status,
+    run.runId,
+    run.status,
+    selectedModel,
+    selectedProvider?.available,
+    selectedProvider?.id,
+  ]);
+
+  const startWeeklyJournalScan = useCallback(async () => {
+    journalStartController.current?.abort();
+    const controller = new AbortController();
+    journalStartController.current = controller;
+    setReaderTarget(null);
+    setGuideState(createIdleGuideState());
+    setJournalRunState({
+      status: "starting",
+      run: null,
+      error: null,
+    });
+    try {
+      const nextRun = await startJournalRun({
+        providerId: selectedProvider?.id,
+        modelId: selectedModel,
+        signal: controller.signal,
+      });
+      syncJournalRun(nextRun);
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      setJournalRunState({
+        status: "error",
+        run: null,
+        error: error.message,
+      });
+    } finally {
+      if (journalStartController.current === controller) journalStartController.current = null;
+    }
+  }, [selectedModel, selectedProvider?.id, syncJournalRun]);
+
+  const resumeCurrentJournalRun = useCallback(async () => {
+    const runId = journalRunState.run?.id;
+    if (!runId) return;
+    journalStartController.current?.abort();
+    const controller = new AbortController();
+    journalStartController.current = controller;
+    try {
+      const nextRun = await resumeJournalRun(runId, { signal: controller.signal });
+      syncJournalRun(nextRun);
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      setJournalRunState((current) => ({
+        status: "error",
+        run: current.run,
+        error: error.message,
+      }));
+    } finally {
+      if (journalStartController.current === controller) {
+        journalStartController.current = null;
+      }
+    }
+  }, [journalRunState.run?.id, syncJournalRun]);
+
+  useEffect(() => {
+    if (journalRunState.run?.status !== "committing") return;
+    void resumeCurrentJournalRun();
+  }, [journalRunState.run?.status, resumeCurrentJournalRun]);
+
+  const openJournalPaper = useCallback((paperId, blockId = null, purpose = "document") => {
+    const liveRun = journalRunState.run;
+    const paper = liveRun?.candidates?.find((candidate) => candidate.id === paperId);
+    if (!liveRun?.id || paper?.mineruStatus !== "ready") return;
+    setReaderContext(null);
+    setReaderSelectionState({ reference: null, error: null });
+    setContextRailView(purpose === "close-reading" ? "agent" : "evidence");
+    if (purpose === "close-reading") setContextRailOpen(true);
+    setReaderTarget({ runId: liveRun.id, paperId, blockId, purpose });
+    setActiveConversationId(`paper:${paperId}`);
+    setMobileView("run");
+  }, [journalRunState.run, setActiveConversationId]);
+
+  const closeJournalPaper = useCallback(() => {
+    setReaderTarget(null);
+    setReaderContext(null);
+    setReaderSelectionState({ reference: null, error: null });
+    setContextRailView("evidence");
+    setActiveConversationId("workflow-run");
+    setMobileView("run");
+  }, [setActiveConversationId]);
+
+  const chooseGuideAction = useCallback(async (paperId, choice) => {
+    if (run.source !== "live") {
+      dispatch({ type: RUN_ACTIONS.CHOOSE_GUIDE_ACTION, paperId, choice });
+      return;
+    }
+    const runId = journalRunState.run?.id;
+    if (!runId || !run.preparedGuideIds.includes(paperId)) return;
+    journalDecisionController.current?.abort();
+    const controller = new AbortController();
+    journalDecisionController.current = controller;
+    try {
+      const decisions = { ...run.guideChoices, [paperId]: choice };
+      const nextRun = await saveJournalPaperDecisions({
+        runId,
+        decisions,
+        signal: controller.signal,
+      });
+      syncJournalRun(nextRun);
+      if (nextRun.status === "reading") {
+        const firstReadingPaperId = nextRun.guides.requestedPaperIds.find(
+          (candidateId) => nextRun.paperDecisions?.[candidateId] === "read",
+        );
+        if (firstReadingPaperId) {
+          setReaderContext(null);
+          setReaderSelectionState({ reference: null, error: null });
+          setContextRailView("agent");
+          setContextRailOpen(true);
+          setReaderTarget({
+            runId,
+            paperId: firstReadingPaperId,
+            blockId: null,
+            purpose: "close-reading",
+          });
+        }
+      }
+      showToast(
+        nextRun.status === "draft_ready"
+          ? "阅读决定已保存，可以生成归档预览"
+          : choice === "read"
+            ? "已加入研读"
+            : "已设为只收藏导读",
+      );
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      showToast(error.message, "warning");
+    } finally {
+      if (journalDecisionController.current === controller) {
+        journalDecisionController.current = null;
+      }
+    }
+  }, [
+    journalRunState.run?.id,
+    run.guideChoices,
+    run.preparedGuideIds,
+    run.source,
+    showToast,
+    syncJournalRun,
+  ]);
+
+  const restartCurrentReadingFromGuide = useCallback(async () => {
+    const runId = journalRunState.run?.id;
+    if (!runId || run.source !== "live") return null;
+    journalRestartController.current?.abort();
+    const controller = new AbortController();
+    journalRestartController.current = controller;
+    try {
+      const nextRun = await restartJournalReadingFromGuide({
+        runId,
+        signal: controller.signal,
+      });
+      setReaderTarget(null);
+      setReaderContext(null);
+      setReaderSelectionState({ reference: null, error: null });
+      setContextRailView("evidence");
+      setActiveConversationId("workflow-run");
+      autoOpenedReaderKeyRef.current = null;
+      setZoteroUiState(createIdleZoteroUiState());
+      setObsidianUiState(createIdleObsidianUiState(runId));
+      setProjectStateUiState(createIdleProjectStateUiState(runId));
+      syncJournalRun(nextRun);
+      showToast("已返回本周推荐文章，可以重新选择要研读的论文");
+      return nextRun;
+    } catch (error) {
+      if (controller.signal.aborted) return null;
+      throw error;
+    } finally {
+      if (journalRestartController.current === controller) {
+        journalRestartController.current = null;
+      }
+    }
+  }, [
+    journalRunState.run?.id,
+    run.source,
+    setActiveConversationId,
+    showToast,
+    syncJournalRun,
+  ]);
+
+  const refreshReadingRun = useCallback(async () => {
+    const runId = journalRunState.run?.id;
+    if (!runId) return;
+    try {
+      syncJournalRun(await fetchJournalRun(runId));
+    } catch (error) {
+      showToast(error.message, "warning");
+    }
+  }, [journalRunState.run?.id, showToast, syncJournalRun]);
+
+  const publishReaderReading = useCallback((nextReading) => {
+    const actionChanged = readingAgentActionRevision(readerContext?.reading)
+      !== readingAgentActionRevision(nextReading);
+    if (actionChanged) {
+      setObsidianUiState((current) => (
+        current.runId === nextReading?.runId
+        && ["loading", "ready"].includes(current.status)
+          ? {
+              runId: nextReading.runId,
+              status: "error",
+              preview: null,
+              error: "Agent 笔记已变化，请重新生成 Obsidian 精确预览。",
+            }
+          : current
+      ));
+    }
+    setReaderContext((current) => (
+      current
+      && current.runId === nextReading?.runId
+      && current.paperId === nextReading?.paperId
+        ? { ...current, reading: nextReading }
+        : current
+    ));
+    void refreshReadingRun();
+  }, [readerContext?.reading, refreshReadingRun]);
+
+  const openReaderBlock = useCallback((blockId) => {
+    if (!blockId) return;
+    setReaderTarget((current) => (
+      current ? { ...current, blockId } : current
+    ));
+    if (window.matchMedia?.("(max-width: 860px)").matches) {
+      setMobileView("run");
+    }
+  }, []);
+
+  const updateReaderSelection = useCallback((nextSelection) => {
+    setReaderSelectionState(nextSelection);
+    if (!nextSelection?.reference && !nextSelection?.error) return;
+    setContextRailOpen(true);
+    setContextRailView("agent");
+    if (window.matchMedia?.("(max-width: 860px)").matches) {
+      setMobileView("evidence");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (readerTarget) return;
+    setReaderContext(null);
+    setReaderSelectionState({ reference: null, error: null });
+    setContextRailView((current) => (
+      ["agent", "notes"].includes(current) ? "evidence" : current
+    ));
+  }, [readerTarget]);
+
+  useEffect(() => {
+    const liveRun = journalRunState.run;
+    if (projectWorkMode || !liveRun?.id || readerTarget || run.source !== "live") return;
+    if (!["guide_ready", "reading"].includes(liveRun.status)) return;
+    const openKey = `${liveRun.id}:${liveRun.status}`;
+    if (autoOpenedReaderKeyRef.current === openKey) return;
+
+    let paperId = null;
+    let blockId = null;
+    let purpose = "orientation";
+    if (liveRun.status === "guide_ready") {
+      paperId = (liveRun.guides?.requestedPaperIds ?? []).find((candidateId) => (
+        liveRun.guides?.papers?.[candidateId]?.status === "ready"
+      ));
+    } else {
+      purpose = "close-reading";
+      paperId = (liveRun.readings?.paperIds ?? []).find((candidateId) => (
+        liveRun.paperDecisions?.[candidateId] === "read"
+      )) ?? Object.entries(liveRun.paperDecisions ?? {})
+        .find(([, decision]) => decision === "read")?.[0];
+      blockId = liveRun.readings?.papers?.[paperId]?.position?.blockId ?? null;
+    }
+    if (!paperId) return;
+    autoOpenedReaderKeyRef.current = openKey;
+    openJournalPaper(paperId, blockId, purpose);
+  }, [journalRunState.run, openJournalPaper, projectWorkMode, readerTarget, run.source]);
+
+  const prepareGuides = useCallback(async () => {
+    if (run.source !== "live") {
+      dispatch({ type: RUN_ACTIONS.PREPARE_GUIDES });
+      return;
+    }
+    const liveRun = journalRunState.run;
+    if (
+      !liveRun?.id
+      || ![RUN_STATUS.REVIEW_READY, RUN_STATUS.GUIDE_READY].includes(run.status)
+      || run.selectedPaperIds.length === 0
+    ) return;
+    if (!selectedProvider?.available || !selectedModel) {
+      showToast("当前没有可用模型，无法生成五分钟导读", "warning");
+      return;
+    }
+
+    journalGuideController.current?.abort();
+    const controller = new AbortController();
+    journalGuideController.current = controller;
+    dispatch({ type: RUN_ACTIONS.PREPARE_GUIDES });
+    setGuideState((current) => ({
+      ...(current.runId === liveRun.id ? current : createIdleGuideState(liveRun.id)),
+      status: "submitting",
+      error: null,
+    }));
+    try {
+      const nextRun = await startJournalGuides({
+        runId: liveRun.id,
+        paperIds: run.selectedPaperIds,
+        providerId: selectedProvider.id,
+        modelId: selectedModel,
+        signal: controller.signal,
+      });
+      syncJournalRun(nextRun);
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      dispatch({ type: RUN_ACTIONS.GUIDES_FAILED, error: error.message });
+      setGuideState((current) => ({
+        ...current,
+        status: "error",
+        error: error.message,
+      }));
+    } finally {
+      if (journalGuideController.current === controller) {
+        journalGuideController.current = null;
+      }
+    }
+  }, [
+    journalRunState.run,
+    run.selectedPaperIds,
+    run.source,
+    run.status,
+    selectedModel,
+    selectedProvider?.available,
+    selectedProvider?.id,
+    showToast,
+    syncJournalRun,
+  ]);
+
+  const generateWritePreview = useCallback(async () => {
+    if (run.source !== "live") {
+      dispatch({ type: RUN_ACTIONS.GENERATE_PREVIEW });
+      return;
+    }
+    const runId = journalRunState.run?.id;
+    const targetId = zoteroUiState.selectedTargetId;
+    if (!runId || !liveZoteroDecisionsReady || !targetId) {
+      setZoteroUiState((current) => ({
+        ...current,
+        error: "请先明确选择一个 Zotero collection",
+      }));
+      return;
+    }
+    const decisions = Object.fromEntries(
+      run.preparedGuideIds.map((paperId) => [paperId, run.guideChoices[paperId]]),
+    );
+    const requiresObsidian = Object.values(decisions).includes("read");
+    zoteroActionController.current?.abort();
+    const controller = new AbortController();
+    zoteroActionController.current = controller;
+    setZoteroUiState((current) => ({
+      ...current,
+      proposalPending: true,
+      error: null,
+    }));
+    setObsidianUiState({
+      runId,
+      status: requiresObsidian ? "loading" : "not_required",
+      preview: null,
+      error: null,
+    });
+    setProjectStateUiState({
+      runId,
+      status: requiresObsidian ? "idle" : "not_required",
+      preview: null,
+      error: null,
+    });
+    let previewStep = requiresObsidian ? "obsidian" : "zotero";
+    try {
+      if (requiresObsidian) {
+        const preview = await createObsidianPreview({
+          runId,
+          signal: controller.signal,
+        });
+        setObsidianUiState({
+          runId,
+          status: "ready",
+          preview,
+          error: null,
+        });
+        previewStep = "project_state";
+        setProjectStateUiState({
+          runId,
+          status: "loading",
+          preview: null,
+          error: null,
+        });
+        try {
+          const projectStatePreview = await createProjectStatePreview({
+            runId,
+            signal: controller.signal,
+          });
+          setProjectStateUiState({
+            runId,
+            status: "ready",
+            preview: projectStatePreview,
+            error: null,
+          });
+        } catch (error) {
+          if (error.code !== "PROJECT_STATE_NOT_REQUIRED") throw error;
+          setProjectStateUiState({
+            runId,
+            status: "not_required",
+            preview: null,
+            error: null,
+          });
+        }
+        previewStep = "zotero";
+      }
+      await createZoteroProposal({
+        runId,
+        decisions,
+        targetId,
+        signal: controller.signal,
+      });
+      const [proposal, nextRun] = await Promise.all([
+        fetchZoteroProposal(runId, { signal: controller.signal }),
+        fetchJournalRun(runId, { signal: controller.signal }),
+      ]);
+      syncJournalRun(mergeZoteroProposal(nextRun, proposal));
+      showToast(requiresObsidian
+        ? "Obsidian、项目状态与 Zotero 精确预览已生成，请逐项核对"
+        : "Zotero 精确预览已生成，请逐篇核对");
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      if (previewStep === "obsidian") {
+        setObsidianUiState({
+          runId,
+          status: "error",
+          preview: null,
+          error: error.message,
+        });
+      } else if (previewStep === "project_state") {
+        setProjectStateUiState({
+          runId,
+          status: "error",
+          preview: null,
+          error: error.message,
+        });
+      } else {
+        setZoteroUiState((current) => ({
+          ...current,
+          error: error.message,
+        }));
+      }
+    } finally {
+      if (zoteroActionController.current === controller) {
+        zoteroActionController.current = null;
+        setZoteroUiState((current) => ({
+          ...current,
+          proposalPending: false,
+        }));
+      }
+    }
+  }, [
+    journalRunState.run?.id,
+    liveZoteroDecisionsReady,
+    run.guideChoices,
+    run.preparedGuideIds,
+    run.source,
+    showToast,
+    syncJournalRun,
+    zoteroUiState.selectedTargetId,
+  ]);
+
+  const commitWritePreview = useCallback(async ({ simulateObsidianFailure = false, retry = false } = {}) => {
+    if (run.source !== "live") {
+      dispatch({
+        type: retry ? RUN_ACTIONS.RETRY_FAILED : RUN_ACTIONS.COMMIT,
+        simulateObsidianFailure,
+      });
+      return;
+    }
+    if (Object.values(run.guideChoices).includes("read")) {
+      setZoteroUiState((current) => ({
+        ...current,
+        error: "本轮包含精读论文；Obsidian 与项目状态目前只完成了精确预览，联合写入尚未启用。",
+      }));
+      return;
+    }
+    const runId = journalRunState.run?.id;
+    const operations = selectZoteroCommitOperations(run.proposals, { retry });
+    if (!runId || !run.zoteroProposalHash || operations.length === 0) {
+      setZoteroUiState((current) => ({
+        ...current,
+        error: "当前没有可确认的 Zotero 写入项",
+      }));
+      return;
+    }
+    zoteroActionController.current?.abort();
+    const controller = new AbortController();
+    zoteroActionController.current = controller;
+    setZoteroUiState((current) => ({
+      ...current,
+      commitPending: true,
+      error: null,
+    }));
+    try {
+      const nextRun = await commitZoteroProposal({
+        runId,
+        proposalHash: run.zoteroProposalHash,
+        operations,
+        signal: controller.signal,
+      });
+      syncJournalRun(nextRun);
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      setZoteroUiState((current) => ({
+        ...current,
+        error: error.message,
+      }));
+    } finally {
+      if (zoteroActionController.current === controller) {
+        zoteroActionController.current = null;
+        setZoteroUiState((current) => ({
+          ...current,
+          commitPending: false,
+        }));
+      }
+    }
+  }, [
+    journalRunState.run?.id,
+    run.guideChoices,
+    run.proposals,
+    run.source,
+    run.zoteroProposalHash,
+    syncJournalRun,
+  ]);
+
+  useEffect(() => {
+    if (run.source === "fixture" && run.status === RUN_STATUS.PREPARING_GUIDES) {
       const timer = window.setTimeout(() => dispatch({ type: RUN_ACTIONS.GUIDES_READY }), 850);
       return () => window.clearTimeout(timer);
     }
-    if (run.status === RUN_STATUS.COMMITTING) {
+    if (run.source === "fixture" && run.status === RUN_STATUS.COMMITTING) {
       const action = run.isRetrying ? RUN_ACTIONS.RETRY_RESULT : RUN_ACTIONS.COMMIT_RESULT;
       const timer = window.setTimeout(() => dispatch({ type: action }), 900);
       return () => window.clearTimeout(timer);
     }
     return undefined;
-  }, [run.status, run.isRetrying]);
+  }, [run.source, run.status, run.isRetrying]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -188,9 +1964,40 @@ export function App() {
   }, []);
 
   const selectProvider = (providerId) => {
-    const nextProvider = providers.find((item) => item.id === providerId) ?? providers[0];
+    const nextProvider = catalogProviders.find((item) => item.id === providerId && item.available);
+    if (!nextProvider) return;
+    if (nextProvider.id === selectedProvider.id && nextProvider.models[0] === selectedModel) return;
+    candidateRequestController.current?.abort();
+    setCandidateSummaryState(createIdleSummaryState());
     setProviderConfig({ providerId: nextProvider.id, model: nextProvider.models[0] });
-    showToast(`已切换到 ${nextProvider.name}（演示配置）`);
+    showToast(`已切换到 ${nextProvider.name} · 点击更新候选说明`);
+  };
+
+  const selectModel = (model) => {
+    if (!selectedProvider?.available || !selectedProvider.models.includes(model)) return;
+    if (model === selectedModel) return;
+    candidateRequestController.current?.abort();
+    setCandidateSummaryState(createIdleSummaryState());
+    setProviderConfig({ providerId: selectedProvider.id, model });
+  };
+
+  const selectProjectWorkProvider = (providerId) => {
+    const nextProvider = projectWorkProviders.find(
+      (item) => item.id === providerId && item.available,
+    );
+    if (!nextProvider) return;
+    setProjectWorkProviderConfig({
+      providerId: nextProvider.id,
+      model: nextProvider.models[0] ?? "",
+    });
+  };
+
+  const selectProjectWorkModel = (model) => {
+    if (!selectedProjectWorkProvider?.models.includes(model)) return;
+    setProjectWorkProviderConfig({
+      providerId: selectedProjectWorkProvider.id,
+      model,
+    });
   };
 
   const openQuickSettings = () => {
@@ -224,7 +2031,7 @@ export function App() {
         [skillId]: { installed: true, enabled: true },
       }));
       setInstallingSkillId(null);
-      showToast("能力包已在本地演示中启用");
+      showToast("能力包已启用");
     }, 700);
   };
 
@@ -245,37 +2052,264 @@ export function App() {
     anchor.click();
     anchor.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    showToast("本轮演示记录已导出为 Markdown");
+    showToast("本轮运行记录已导出为 Markdown");
   };
 
   const dispatchAction = (type, payload = {}) => dispatch({ type, ...payload });
 
-  const gridColumns = `${sidebarOpen ? 240 : 0}px minmax(0, 1fr) ${contextRailOpen ? rightRailWidth : 0}px`;
+  const createWorkConversation = async (projectId) => {
+    if (!projectId) return null;
+    setLiveProjectWork((current) => ({
+      ...current,
+      status: "loading",
+      error: null,
+    }));
+    try {
+      const created = await projectWorkApi.createConversation({
+        projectId,
+        providerId: selectedProjectWorkProvider?.id,
+        modelId: selectedProjectWorkModel || undefined,
+      });
+      await loadLiveProjectWork({
+        preferredProjectId: projectId,
+        preferredConversationId: created.id,
+      });
+      return created.id;
+    } catch (error) {
+      setLiveProjectWork((current) => ({
+        ...current,
+        status: "error",
+        error,
+      }));
+      showToast(error.message || "无法新建工作会话", "warning");
+      return null;
+    }
+  };
+
+  const selectWorkspaceKind = (nextKind) => {
+    if (!["project_work", "paper_reading"].includes(nextKind) || nextKind === workspaceKind) {
+      return;
+    }
+    setWorkspaceKind(nextKind);
+    setProjectQuery("");
+    const savedSelection = workspaceSelection?.[nextKind];
+    if (nextKind === "paper_reading") {
+      const nextProject = allProjects.find(
+        (item) => item.id === savedSelection?.projectId && item.workspaceKinds.includes(nextKind),
+      ) ?? allProjects.find((item) => item.workspaceKinds.includes(nextKind));
+      if (nextProject) setSelectedProjectId(nextProject.id);
+      const savedPaperConversation = paperConversations.find(
+        (conversation) => conversation.id === savedSelection?.conversationId
+          && conversation.kind === "paper_reading"
+          && conversation.projectId === nextProject?.id,
+      );
+      setActiveConversationId(
+        savedPaperConversation && readerPaper
+          ? savedPaperConversation.id
+          : "workflow-run",
+      );
+      setMobileView("run");
+      return;
+    }
+
+    const nextProject = liveProjectWork.projects.find(
+      (item) => item.id === savedSelection?.projectId,
+    ) ?? liveProjectWork.projects[0];
+    if (!nextProject) {
+      setSelectedProjectId("");
+      setActiveConversationId("");
+      setMobileView("agent");
+      return;
+    }
+    selectLiveProject(nextProject.id, savedSelection?.conversationId);
+  };
+
+  const addProject = async (nextProject) => {
+    if (!nextProject?.id || !nextProject?.name || !nextProject?.rootLabel) return;
+    if (workspaceKind === "project_work") {
+      const projectRecord = {
+        ...nextProject,
+        conversationCount: nextProject.conversationCount ?? 0,
+      };
+      const conversationId = await createWorkConversation(projectRecord.id);
+      if (!conversationId) throw new Error("项目已绑定，但工作会话创建失败");
+      showToast("已绑定本地项目并创建工作会话");
+      return;
+    }
+    const projectRecord = {
+      ...nextProject,
+      workspaceKinds: Array.from(new Set([
+        ...(nextProject.workspaceKinds ?? []),
+        workspaceKind,
+      ])),
+      seeded: false,
+      updated: nextProject.updated ?? "刚刚",
+    };
+    setRegisteredProjects((current) => {
+      const projects = Array.isArray(current) ? current : [];
+      const existing = projects.find((item) => item.id === projectRecord.id);
+      if (!existing) return [...projects, projectRecord];
+      return projects.map((item) => item.id === projectRecord.id
+        ? {
+          ...item,
+          ...projectRecord,
+          workspaceKinds: Array.from(new Set([
+            ...(item.workspaceKinds ?? []),
+            workspaceKind,
+          ])),
+        }
+        : item);
+    });
+    setSelectedProjectId(projectRecord.id);
+    setActiveConversationId("workflow-run");
+    setMobileView("run");
+    showToast(`已添加到${workspaceKind === "paper_reading" ? "论文精读" : "正常工作"}`);
+  };
+
+  const removeProject = async (projectId) => {
+    if (workspaceKind === "project_work") {
+      const target = liveProjectWork.projects.find((item) => item.id === projectId);
+      const confirmed = window.confirm(
+        `解绑“${target?.name ?? "这个项目"}”会移除 Pi Agent 中的工作会话和快照，但不会删除本地文件。是否继续？`,
+      );
+      if (!confirmed) return;
+      try {
+        await projectWorkApi.removeProject({ projectId });
+        const savedSelection = workspaceSelection?.project_work;
+        await loadLiveProjectWork({
+          preferredProjectId: savedSelection?.projectId === projectId
+            ? undefined
+            : savedSelection?.projectId,
+          preferredConversationId: savedSelection?.projectId === projectId
+            ? undefined
+            : savedSelection?.conversationId,
+        });
+        showToast("已解绑项目；本地文件未删除");
+      } catch (error) {
+        showToast(error.message || "无法解绑项目", "warning");
+      }
+      return;
+    }
+    const targetProject = registeredProjectItems.find((item) => item.id === projectId);
+    if (!targetProject) return;
+    setRegisteredProjects((current) => (Array.isArray(current) ? current : [])
+      .map((item) => item.id === projectId
+        ? {
+          ...item,
+          workspaceKinds: item.workspaceKinds.filter((kind) => kind !== workspaceKind),
+        }
+        : item)
+      .filter((item) => item.workspaceKinds.length > 0));
+    const fallbackProject = BASE_PROJECTS.find(
+      (item) => item.workspaceKinds.includes(workspaceKind),
+    );
+    if (fallbackProject) {
+      setSelectedProjectId(fallbackProject.id);
+      setActiveConversationId("workflow-run");
+      setMobileView("run");
+    }
+    showToast("已从论文精读移除；本地文件未删除");
+  };
+
+  const artifactMode = readingMode || projectWorkMode;
+  const gridColumns = artifactMode
+    ? `${sidebarOpen ? leftRailWidth : 0}px minmax(0, 1fr)`
+    : `${sidebarOpen ? leftRailWidth : 0}px minmax(0, 1fr) ${contextRailOpen ? rightRailWidth : 0}px`;
 
   return (
     <div className="app-shell">
       <div
-        className={`app-body${sidebarOpen ? "" : " no-sidebar"}${contextRailOpen ? "" : " no-context"}${isResizing ? " is-resizing-active" : ""}`}
+        className={`app-body${sidebarOpen ? "" : " no-sidebar"}${!artifactMode && !contextRailOpen ? " no-context" : ""}${artifactMode ? " is-artifact-mode" : ""}${isResizing ? " is-resizing-active" : ""}`}
         style={{ gridTemplateColumns: gridColumns }}
       >
         <ProjectRail
-          projects={projects}
+          projects={projectItems}
           selectedId={project.id}
           onSelect={(projectId) => {
-            setSelectedProjectId(projectId);
-            setMobileView("run");
+            if (workspaceKind === "paper_reading") {
+              setSelectedProjectId(projectId);
+              setActiveConversationId(
+                readerPaper && projectId === workflowFixture.project.id
+                  ? paperConversationId
+                  : "workflow-run",
+              );
+              setMobileView("run");
+              return;
+            }
+            if (projectId === selectedProjectId) return;
+            const savedConversationId = workspaceSelection?.project_work?.projectId === projectId
+              ? workspaceSelection.project_work.conversationId
+              : undefined;
+            selectLiveProject(projectId, savedConversationId);
           }}
+          conversations={visibleConversations}
+          selectedConversationId={projectWorkMode
+            ? activeProjectWorkState?.id ?? null
+            : readingMode
+              ? paperConversationId
+              : null}
+          onSelectConversation={(conversationId) => {
+            if (projectWorkMode) {
+              if (conversationId !== activeProjectWorkState?.id) {
+                selectLiveConversation(conversationId);
+              }
+              return;
+            }
+            if (readerPaper && conversationId === paperConversationId) {
+              setActiveConversationId(conversationId);
+              setMobileView("run");
+              return;
+            }
+            setActiveConversationId("workflow-run");
+            setMobileView("run");
+            showToast("请先从本周 Run 选择一篇已解析论文", "warning");
+          }}
+          onNewConversation={(projectId) => {
+            if (workspaceKind === "project_work") {
+              createWorkConversation(projectId).then((conversationId) => {
+                if (conversationId) showToast("正常工作会话已创建");
+              });
+              return;
+            }
+            setSelectedProjectId(projectId);
+            setActiveConversationId(
+              readerPaper && projectId === workflowFixture.project.id
+                ? paperConversationId
+                : "workflow-run",
+            );
+            setMobileView("run");
+            showToast(
+              projectId === workflowFixture.project.id
+                ? "请从本周追踪选择要精读的论文"
+                : "该项目尚未设置论文追踪",
+              "warning",
+            );
+          }}
+          workspaceKind={workspaceKind}
+          onWorkspaceKindChange={selectWorkspaceKind}
           query={projectQuery}
           onQueryChange={setProjectQuery}
-          onAddProject={() => showToast("正式版将在这里绑定本地项目；当前原型不会读取真实文件", "warning")}
+          onAddProject={() => setBindProjectOpen(true)}
+          onRemoveProject={removeProject}
           onOpenSettings={openQuickSettings}
           settingsOpen={Boolean(settingsView)}
           mobileActive={mobileView === "projects"}
-          activeRun={activeRun}
-          onSelectRun={() => setMobileView("run")}
-          providers={providers}
+          activeRun={workspaceKind === "paper_reading"
+            && project.id === workflowFixture.project.id
+            ? activeRun
+            : null}
+          selectedRunId={workspaceKind === "paper_reading"
+            && workflowMode
+            && project.id === workflowFixture.project.id
+            ? activeRun.id
+            : null}
+          onSelectRun={() => {
+            setActiveConversationId("workflow-run");
+            setMobileView("run");
+          }}
+          providers={catalogProviders}
           providerId={selectedProvider.id}
-          model={providerConfig.model}
+          model={selectedModel}
           providerOpen={providerOpen}
           onProviderOpenChange={(open) => {
             setProviderOpen(open);
@@ -285,7 +2319,7 @@ export function App() {
             }
           }}
           onProviderChange={selectProvider}
-          onModelChange={(model) => setProviderConfig((current) => ({ ...current, model }))}
+          onModelChange={selectModel}
           onOpenSkills={() => {
             setProviderOpen(false);
             setSettingsView(null);
@@ -293,23 +2327,136 @@ export function App() {
           }}
           installedSkillCount={installedSkillCount}
           sidebarOpen={sidebarOpen}
-          onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
+          onMouseDownResizer={startResizing("left")}
+          isResizing={resizingSide === "left"}
         />
 
+        {projectWorkMode ? (
+          <LiveProjectWorkbench
+            key={activeProjectWorkState?.id ?? project.id ?? "empty-project-workbench"}
+            project={project}
+            conversation={activeProjectWorkState}
+            providers={projectWorkProviders}
+            providerId={selectedProjectWorkProvider?.id}
+            modelId={selectedProjectWorkModel}
+            providerOpen={providerOpen}
+            onProviderOpenChange={(open) => {
+              setProviderOpen(open);
+              if (open) {
+                setSettingsView(null);
+                setSkillCenterOpen(false);
+              }
+            }}
+            onProviderChange={selectProjectWorkProvider}
+            onModelChange={selectProjectWorkModel}
+            onOpenSkills={() => {
+              setProviderOpen(false);
+              setSettingsView(null);
+              setSkillCenterOpen(true);
+            }}
+            installedSkillCount={installedSkillCount}
+            sidebarOpen={sidebarOpen}
+            onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
+            onConversationChange={updateLiveConversation}
+            onError={handleProjectWorkError}
+          />
+        ) : readingMode ? (
+          <ReadingWorkbench
+            readerTarget={readerTarget}
+            readerPaper={readerPaper}
+            readerGuide={readerGuide}
+            readerPeerPapers={readerPeerPapers}
+            readerContext={readerContext}
+            readerSelectionState={readerSelectionState}
+            providers={catalogProviders}
+            providerId={selectedProvider?.id}
+            modelId={selectedModel}
+            readingProviderId={selectedProvider?.id}
+            readingModelId={selectedModel}
+            projectContextState={projectContextState}
+            onReloadProjectContext={loadProjectContext}
+            onSwitchPaper={(paperId) => openJournalPaper(
+              paperId,
+              readerTarget?.purpose === "close-reading"
+                ? journalRunState.run?.readings?.papers?.[paperId]?.position?.blockId ?? null
+                : null,
+              readerTarget?.purpose ?? "document",
+            )}
+            onGuideDecision={(choice) => chooseGuideAction(readerPaper.id, choice)}
+            guideDecision={run.guideChoices?.[readerPaper.id] ?? null}
+            onReaderSelectionChange={updateReaderSelection}
+            onReaderContextChange={setReaderContext}
+            onReaderReadingChange={publishReaderReading}
+            onReadingChange={refreshReadingRun}
+            onOpenReaderBlock={openReaderBlock}
+            onClose={closeJournalPaper}
+            sidebarOpen={sidebarOpen}
+            onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
+            onOpenSkills={() => {
+              setProviderOpen(false);
+              setSettingsView(null);
+              setSkillCenterOpen(true);
+            }}
+            installedSkillCount={installedSkillCount}
+            providerOpen={providerOpen}
+            onProviderOpenChange={(open) => {
+              setProviderOpen(open);
+              if (open) {
+                setSettingsView(null);
+                setSkillCenterOpen(false);
+              }
+            }}
+            onProviderChange={selectProvider}
+            onModelChange={selectModel}
+            onRestartFromGuide={readerTarget?.purpose === "close-reading" ? restartCurrentReadingFromGuide : undefined}
+            mobileActive={mobileView === "run" || mobileView === "evidence"}
+            mobileView={mobileView}
+          />
+        ) : (
+          <>
         <WorkflowWorkspace
           run={run}
+          papers={workflowPapers}
+          candidateSummaryState={candidateSummaryState}
+          onGenerateCandidateSummaries={generateCandidateSummaries}
+          journalRunState={journalRunState}
+          readerTarget={readerTarget}
+          onOpenPaper={openJournalPaper}
+          onOpenCloseReading={(paperId) => openJournalPaper(
+            paperId,
+            journalRunState.run?.readings?.papers?.[paperId]?.position?.blockId ?? null,
+            "close-reading",
+          )}
+          onCloseReader={closeJournalPaper}
+          onReaderSelectionChange={updateReaderSelection}
+          onReaderContextChange={setReaderContext}
+          onReadingChange={refreshReadingRun}
+          onStartJournalRun={startWeeklyJournalScan}
+          onRestoreJournalRuns={restoreJournalRuns}
+          onResumeJournalRun={resumeCurrentJournalRun}
+          onRestartFromGuide={restartCurrentReadingFromGuide}
+          guideState={guideState}
           onTogglePaper={(paperId) => dispatchAction(RUN_ACTIONS.TOGGLE_PAPER, { paperId })}
-          onPrepareGuides={() => dispatchAction(RUN_ACTIONS.PREPARE_GUIDES)}
+          onPrepareGuides={prepareGuides}
           onSkipRun={() => dispatchAction(RUN_ACTIONS.SKIP_RUN)}
           onSetActivePaper={(paperId) => dispatchAction(RUN_ACTIONS.SET_ACTIVE_PAPER, { paperId })}
-          onChooseGuideAction={(paperId, choice) => dispatchAction(RUN_ACTIONS.CHOOSE_GUIDE_ACTION, { paperId, choice })}
+          onChooseGuideAction={chooseGuideAction}
           onPreviousStage={() => dispatchAction(RUN_ACTIONS.PREVIOUS_READING_STAGE)}
           onNextStage={() => dispatchAction(RUN_ACTIONS.NEXT_READING_STAGE)}
           onAddQuestion={(text, paperId) => dispatchAction(RUN_ACTIONS.ADD_QUESTION, { text, paperId })}
-          onGeneratePreview={() => dispatchAction(RUN_ACTIONS.GENERATE_PREVIEW)}
+          zoteroUiState={zoteroUiState}
+          obsidianUiState={obsidianUiState}
+          projectStateUiState={projectStateUiState}
+          onSelectZoteroTarget={(targetId) => setZoteroUiState((current) => ({
+            ...current,
+            selectedTargetId: targetId,
+            error: null,
+          }))}
+          onRetryZoteroTargets={() => loadZoteroTargets(run.runId, run.zoteroTarget?.id)}
+          onGeneratePreview={generateWritePreview}
           onToggleProposal={(proposalId) => dispatchAction(RUN_ACTIONS.TOGGLE_PROPOSAL, { proposalId })}
-          onCommit={({ simulateObsidianFailure }) => dispatchAction(RUN_ACTIONS.COMMIT, { simulateObsidianFailure })}
-          onRetryFailed={() => dispatchAction(RUN_ACTIONS.RETRY_FAILED)}
+          onCommit={commitWritePreview}
+          onRetryFailed={() => commitWritePreview({ retry: true })}
           onReset={() => {
             dispatchAction(RUN_ACTIONS.RESET);
             showToast("已重置为本周待审阅状态");
@@ -319,9 +2466,9 @@ export function App() {
           onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
           contextRailOpen={contextRailOpen}
           onToggleContextRail={() => setContextRailOpen((prev) => !prev)}
-          providers={providers}
+          providers={catalogProviders}
           providerId={selectedProvider.id}
-          model={providerConfig.model}
+          model={selectedModel}
           providerOpen={providerOpen}
           onProviderOpenChange={(open) => {
             setProviderOpen(open);
@@ -331,23 +2478,41 @@ export function App() {
             }
           }}
           onProviderChange={selectProvider}
-          onModelChange={(model) => setProviderConfig((current) => ({ ...current, model }))}
+          onModelChange={selectModel}
           onOpenSkills={() => {
             setProviderOpen(false);
             setSettingsView(null);
             setSkillCenterOpen(true);
           }}
           installedSkillCount={installedSkillCount}
+          readingProviderId={selectedProvider?.id}
+          readingModelId={selectedModel}
         />
 
         <WorkflowContextRail
           run={run}
+          papers={workflowPapers}
+          preferredPaperId={readerTarget?.paperId}
           mobileActive={mobileView === "evidence"}
+          readerContext={readerContext}
+          readerSelectionState={readerSelectionState}
+          activeView={contextRailView}
+          onActiveViewChange={setContextRailView}
+          providers={catalogProviders}
+          providerId={selectedProvider?.id}
+          modelId={selectedModel}
+          projectContextState={projectContextState}
+          onReloadProjectContext={loadProjectContext}
+          onOpenReaderBlock={openReaderBlock}
+          onReaderReadingChange={publishReaderReading}
+          onReaderSelectionChange={updateReaderSelection}
           contextRailOpen={contextRailOpen}
           onToggleContextRail={() => setContextRailOpen((prev) => !prev)}
-          onMouseDownResizer={startResizing}
-          isResizing={isResizing}
+          onMouseDownResizer={startResizing("right")}
+          isResizing={resizingSide === "right"}
         />
+          </>
+        )}
       </div>
 
       <nav className="mobile-nav" aria-label="移动端主导航">
@@ -355,14 +2520,29 @@ export function App() {
           <FolderSimple size={19} weight={mobileView === "projects" ? "fill" : "regular"} aria-hidden="true" />
           项目
         </button>
-        <button className={mobileView === "run" ? "is-active" : ""} type="button" onClick={() => setMobileView("run")}>
-          <PlayCircle size={19} weight={mobileView === "run" ? "fill" : "regular"} aria-hidden="true" />
-          本轮
-        </button>
-        <button className={mobileView === "evidence" ? "is-active" : ""} type="button" onClick={() => setMobileView("evidence")}>
-          <ListChecks size={19} weight={mobileView === "evidence" ? "fill" : "regular"} aria-hidden="true" />
-          依据
-        </button>
+        {projectWorkMode ? (
+          <>
+            <button className={mobileView === "agent" ? "is-active" : ""} type="button" onClick={() => setMobileView("agent")}>
+              <ChatText size={19} weight={mobileView === "agent" ? "fill" : "regular"} aria-hidden="true" />
+              Agent
+            </button>
+            <button className={mobileView === "artifact" ? "is-active" : ""} type="button" onClick={() => setMobileView("artifact")}>
+              <Files size={19} weight={mobileView === "artifact" ? "fill" : "regular"} aria-hidden="true" />
+              工件
+            </button>
+          </>
+        ) : (
+          <>
+            <button className={mobileView === "run" ? "is-active" : ""} type="button" onClick={() => setMobileView("run")}>
+              <PlayCircle size={19} weight={mobileView === "run" ? "fill" : "regular"} aria-hidden="true" />
+              本轮
+            </button>
+            <button className={mobileView === "evidence" ? "is-active" : ""} type="button" onClick={() => setMobileView("evidence")}>
+              <ListChecks size={19} weight={mobileView === "evidence" ? "fill" : "regular"} aria-hidden="true" />
+              {readerTarget?.purpose === "close-reading" ? "Agent" : "依据"}
+            </button>
+          </>
+        )}
         <button type="button" onClick={() => {
           setProviderOpen(false);
           setSettingsView(null);
@@ -372,6 +2552,13 @@ export function App() {
           技能
         </button>
       </nav>
+
+      <BindProjectDialog
+        open={bindProjectOpen}
+        workspaceKind={workspaceKind}
+        onClose={() => setBindProjectOpen(false)}
+        onBind={addProject}
+      />
 
       {skillCenterOpen ? (
         <SkillCenter
@@ -386,8 +2573,12 @@ export function App() {
 
       {settingsView === "quick" ? (
         <SettingsQuickPanel
-          providerName={selectedProvider.name}
-          model={providerConfig.model}
+          providerName={projectWorkMode
+            ? selectedProjectWorkProvider?.name ?? "Pi 本机模型"
+            : selectedProvider.name}
+          model={getModelDisplayName(
+            projectWorkMode ? selectedProjectWorkModel : selectedModel,
+          )}
           onOpenFull={openFullSettings}
           onClose={closeSettings}
         />
@@ -397,8 +2588,12 @@ export function App() {
         <SettingsDialog
           section={settingsSection}
           onSectionChange={setSettingsSection}
-          providerName={selectedProvider.name}
-          model={providerConfig.model}
+          providerName={projectWorkMode
+            ? selectedProjectWorkProvider?.name ?? "Pi 本机模型"
+            : selectedProvider.name}
+          model={getModelDisplayName(
+            projectWorkMode ? selectedProjectWorkModel : selectedModel,
+          )}
           onOpenProvider={openProviderFromSettings}
           onClose={closeSettings}
         />

@@ -89,7 +89,7 @@ function SettingsContent({ section, providerName, model, onOpenProvider }) {
         <div className="settings-section-heading">
           <span className="eyebrow">连接</span>
           <h2>模型服务商</h2>
-          <p>当前只保留服务商与模型选择；API 密钥不会写进这个前端原型。</p>
+          <p>当前只保留服务商与模型选择；API 密钥不会保存在前端。</p>
         </div>
         <div className="settings-card">
           <SettingRow label="当前服务商" detail="用于此工作区的新请求" value={providerName} />
@@ -109,7 +109,7 @@ function SettingsContent({ section, providerName, model, onOpenProvider }) {
           <p>先锁定当前浅色、紧凑的基础风格，再决定是否扩展主题。</p>
         </div>
         <div className="settings-card">
-          <SettingRow label="颜色模式" detail="当前原型的唯一完成主题" value="浅色" />
+          <SettingRow label="颜色模式" detail="当前唯一提供的主题" value="浅色" />
           <SettingRow label="深色模式" detail="等整体界面稳定后再设计" value="稍后开放" disabled />
           <SettingRow label="界面密度" detail="保持信息紧凑，不做大卡片堆叠" value="紧凑" />
         </div>
@@ -123,12 +123,12 @@ function SettingsContent({ section, providerName, model, onOpenProvider }) {
         <div className="settings-section-heading">
           <span className="eyebrow">本地优先</span>
           <h2>项目与数据</h2>
-          <p>V1 只演示期刊追踪与精读的项目、Run 和产物流转，尚未读取真实项目。</p>
+          <p>管理论文工作流、项目工作会话与本机产物。</p>
         </div>
         <div className="settings-card">
-          <SettingRow label="工作目录" detail="Pi Agent 的正式开发位置" value="/Users/yuzhou4tc/Public/pi Agent" />
-          <SettingRow label="V1 演示数据" detail="项目、Run 与产物均使用本地 fixture" value="已启用" />
-          <SettingRow label="本地存储" detail="原型配置只存浏览器本地" value="已启用" />
+          <SettingRow label="项目路径" detail="真实绝对路径只保存在本机服务端" value="受保护" />
+          <SettingRow label="本地数据" detail="会话、Run、事件与工作快照保存在本地" value="已启用" />
+          <SettingRow label="浏览器状态" detail="只保存工作类型、当前会话和界面偏好" value="已启用" />
         </div>
       </>
     );
@@ -157,11 +157,11 @@ function SettingsContent({ section, providerName, model, onOpenProvider }) {
         <div className="settings-section-heading">
           <span className="eyebrow">边界</span>
           <h2>隐私与权限</h2>
-          <p>V1 只演示权限与确认交互，不会读取真实项目或执行正式写入。</p>
+          <p>写入外部工具前都会展示预览并要求显式确认。</p>
         </div>
         <div className="settings-card">
-          <SettingRow label="读取真实项目" detail="当前界面只使用演示数据" value="关闭" />
-          <SettingRow label="保存 API 密钥" detail="密钥应由未来的安全配置层管理" value="关闭" />
+          <SettingRow label="读取真实项目" detail="只读取用户明确绑定的项目" value="已启用" />
+          <SettingRow label="模型凭据" detail="只由本机服务或 Pi 配置读取，不进入浏览器" value="受保护" />
           <SettingRow label="正式写入" detail="写入 Zotero、Obsidian 或项目状态前必须展示预览并显式确认" value="需确认" />
         </div>
       </>
@@ -173,11 +173,11 @@ function SettingsContent({ section, providerName, model, onOpenProvider }) {
       <div className="settings-section-heading">
         <span className="eyebrow">Pi Agent</span>
         <h2>常规</h2>
-        <p>当前设置对应“期刊追踪与精读”V1 交互演示，尚未接入真实数据与外部写入。</p>
+        <p>当前设置同时适用于项目工作与论文工作流。</p>
       </div>
       <div className="settings-card">
         <SettingRow label="界面语言" detail="所有用户界面使用简体中文" value="简体中文" />
-        <SettingRow label="产品阶段" detail="验证首个完整工作流的按钮、状态与确认路径" value="V1 演示" />
+        <SettingRow label="产品阶段" detail="论文闭环与真实项目工作纵向切片" value="V1" />
         <SettingRow label="技能" detail="工作流内部能力暂不作为市场条目展示" value="0 个" />
       </div>
     </>
@@ -196,7 +196,7 @@ export function SettingsDialog({ section, onSectionChange, providerName, model, 
       >
         <header className="settings-dialog-header">
           <div>
-            <span className="eyebrow">V1 演示设置</span>
+            <span className="eyebrow">偏好设置</span>
             <h2 id="all-settings-title">全部设置</h2>
           </div>
           <button className="icon-button" type="button" aria-label="关闭全部设置" onClick={onClose} autoFocus>

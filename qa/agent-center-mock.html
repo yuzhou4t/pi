@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pi Agent · Agent 居中布局验证</title>
+<style>
+:root{
+  --bg:#faf9f5;--sidebar:#f5f4ef;--surface:#fffdf7;--surface-soft:#fcfbf8;
+  --text:#24221e;--muted:#6b675e;--weak:#8c877c;
+  --border:rgba(220,216,206,.55);--border-strong:rgba(195,190,178,.75);
+  --accent:#2c2925;--teal:#0f766e;--teal-hover:#0b5f59;
+  --teal-tint:rgba(15,118,110,.06);--teal-border:rgba(15,118,110,.2);
+  --risk:#7c3a2d;
+  --serif:"Source Serif 4","Noto Serif SC","Songti SC",Georgia,serif;
+  --mono:ui-monospace,"SF Mono",Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;width:100%}
+body{
+  background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans SC",sans-serif;
+  font-size:13px;line-height:1.6;-webkit-font-smoothing:antialiased;overflow:hidden;
+}
+.pi-shell{display:grid;grid-template-columns:236px 440px 7px minmax(0,1fr);height:100vh;min-width:1200px;overflow:hidden}
+.pi-shell.is-immersive{grid-template-columns:236px 0 7px minmax(0,1fr)}
+.pi-shell.is-immersive .pi-center{opacity:0;pointer-events:none}
+.pi-col{min-height:0;display:flex;flex-direction:column}
+.pi-left{background:var(--sidebar);border-right:1px solid var(--border)}
+.pi-left-head{display:flex;align-items:center;justify-content:space-between;padding:12px 12px 8px}
+.pi-brand{font-weight:600;font-size:13px;letter-spacing:.02em}
+.pi-skills{font-size:11px;color:var(--muted);background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:3px 10px;cursor:pointer}
+.pi-project{margin:4px 10px 6px;padding:10px;background:var(--surface);border:1px solid var(--border);border-radius:8px}
+.pi-project-name{font-weight:600;font-size:12.5px}
+.pi-run{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--teal);margin-top:6px;padding-left:8px;border-left:2px solid var(--teal-border)}
+.pi-run::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--teal)}
+.pi-group-label{font-size:10.5px;letter-spacing:.08em;color:var(--weak);text-transform:uppercase;padding:8px 14px 4px}
+.pi-convo{display:block;text-align:left;background:transparent;border:1px solid transparent;border-radius:8px;padding:8px 10px;margin:2px 8px;width:auto;cursor:pointer;color:var(--text);font:inherit}
+.pi-convo small{display:block;color:var(--weak);font-size:11px;margin-top:2px}
+.pi-convo:hover{background:var(--teal-tint)}
+.pi-convo.is-active{background:var(--surface);border-color:var(--teal-border)}
+.pi-convo-branch{margin:6px 8px;background:transparent;border:1px dashed var(--border-strong);color:var(--muted);border-radius:8px;padding:7px;font-size:11.5px;cursor:pointer;font:inherit;text-align:left}
+.pi-left-foot{margin-top:auto;padding:10px}
+.pi-tagline{font-size:11px;color:var(--weak);margin:0 4px 8px}
+.pi-settings{width:100%;background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;padding:9px;font-size:12px;color:var(--teal);cursor:pointer;font-weight:500}
+.pi-center{background:var(--bg);border-right:1px solid var(--border);transition:opacity .15s}
+.pi-center-head{padding:12px 16px 8px;border-bottom:1px solid var(--border)}
+.pi-eyebrow{font-size:10.5px;letter-spacing:.06em;color:var(--teal);text-transform:uppercase}
+.pi-center-head h2{font-family:var(--serif);font-size:16px;font-weight:600;margin:3px 0 0}
+.pi-bg-activity{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);background:var(--surface-soft);border:1px solid var(--border);border-radius:20px;padding:3px 10px;margin-top:8px}
+.pi-bg-activity::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--teal)}
+.pi-stream{flex:1;overflow:auto;padding:14px 16px;display:flex;flex-direction:column;gap:14px}
+.pi-msg-role{font-size:10.5px;color:var(--weak);margin-bottom:4px}
+.pi-msg-user{align-self:flex-end;max-width:82%}
+.pi-msg-agent{align-self:flex-start;max-width:94%}
+.pi-bubble{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+.pi-msg-user .pi-bubble{background:var(--teal-tint);border-color:var(--teal-border)}
+.pi-bubble p{margin:0 0 7px}
+.pi-bubble p:last-child{margin-bottom:0}
+.pi-bubble b{font-weight:600}
+.pi-caveat{color:var(--risk);font-size:12.5px}
+.pi-cite{background:var(--surface-soft);border:1px solid var(--teal-border);color:var(--teal);border-radius:6px;padding:1px 8px;font-size:11.5px;cursor:pointer;font-family:var(--mono)}
+.pi-cite:hover{background:var(--teal-tint)}
+.pi-center-tools{display:flex;gap:8px;padding:6px 16px}
+.pi-quiet{background:transparent;border:none;color:var(--muted);font-size:11.5px;cursor:pointer;padding:4px 6px;border-radius:6px;font:inherit}
+.pi-quiet:hover{background:var(--surface-soft);color:var(--text)}
+.pi-pop{margin:0 16px 6px;background:var(--surface-soft);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:11.5px;color:var(--muted);display:none}
+.pi-pop.is-open{display:block}
+.pi-pop b{color:var(--text)}
+.pi-composer{margin:6px 12px 12px;background:var(--surface);border:1px solid var(--border-strong);border-radius:12px;padding:10px}
+.pi-cite-chip{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;color:var(--teal);background:var(--teal-tint);border:1px solid var(--teal-border);border-radius:6px;padding:4px 8px;margin-bottom:8px}
+.pi-cite-chip.is-hidden{display:none}
+.pi-cite-x{background:transparent;border:none;color:var(--teal);cursor:pointer;font-size:14px;line-height:1}
+.pi-composer textarea{width:100%;border:none;background:transparent;resize:none;height:40px;font:inherit;color:var(--text);outline:none}
+.pi-composer textarea::placeholder{color:var(--weak)}
+.pi-composer-foot{display:flex;align-items:center;justify-content:space-between;margin-top:6px}
+.pi-composer-left{display:flex;gap:8px;align-items:center}
+.pi-model-chip{font-size:11px;color:var(--muted);font-family:var(--mono);border:1px solid var(--border);border-radius:6px;padding:3px 8px}
+.pi-toggle{font-size:11px;border:1px solid var(--border);background:var(--surface-soft);color:var(--muted);border-radius:20px;padding:3px 10px;cursor:pointer;font:inherit}
+.pi-toggle.is-on{background:var(--teal-tint);border-color:var(--teal-border);color:var(--teal)}
+.pi-send{background:var(--teal);color:#fff;border:none;border-radius:8px;padding:7px 16px;font-size:12.5px;font-weight:500;cursor:pointer}
+.pi-send:hover{background:var(--teal-hover)}
+.pi-drag{background:transparent;cursor:col-resize;position:relative}
+.pi-drag::after{content:"";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:3px;height:40px;border-radius:3px;background:var(--border-strong)}
+.pi-right{background:var(--bg)}
+.pi-right-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border)}
+.pi-tabs{display:flex;gap:4px}
+.pi-tab{background:transparent;border:1px solid transparent;border-radius:8px;padding:6px 12px;font-size:12px;color:var(--muted);cursor:pointer;font:inherit}
+.pi-tab:hover{background:var(--surface-soft)}
+.pi-tab.is-active{background:var(--surface);border-color:var(--border-strong);color:var(--text);font-weight:500}
+.pi-immersive{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:11.5px;color:var(--muted);cursor:pointer;font:inherit}
+.pi-artifact{flex:1;overflow:auto;padding:18px 26px}
+.pi-panel{display:none}
+.pi-panel.is-active{display:block}
+.pi-posbar{display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+.pi-pdf{color:var(--teal);border:1px solid var(--teal-border);border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;background:var(--surface-soft);font:inherit}
+.pi-doc h1{font-family:var(--serif);font-size:20px;margin:0 0 4px}
+.pi-doc .pi-venue{color:var(--weak);font-size:12px;margin-bottom:16px}
+.pi-doc h2{font-family:var(--serif);font-size:15px;margin:18px 0 6px}
+.pi-doc p{font-size:13.5px;line-height:1.7;margin:0 0 10px;max-width:62ch}
+.pi-block{padding:4px 10px;margin:0 -10px 10px;border-radius:8px;border:1px solid transparent}
+.pi-block.is-hot{background:var(--teal-tint);border-color:var(--teal-border)}
+.pi-note-sec{border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:12px;background:var(--surface)}
+.pi-note-sec h3{margin:0 0 6px;font-size:13px}
+.pi-note-sec p{margin:0;font-size:12.5px;color:var(--text)}
+.pi-note-sec.is-pending{border-style:dashed;background:var(--surface-soft)}
+.pi-note-sec.is-pending p{color:var(--weak)}
+.pi-tag{display:inline-block;font-size:10px;border-radius:20px;padding:1px 8px;margin-bottom:6px}
+.pi-tag.ok{background:var(--teal-tint);color:var(--teal)}
+.pi-tag.pend{background:var(--surface-soft);color:var(--weak);border:1px solid var(--border)}
+.pi-prev-card{border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:12px;background:var(--surface)}
+.pi-prev-card h3{margin:0 0 8px;font-size:13px;display:flex;justify-content:space-between}
+.pi-diff{font-family:var(--mono);font-size:11.5px;background:var(--surface-soft);border:1px solid var(--border);border-radius:6px;padding:8px;white-space:pre-wrap;color:var(--muted)}
+.pi-diff .add{color:var(--teal)}
+.pi-hash{font-family:var(--mono);font-size:10px;color:var(--weak);margin-top:6px}
+.pi-blocked{color:var(--risk)}
+.pi-confirm-row{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--border);margin-top:6px;padding-top:12px}
+.pi-confirm-row small{color:var(--muted);font-size:11px}
+.pi-confirm{background:var(--teal);color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:12.5px;font-weight:500;cursor:pointer}
+.pi-guide-grid article{border-bottom:1px solid var(--border);padding:10px 0}
+.pi-guide-grid h3{margin:0 0 3px;font-size:12.5px}
+.pi-guide-grid p{margin:0;font-size:12.5px;color:var(--muted)}
+.pi-note-caption{font-size:11.5px;color:var(--muted);border-top:1px dashed var(--border);margin:14px -26px 0;padding:12px 26px 0}
+</style>
+</head>
+<body>
+<div class="pi-shell" id="pi-shell">
+  <aside class="pi-col pi-left">
+    <div class="pi-left-head"><span class="pi-brand">Pi Agent</span><button class="pi-skills">技能</button></div>
+    <div class="pi-project"><div class="pi-project-name">记忆增强的 LLM Agent</div><div class="pi-run">当前 Run · 本周待研读</div></div>
+    <div class="pi-group-label">本项目对话</div>
+    <button class="pi-convo" data-title="本周论文跟踪">本周论文跟踪<small>5 篇候选 · 2 篇建议研读</small></button>
+    <button class="pi-convo is-active" data-title="研读 · ReAct：推理与行动协同">研读 · ReAct：推理与行动协同<small>读到 · 实验证据</small></button>
+    <button class="pi-convo" data-title="研读 · 长期记忆检索">研读 · 长期记忆检索<small>只收藏导读</small></button>
+    <button class="pi-convo-branch">＋ 从检查点开新研读分支</button>
+    <div class="pi-left-foot"><div class="pi-tagline">项目中心的工作流播放器</div><button class="pi-settings">⚙ 设置</button></div>
+  </aside>
+
+  <section class="pi-col pi-center">
+    <header class="pi-center-head">
+      <div class="pi-eyebrow">Agent 对话 · 始终在这里</div>
+      <h2 id="pi-convo-title">研读 · ReAct：推理与行动协同</h2>
+      <div class="pi-bg-activity">后台 · 本周跟踪已就绪，无需你操作</div>
+    </header>
+    <div class="pi-stream" id="pi-stream">
+      <div class="pi-msg pi-msg-agent">
+        <div class="pi-msg-role">开场 · 复用五分钟导读（未额外计费）</div>
+        <div class="pi-bubble">
+          <p><b>这篇解决什么问题</b>：让语言模型把「推理」与「调用工具行动」交替进行，减少纯思维链的幻觉。</p>
+          <p><b>为什么值得读</b>：和本项目「规划与工具使用」直接相关，是一条常被引用的基线。</p>
+          <p><b>建议先看两处</b>：<button class="pi-cite" data-block="b-method">方法 · 交替提示</button> 和 <button class="pi-cite" data-block="b-exp">实验 · HotpotQA</button>。</p>
+          <p class="pi-caveat">保持怀疑：增益主要来自检索工具，纯推理部分的贡献需在消融里核对。</p>
+        </div>
+      </div>
+      <div class="pi-msg pi-msg-user"><div class="pi-bubble">带我看最关键的实验，作者的证据真的支持这个结论吗？</div></div>
+      <div class="pi-msg pi-msg-agent">
+        <div class="pi-msg-role">DeepSeek-v4-pro · 本轮</div>
+        <div class="pi-bubble">
+          <p>最关键的是 HotpotQA 与 Fever 上的对照，见 <button class="pi-cite" data-block="b-exp">表 2 · HotpotQA</button>。ReAct 相对纯推理与纯行动都更稳。</p>
+          <p class="pi-caveat">证据边界：多为精确匹配指标、单一检索源；换开放式生成任务时结论未必成立。</p>
+        </div>
+      </div>
+    </div>
+    <div class="pi-center-tools">
+      <button class="pi-quiet" id="pi-coverage-btn">查看研读覆盖 · 3/4</button>
+      <button class="pi-quiet" id="pi-archive-btn">准备归档 →</button>
+    </div>
+    <div class="pi-pop" id="pi-coverage-pop"><b>研读覆盖（可选检查，不拦你）</b><br>研究问题 ✓ · 方法机制 ✓ · 实验证据 ✓ · 项目关系 ○ 待综合。归档时才会要求补齐并产出可核验引用。</div>
+    <div class="pi-composer">
+      <div class="pi-cite-chip" id="pi-cite-chip"><span>引用：「…interleaving reasoning traces with actions…」</span><button class="pi-cite-x" id="pi-cite-x">×</button></div>
+      <textarea placeholder="用自然语言继续：解释我选中的这一段 / 结合项目状态分析"></textarea>
+      <div class="pi-composer-foot">
+        <div class="pi-composer-left"><span class="pi-model-chip">DeepSeek-v4-pro ▾</span><button class="pi-toggle" id="pi-ctx-toggle">＋ 项目状态</button></div>
+        <button class="pi-send">发送</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="pi-drag"></div>
+
+  <section class="pi-col pi-right">
+    <header class="pi-right-head">
+      <div class="pi-tabs">
+        <button class="pi-tab is-active" data-tab="doc">原文</button>
+        <button class="pi-tab" data-tab="note">研读笔记</button>
+        <button class="pi-tab" data-tab="guide">五分钟导读</button>
+        <button class="pi-tab" data-tab="preview">写入预览</button>
+      </div>
+      <button class="pi-immersive" id="pi-immersive">沉浸阅读</button>
+    </header>
+    <div class="pi-artifact" id="pi-artifact">
+      <div class="pi-panel is-active" data-panel="doc">
+        <div class="pi-posbar"><span>第 12 / 48 段 · 位置已保存</span><button class="pi-pdf">查看原版 PDF</button></div>
+        <div class="pi-doc">
+          <h1>ReAct: Synergizing Reasoning and Acting in Language Models</h1>
+          <div class="pi-venue">ICLR · 2023</div>
+          <h2>方法</h2>
+          <div class="pi-block" id="b-method"><p>我们让模型在同一序列里交替产生推理轨迹（thought）与行动（action），行动结果作为观察反馈回上下文，形成 reason → act → observe 的循环。相比纯思维链，模型可以在外部环境中查证中间结论。</p></div>
+          <p>提示由少量人工示例构成，示例中显式标注 Thought / Action / Observation 三类步骤。</p>
+          <h2>实验</h2>
+          <div class="pi-block" id="b-exp"><p>在 HotpotQA 与 Fever 上，ReAct 相比纯 CoT 与纯 Act 基线在精确匹配指标上更稳定；作者报告了检索工具带来的主要增益，并给出失败案例分析。</p></div>
+          <p>消融显示：去掉行动步骤后性能显著下降，去掉推理步骤影响相对较小。</p>
+        </div>
+      </div>
+      <div class="pi-panel" data-panel="note">
+        <div class="pi-note-sec"><span class="pi-tag ok">已确认结论</span><h3>研究问题</h3><p>纯思维链在多跳问答中易累积幻觉；本文用「推理+行动」交替来引入外部核查。</p></div>
+        <div class="pi-note-sec"><span class="pi-tag ok">已确认结论</span><h3>方法机制</h3><p>reason→act→observe 循环；行动结果回灌上下文；提示含 Thought/Action/Observation 标注。</p></div>
+        <div class="pi-note-sec"><span class="pi-tag ok">已确认结论</span><h3>实验证据</h3><p>HotpotQA / Fever 对照；增益主要来自检索工具；已记录证据边界。</p></div>
+        <div class="pi-note-sec is-pending"><span class="pi-tag pend">待综合</span><h3>项目关系</h3><p>归档前由 Agent 综合前三项，产出对本项目的启发与可执行下一步（带原文引用）。</p></div>
+        <div class="pi-note-caption">笔记是工件，随对话里「确认过的结论」逐步长出；不是四张阶段报告。</div>
+      </div>
+      <div class="pi-panel" data-panel="guide">
+        <div class="pi-guide-grid">
+          <article><h3>这篇解决什么问题</h3><p>让模型把推理与工具行动交替，减少纯思维链幻觉。</p></article>
+          <article><h3>为什么现在值得读</h3><p>与项目「规划与工具使用」直接相关的常引基线。</p></article>
+          <article><h3>方法的核心直觉</h3><p>reason→act→observe，用外部观察纠正中间推理。</p></article>
+          <article><h3>作者提供的主要证据</h3><p>HotpotQA/Fever 对照与消融，检索工具为主要增益来源。</p></article>
+          <article><h3>局限与待核验</h3><p>指标偏精确匹配、检索源单一，开放式任务未必成立。</p></article>
+        </div>
+      </div>
+      <div class="pi-panel" data-panel="preview">
+        <div class="pi-prev-card"><h3>Zotero<span class="pi-tag ok">新建条目</span></h3><div class="pi-diff"><span class="add">+ 题录：ReAct… (ICLR 2023)</span>
+<span class="add">+ 附件：原版 PDF</span>
+<span class="add">+ 五分钟导读（HTML）</span></div><div class="pi-hash">目标 collection：Agent/Planning · 查重通过 · hash 3f9a…</div></div>
+        <div class="pi-prev-card"><h3>Obsidian<span class="pi-tag ok">追加</span></h3><div class="pi-diff">  # ReAct（既有主笔记）
+<span class="add">+ ## 项目关系（workflow 区）</span>
+<span class="add">+ 可迁移：交替 reason/act 用于本项目工具循环</span></div><div class="pi-hash">仅更新 workflow 区，保留已确认 Agent 补充块 · 目标 hash 7c2e…</div></div>
+        <div class="pi-prev-card"><h3>项目状态<span class="pi-tag pend">追加 1 项</span></h3><div class="pi-diff"><span class="add">+ 下一步：在工具循环里加 observe 回灌，复现 ReAct 收益</span></div><div class="pi-hash">前后哈希一致，可写入。</div></div>
+        <div class="pi-confirm-row"><small>预览与确认同栏就近；确认按钮也会镜像到对话中。未确认不写入。</small><button class="pi-confirm">确认写入所选 3 项</button></div>
+      </div>
+    </div>
+  </section>
+</div>
+<script>
+const artifact=document.getElementById('pi-artifact');
+function showTab(name){
+  document.querySelectorAll('.pi-tab').forEach(t=>t.classList.toggle('is-active',t.dataset.tab===name));
+  artifact.querySelectorAll('.pi-panel').forEach(p=>p.classList.toggle('is-active',p.dataset.panel===name));
+}
+document.querySelectorAll('.pi-tab').forEach(t=>t.addEventListener('click',()=>showTab(t.dataset.tab)));
+document.querySelectorAll('.pi-cite').forEach(c=>c.addEventListener('click',()=>{
+  showTab('doc');
+  const id=c.dataset.block;
+  document.querySelectorAll('.pi-block').forEach(b=>b.classList.remove('is-hot'));
+  const el=document.getElementById(id);
+  if(el){el.classList.add('is-hot');el.scrollIntoView({block:'center',behavior:'smooth'});}
+}));
+const pop=document.getElementById('pi-coverage-pop');
+document.getElementById('pi-coverage-btn').addEventListener('click',()=>pop.classList.toggle('is-open'));
+document.getElementById('pi-archive-btn').addEventListener('click',()=>showTab('preview'));
+const ctx=document.getElementById('pi-ctx-toggle');
+ctx.addEventListener('click',()=>ctx.classList.toggle('is-on'));
+const chip=document.getElementById('pi-cite-chip');
+document.getElementById('pi-cite-x').addEventListener('click',()=>chip.classList.add('is-hidden'));
+const shell=document.getElementById('pi-shell');
+const imm=document.getElementById('pi-immersive');
+imm.addEventListener('click',()=>{
+  shell.classList.toggle('is-immersive');
+  imm.textContent=shell.classList.contains('is-immersive')?'唤起 Agent':'沉浸阅读';
+});
+document.querySelectorAll('.pi-convo').forEach(c=>c.addEventListener('click',()=>{
+  document.querySelectorAll('.pi-convo').forEach(x=>x.classList.remove('is-active'));
+  c.classList.add('is-active');
+  document.getElementById('pi-convo-title').textContent=c.dataset.title;
+}));
+</script>
+</body>
+</html>

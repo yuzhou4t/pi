@@ -1,6 +1,6 @@
 import { useEffect, useReducer } from "react";
 
-export const RUN_STORAGE_VERSION = 1;
+export const RUN_STORAGE_VERSION = 2;
 export const RUN_STORAGE_KEY = `pi-agent:journal-reading-run:v${RUN_STORAGE_VERSION}`;
 
 function resolveInitialState(initialState) {
