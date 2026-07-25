@@ -48,7 +48,7 @@ cd '/Users/yuzhou4tc/Public/pi Agent'
 npm run dev -- --host 127.0.0.1 --port 4173
 ```
 
-`npm run dev:api` 默认读取 `.env.local`。论文语义步骤的 GPT 通道继续使用已登录的 Codex 订阅，DeepSeek 读取 `PI_DEEPSEEK_API_KEY`；项目工作会话直接读取 Pi 本机已配置且可用的模型目录，不读取或复制 Pi/Codex 凭据。MinerU Cloud 读取 `PI_MINERU_API_TOKEN`。Zotero Desktop 默认只通过 `http://127.0.0.1:23119` 连接本机，必要时可用 `PI_ZOTERO_BASE_URL` 覆盖。所有密钥只放在未跟踪的 `.env.local`，不要写入前端、聊天或 Git。
+`npm run dev:api` 默认读取 `.env.local`，并在服务端代码变化后自动重启，避免前端命中旧版接口。论文语义步骤的 GPT 通道继续使用已登录的 Codex 订阅，DeepSeek 读取 `PI_DEEPSEEK_API_KEY`；项目工作会话直接读取 Pi 本机已配置且可用的模型目录，不读取或复制 Pi/Codex 凭据。MinerU Cloud 读取 `PI_MINERU_API_TOKEN`。Zotero Desktop 默认只通过 `http://127.0.0.1:23119` 连接本机，必要时可用 `PI_ZOTERO_BASE_URL` 覆盖。所有密钥只放在未跟踪的 `.env.local`，不要写入前端、聊天或 Git。
 
 项目工作会话数据默认保存在 macOS `Application Support/Pi Agent/project-work`，可通过服务端环境变量 `PI_PROJECT_WORK_STORAGE_ROOT` 覆盖。该目录保存安全项目注册、会话状态、事件流、稀疏审阅层与 Pi JSONL 会话；不会进入浏览器或 Git。创建空会话只写轻量元数据，不扫描或复制整个项目。
 
