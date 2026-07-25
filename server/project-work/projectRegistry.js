@@ -200,6 +200,16 @@ export function createProjectRegistry({
     return structuredClone(project);
   }
 
+  async function getMetadata(projectId) {
+    const id = assertProjectId(projectId);
+    const registry = await load();
+    const project = registry.projects.find((item) => item.id === id);
+    if (!project) {
+      throw projectWorkError("PROJECT_WORK_PROJECT_NOT_FOUND", "项目不存在", 404);
+    }
+    return structuredClone(project);
+  }
+
   async function list() {
     const registry = await load();
     return registry.projects
@@ -223,6 +233,7 @@ export function createProjectRegistry({
 
   return Object.freeze({
     get,
+    getMetadata,
     list,
     register,
     remove,

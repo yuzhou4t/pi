@@ -762,7 +762,7 @@ export function createApiServer({
   if (request.method === "OPTIONS") {
     response.writeHead(204, {
       "access-control-allow-origin": origin || "http://127.0.0.1:4173",
-      "access-control-allow-methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS",
+      "access-control-allow-methods": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
       "access-control-allow-headers": "content-type, range, if-range",
       "access-control-expose-headers": "accept-ranges, content-range, content-length, etag",
       vary: "Origin",
@@ -866,6 +866,43 @@ export function createApiServer({
           thinkingLevel: payload.thinking_level,
         });
         sendJson(response, 201, result, origin);
+        return;
+      }
+
+      const projectConversationMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/projects\/([^/]+)\/conversations\/([^/]+)$/,
+      );
+      if (projectConversationMatch && request.method === "PATCH") {
+        requireProjectWorkMutationOrigin(origin);
+        const projectId = decodeProjectWorkSegment(projectConversationMatch[1]);
+        const conversationId = decodeProjectWorkSegment(projectConversationMatch[2]);
+        const payload = await readProjectWorkJson(request);
+        const conversation = await projectWorkService.renameConversation(
+          projectId,
+          conversationId,
+          { title: payload.title },
+        );
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          conversation,
+        }, origin);
+        return;
+      }
+      if (projectConversationMatch && request.method === "DELETE") {
+        requireProjectWorkMutationOrigin(origin);
+        const projectId = decodeProjectWorkSegment(projectConversationMatch[1]);
+        const conversationId = decodeProjectWorkSegment(projectConversationMatch[2]);
+        const result = await projectWorkService.removeConversation(
+          projectId,
+          conversationId,
+        );
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          projectId: result.projectId,
+          conversationId: result.id,
+          removed: result.removed === true,
+          conversationCount: result.conversationCount,
+        }, origin);
         return;
       }
 

@@ -169,6 +169,8 @@ test("left rail shows the selected work type, nested conversations, and one proj
       query: "",
       onQueryChange() {},
       onNewConversation() {},
+      onDeleteConversation() {},
+      onRenameConversation() {},
       onAddProject() {},
     }));
 
@@ -180,10 +182,118 @@ test("left rail shows the selected work type, nested conversations, and one proj
     assert.match(html, /向正常工作添加项目/);
     assert.match(html, /在 Pi Agent 产品设计 中新建会话/);
     assert.match(html, /在 方法研究 中新建会话/);
+    assert.match(html, /打开“修复设置页移动端遮挡”的更多操作/);
     assert.match(html, /项目工作 · 修改待审阅/);
     assert.doesNotMatch(html, /收起左边栏/);
     assert.doesNotMatch(html, />会话</);
     assert.doesNotMatch(html, /后台运行/);
+  });
+});
+
+test("paper reading conversations do not expose project-work deletion actions", async () => {
+  await withViteModule("/src/components/ProjectRail.jsx", ({ ProjectRail }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectRail, {
+      projects: [{
+        id: "paper-project",
+        name: "期刊研读",
+        state: "1 个会话",
+        updated: "本周",
+      }],
+      selectedId: "paper-project",
+      conversations: [{
+        id: "paper-1",
+        projectId: "paper-project",
+        kind: "paper_reading",
+        title: "精读 · Agent 论文",
+        subtitle: "论文精读 · 位置与对话已保存",
+      }],
+      selectedConversationId: "paper-1",
+      workspaceKind: "paper_reading",
+      query: "",
+      onQueryChange() {},
+      onDeleteConversation() {},
+      onRenameConversation() {},
+      onAddProject() {},
+    }));
+
+    assert.match(html, /精读 · Agent 论文/);
+    assert.doesNotMatch(html, /更多操作|删除会话/);
+  });
+});
+
+test("deleting conversation remains in the rail with a busy status", async () => {
+  await withViteModule("/src/components/ProjectRail.jsx", ({ ProjectRail }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectRail, {
+      projects: [{
+        id: "project-1",
+        name: "Pi Agent",
+        state: "1 个会话",
+        updated: "刚刚",
+      }],
+      selectedId: "project-1",
+      conversations: [{
+        id: "work-1",
+        projectId: "project-1",
+        kind: "project_work",
+        title: "检查登录页",
+        subtitle: "正常工作 · 空闲",
+      }],
+      selectedConversationId: "work-1",
+      deletingConversationId: "work-1",
+      workspaceKind: "project_work",
+      query: "",
+      onQueryChange() {},
+      onDeleteConversation() {},
+      onRenameConversation() {},
+      onAddProject() {},
+    }));
+
+    assert.match(html, /检查登录页/);
+    assert.match(html, /正在删除/);
+    assert.match(html, /disabled/);
+    assert.doesNotMatch(html, /更多操作/);
+  });
+});
+
+test("only the current live busy conversation pre-blocks deletion", async () => {
+  await withViteModule("/src/components/ProjectRail.jsx", ({ ProjectRail }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectRail, {
+      projects: [{
+        id: "project-1",
+        name: "Pi Agent",
+        state: "2 个会话",
+        updated: "刚刚",
+      }],
+      selectedId: "project-1",
+      conversations: [{
+        id: "work-current",
+        projectId: "project-1",
+        kind: "project_work",
+        title: "当前运行",
+        subtitle: "正常工作 · 正在工作",
+        status: "running",
+        deleteBlocked: true,
+      }, {
+        id: "work-background",
+        projectId: "project-1",
+        kind: "project_work",
+        title: "背景旧状态",
+        subtitle: "正常工作 · 正在工作",
+        status: "running",
+        deleteBlocked: false,
+      }],
+      selectedConversationId: "work-current",
+      workspaceKind: "project_work",
+      query: "",
+      onQueryChange() {},
+      onDeleteConversation() {},
+      onRenameConversation() {},
+      onAddProject() {},
+    }));
+
+    assert.equal((html.match(/data-delete-blocked="true"/g) ?? []).length, 1);
+    assert.match(html, /打开“当前运行”的更多操作/);
+    assert.match(html, /打开“背景旧状态”的更多操作/);
   });
 });
 

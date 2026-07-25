@@ -641,6 +641,11 @@ button:disabled {
   min-width: 0;
 }
 
+.project-conversation-item {
+  position: relative;
+  min-width: 0;
+}
+
 .project-conversation-row {
   display: flex;
   width: 100%;
@@ -657,6 +662,10 @@ button:disabled {
   text-align: left;
 }
 
+.project-conversation-item.has-actions .project-conversation-row {
+  padding-right: 34px;
+}
+
 .project-conversation-row:hover {
   color: var(--text);
   background: rgba(255, 253, 247, 0.65);
@@ -666,6 +675,10 @@ button:disabled {
   color: var(--text);
   background: var(--surface);
   border-color: var(--teal-border);
+}
+
+.project-conversation-row:disabled {
+  cursor: wait;
 }
 
 .project-conversation-row > svg {
@@ -697,6 +710,87 @@ button:disabled {
   color: var(--weak);
   font-size: 10.5px;
   line-height: 1.4;
+}
+
+.project-conversation-more {
+  position: absolute;
+  top: 7px;
+  right: 5px;
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  cursor: pointer;
+  color: var(--weak);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  opacity: 0;
+  transition: opacity 0.14s ease, color 0.14s ease, background 0.14s ease;
+}
+
+.project-conversation-item:hover .project-conversation-more,
+.project-conversation-item:focus-within .project-conversation-more,
+.project-conversation-item.has-open-menu .project-conversation-more {
+  opacity: 1;
+}
+
+.project-conversation-more:hover,
+.project-conversation-more:focus-visible,
+.project-conversation-item.has-open-menu .project-conversation-more {
+  color: var(--text);
+  background: var(--surface);
+  border-color: var(--border);
+}
+
+.project-conversation-menu {
+  position: absolute;
+  z-index: 20;
+  top: 35px;
+  right: 4px;
+  width: 132px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(42, 40, 34, 0.14);
+}
+
+.project-conversation-menu button {
+  display: flex;
+  width: 100%;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px;
+  cursor: pointer;
+  color: var(--muted);
+  background: transparent;
+  border-radius: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.project-conversation-menu button:hover,
+.project-conversation-menu button:focus-visible {
+  color: var(--text);
+  background: var(--surface-soft);
+  outline: none;
+}
+
+.project-conversation-menu button.is-danger {
+  color: var(--risk);
+}
+
+.project-conversation-menu button.is-danger:hover,
+.project-conversation-menu button.is-danger:focus-visible {
+  background: var(--risk-pale);
+}
+
+.project-conversation-menu button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
 }
 
 .project-child-empty {
@@ -4817,6 +4911,164 @@ h4.reader-rail-full-heading {
   place-items: center;
   padding: 24px;
   background: rgba(25, 24, 21, 0.38);
+}
+
+.conversation-delete-backdrop,
+.conversation-rename-backdrop {
+  z-index: 190;
+  backdrop-filter: blur(2px);
+}
+
+:is(.conversation-delete-dialog, .conversation-rename-dialog) {
+  width: min(440px, 100%);
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: 0 24px 72px rgba(42, 40, 34, 0.2);
+}
+
+:is(.conversation-delete-dialog, .conversation-rename-dialog) > header {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+}
+
+:is(.conversation-delete-dialog, .conversation-rename-dialog) > header > span {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--risk);
+  background: var(--risk-pale);
+  border-radius: 9px;
+}
+
+:is(.conversation-delete-dialog, .conversation-rename-dialog) h2 {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 18px;
+}
+
+.conversation-delete-dialog header p,
+.conversation-rename-dialog header p,
+.conversation-delete-note,
+.conversation-delete-error,
+.conversation-rename-error {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.conversation-delete-note {
+  margin-top: 16px;
+  padding: 10px 11px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.conversation-delete-error,
+.conversation-rename-error {
+  padding: 8px 10px;
+  color: var(--risk);
+  background: var(--risk-pale);
+  border-radius: 7px;
+}
+
+.conversation-delete-checking {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+:is(.conversation-delete-dialog, .conversation-rename-dialog) > footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+:is(.conversation-delete-dialog, .conversation-rename-dialog) > footer button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 13px;
+  cursor: pointer;
+  color: var(--muted);
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.conversation-delete-dialog > footer button.is-danger {
+  color: #fff;
+  background: var(--risk);
+  border-color: var(--risk);
+}
+
+.conversation-rename-dialog > header > span {
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+}
+
+.conversation-rename-dialog > label {
+  position: relative;
+  display: grid;
+  gap: 7px;
+  margin-top: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.conversation-rename-dialog > label input {
+  width: 100%;
+  height: 40px;
+  padding: 0 48px 0 11px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  outline: none;
+  font-size: 13px;
+}
+
+.conversation-rename-dialog > label input:focus {
+  border-color: rgba(15, 118, 110, 0.55);
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.08);
+}
+
+.conversation-rename-dialog > label small {
+  position: absolute;
+  right: 10px;
+  bottom: 12px;
+  color: var(--weak);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.conversation-rename-error {
+  margin: 10px 0 0;
+}
+
+.conversation-rename-dialog > footer button.is-primary {
+  color: #fff;
+  background: var(--teal-accent);
+  border-color: var(--teal-accent);
+}
+
+:is(.conversation-delete-dialog, .conversation-rename-dialog) > footer button:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 /* ===== Settings ===== */

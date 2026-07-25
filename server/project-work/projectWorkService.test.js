@@ -116,6 +116,43 @@ function createFakeSessionFactory({
   return factory;
 }
 
+function createBlockingSessionFactory() {
+  const sessions = [];
+  const factory = async () => {
+    let releasePrompt;
+    const record = {
+      aborts: 0,
+      release() {
+        releasePrompt?.();
+      },
+    };
+    const host = {
+      subscribe() {
+        return () => {};
+      },
+      prompt() {
+        return new Promise((resolve) => {
+          releasePrompt = resolve;
+        });
+      },
+      async steer() {},
+      async abort() {
+        record.aborts += 1;
+        record.release();
+      },
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
 async function eventually(read, predicate, message) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const value = await read();
@@ -545,6 +582,15 @@ test("real project-work chain binds context and changes, applies by hash, and pr
   assert.equal(settled.conversation.plan.steps.length, 3);
   assert.equal(settled.conversation.activeChangeSet.status, "ready");
   assert.equal(settled.conversation.activeChangeSet.files.length, 1);
+  assert.equal(settled.conversation.pendingChangeFileCount, 1);
+  const listedWhilePending = await service.listConversations(project.id);
+  assert.equal(listedWhilePending[0].pendingChangeFileCount, 1);
+  const renamedWhilePending = await service.renameConversation(
+    project.id,
+    conversation.id,
+    { title: "Review the safe change" },
+  );
+  assert.equal(renamedWhilePending.pendingChangeFileCount, 1);
   const changeReady = settled.events.find(
     (event) => event.type === "change_set.ready",
   );
@@ -588,6 +634,10 @@ test("real project-work chain binds context and changes, applies by hash, and pr
   });
   assert.equal(applied.appliedChangeSet.status, "applied");
   assert.equal(applied.remainingChangeSet.status, "clean");
+  assert.equal(
+    (await service.listConversations(project.id))[0].pendingChangeFileCount,
+    0,
+  );
   assert.equal(
     await readFile(path.join(projectRoot, "app.js"), "utf8"),
     "export const version = 2;\n",
@@ -719,4 +769,295 @@ test("partial apply keeps unselected files reviewable and blocks verification", 
   });
   assert.equal(completed.remainingChangeSet.status, "clean");
   assert.equal(await readFile(path.join(projectRoot, "other.js"), "utf8"), "other v2\n");
+});
+
+test("deleting conversations removes only their private state and updates project counts", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-conversation-delete-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const firstProjectRoot = path.join(temporaryRoot, "first-project");
+  const secondProjectRoot = path.join(temporaryRoot, "second-project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await Promise.all([
+    mkdir(firstProjectRoot),
+    mkdir(secondProjectRoot),
+  ]);
+  await Promise.all([
+    writeFile(path.join(firstProjectRoot, "app.js"), "first project\n", "utf8"),
+    writeFile(path.join(secondProjectRoot, "app.js"), "second project\n", "utf8"),
+  ]);
+  const pickedRoots = [firstProjectRoot, secondProjectRoot];
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory(),
+    picker: async () => ({ rootPath: pickedRoots.shift() }),
+    idFactory: incrementalId("delete"),
+  });
+  t.after(() => service.dispose());
+
+  const firstSelection = await service.pickProjectRoot({ mode: "existing" });
+  const firstProject = await service.registerProject({
+    selectionId: firstSelection.selectionId,
+  });
+  const secondSelection = await service.pickProjectRoot({ mode: "existing" });
+  const secondProject = await service.registerProject({
+    selectionId: secondSelection.selectionId,
+  });
+  const firstConversation = await service.createConversation(firstProject.id);
+  const remainingConversation = await service.createConversation(firstProject.id);
+  const otherProjectConversation = await service.createConversation(secondProject.id);
+  const firstConversationDirectory = path.join(
+    storageRoot,
+    "conversations",
+    firstConversation.id,
+  );
+
+  await assert.rejects(
+    service.removeConversation(secondProject.id, firstConversation.id),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_CONVERSATION_NOT_FOUND");
+      assert.equal(error.status, 404);
+      return true;
+    },
+  );
+  await assert.rejects(
+    service.removeConversation(firstProject.id, "conversation-missing"),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_CONVERSATION_NOT_FOUND");
+      assert.equal(error.status, 404);
+      return true;
+    },
+  );
+  await access(firstConversationDirectory);
+
+  const firstRemoval = await service.removeConversation(
+    firstProject.id,
+    firstConversation.id,
+  );
+  assert.deepEqual(firstRemoval, {
+    id: firstConversation.id,
+    projectId: firstProject.id,
+    removed: true,
+    conversationCount: 1,
+  });
+  assert.equal(JSON.stringify(firstRemoval).includes(storageRoot), false);
+  await assert.rejects(access(firstConversationDirectory), { code: "ENOENT" });
+  assert.equal(
+    (await service.getConversation(remainingConversation.id)).conversation.id,
+    remainingConversation.id,
+  );
+  assert.equal(
+    (await service.getConversation(otherProjectConversation.id)).conversation.id,
+    otherProjectConversation.id,
+  );
+  let projects = await service.listProjects();
+  assert.equal(
+    projects.find((project) => project.id === firstProject.id).conversationCount,
+    1,
+  );
+  assert.equal(
+    projects.find((project) => project.id === secondProject.id).conversationCount,
+    1,
+  );
+
+  const lastRemoval = await service.removeConversation(
+    firstProject.id,
+    remainingConversation.id,
+  );
+  assert.equal(lastRemoval.conversationCount, 0);
+  assert.deepEqual(await service.listConversations(firstProject.id), []);
+  projects = await service.listProjects();
+  assert.equal(
+    projects.find((project) => project.id === firstProject.id).conversationCount,
+    0,
+  );
+  assert.equal(
+    await readFile(path.join(firstProjectRoot, "app.js"), "utf8"),
+    "first project\n",
+  );
+  assert.equal(
+    (await service.getConversation(otherProjectConversation.id)).conversation.id,
+    otherProjectConversation.id,
+  );
+});
+
+test("renaming a conversation updates only safe scoped metadata", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-conversation-rename-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const firstProjectRoot = path.join(temporaryRoot, "first-project");
+  const secondProjectRoot = path.join(temporaryRoot, "second-project");
+  await Promise.all([
+    mkdir(firstProjectRoot),
+    mkdir(secondProjectRoot),
+  ]);
+  await writeFile(path.join(firstProjectRoot, "app.js"), "unchanged\n", "utf8");
+  const pickedRoots = [firstProjectRoot, secondProjectRoot];
+  const sessionFactory = createFakeSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    picker: async () => ({ rootPath: pickedRoots.shift() }),
+    idFactory: incrementalId("rename"),
+  });
+  t.after(() => service.dispose());
+
+  const firstSelection = await service.pickProjectRoot({ mode: "existing" });
+  const firstProject = await service.registerProject({
+    selectionId: firstSelection.selectionId,
+  });
+  const secondSelection = await service.pickProjectRoot({ mode: "existing" });
+  const secondProject = await service.registerProject({
+    selectionId: secondSelection.selectionId,
+  });
+  const conversation = await service.createConversation(firstProject.id);
+
+  await assert.rejects(
+    service.renameConversation(secondProject.id, conversation.id, {
+      title: "不应成功",
+    }),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_CONVERSATION_NOT_FOUND");
+      assert.equal(error.status, 404);
+      return true;
+    },
+  );
+  for (const title of ["   ", "x".repeat(81)]) {
+    await assert.rejects(
+      service.renameConversation(firstProject.id, conversation.id, { title }),
+      (error) => {
+        assert.equal(error.code, "PROJECT_WORK_CONVERSATION_TITLE_INVALID");
+        assert.equal(error.status, 400);
+        return true;
+      },
+    );
+  }
+
+  const renamed = await service.renameConversation(
+    firstProject.id,
+    conversation.id,
+    { title: "  修复   登录流程  " },
+  );
+  assert.equal(renamed.title, "修复 登录流程");
+  assert.equal(renamed.projectId, firstProject.id);
+  assert.equal(Object.hasOwn(renamed, "messages"), false);
+  assert.equal(Object.hasOwn(renamed, "rootPath"), false);
+  assert.equal(
+    (await service.getConversation(conversation.id)).conversation.title,
+    "修复 登录流程",
+  );
+  assert.equal(sessionFactory.sessions.length, 0);
+  assert.equal(
+    await readFile(path.join(firstProjectRoot, "app.js"), "utf8"),
+    "unchanged\n",
+  );
+
+  const movedProjectRoot = path.join(temporaryRoot, "moved-first-project");
+  await rename(firstProjectRoot, movedProjectRoot);
+  const renamedAfterMove = await service.renameConversation(
+    firstProject.id,
+    conversation.id,
+    { title: "项目已移动后的会话" },
+  );
+  assert.equal(renamedAfterMove.title, "项目已移动后的会话");
+  const removedAfterMove = await service.removeConversation(
+    firstProject.id,
+    conversation.id,
+  );
+  assert.equal(removedAfterMove.removed, true);
+  assert.equal(removedAfterMove.conversationCount, 0);
+});
+
+test("the first explicit message derives a short title without overriding a user rename", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-conversation-title-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "project\n", "utf8");
+  const sessionFactory = createFakeSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("title"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const automatic = await service.createConversation(project.id);
+  const task = "  请   检查这个项目中的登录流程，并修复所有会导致用户无法保存设置的问题，同时补充相关测试和验证说明  ";
+  await service.sendMessage(automatic.id, { text: task });
+  const automaticSettled = await eventually(
+    () => service.getConversation(automatic.id),
+    (snapshot) => snapshot.conversation.status === "awaiting_confirmation",
+    "automatic-title conversation did not settle",
+  );
+  const expectedTitle = task
+    .normalize("NFKC")
+    .trim()
+    .replaceAll(/\s+/g, " ")
+    .slice(0, 48);
+  assert.equal(automaticSettled.conversation.title, expectedTitle);
+  assert.ok(automaticSettled.conversation.title.length <= 48);
+
+  const userNamed = await service.createConversation(project.id);
+  await service.renameConversation(project.id, userNamed.id, {
+    title: "我的自定义会话",
+  });
+  await service.sendMessage(userNamed.id, { text: "这条消息不能覆盖名称" });
+  const userNamedSettled = await eventually(
+    () => service.getConversation(userNamed.id),
+    (snapshot) => snapshot.conversation.status === "awaiting_confirmation",
+    "user-named conversation did not settle",
+  );
+  assert.equal(userNamedSettled.conversation.title, "我的自定义会话");
+  assert.equal(sessionFactory.sessions.length, 2);
+  assert.deepEqual(
+    sessionFactory.sessions.map((session) => session.prompts.length),
+    [1, 1],
+  );
+});
+
+test("deleting a running conversation is rejected without aborting it", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-conversation-delete-busy-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "project\n", "utf8");
+  const sessionFactory = createBlockingSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("delete-busy"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, { text: "继续运行" });
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "running",
+    "conversation did not enter running state",
+  );
+
+  await assert.rejects(
+    service.removeConversation(project.id, conversation.id),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_CONVERSATION_DELETE_BUSY");
+      assert.equal(error.status, 409);
+      return true;
+    },
+  );
+  assert.equal(sessionFactory.sessions[0].aborts, 0);
+  await access(path.join(storageRoot, "conversations", conversation.id));
+
+  sessionFactory.sessions[0].release();
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "conversation did not settle after release",
+  );
 });

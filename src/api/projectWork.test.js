@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  deleteProjectWorkConversation,
   fetchProjectWorkFile,
   fetchProjectWorkTree,
   mapProjectWorkConversation,
+  renameProjectWorkConversation,
 } from "./projectWork.js";
 
 function jsonResponse(body, status = 200) {
@@ -64,6 +66,7 @@ test("conversation mapping preserves a ready, hash-bound change set", () => {
 
   assert.equal(mapped.pendingChangeSet.status, "ready");
   assert.equal(mapped.pendingChangeSet.proposalHash, "sha256:proposal");
+  assert.equal(mapped.pendingChangeFileCount, 1);
   assert.equal(mapped.pendingChangeSet.files[0].baseHash, "sha256:before");
   assert.equal(mapped.pendingChangeSet.files[0].afterHash, "sha256:after");
   assert.deepEqual(mapped.pendingChangeSet.files[0].diff.slice(-2), [
@@ -278,4 +281,70 @@ test("conversation file reads use the sparse overlay endpoint", async () => {
   assert.equal(calls[0].options.method, "GET");
   assert.equal(file.contentHash, "sha256:overlay");
   assert.match(file.content, /generated = true/);
+});
+
+test("conversation deletion uses the project-scoped endpoint and preserves the returned count", async () => {
+  const calls = [];
+  const result = await deleteProjectWorkConversation({
+    projectId: "project/with spaces",
+    conversationId: "conversation/with spaces",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        schema_version: 1,
+        project_id: "project/with spaces",
+        conversation_id: "conversation/with spaces",
+        removed: true,
+        conversation_count: 2,
+      });
+    },
+  });
+
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/projects/project%2Fwith%20spaces/conversations/conversation%2Fwith%20spaces",
+  );
+  assert.equal(calls[0].options.method, "DELETE");
+  assert.equal(calls[0].options.body, undefined);
+  assert.deepEqual(result, {
+    projectId: "project/with spaces",
+    conversationId: "conversation/with spaces",
+    removed: true,
+    conversationCount: 2,
+  });
+});
+
+test("conversation rename normalizes the title and uses the project-scoped endpoint", async () => {
+  const calls = [];
+  const result = await renameProjectWorkConversation({
+    projectId: "project-1",
+    conversationId: "conversation-1",
+    title: "  检查   登录页  ",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        schema_version: 1,
+        conversation: {
+          id: "conversation-1",
+          project_id: "project-1",
+          title: "检查 登录页",
+          status: "idle",
+          pending_change_file_count: 3,
+        },
+      });
+    },
+  });
+
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/projects/project-1/conversations/conversation-1",
+  );
+  assert.equal(calls[0].options.method, "PATCH");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
+    title: "检查 登录页",
+  });
+  assert.equal(result.id, "conversation-1");
+  assert.equal(result.title, "检查 登录页");
+  assert.equal(result.pendingChangeFileCount, 3);
 });

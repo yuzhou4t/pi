@@ -1,14 +1,17 @@
-import { Fragment } from "react";
+import { Fragment, useEffect, useState } from "react";
 import {
   BookOpenText,
   CircleNotch,
   Code,
+  DotsThree,
   FolderSimplePlus,
   GearSix,
   MagnifyingGlass,
+  PencilSimple,
   PlayCircle,
   Plus,
   Sparkle,
+  Trash,
   X,
 } from "@phosphor-icons/react";
 
@@ -20,6 +23,9 @@ export function ProjectRail({
   selectedConversationId = null,
   onSelectConversation,
   onNewConversation,
+  onDeleteConversation,
+  onRenameConversation,
+  deletingConversationId = null,
   creatingConversationProjectIds = [],
   preparingConversationProjectId = null,
   workspaceKind = "project_work",
@@ -37,6 +43,7 @@ export function ProjectRail({
   onMouseDownResizer,
   isResizing,
 }) {
+  const [openConversationMenuId, setOpenConversationMenuId] = useState(null);
   const creatingProjectIds = new Set(creatingConversationProjectIds);
   const normalizedQuery = query.trim().toLowerCase();
   const matchesQuery = (value) => String(value ?? "").toLowerCase().includes(normalizedQuery);
@@ -51,6 +58,20 @@ export function ProjectRail({
       && matchesQuery(`${activeRun?.name} ${activeRun?.title} ${activeRun?.statusLabel}`);
     return projectMatches || conversationMatches || runMatches;
   });
+
+  useEffect(() => {
+    if (!openConversationMenuId) return undefined;
+    const closeMenu = () => setOpenConversationMenuId(null);
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") closeMenu();
+    };
+    window.addEventListener("pointerdown", closeMenu);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [openConversationMenuId]);
 
   return (
     <aside className={`project-rail${mobileActive ? " is-mobile-active" : ""}`} aria-label="项目列表">
@@ -180,27 +201,106 @@ export function ProjectRail({
                     ) : null}
                     {projectConversations.map((conversation) => {
                       const conversationSelected = conversation.id === selectedConversationId;
+                      const deletingConversation = conversation.id === deletingConversationId;
+                      const deletionBlocked = conversation.deleteBlocked === true;
                       const ConversationIcon = conversation.kind === "paper_reading"
                         ? BookOpenText
                         : Code;
+                      const hasConversationActions = conversation.kind === "project_work"
+                        && (onRenameConversation || onDeleteConversation);
                       return (
-                        <button
+                        <div
                           key={conversation.id}
-                          className={`project-conversation-row${conversationSelected ? " is-active" : ""}`}
-                          type="button"
-                          aria-current={conversationSelected ? "page" : undefined}
-                          onClick={() => onSelectConversation?.(conversation.id)}
+                          className={`project-conversation-item${hasConversationActions ? " has-actions" : ""}${openConversationMenuId === conversation.id ? " has-open-menu" : ""}`}
+                          data-conversation-menu
+                          data-delete-blocked={deletionBlocked || undefined}
                         >
-                          <ConversationIcon
-                            size={16}
-                            weight={conversationSelected ? "fill" : "regular"}
-                            aria-hidden="true"
-                          />
-                          <span>
-                            <strong>{conversation.title}</strong>
-                            <small>{conversation.subtitle}</small>
-                          </span>
-                        </button>
+                          <button
+                            className={`project-conversation-row${conversationSelected ? " is-active" : ""}`}
+                            type="button"
+                            disabled={deletingConversation}
+                            aria-current={conversationSelected ? "page" : undefined}
+                            onClick={() => onSelectConversation?.(conversation.id)}
+                          >
+                            {deletingConversation ? (
+                              <CircleNotch className="spin" size={16} weight="bold" aria-hidden="true" />
+                            ) : (
+                              <ConversationIcon
+                                size={16}
+                                weight={conversationSelected ? "fill" : "regular"}
+                                aria-hidden="true"
+                              />
+                            )}
+                            <span>
+                              <strong>{conversation.title}</strong>
+                              <small>{deletingConversation ? "正在删除…" : conversation.subtitle}</small>
+                            </span>
+                          </button>
+                          {hasConversationActions && !deletingConversation ? (
+                            <>
+                              <button
+                                className="project-conversation-more"
+                                type="button"
+                                aria-label={`打开“${conversation.title}”的更多操作`}
+                                aria-haspopup="menu"
+                                aria-expanded={openConversationMenuId === conversation.id}
+                                onPointerDown={(event) => event.stopPropagation()}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setOpenConversationMenuId((current) => (
+                                    current === conversation.id ? null : conversation.id
+                                  ));
+                                }}
+                              >
+                                <DotsThree size={17} weight="bold" aria-hidden="true" />
+                              </button>
+                              {openConversationMenuId === conversation.id ? (
+                                <div
+                                  className="project-conversation-menu"
+                                  role="menu"
+                                  aria-label={`“${conversation.title}”会话操作`}
+                                  onPointerDown={(event) => event.stopPropagation()}
+                                >
+                                  {onRenameConversation ? (
+                                    <button
+                                      type="button"
+                                      role="menuitem"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        setOpenConversationMenuId(null);
+                                        onRenameConversation(conversation);
+                                      }}
+                                    >
+                                      <PencilSimple size={15} weight="regular" aria-hidden="true" />
+                                      重命名
+                                    </button>
+                                  ) : null}
+                                  {onDeleteConversation ? (
+                                    <button
+                                      className="is-danger"
+                                      type="button"
+                                      role="menuitem"
+                                      disabled={deletionBlocked}
+                                      title={deletionBlocked ? "请先停止当前运行，再删除会话" : undefined}
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        setOpenConversationMenuId(null);
+                                        onDeleteConversation(conversation, {
+                                          visibleConversationIds: projectConversations.map(
+                                            (item) => item.id,
+                                          ),
+                                        });
+                                      }}
+                                    >
+                                      <Trash size={15} weight="regular" aria-hidden="true" />
+                                      删除会话
+                                    </button>
+                                  ) : null}
+                                </div>
+                              ) : null}
+                            </>
+                          ) : null}
+                        </div>
                       );
                     })}
                     {projectConversations.length === 0 && !creatingConversation ? (

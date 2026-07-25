@@ -75,6 +75,24 @@ const project = {
   rootLabel: "真实项目",
 };
 
+test("same-session rename updates the workbench title without resetting local detail", async () => {
+  await withLiveWorkbench(({ mergeConversationTitle }) => {
+    const snapshot = conversation({
+      title: "新工作会话",
+      messages: [{ id: "message-1", role: "user", text: "保留当前对话" }],
+    });
+    const renamed = mergeConversationTitle(snapshot, {
+      id: snapshot.id,
+      title: "检查登录页",
+      updatedAt: "2026-07-25T14:00:00.000Z",
+    });
+
+    assert.equal(renamed.title, "检查登录页");
+    assert.equal(renamed.messages[0].text, "保留当前对话");
+    assert.equal(renamed.updatedAt, "2026-07-25T14:00:00.000Z");
+  });
+});
+
 test("live project workbench renders the honest empty states without starting work", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const noConversationHtml = renderToStaticMarkup(React.createElement(

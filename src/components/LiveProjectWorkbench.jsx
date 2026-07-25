@@ -27,6 +27,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { projectWorkApi } from "../api/projectWork.js";
+import { mergeFreshConversationSnapshot } from "../project-work/liveProjectWorkState.js";
 import { AgentArtifactLayout } from "./AgentArtifactLayout.jsx";
 import { ProviderMenu } from "./ProviderMenu.jsx";
 
@@ -133,6 +134,23 @@ function writeLastArtifact(conversationId, artifactId) {
   } catch {
     // Artifact preference is optional; the live conversation remains authoritative.
   }
+}
+
+export function mergeConversationTitle(snapshot, conversation) {
+  if (
+    !snapshot
+    || !conversation
+    || snapshot.id !== conversation.id
+    || typeof conversation.title !== "string"
+    || snapshot.title === conversation.title
+  ) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    title: conversation.title,
+    updatedAt: conversation.updatedAt ?? snapshot.updatedAt,
+  };
 }
 
 function activeStatus(conversation) {
@@ -1213,6 +1231,7 @@ export function LiveProjectWorkbench({
   const [actionError, setActionError] = useState(null);
   const [applyError, setApplyError] = useState(null);
   const [verificationError, setVerificationError] = useState(null);
+  const snapshotRef = useRef(conversation);
   const conversationChangeRef = useRef(onConversationChange);
   const errorRef = useRef(onError);
 
@@ -1222,6 +1241,7 @@ export function LiveProjectWorkbench({
   }, [onConversationChange, onError]);
 
   useEffect(() => {
+    snapshotRef.current = conversation;
     setSnapshot(conversation);
     setDraft("");
     setContextChips([]);
@@ -1236,13 +1256,29 @@ export function LiveProjectWorkbench({
   }, [conversation?.id]);
 
   useEffect(() => {
+    setSnapshot((current) => {
+      const merged = mergeConversationTitle(current, conversation);
+      snapshotRef.current = merged;
+      return merged;
+    });
+  }, [conversation?.id, conversation?.title, conversation?.updatedAt]);
+
+  useEffect(() => {
     writeLastArtifact(snapshot?.id, activeArtifactId);
   }, [activeArtifactId, snapshot?.id]);
 
   const publishSnapshot = useCallback((nextSnapshot) => {
     if (!nextSnapshot) return;
-    setSnapshot(nextSnapshot);
-    conversationChangeRef.current?.(nextSnapshot);
+    const acceptedSnapshot = mergeFreshConversationSnapshot(
+      snapshotRef.current,
+      nextSnapshot,
+    );
+    if (acceptedSnapshot !== snapshotRef.current) {
+      snapshotRef.current = acceptedSnapshot;
+      setSnapshot(acceptedSnapshot);
+      conversationChangeRef.current?.(acceptedSnapshot);
+    }
+    return acceptedSnapshot;
   }, []);
 
   useEffect(() => {
@@ -1260,8 +1296,8 @@ export function LiveProjectWorkbench({
           signal: controller.signal,
         });
         if (disposed) return;
-        publishSnapshot(nextSnapshot);
-        if (isConversationRunning(nextSnapshot)) {
+        const acceptedSnapshot = publishSnapshot(nextSnapshot);
+        if (isConversationRunning(acceptedSnapshot)) {
           timeoutId = window.setTimeout(poll, pollIntervalMs);
         }
       } catch (error) {
@@ -1301,8 +1337,7 @@ export function LiveProjectWorkbench({
     setLocalError(null);
     try {
       const nextSnapshot = await operation();
-      publishSnapshot(nextSnapshot);
-      return nextSnapshot;
+      return publishSnapshot(nextSnapshot);
     } catch (error) {
       setLocalError(error);
       errorRef.current?.(error);

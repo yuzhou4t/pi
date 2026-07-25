@@ -43,6 +43,7 @@ const THINKING_LEVELS = new Set([
 ]);
 const SAFE_VERIFICATION_FILES = new Set(["npm", "pnpm", "yarn", "bun", "node"]);
 const PACKAGE_COMMANDS = new Set(["test", "run", "lint", "check", "typecheck"]);
+const DEFAULT_CONVERSATION_TITLE = "新工作会话";
 const BUSY_CONVERSATION_STATUSES = new Set([
   "running",
   "compacting",
@@ -57,6 +58,29 @@ function compactText(value, maxLength, fallback = "") {
   return normalized.slice(0, maxLength) || fallback;
 }
 
+function conversationTitle(value) {
+  const normalized = String(value ?? "")
+    .normalize("NFKC")
+    .trim()
+    .replaceAll(/\s+/g, " ");
+  if (!normalized || normalized.length > 80) {
+    throw projectWorkError(
+      "PROJECT_WORK_CONVERSATION_TITLE_INVALID",
+      "工作会话名称必须包含 1 到 80 个字符",
+      400,
+    );
+  }
+  return normalized;
+}
+
+function conversationTitleFromMessage(value) {
+  return String(value ?? "")
+    .normalize("NFKC")
+    .trim()
+    .replaceAll(/\s+/g, " ")
+    .slice(0, 48) || DEFAULT_CONVERSATION_TITLE;
+}
+
 function publicConversationSummary(conversation) {
   return {
     id: conversation.id,
@@ -66,6 +90,12 @@ function publicConversationSummary(conversation) {
     providerId: conversation.providerId ?? null,
     modelId: conversation.modelId,
     thinkingLevel: conversation.thinkingLevel,
+    pendingChangeFileCount: (
+      conversation.activeChangeSet?.status === "ready"
+      && Array.isArray(conversation.activeChangeSet.files)
+    )
+      ? conversation.activeChangeSet.files.length
+      : 0,
     lastEventSeq: conversation.lastEventSeq ?? 0,
     createdAt: conversation.createdAt,
     updatedAt: conversation.updatedAt,
@@ -379,6 +409,7 @@ export function createProjectWorkService({
   const runtimes = new Map();
   const verificationControllers = new Map();
   const applyQueues = new Map();
+  const deletingConversations = new Set();
   let disposed = false;
 
   function timestamp() {
@@ -387,6 +418,46 @@ export function createProjectWorkService({
 
   function assertActive() {
     if (disposed) throw new Error("project work service is disposed");
+  }
+
+  function assertConversationNotDeleting(conversationId) {
+    if (deletingConversations.has(conversationId)) {
+      throw projectWorkError(
+        "PROJECT_WORK_CONVERSATION_DELETE_IN_PROGRESS",
+        "工作会话正在删除",
+        409,
+        true,
+      );
+    }
+  }
+
+  function assertConversationProject(conversation, projectId) {
+    if (conversation.projectId !== projectId) {
+      throw projectWorkError(
+        "PROJECT_WORK_CONVERSATION_NOT_FOUND",
+        "工作会话不存在",
+        404,
+      );
+    }
+  }
+
+  function assertConversationDeletable(conversation) {
+    const runtime = runtimes.get(conversation.id);
+    if (
+      BUSY_CONVERSATION_STATUSES.has(conversation.status)
+      || verificationControllers.has(conversation.id)
+      || Boolean(runtime?.completion)
+      || (conversation.verifications ?? []).some(
+        (verification) => verification.status === "running",
+      )
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_CONVERSATION_DELETE_BUSY",
+        "工作会话仍有正在运行的 Agent、验证或修改应用操作",
+        409,
+        true,
+      );
+    }
   }
 
   function conversationPaths(conversationId) {
@@ -584,12 +655,15 @@ export function createProjectWorkService({
       case "agent_settled":
         try {
           const changeSet = await refreshChangeSet(conversationId);
-          await updateConversation(conversationId, {
-            status: changeSet.files.length > 0 ? "awaiting_confirmation" : "idle",
-            lastError: null,
-          });
+          const settledStatus = changeSet.files.length > 0
+            ? "awaiting_confirmation"
+            : "idle";
           await appendEvent(conversationId, "agent.status", {
-            status: changeSet.files.length > 0 ? "awaiting_confirmation" : "idle",
+            status: settledStatus,
+          });
+          await updateConversation(conversationId, {
+            status: settledStatus,
+            lastError: null,
           });
         } catch (error) {
           const safeError = safeProjectWorkError(error);
@@ -716,6 +790,7 @@ export function createProjectWorkService({
   }
 
   async function getRuntime(conversationId) {
+    assertConversationNotDeleting(conversationId);
     const current = runtimes.get(conversationId);
     if (current) return current;
     const conversation = await conversationStore.get(conversationId);
@@ -764,6 +839,10 @@ export function createProjectWorkService({
     });
     if (!runtime.host || typeof runtime.host.subscribe !== "function") {
       throw new Error("sessionFactory must return a subscribable Pi session host");
+    }
+    if (deletingConversations.has(conversationId)) {
+      runtime.host.dispose?.();
+      assertConversationNotDeleting(conversationId);
     }
     runtime.unsubscribe = runtime.host.subscribe((event) => {
       queueRuntimeEvent(runtime, event);
@@ -1044,7 +1123,7 @@ export function createProjectWorkService({
         schemaVersion: 1,
         id: conversationId,
         projectId: project.id,
-        title: compactText(title, 160, "新工作会话"),
+        title: compactText(title, 160, DEFAULT_CONVERSATION_TITLE),
         status: "idle",
         providerId: selectedModel.providerId,
         modelId: selectedModel.modelId,
@@ -1162,6 +1241,7 @@ export function createProjectWorkService({
     modelId,
   } = {}) {
     assertActive();
+    assertConversationNotDeleting(conversationId);
     const messageText = String(text ?? "").trim();
     if (!messageText || messageText.length > 32_000) {
       throw projectWorkError(
@@ -1211,6 +1291,12 @@ export function createProjectWorkService({
       createdAt,
     };
     await updateConversation(conversationId, (current) => ({
+      title: (
+        current.title === DEFAULT_CONVERSATION_TITLE
+        && (current.messages ?? []).length === 0
+      )
+        ? conversationTitleFromMessage(messageText)
+        : current.title,
       status: "running",
       messages: [...(current.messages ?? []), userMessage],
       lastError: null,
@@ -1241,6 +1327,7 @@ export function createProjectWorkService({
 
   async function steerConversation(conversationId, { text } = {}) {
     assertActive();
+    assertConversationNotDeleting(conversationId);
     const messageText = String(text ?? "").trim();
     if (!messageText || messageText.length > 8_000) {
       throw projectWorkError(
@@ -1275,6 +1362,7 @@ export function createProjectWorkService({
 
   async function abortConversation(conversationId) {
     assertActive();
+    assertConversationNotDeleting(conversationId);
     const conversation = await conversationStore.get(conversationId);
     const runtime = runtimes.get(conversationId);
     const verificationController = verificationControllers.get(conversationId);
@@ -1292,6 +1380,7 @@ export function createProjectWorkService({
 
   async function compactConversation(conversationId, { instructions } = {}) {
     assertActive();
+    assertConversationNotDeleting(conversationId);
     const conversation = await conversationStore.get(conversationId);
     if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
       throw projectWorkError(
@@ -1393,8 +1482,10 @@ export function createProjectWorkService({
     files,
   } = {}) {
     assertActive();
+    assertConversationNotDeleting(conversationId);
     const initial = await conversationStore.get(conversationId);
     return withApplyLock(`project:${initial.projectId}`, async () => {
+      assertConversationNotDeleting(conversationId);
       const conversation = await conversationStore.get(conversationId);
       if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
         throw projectWorkError(
@@ -1479,6 +1570,7 @@ export function createProjectWorkService({
 
   async function runVerification(conversationId, { requestId } = {}) {
     assertActive();
+    assertConversationNotDeleting(conversationId);
     const conversation = await conversationStore.get(conversationId);
     const verification = (conversation.verifications ?? []).find(
       (item) => item.id === requestId && item.status === "requested",
@@ -1514,6 +1606,7 @@ export function createProjectWorkService({
       );
     }
     const project = await registry.get(conversation.projectId);
+    assertConversationNotDeleting(conversationId);
     const paths = conversationPaths(conversationId);
     const controller = new AbortController();
     verificationControllers.set(conversationId, controller);
@@ -1647,6 +1740,65 @@ export function createProjectWorkService({
     return completed;
   }
 
+  async function removeConversation(projectId, conversationId) {
+    assertActive();
+    const project = await registry.getMetadata(projectId);
+    const conversation = await conversationStore.get(conversationId);
+    assertConversationProject(conversation, project.id);
+    assertConversationNotDeleting(conversationId);
+    assertConversationDeletable(conversation);
+    const lockKey = `project:${project.id}`;
+    if (applyQueues.has(lockKey)) {
+      throw projectWorkError(
+        "PROJECT_WORK_CONVERSATION_DELETE_BUSY",
+        "工作会话仍有正在运行的 Agent、验证或修改应用操作",
+        409,
+        true,
+      );
+    }
+
+    deletingConversations.add(conversationId);
+    try {
+      return await withApplyLock(lockKey, async () => {
+        const current = await conversationStore.get(conversationId);
+        assertConversationProject(current, project.id);
+        assertConversationDeletable(current);
+        const runtime = runtimes.get(conversationId);
+        if (runtime?.eventQueue) await runtime.eventQueue;
+        const latest = await conversationStore.get(conversationId);
+        assertConversationProject(latest, project.id);
+        assertConversationDeletable(latest);
+        runtime?.unsubscribe?.();
+        runtime?.host?.dispose?.();
+        runtimes.delete(conversationId);
+        await conversationStore.remove(conversationId);
+        const conversationCount = (await conversationStore.list(project.id)).length;
+        return {
+          id: conversationId,
+          projectId: project.id,
+          removed: true,
+          conversationCount,
+        };
+      });
+    } finally {
+      deletingConversations.delete(conversationId);
+    }
+  }
+
+  async function renameConversation(projectId, conversationId, { title } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const normalizedTitle = conversationTitle(title);
+    const project = await registry.getMetadata(projectId);
+    const conversation = await conversationStore.get(conversationId);
+    assertConversationProject(conversation, project.id);
+    assertConversationNotDeleting(conversationId);
+    const updated = await updateConversation(conversationId, {
+      title: normalizedTitle,
+    });
+    return publicConversationSummary(updated);
+  }
+
   async function removeProject(projectId) {
     assertActive();
     const project = await registry.get(projectId);
@@ -1711,7 +1863,9 @@ export function createProjectWorkService({
     readConversationFile,
     readProjectFile,
     registerProject,
+    removeConversation,
     removeProject,
+    renameConversation,
     runVerification,
     sendMessage,
     steerConversation,

@@ -8,7 +8,9 @@ import {
   PlayCircle,
 } from "@phosphor-icons/react";
 import { BindProjectDialog } from "./components/BindProjectDialog.jsx";
+import { DeleteConversationDialog } from "./components/DeleteConversationDialog.jsx";
 import { ProjectRail } from "./components/ProjectRail.jsx";
+import { RenameConversationDialog } from "./components/RenameConversationDialog.jsx";
 import { LiveProjectWorkbench } from "./components/LiveProjectWorkbench.jsx";
 import { SettingsDialog, SettingsQuickPanel } from "./components/SettingsPanel.jsx";
 import { SkillCenter } from "./components/SkillCenter.jsx";
@@ -18,9 +20,15 @@ import { ReadingWorkbench } from "./components/ReadingWorkbench.jsx";
 import { fetchCandidateSummaries, fetchModelProviders, mergeCandidateSummaries } from "./api/candidateSummaries.js";
 import { projectWorkApi } from "./api/projectWork.js";
 import {
+  adjacentConversationAfterRemoval,
   createProjectConversationLock,
   hydrateCreatedConversation,
   insertCreatedConversation,
+  isProjectWorkConversationBusy,
+  isProjectWorkConversationDeleteBlocked,
+  mergeFreshConversationSnapshot,
+  removeLiveConversation,
+  renameLiveConversation,
   upsertLiveProject,
 } from "./project-work/liveProjectWorkState.js";
 import {
@@ -458,6 +466,9 @@ export function App() {
   const [mobileView, setMobileView] = useState("agent");
   const [toast, setToast] = useState(null);
   const [bindProjectOpen, setBindProjectOpen] = useState(false);
+  const [conversationToDelete, setConversationToDelete] = useState(null);
+  const [conversationToRename, setConversationToRename] = useState(null);
+  const [deletingConversationId, setDeletingConversationId] = useState(null);
   const [activeConversationId, setActiveConversationId] = usePersistentState(
     "pi-agent-active-conversation-v1",
     "",
@@ -479,6 +490,7 @@ export function App() {
   const selectedProjectIdRef = useRef(selectedProjectId);
   const projectConversationCreationLockRef = useRef(null);
   const preparingConversationSelectionRef = useRef(null);
+  const deletePreflightRequestRef = useRef(0);
   const [creatingConversationProjectIds, setCreatingConversationProjectIds] = useState([]);
   const [preparingConversationSelection, setPreparingConversationSelection] = useState(null);
   const toastTimer = useRef(null);
@@ -664,9 +676,18 @@ export function App() {
       projectId: conversation.projectId,
       kind: "project_work",
       title: conversation.title,
+      status: conversation.status,
       subtitle: `正常工作 · ${projectWorkConversationLabel(conversation.status)}`,
+      pendingChangeFileCount: conversation.pendingChangeFileCount ?? 0,
+      deleteBlocked: isProjectWorkConversationDeleteBlocked(
+        conversation.id,
+        activeProjectWorkState,
+      ),
     })),
-    [liveProjectWork.conversations],
+    [
+      activeProjectWorkState,
+      liveProjectWork.conversations,
+    ],
   );
   const conversations = workspaceKind === "project_work"
     ? liveProjectWorkConversations
@@ -828,6 +849,7 @@ export function App() {
                 status: conversation.status,
                 providerId: conversation.providerId,
                 modelId: conversation.modelId,
+                pendingChangeFileCount: conversation.pendingChangeFileCount,
                 updatedAt: conversation.updatedAt,
               }
             : item
@@ -864,8 +886,16 @@ export function App() {
     ) {
       return;
     }
+    const acceptedConversation = activeProjectWorkState?.id === conversation.id
+      ? mergeFreshConversationSnapshot(activeProjectWorkState, conversation)
+      : conversation;
+    if (acceptedConversation !== conversation) return;
     syncProjectWorkModel(conversation);
     setLiveProjectWork((current) => {
+      const freshConversation = current.conversation?.id === conversation.id
+        ? mergeFreshConversationSnapshot(current.conversation, conversation)
+        : conversation;
+      if (freshConversation !== conversation) return current;
       const summary = {
         id: conversation.id,
         projectId: conversation.projectId,
@@ -875,6 +905,7 @@ export function App() {
         modelId: conversation.modelId,
         thinkingLevel: conversation.thinkingLevel,
         lastEventSeq: conversation.lastEventSeq,
+        pendingChangeFileCount: conversation.pendingChangeFileCount,
         updatedAt: conversation.updatedAt,
       };
       const existing = current.conversations.some((item) => item.id === conversation.id);
@@ -886,11 +917,11 @@ export function App() {
               item.id === conversation.id ? { ...item, ...summary } : item
             ))
           : [summary, ...current.conversations],
-        conversation,
+        conversation: freshConversation,
         error: null,
       };
     });
-  }, [syncProjectWorkModel]);
+  }, [activeProjectWorkState, syncProjectWorkModel]);
 
   useEffect(() => {
     activeConversationIdRef.current = activeConversationId;
@@ -2177,6 +2208,142 @@ export function App() {
     }, () => focusCreatingWorkConversation(projectId));
   };
 
+  const closeDeleteConversation = () => {
+    deletePreflightRequestRef.current += 1;
+    setConversationToDelete(null);
+  };
+
+  const requestDeleteWorkConversation = (conversation, {
+    visibleConversationIds = [],
+  } = {}) => {
+    if (!conversation?.id || !conversation?.projectId) return;
+    const requestId = deletePreflightRequestRef.current + 1;
+    deletePreflightRequestRef.current = requestId;
+    setConversationToDelete({
+      ...conversation,
+      visibleConversationIds,
+      checking: true,
+      checkError: "",
+      deleteBlocked: false,
+    });
+    projectWorkApi.fetchConversation({
+      conversationId: conversation.id,
+    }).then((latestConversation) => {
+      if (deletePreflightRequestRef.current !== requestId) return;
+      setLiveProjectWork((current) => (
+        hydrateCreatedConversation(current, latestConversation)
+      ));
+      setConversationToDelete((current) => (
+        current?.id === latestConversation.id
+          ? {
+              ...current,
+              title: latestConversation.title,
+              status: latestConversation.status,
+              pendingChangeFileCount: latestConversation.pendingChangeSet?.status === "ready"
+                ? latestConversation.pendingChangeSet.files?.length ?? 0
+                : 0,
+              checking: false,
+              checkError: "",
+              deleteBlocked: isProjectWorkConversationBusy(latestConversation),
+            }
+          : current
+      ));
+    }).catch(() => {
+      if (deletePreflightRequestRef.current !== requestId) return;
+      setConversationToDelete((current) => (
+        current?.id === conversation.id
+          ? {
+              ...current,
+              checking: false,
+              checkError: "无法核对会话状态，请取消后重试",
+              deleteBlocked: true,
+            }
+          : current
+      ));
+    });
+  };
+
+  const deleteWorkConversation = async (targetConversation) => {
+    if (!targetConversation?.id || !targetConversation?.projectId) return;
+    if (
+      targetConversation.checking
+      || targetConversation.checkError
+      || targetConversation.deleteBlocked
+    ) {
+      throw new Error(
+        targetConversation.checkError || "请先停止当前运行，再删除会话",
+      );
+    }
+    setDeletingConversationId(targetConversation.id);
+    try {
+      const deletingActive = activeConversationIdRef.current === targetConversation.id;
+      const adjacentConversation = deletingActive
+        ? adjacentConversationAfterRemoval(
+            liveProjectWork.conversations,
+            targetConversation.id,
+            targetConversation.visibleConversationIds,
+          )
+        : null;
+      const result = await projectWorkApi.deleteConversation({
+        projectId: targetConversation.projectId,
+        conversationId: targetConversation.id,
+      });
+      if (!result?.removed) {
+        throw new Error("服务未确认删除，请稍后重试");
+      }
+
+      setLiveProjectWork((current) => removeLiveConversation(
+        current,
+        targetConversation.id,
+        { conversationCount: result.conversationCount },
+      ));
+
+      if (!deletingActive) {
+        showToast("工作会话已删除");
+        return;
+      }
+
+      clearPreparingConversationSelection();
+      if (adjacentConversation) {
+        selectLiveConversation(adjacentConversation.id).then((loaded) => {
+          if (!loaded) {
+            showToast("会话已删除，相邻会话暂时无法载入", "warning");
+          }
+        });
+        showToast("工作会话已删除");
+        return;
+      }
+
+      projectWorkLoadRef.current += 1;
+      activeConversationIdRef.current = "";
+      setActiveConversationId("");
+      setLiveProjectWork((current) => ({
+        ...current,
+        status: "ready",
+        conversation: null,
+        error: null,
+      }));
+      setMobileView("agent");
+      showToast("工作会话已删除");
+    } finally {
+      setDeletingConversationId((current) => (
+        current === targetConversation.id ? null : current
+      ));
+    }
+  };
+
+  const renameWorkConversation = async (targetConversation, title) => {
+    if (!targetConversation?.id || !targetConversation?.projectId) return;
+    const renamed = await projectWorkApi.renameConversation({
+      projectId: targetConversation.projectId,
+      conversationId: targetConversation.id,
+      title,
+    });
+    if (!renamed?.id) throw new Error("服务未确认重命名，请稍后重试");
+    setLiveProjectWork((current) => renameLiveConversation(current, renamed));
+    showToast("会话名称已更新");
+  };
+
   const selectWorkspaceKind = (nextKind) => {
     if (!["project_work", "paper_reading"].includes(nextKind) || nextKind === workspaceKind) {
       return;
@@ -2342,7 +2509,7 @@ export function App() {
           }}
           conversations={visibleConversations}
           selectedConversationId={projectWorkMode
-            ? activeProjectWorkState?.id ?? null
+            ? activeConversationId || activeProjectWorkState?.id || null
             : readingMode
               ? paperConversationId
               : null}
@@ -2364,6 +2531,7 @@ export function App() {
           }}
           creatingConversationProjectIds={creatingConversationProjectIds}
           preparingConversationProjectId={preparingConversationSelection?.projectId ?? null}
+          deletingConversationId={deletingConversationId}
           onNewConversation={(projectId) => {
             if (workspaceKind === "project_work") {
               createWorkConversation(projectId).then((conversationId) => {
@@ -2385,6 +2553,12 @@ export function App() {
               "warning",
             );
           }}
+          onRenameConversation={workspaceKind === "project_work"
+            ? setConversationToRename
+            : undefined}
+          onDeleteConversation={workspaceKind === "project_work"
+            ? requestDeleteWorkConversation
+            : undefined}
           workspaceKind={workspaceKind}
           onWorkspaceKindChange={selectWorkspaceKind}
           query={projectQuery}
@@ -2661,6 +2835,18 @@ export function App() {
         workspaceKind={workspaceKind}
         onClose={() => setBindProjectOpen(false)}
         onBind={addProject}
+      />
+
+      <DeleteConversationDialog
+        conversation={conversationToDelete}
+        onClose={closeDeleteConversation}
+        onConfirm={deleteWorkConversation}
+      />
+
+      <RenameConversationDialog
+        conversation={conversationToRename}
+        onClose={() => setConversationToRename(null)}
+        onConfirm={renameWorkConversation}
       />
 
       {skillCenterOpen ? (

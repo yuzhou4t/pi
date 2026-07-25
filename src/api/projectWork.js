@@ -377,6 +377,17 @@ export function mapProjectWorkConversation(raw) {
       source.activeChangeSet ?? source.change_set ?? source.changeSet,
     ),
   );
+  const rawPendingChangeFileCount = pick(
+    source,
+    "pending_change_file_count",
+    "pendingChangeFileCount",
+  );
+  const parsedPendingChangeFileCount = Number(rawPendingChangeFileCount);
+  const pendingChangeFileCount = rawPendingChangeFileCount !== null
+    && Number.isSafeInteger(parsedPendingChangeFileCount)
+    && parsedPendingChangeFileCount >= 0
+    ? parsedPendingChangeFileCount
+    : changeSet?.files?.length ?? 0;
   const verificationRuns = asArray(
     pick(
       source,
@@ -436,6 +447,7 @@ export function mapProjectWorkConversation(raw) {
       title: step?.title ?? step?.text,
     }, index)).filter(Boolean),
     pendingChangeSet: changeSet,
+    pendingChangeFileCount,
     verificationCommand,
     verificationRuns,
     workspaceSnapshot: mapWorkspaceSnapshot(
@@ -540,6 +552,57 @@ export async function listProjectWorkConversations({
   return asArray(payload?.conversations).map((conversation) => (
     mapProjectWorkConversation({ conversation })
   ));
+}
+
+export async function deleteProjectWorkConversation({
+  projectId,
+  conversationId,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(projectId, "projectId");
+  requiredId(conversationId, "conversationId");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/conversations/${encodeURIComponent(conversationId)}`,
+    { method: "DELETE", signal, fetchImpl },
+  );
+  const count = Number(payload?.conversationCount ?? payload?.conversation_count);
+  return {
+    projectId: payload?.projectId ?? payload?.project_id ?? projectId,
+    conversationId: payload?.conversationId ?? payload?.conversation_id ?? conversationId,
+    removed: payload?.removed === true,
+    conversationCount: Number.isSafeInteger(count) && count >= 0 ? count : null,
+  };
+}
+
+export async function renameProjectWorkConversation({
+  projectId,
+  conversationId,
+  title,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(projectId, "projectId");
+  requiredId(conversationId, "conversationId");
+  const normalizedTitle = typeof title === "string"
+    ? title.trim().replace(/\s+/g, " ")
+    : "";
+  if (!normalizedTitle || normalizedTitle.length > 80) {
+    throw new TypeError("title 必须是 1–80 个字符");
+  }
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/conversations/${encodeURIComponent(conversationId)}`,
+    {
+      method: "PATCH",
+      body: {
+        schema_version: 1,
+        title: normalizedTitle,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
 }
 
 export async function removeProjectWorkProject({
@@ -835,6 +898,8 @@ export const projectWorkApi = {
   registerProject: registerProjectWorkProject,
   removeProject: removeProjectWorkProject,
   createConversation: createProjectWorkConversation,
+  deleteConversation: deleteProjectWorkConversation,
+  renameConversation: renameProjectWorkConversation,
   listConversations: listProjectWorkConversations,
   fetchConversation: fetchProjectWorkConversation,
   sendMessage: sendProjectWorkMessage,

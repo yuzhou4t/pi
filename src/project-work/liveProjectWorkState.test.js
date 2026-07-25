@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  adjacentConversationAfterRemoval,
   createProjectConversationLock,
   hydrateCreatedConversation,
   insertCreatedConversation,
+  isProjectWorkConversationBusy,
+  isProjectWorkConversationDeleteBlocked,
+  mergeFreshConversationSnapshot,
+  removeLiveConversation,
+  renameLiveConversation,
   upsertLiveProject,
 } from "./liveProjectWorkState.js";
 
@@ -250,4 +256,189 @@ test("equal-sequence hydration keeps the snapshot with the newer update time", (
 
   assert.equal(hydrated.conversation.status, "running");
   assert.equal(hydrated.conversations[0].status, "running");
+});
+
+test("deleting the current conversation chooses the next row, then the previous row", () => {
+  const conversations = [{
+    id: "conversation-newest",
+    projectId: "project-1",
+  }, {
+    id: "conversation-current",
+    projectId: "project-1",
+  }, {
+    id: "conversation-oldest",
+    projectId: "project-1",
+  }, {
+    id: "conversation-other-project",
+    projectId: "project-2",
+  }];
+
+  assert.equal(
+    adjacentConversationAfterRemoval(conversations, "conversation-current").id,
+    "conversation-oldest",
+  );
+  assert.equal(
+    adjacentConversationAfterRemoval(conversations, "conversation-oldest").id,
+    "conversation-current",
+  );
+  assert.equal(
+    adjacentConversationAfterRemoval(conversations, "missing"),
+    null,
+  );
+  assert.equal(
+    adjacentConversationAfterRemoval(
+      conversations,
+      "conversation-current",
+      ["conversation-current"],
+    ),
+    null,
+  );
+  assert.equal(
+    adjacentConversationAfterRemoval(
+      conversations,
+      "conversation-current",
+      ["conversation-current", "conversation-newest"],
+    ).id,
+    "conversation-newest",
+  );
+});
+
+test("deleting a live conversation removes only that row and decrements its project count", () => {
+  const current = state({
+    projects: [{
+      id: "project-1",
+      name: "项目一",
+      conversationCount: 2,
+    }, {
+      id: "project-2",
+      name: "项目二",
+      conversationCount: 1,
+    }],
+    conversations: [{
+      id: "conversation-current",
+      projectId: "project-1",
+    }, {
+      id: "conversation-neighbor",
+      projectId: "project-1",
+    }, {
+      id: "conversation-other",
+      projectId: "project-2",
+    }],
+    conversation: {
+      id: "conversation-current",
+      projectId: "project-1",
+    },
+  });
+
+  const next = removeLiveConversation(current, "conversation-current");
+
+  assert.deepEqual(
+    next.conversations.map((conversation) => conversation.id),
+    ["conversation-neighbor", "conversation-other"],
+  );
+  assert.equal(next.projects[0].conversationCount, 1);
+  assert.equal(next.projects[1].conversationCount, 1);
+  assert.equal(next.conversation, null);
+});
+
+test("deleting a background conversation preserves the active conversation and trusts server count", () => {
+  const current = state({
+    projects: [{
+      id: "project-1",
+      name: "项目一",
+      conversationCount: 8,
+    }],
+    conversations: [{
+      id: "conversation-old",
+      projectId: "project-1",
+    }, {
+      id: "conversation-background",
+      projectId: "project-1",
+    }],
+  });
+
+  const next = removeLiveConversation(current, "conversation-background", {
+    conversationCount: 1,
+  });
+
+  assert.equal(next.projects[0].conversationCount, 1);
+  assert.equal(next.conversation.id, "conversation-old");
+});
+
+test("renaming a conversation updates its list row and active heading without replacing detail", () => {
+  const current = state({
+    conversation: {
+      id: "conversation-old",
+      projectId: "project-1",
+      title: "新工作会话",
+      messages: [{ id: "message-1", content: "保留详情" }],
+    },
+  });
+  const next = renameLiveConversation(current, {
+    id: "conversation-old",
+    title: "检查登录页",
+    updatedAt: "2026-07-25T13:00:00.000Z",
+  });
+
+  assert.equal(next.conversations[0].title, "检查登录页");
+  assert.equal(next.conversation.title, "检查登录页");
+  assert.equal(next.conversation.messages[0].content, "保留详情");
+  assert.equal(next.conversation.updatedAt, "2026-07-25T13:00:00.000Z");
+});
+
+test("late hydration cannot resurrect a deleted conversation", () => {
+  const removed = removeLiveConversation(state(), "conversation-old");
+  const hydrated = hydrateCreatedConversation(removed, {
+    id: "conversation-old",
+    projectId: "project-1",
+    title: "迟到的会话快照",
+    status: "idle",
+    lastEventSeq: 9,
+  });
+
+  assert.equal(hydrated.conversations.some((item) => item.id === "conversation-old"), false);
+  assert.equal(hydrated.conversation, null);
+});
+
+test("a late idle snapshot cannot roll back a newer manual rename", () => {
+  const renamed = {
+    id: "conversation-old",
+    projectId: "project-1",
+    title: "检查登录页",
+    status: "running",
+    lastEventSeq: 4,
+    updatedAt: "2026-07-25T14:00:00.000Z",
+  };
+  const lateIdle = {
+    ...renamed,
+    title: "新工作会话",
+    status: "idle",
+    lastEventSeq: 5,
+    updatedAt: "2026-07-25T13:59:59.000Z",
+  };
+
+  assert.equal(mergeFreshConversationSnapshot(renamed, lateIdle), renamed);
+});
+
+test("only a live busy status blocks conversation deletion", () => {
+  assert.equal(isProjectWorkConversationBusy({ status: "running" }), true);
+  assert.equal(
+    isProjectWorkConversationBusy({ status: "idle", turnStatus: "verifying" }),
+    true,
+  );
+  assert.equal(isProjectWorkConversationBusy({ status: "awaiting_confirmation" }), false);
+  assert.equal(
+    isProjectWorkConversationDeleteBlocked(
+      "conversation-current",
+      { id: "conversation-current", status: "running" },
+    ),
+    true,
+  );
+  assert.equal(
+    isProjectWorkConversationDeleteBlocked(
+      "conversation-background",
+      { id: "conversation-current", status: "running" },
+    ),
+    false,
+  );
 });

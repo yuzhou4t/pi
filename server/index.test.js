@@ -374,10 +374,12 @@ function committingRun() {
 async function startTestServer(
   journalWorkflowService,
   summaryService = candidateSummaryService,
+  projectWorkService,
 ) {
   const server = createApiServer({
     candidateSummaryService: summaryService,
     journalWorkflowService,
+    projectWorkService,
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -391,6 +393,95 @@ async function startTestServer(
     }),
   };
 }
+
+test("project-work conversation menu routes stay project-scoped and return safe data", async (t) => {
+  const calls = [];
+  const projectWorkService = {
+    renameConversation: async (projectId, conversationId, { title }) => {
+      calls.push({ action: "rename", projectId, conversationId, title });
+      return {
+        id: conversationId,
+        projectId,
+        title,
+        status: "idle",
+        providerId: "deepseek",
+        modelId: "deepseek-v4-flash",
+        thinkingLevel: "medium",
+        pendingChangeFileCount: 2,
+        lastEventSeq: 0,
+        createdAt: "2026-07-25T00:00:00.000Z",
+        updatedAt: "2026-07-25T00:01:00.000Z",
+      };
+    },
+    removeConversation: async (projectId, conversationId) => {
+      calls.push({ action: "delete", projectId, conversationId });
+      return {
+        id: conversationId,
+        projectId,
+        removed: true,
+        conversationCount: 2,
+        rootPath: "/private/project/must-not-leak",
+      };
+    },
+  };
+  const server = await startTestServer({}, candidateSummaryService, projectWorkService);
+  t.after(server.close);
+
+  const endpoint = `${server.baseUrl}/api/v1/project-work/projects/project-one/conversations/conversation-two`;
+  const renameResponse = await fetch(endpoint, {
+    method: "PATCH",
+    headers: {
+      "content-type": "application/json",
+      origin: "http://127.0.0.1:4173",
+    },
+    body: JSON.stringify({ title: "新的会话名称" }),
+  });
+  const renamePayload = await renameResponse.json();
+  assert.equal(renameResponse.status, 200);
+  assert.equal(renamePayload.conversation.title, "新的会话名称");
+  assert.equal(renamePayload.conversation.pendingChangeFileCount, 2);
+  assert.equal(Object.hasOwn(renamePayload.conversation, "rootPath"), false);
+
+  const response = await fetch(
+    endpoint,
+    {
+      method: "DELETE",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+      },
+    },
+  );
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls, [{
+    action: "rename",
+    projectId: "project-one",
+    conversationId: "conversation-two",
+    title: "新的会话名称",
+  }, {
+    action: "delete",
+    projectId: "project-one",
+    conversationId: "conversation-two",
+  }]);
+  assert.deepEqual(payload, {
+    schemaVersion: 1,
+    projectId: "project-one",
+    conversationId: "conversation-two",
+    removed: true,
+    conversationCount: 2,
+  });
+  assert.equal(JSON.stringify(payload).includes("must-not-leak"), false);
+
+  const preflight = await fetch(endpoint, {
+    method: "OPTIONS",
+    headers: {
+      origin: "http://127.0.0.1:4173",
+    },
+  });
+  assert.equal(preflight.status, 204);
+  assert.match(preflight.headers.get("access-control-allow-methods"), /\bPATCH\b/);
+});
 
 test("candidate summaries use the server project-state source", async (t) => {
   let receivedPayload = null;
