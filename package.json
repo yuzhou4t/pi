@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:api": "node --watch --env-file-if-exists=.env.local server/index.js",
+    "dev:api": "PI_API_PORT=8788 node --watch --env-file-if-exists=.env.local server/index.js",
+    "local": "node scripts/pi-agent-local.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test"

@@ -150,6 +150,12 @@ When implementing from a selected generated mock, treat that image as the source
 - The verification subprocess still inherits the current macOS user permissions; do not call it an OS/container sandbox. Surface that boundary in the UI, kill the POSIX process group on abort/timeout, cap output and duration, and never install missing dependencies automatically.
 - A preview URL is valid only when a future server capability registers a loopback HTTP(S) address. The current runtime does not auto-start project servers; show an honest empty preview instead of a fixture.
 
+## Local desktop launcher (2026-07-25, confirmed)
+
+- During the active development phase, the everyday entry point is one desktop `Pi Agent.command`, not a persistent LaunchAgent or packaged app. It supervises both the Vite frontend and loopback API in one foreground terminal session, opens the site only after an application marker and health contract both pass, and stops only its own process groups when that terminal closes or receives `Control+C`.
+- Keep the public URL fixed at `http://127.0.0.1:4173/`, while the launcher selects an available private API port from a bounded high-port range and passes it through `PI_API_PORT` / `PI_API_TARGET`. Never reuse `8787`, which belongs to another local application, and never treat an arbitrary HTTP response as proof of Pi Agent ownership.
+- A foreign, hung or unidentified listener on `4173` must fail closed with a clear conflict message. The launcher must never scan upward to a different public URL, open an unrelated page, or kill a process merely because it owns the desired port. A future packaged app should reuse this supervisor and ownership contract.
+
 ## Standalone work conversations (2026-07-25, confirmed)
 
 - `正常工作` supports first-class standalone conversations in addition to project-bound conversations. A standalone conversation is not a hidden or copied project: its public contract is `projectId: null`, `scope: standalone`, and `workspaceKind: scratch`.
