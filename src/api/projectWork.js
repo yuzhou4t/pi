@@ -191,6 +191,47 @@ function mapWorkspaceSnapshot(raw) {
   };
 }
 
+function nullableNumber(raw, snakeKey, camelKey) {
+  const value = pick(raw, snakeKey, camelKey);
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function mapContextUsage(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const contextWindow = nullableNumber(raw, "context_window", "contextWindow");
+  return {
+    tokens: nullableNumber(raw, "tokens", "tokens"),
+    contextWindow: contextWindow > 0 ? contextWindow : null,
+    percent: nullableNumber(raw, "percent", "percent"),
+    status: pick(raw, "status", "status", "awaiting_measurement"),
+    updatedAt: pick(raw, "updated_at", "updatedAt"),
+  };
+}
+
+function mapCompaction(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return {
+    autoEnabled: pick(raw, "auto_enabled", "autoEnabled", true) !== false,
+    status: pick(raw, "status", "status", "idle"),
+    reason: pick(raw, "reason", "reason", pick(raw, "trigger", "trigger")),
+    tokensBefore: nullableNumber(raw, "tokens_before", "tokensBefore"),
+    estimatedTokensAfter: nullableNumber(
+      raw,
+      "estimated_tokens_after",
+      "estimatedTokensAfter",
+    ),
+    willRetry: pick(raw, "will_retry", "willRetry", false) === true,
+    completedAt: pick(
+      raw,
+      "completed_at",
+      "completedAt",
+      pick(raw, "last_completed_at", "lastCompletedAt"),
+    ),
+  };
+}
+
 function mapChangeFile(raw) {
   if (!raw || typeof raw !== "object") return null;
   const id = pick(raw, "file_id", "fileId", raw.id);
@@ -467,8 +508,11 @@ export function mapProjectWorkConversation(raw) {
     workspaceSnapshot: mapWorkspaceSnapshot(
       pick(source, "workspace_snapshot", "workspaceSnapshot"),
     ),
+    contextUsage: mapContextUsage(
+      pick(source, "context_usage", "contextUsage"),
+    ),
     preview: pick(source, "preview", "preview"),
-    compaction: pick(source, "compaction", "compaction"),
+    compaction: mapCompaction(pick(source, "compaction", "compaction")),
     error: pick(source, "last_error", "lastError"),
     hasMoreEvents: Boolean(raw?.hasMoreEvents ?? raw?.has_more_events ?? source.hasMoreEvents),
     createdAt: pick(source, "created_at", "createdAt"),

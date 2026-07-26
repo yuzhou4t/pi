@@ -7,6 +7,8 @@ import { createServer } from "vite";
 
 const COMPONENT_PATH = "/src/components/LiveProjectWorkbench.jsx";
 const COMPONENT_URL = new URL("./LiveProjectWorkbench.jsx", import.meta.url);
+const APP_URL = new URL("../App.jsx", import.meta.url);
+const STYLES_URL = new URL("../styles.css", import.meta.url);
 
 const artifactLayoutStub = {
   name: "live-project-workbench-artifact-layout-stub",
@@ -75,6 +77,16 @@ const project = {
   rootLabel: "真实项目",
 };
 
+function findElement(node, predicate) {
+  if (!React.isValidElement(node)) return null;
+  if (predicate(node)) return node;
+  for (const child of React.Children.toArray(node.props.children)) {
+    const match = findElement(child, predicate);
+    if (match) return match;
+  }
+  return null;
+}
+
 test("same-session rename updates the workbench title without resetting local detail", async () => {
   await withLiveWorkbench(({ mergeConversationTitle }) => {
     const snapshot = conversation({
@@ -138,6 +150,204 @@ test("standalone workbench states that it cannot read a local folder", async () 
     assert.match(html, /私有草稿区/);
     assert.match(html, /只有显式发送才开始工作/);
     assert.doesNotMatch(html, /真实项目上下文|读取当前项目/);
+  });
+});
+
+test("context usage menu exposes exact usage, automatic compaction, and an explicit action", async () => {
+  await withLiveWorkbench(({ ProjectContextUsageMenu }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectContextUsageMenu, {
+      open: true,
+      onOpenChange: () => {},
+      contextUsage: {
+        tokens: 30_720,
+        contextWindow: 128_000,
+        percent: 24,
+      },
+      modelContextWindow: null,
+      compaction: {
+        autoEnabled: true,
+        status: "idle",
+      },
+      hasAssistantReply: true,
+      running: false,
+      compacting: false,
+      onCompact: () => {},
+    }));
+
+    assert.match(html, /上下文 24%/);
+    assert.match(html, /30\.7k \/ 128k tokens/);
+    assert.match(html, /aria-valuenow="24"/);
+    assert.match(html, /自动压缩/);
+    assert.match(html, /已开启/);
+    assert.match(html, /立即压缩上下文/);
+    assert.doesNotMatch(html, /整理上下文/);
+  });
+});
+
+test("context usage stays unknown after compaction until Pi recalculates it", async () => {
+  await withLiveWorkbench(({ ProjectContextUsageMenu }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectContextUsageMenu, {
+      open: true,
+      onOpenChange: () => {},
+      contextUsage: {
+        tokens: null,
+        contextWindow: null,
+        percent: null,
+        status: "awaiting_measurement",
+      },
+      modelContextWindow: 131_072,
+      compaction: {
+        autoEnabled: true,
+        status: "completed",
+        completedAt: "2026-07-26T00:01:00.000Z",
+      },
+      hasAssistantReply: true,
+      running: false,
+      compacting: false,
+      onCompact: () => {},
+    }));
+
+    assert.match(html, /上下文 · 重新计算中/);
+    assert.match(html, /— \/ 131k tokens/);
+    assert.match(html, /aria-valuetext="重新计算中"/);
+    assert.match(html, /压缩已完成，下一次模型响应后重新计算/);
+    assert.match(html, /disabled=""[^>]*>立即压缩上下文/);
+  });
+});
+
+test("opening context usage does not invoke compaction, while its action does", async () => {
+  await withLiveWorkbench(({ ProjectContextUsageMenu }) => {
+    const openChanges = [];
+    let compactCalls = 0;
+    const menuProps = {
+      onOpenChange: (open) => openChanges.push(open),
+      contextUsage: {
+        tokens: 10_000,
+        contextWindow: 100_000,
+        percent: 10,
+      },
+      modelContextWindow: null,
+      compaction: { autoEnabled: true, status: "idle" },
+      hasAssistantReply: true,
+      running: false,
+      compacting: false,
+      onCompact: () => {
+        compactCalls += 1;
+      },
+    };
+    const closedMenu = ProjectContextUsageMenu({
+      ...menuProps,
+      open: false,
+    });
+    const trigger = findElement(
+      closedMenu,
+      (element) => element.props.className?.includes("project-context-usage-trigger"),
+    );
+    trigger.props.onClick();
+
+    assert.deepEqual(openChanges, [true]);
+    assert.equal(compactCalls, 0);
+
+    const openMenu = ProjectContextUsageMenu({
+      ...menuProps,
+      open: true,
+    });
+    const compactButton = findElement(
+      openMenu,
+      (element) => element.props.className === "project-context-compact-button",
+    );
+    compactButton.props.onClick();
+
+    assert.deepEqual(openChanges, [true, false]);
+    assert.equal(compactCalls, 1);
+  });
+});
+
+test("manual context compaction waits for the first assistant reply", async () => {
+  await withLiveWorkbench(({ ProjectContextUsageMenu }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectContextUsageMenu, {
+      open: true,
+      onOpenChange: () => {},
+      contextUsage: null,
+      modelContextWindow: null,
+      compaction: { autoEnabled: true, status: "idle" },
+      hasAssistantReply: false,
+      running: false,
+      compacting: false,
+      onCompact: () => {},
+    }));
+
+    assert.match(html, /— \/ — tokens/);
+    assert.match(html, /disabled=""[^>]*>立即压缩上下文/);
+    assert.match(html, /产生首轮回复后可手动压缩/);
+  });
+});
+
+test("normal-work keeps context usage beside the composer model and out of the header", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  const headerStart = source.indexOf("const headerActions");
+  const headerEnd = source.indexOf("if (!snapshot)", headerStart);
+  const headerImplementation = source.slice(headerStart, headerEnd);
+  const composerStart = source.indexOf('<form className="project-agent-composer"');
+  const composerEnd = source.indexOf("</form>", composerStart);
+  const composerImplementation = source.slice(composerStart, composerEnd);
+
+  const providerIndex = headerImplementation.indexOf("<ProviderMenu");
+  const skillsIndex = headerImplementation.indexOf("header-skill-pill");
+  const modelIndex = composerImplementation.indexOf("project-composer-model");
+  const contextIndex = composerImplementation.indexOf("{contextUsageControl}");
+  assert.ok(providerIndex >= 0 && providerIndex < skillsIndex);
+  assert.doesNotMatch(headerImplementation, /ProjectContextUsageMenu/);
+  assert.ok(modelIndex >= 0 && modelIndex < contextIndex);
+  assert.doesNotMatch(source, />\s*整理上下文\s*</);
+});
+
+test("composer context menu expands above its trigger", async () => {
+  const styles = await readFile(STYLES_URL, "utf8");
+  const selectorStart = styles.indexOf(
+    ".project-agent-composer .project-context-usage-popover",
+  );
+  const selectorEnd = styles.indexOf("}", selectorStart);
+  const rule = styles.slice(selectorStart, selectorEnd);
+
+  assert.notEqual(selectorStart, -1);
+  assert.match(rule, /top: auto/);
+  assert.match(rule, /bottom: calc\(100% \+ 8px\)/);
+});
+
+test("normal-work model menu honestly explains an unavailable ChatGPT subscription", async () => {
+  const source = await readFile(APP_URL, "utf8");
+
+  assert.match(source, /provider\.id === "openai-codex"/);
+  assert.match(source, /name: "GPT · ChatGPT 订阅"/);
+  assert.match(source, /provider\.id === "openai-codex"[\s\S]*\? "GPT · ChatGPT 订阅"/);
+  assert.match(source, /available: false/);
+  assert.match(source, /hint: "需在 Pi 中单独连接 ChatGPT 订阅"/);
+  assert.match(source, /models: \[\]/);
+  assert.match(source, /modelContextWindow=\{selectedProjectWorkModelInfo\?\.contextWindow \?\? null\}/);
+});
+
+test("compacting state uses the context-specific status copy", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        status: "compacting",
+        turnStatus: "compacting",
+        messages: [{
+          id: "message-assistant",
+          role: "assistant",
+          content: "已有首轮回复。",
+        }],
+        compaction: {
+          autoEnabled: true,
+          status: "running",
+        },
+      }),
+    }));
+
+    assert.match(html, /正在压缩上下文/);
+    assert.doesNotMatch(html, /正在整理上下文|>整理上下文</);
   });
 });
 
@@ -366,6 +576,100 @@ test("settled activity is coalesced and collapsed above the final answer", async
       html.indexOf('aria-label="Pi Agent 活动"') < html.indexOf("这是本轮最终答案。"),
       "completed activity should render before the final answer",
     );
+  });
+});
+
+test("assistant messages render safe structured Markdown while user text stays literal", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        messages: [
+          { id: "message-user", role: "user", content: "**不要格式化我**" },
+          {
+            id: "message-assistant",
+            role: "assistant",
+            content: [
+              "## 我能完成三类工作",
+              "",
+              "1. **阅读与分析代码**",
+              "2. 使用 `grep` 搜索项目",
+              "",
+              "> 修改会先等待审阅。",
+              "",
+              "```js",
+              "const ready = true;",
+              "```",
+              "",
+              "<script>window.bad = true</script>",
+            ].join("\n"),
+          },
+        ],
+      }),
+    }));
+
+    assert.match(html, /class="project-agent-plain-text">\*\*不要格式化我\*\*<\/div>/);
+    assert.match(html, /class="project-agent-markdown"/);
+    assert.match(html, /<h2>我能完成三类工作<\/h2>/);
+    assert.match(html, /<ol>/);
+    assert.match(html, /<strong>阅读与分析代码<\/strong>/);
+    assert.match(html, /<code>grep<\/code>/);
+    assert.match(html, /<blockquote>/);
+    assert.match(html, /<pre><code class="language-js">const ready = true;/);
+    assert.doesNotMatch(html, /<script>|window\.bad/);
+    assert.doesNotMatch(html, /\*\*阅读与分析代码\*\*/);
+  });
+});
+
+test("project composer sends on Enter and preserves Shift+Enter for a new line", async () => {
+  await withLiveWorkbench(({ handleProjectComposerKeyDown }) => {
+    let prevented = 0;
+    let submitted = 0;
+    const baseEvent = {
+      key: "Enter",
+      repeat: false,
+      preventDefault: () => {
+        prevented += 1;
+      },
+      currentTarget: {
+        form: {
+          requestSubmit: () => {
+            submitted += 1;
+          },
+        },
+      },
+      nativeEvent: {
+        isComposing: false,
+        keyCode: 13,
+      },
+    };
+
+    handleProjectComposerKeyDown(baseEvent);
+    assert.equal(prevented, 1);
+    assert.equal(submitted, 1);
+
+    handleProjectComposerKeyDown({ ...baseEvent, shiftKey: true });
+    assert.equal(prevented, 1);
+    assert.equal(submitted, 1);
+
+    handleProjectComposerKeyDown({ ...baseEvent, metaKey: true });
+    assert.equal(prevented, 2);
+    assert.equal(submitted, 2);
+
+    handleProjectComposerKeyDown({
+      ...baseEvent,
+      nativeEvent: { isComposing: true, keyCode: 229 },
+    });
+    assert.equal(prevented, 2);
+    assert.equal(submitted, 2);
+
+    handleProjectComposerKeyDown({ ...baseEvent, repeat: true });
+    assert.equal(prevented, 3);
+    assert.equal(submitted, 2);
+
+    handleProjectComposerKeyDown({ ...baseEvent, key: "a" });
+    assert.equal(prevented, 3);
+    assert.equal(submitted, 2);
   });
 });
 

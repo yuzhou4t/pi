@@ -285,6 +285,85 @@ function createThinkingSessionFactory() {
   return factory;
 }
 
+function createContextSessionFactory() {
+  const sessions = [];
+  const factory = async () => {
+    let subscriber = null;
+    const record = {
+      prompts: [],
+      contextUsage: {
+        tokens: 42_000,
+        contextWindow: 200_000,
+        percent: 21,
+      },
+      emit(event) {
+        subscriber?.(event);
+      },
+    };
+    const host = {
+      get autoCompactionEnabled() {
+        return true;
+      },
+      getContextUsage() {
+        return structuredClone(record.contextUsage);
+      },
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt(prompt) {
+        record.prompts.push(prompt);
+        if (record.prompts.length > 1) {
+          record.contextUsage = {
+            tokens: 28_000,
+            contextWindow: 200_000,
+            percent: 14,
+          };
+        }
+        record.emit({ type: "agent_settled" });
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {
+        const result = {
+          summary: "private summary containing /Users/private/project",
+          firstKeptEntryId: "private-entry-id",
+          tokensBefore: 42_000,
+          estimatedTokensAfter: 18_500,
+          details: {
+            readFiles: ["/Users/private/project/secret.txt"],
+          },
+        };
+        record.emit({ type: "compaction_start", reason: "manual" });
+        record.contextUsage = {
+          tokens: null,
+          contextWindow: 200_000,
+          percent: null,
+        };
+        record.emit({
+          type: "compaction_end",
+          reason: "manual",
+          result,
+          aborted: false,
+          willRetry: false,
+        });
+        return result;
+      },
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
 async function eventually(read, predicate, message) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const value = await read();
@@ -293,6 +372,211 @@ async function eventually(read, predicate, message) {
   }
   assert.fail(message);
 }
+
+test("context usage stays read-only until a turn and compaction persists only safe metrics", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-context-usage-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionFactory = createContextSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    idFactory: incrementalId("context"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  const untouched = await service.getConversation(conversation.id);
+  assert.equal(sessionFactory.sessions.length, 0);
+  assert.deepEqual(untouched.conversation.contextUsage, {
+    tokens: null,
+    contextWindow: null,
+    percent: null,
+    status: "awaiting_measurement",
+    updatedAt: null,
+  });
+  assert.deepEqual(untouched.conversation.compaction, {
+    autoEnabled: true,
+    status: "idle",
+    reason: null,
+    tokensBefore: null,
+    estimatedTokensAfter: null,
+    willRetry: false,
+    completedAt: null,
+  });
+
+  await service.sendMessage(conversation.id, { text: "检查当前上下文" });
+  const measured = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.contextUsage.status === "estimated"
+    ),
+    "context usage was not refreshed after agent_settled",
+  );
+  assert.deepEqual(
+    {
+      tokens: measured.conversation.contextUsage.tokens,
+      contextWindow: measured.conversation.contextUsage.contextWindow,
+      percent: measured.conversation.contextUsage.percent,
+      status: measured.conversation.contextUsage.status,
+    },
+    {
+      tokens: 42_000,
+      contextWindow: 200_000,
+      percent: 21,
+      status: "estimated",
+    },
+  );
+  assert.equal(measured.conversation.compaction.autoEnabled, true);
+
+  const compacted = await service.compactConversation(conversation.id);
+  assert.deepEqual(
+    {
+      tokens: compacted.conversation.contextUsage.tokens,
+      contextWindow: compacted.conversation.contextUsage.contextWindow,
+      percent: compacted.conversation.contextUsage.percent,
+      status: compacted.conversation.contextUsage.status,
+    },
+    {
+      tokens: null,
+      contextWindow: 200_000,
+      percent: null,
+      status: "awaiting_measurement",
+    },
+  );
+  assert.equal(compacted.conversation.compaction.status, "completed");
+  assert.equal(compacted.conversation.compaction.reason, "manual");
+  assert.equal(compacted.conversation.compaction.tokensBefore, 42_000);
+  assert.equal(compacted.conversation.compaction.estimatedTokensAfter, 18_500);
+  assert.equal(compacted.conversation.compaction.willRetry, false);
+  assert.ok(compacted.conversation.compaction.completedAt);
+
+  const publicPayload = JSON.stringify(compacted);
+  assert.doesNotMatch(publicPayload, /private summary|private-entry-id|secret\.txt/);
+
+  await service.sendMessage(conversation.id, { text: "继续下一轮" });
+  const remeasured = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.contextUsage.status === "estimated"
+    ),
+    "context usage was not remeasured after the post-compaction turn",
+  );
+  assert.equal(remeasured.conversation.contextUsage.tokens, 28_000);
+  assert.equal(remeasured.conversation.contextUsage.percent, 14);
+});
+
+test("automatic compaction failure records a safe terminal state", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-auto-compaction-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionFactory = createContextSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    idFactory: incrementalId("auto-context"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "建立会话" });
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "initial turn did not settle",
+  );
+
+  const session = sessionFactory.sessions[0];
+  session.emit({ type: "compaction_start", reason: "threshold" });
+  session.emit({
+    type: "compaction_end",
+    reason: "threshold",
+    result: undefined,
+    aborted: false,
+    willRetry: false,
+    errorMessage: "private provider error at /Users/private/project",
+  });
+  const failed = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.compaction.status === "failed",
+    "automatic compaction failure was not persisted",
+  );
+
+  assert.equal(failed.conversation.status, "idle");
+  assert.equal(failed.conversation.compaction.autoEnabled, true);
+  assert.equal(failed.conversation.compaction.reason, "threshold");
+  assert.equal(failed.conversation.compaction.tokensBefore, null);
+  assert.equal(failed.conversation.compaction.estimatedTokensAfter, null);
+  assert.ok(failed.conversation.compaction.completedAt);
+  assert.doesNotMatch(JSON.stringify(failed), /private provider error|Users\/private/);
+  assert.deepEqual(
+    failed.events
+      .filter((event) => event.type.startsWith("compaction."))
+      .map((event) => ({
+        type: event.type,
+        reason: event.data.reason,
+        status: event.data.status,
+      })),
+    [{
+      type: "compaction.started",
+      reason: "threshold",
+      status: undefined,
+    }, {
+      type: "compaction.completed",
+      reason: "threshold",
+      status: "failed",
+    }],
+  );
+});
+
+test("restoring an interrupted automatic compaction terminates its running state", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-compaction-restore-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const interruptedAt = new Date("2026-07-26T10:00:00.000Z");
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createContextSessionFactory(),
+    now: () => interruptedAt,
+    idFactory: incrementalId("restore-context"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  const statePath = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+    "conversation.json",
+  );
+  const persisted = JSON.parse(await readFile(statePath, "utf8"));
+  await writeFile(statePath, `${JSON.stringify({
+    ...persisted,
+    status: "running",
+    compaction: {
+      autoEnabled: true,
+      status: "running",
+      reason: "threshold",
+      tokensBefore: 61_000,
+      estimatedTokensAfter: 22_000,
+      willRetry: false,
+      completedAt: null,
+    },
+  }, null, 2)}\n`);
+
+  const restored = await service.getConversation(conversation.id);
+  assert.equal(restored.conversation.status, "interrupted");
+  assert.deepEqual(restored.conversation.compaction, {
+    autoEnabled: true,
+    status: "aborted",
+    reason: "threshold",
+    tokensBefore: 61_000,
+    estimatedTokensAfter: 22_000,
+    willRetry: false,
+    completedAt: interruptedAt.toISOString(),
+  });
+  assert.equal(restored.conversation.lastError.code, "PROJECT_WORK_SESSION_INTERRUPTED");
+});
 
 test("thinking deltas persist only one lifecycle pair per agent run", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-thinking-events-"));

@@ -1093,6 +1093,140 @@ button:disabled {
   line-height: 1.5;
 }
 
+.project-context-usage-trigger.is-warning {
+  color: #8a5f20;
+  background: rgba(138, 95, 32, 0.05);
+  border-color: rgba(138, 95, 32, 0.2);
+}
+
+.project-context-usage-trigger.is-critical {
+  color: var(--risk);
+  background: var(--risk-pale);
+  border-color: rgba(124, 58, 45, 0.2);
+}
+
+.project-context-usage-popover {
+  width: 320px;
+}
+
+.project-context-usage-percent {
+  color: var(--teal-accent);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.project-context-usage-summary {
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.project-context-usage-summary > span {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.project-context-usage-summary small,
+.project-context-compact-hint {
+  color: var(--weak);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.project-context-usage-progress {
+  position: relative;
+  height: 6px;
+  overflow: hidden;
+  background: var(--accent-pale);
+  border-radius: 999px;
+}
+
+.project-context-usage-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--teal-accent);
+  border-radius: inherit;
+  transition: width 0.15s ease;
+}
+
+.project-context-auto-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 2px 9px;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-context-auto-row > div {
+  display: grid;
+  gap: 2px;
+}
+
+.project-context-auto-row strong {
+  font-size: 12px;
+}
+
+.project-context-auto-row > div > span {
+  color: var(--weak);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.project-context-auto-row > span {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  color: var(--muted);
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.project-context-auto-row > span.is-enabled {
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+}
+
+.project-context-compaction-note {
+  margin: 9px 2px 7px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.project-context-compact-button {
+  display: inline-flex;
+  width: 100%;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  cursor: pointer;
+  color: #fff;
+  background: var(--teal-accent);
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.project-context-compact-button:hover:not(:disabled) {
+  background: var(--teal-hover);
+}
+
+.project-context-compact-hint {
+  display: block;
+  margin: 6px 2px 0;
+  text-align: center;
+}
+
 /* ===== Workflow header ===== */
 
 .workflow-workspace {
@@ -7088,12 +7222,14 @@ h4.reader-rail-full-heading {
 }
 
 .project-agent-message > div {
+  min-width: 0;
   padding: 10px 12px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 10px;
   font-size: 13.5px;
   line-height: 1.65;
+  overflow-wrap: anywhere;
 }
 
 .project-agent-message.is-user {
@@ -7108,6 +7244,141 @@ h4.reader-rail-full-heading {
 .project-agent-message.is-user > div {
   background: var(--teal-tint);
   border-color: var(--teal-border);
+}
+
+.project-agent-plain-text {
+  white-space: pre-wrap;
+}
+
+.project-agent-markdown > :first-child {
+  margin-top: 0;
+}
+
+.project-agent-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.project-agent-markdown p {
+  margin: 0 0 0.72em;
+}
+
+.project-agent-markdown h1,
+.project-agent-markdown h2,
+.project-agent-markdown h3,
+.project-agent-markdown h4 {
+  margin: 1.05em 0 0.45em;
+  color: var(--text);
+  line-height: 1.35;
+}
+
+.project-agent-markdown h1 {
+  font-size: 16px;
+}
+
+.project-agent-markdown h2 {
+  font-size: 15px;
+}
+
+.project-agent-markdown h3,
+.project-agent-markdown h4 {
+  font-size: 14px;
+}
+
+.project-agent-markdown ul,
+.project-agent-markdown ol {
+  display: grid;
+  gap: 0.3em;
+  margin: 0.45em 0 0.8em;
+  padding-left: 1.45em;
+}
+
+.project-agent-markdown li {
+  padding-left: 0.12em;
+}
+
+.project-agent-markdown li > p {
+  margin: 0;
+}
+
+.project-agent-markdown blockquote {
+  margin: 0.7em 0;
+  padding: 0.48em 0.75em;
+  color: var(--muted);
+  background: var(--accent-pale);
+  border-left: 3px solid var(--teal-border);
+  border-radius: 0 6px 6px 0;
+}
+
+.project-agent-markdown blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+.project-agent-markdown hr {
+  margin: 0.9em 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+.project-agent-markdown a {
+  color: var(--teal-accent);
+  text-decoration: underline;
+  text-decoration-color: rgba(15, 118, 110, 0.35);
+  text-underline-offset: 2px;
+}
+
+.project-agent-markdown code {
+  padding: 0.12em 0.34em;
+  background: var(--accent-pale);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.project-agent-markdown pre {
+  max-width: 100%;
+  margin: 0.7em 0;
+  padding: 10px 11px;
+  overflow-x: auto;
+  background: #f5f1e8;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  line-height: 1.55;
+}
+
+.project-agent-markdown pre code {
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-size: 11.5px;
+}
+
+.project-agent-markdown table {
+  display: block;
+  max-width: 100%;
+  margin: 0.7em 0;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.project-agent-markdown th,
+.project-agent-markdown td {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.project-agent-markdown th {
+  background: var(--accent-pale);
+  font-weight: 650;
+}
+
+.project-agent-markdown input[type="checkbox"] {
+  margin: 0 0.35em 0 0;
+  accent-color: var(--teal-accent);
 }
 
 .project-plan-card,
@@ -7468,10 +7739,17 @@ h4.reader-rail-full-heading {
   margin-top: 6px;
 }
 
-.project-agent-composer > footer > div {
+.project-composer-meta {
   display: grid;
   min-width: 0;
   gap: 1px;
+}
+
+.project-composer-tools {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
 }
 
 .project-agent-composer > footer small {
@@ -7481,11 +7759,42 @@ h4.reader-rail-full-heading {
 
 .project-composer-model {
   overflow: hidden;
+  max-width: 220px;
   color: var(--muted);
   font-family: var(--font-mono);
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.project-composer-tool {
+  display: inline-flex;
+  height: 24px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  padding: 0 7px;
+  cursor: pointer;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.project-composer-tool:hover {
+  color: var(--text);
+  background: var(--surface-soft);
+  border-color: var(--border-strong);
+}
+
+.project-agent-composer .project-context-usage-popover {
+  top: auto;
+  right: auto;
+  bottom: calc(100% + 8px);
+  left: 0;
 }
 
 .project-agent-composer > footer > button {

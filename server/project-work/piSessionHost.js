@@ -1101,6 +1101,12 @@ export function createPiSessionFactory({
       get isStreaming() {
         return session.isStreaming;
       },
+      get autoCompactionEnabled() {
+        return session.autoCompactionEnabled === true;
+      },
+      getContextUsage() {
+        return session.getContextUsage();
+      },
       prompt(text, options) {
         return session.prompt(text, options);
       },

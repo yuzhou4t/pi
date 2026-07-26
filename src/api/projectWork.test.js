@@ -4,6 +4,7 @@ import {
   createStandaloneProjectWorkConversation,
   deleteProjectWorkConversation,
   fetchProjectWorkFile,
+  fetchProjectWorkModels,
   fetchProjectWorkTree,
   listStandaloneProjectWorkConversations,
   mapProjectWorkConversation,
@@ -104,6 +105,92 @@ test("standalone conversation mapping preserves its explicit scratch scope", () 
   assert.equal(mapped.workspaceKind, "scratch");
   assert.equal(mapped.scope, "standalone");
   assert.equal(mapped.rootLabel, "未连接文件夹");
+});
+
+test("conversation mapping preserves known and recalculating context usage", () => {
+  const known = mapProjectWorkConversation({
+    conversation: {
+      id: "conversation-context-known",
+      project_id: "project-1",
+      context_usage: {
+        tokens: 30_720,
+        context_window: 128_000,
+        percent: 24,
+        status: "estimated",
+        updated_at: "2026-07-26T00:00:00.000Z",
+      },
+      compaction: {
+        auto_enabled: true,
+        status: "idle",
+      },
+    },
+  });
+  assert.deepEqual(known.contextUsage, {
+    tokens: 30_720,
+    contextWindow: 128_000,
+    percent: 24,
+    status: "estimated",
+    updatedAt: "2026-07-26T00:00:00.000Z",
+  });
+  assert.deepEqual(known.compaction, {
+    autoEnabled: true,
+    status: "idle",
+    reason: null,
+    tokensBefore: null,
+    estimatedTokensAfter: null,
+    willRetry: false,
+    completedAt: null,
+  });
+
+  const recalculating = mapProjectWorkConversation({
+    conversation: {
+      id: "conversation-context-recalculating",
+      project_id: "project-1",
+      context_usage: {
+        tokens: null,
+        context_window: 128_000,
+        percent: null,
+        status: "awaiting_measurement",
+      },
+      compaction: {
+        auto_enabled: true,
+        status: "completed",
+        reason: "manual",
+        tokens_before: 30_720,
+        estimated_tokens_after: 9_400,
+        will_retry: false,
+        completed_at: "2026-07-26T00:01:00.000Z",
+      },
+    },
+  });
+  assert.equal(recalculating.contextUsage.tokens, null);
+  assert.equal(recalculating.contextUsage.percent, null);
+  assert.equal(recalculating.contextUsage.contextWindow, 128_000);
+  assert.equal(recalculating.compaction.status, "completed");
+  assert.equal(recalculating.compaction.reason, "manual");
+  assert.equal(recalculating.compaction.tokensBefore, 30_720);
+  assert.equal(recalculating.compaction.estimatedTokensAfter, 9_400);
+  assert.equal(recalculating.compaction.completedAt, "2026-07-26T00:01:00.000Z");
+});
+
+test("project-work model catalog keeps the real context window metadata", async () => {
+  const catalog = await fetchProjectWorkModels({
+    fetchImpl: async () => jsonResponse({
+      providers: [{
+        id: "deepseek",
+        name: "DeepSeek",
+        models: [{
+          id: "deepseek-v4-flash",
+          name: "DeepSeek V4 Flash",
+          context_window: 131_072,
+        }],
+      }],
+      default_provider_id: "deepseek",
+      default_model_id: "deepseek-v4-flash",
+    }),
+  });
+
+  assert.equal(catalog.providers[0].models[0].contextWindow, 131_072);
 });
 
 test("standalone conversations use global list and create routes", async () => {

@@ -50,6 +50,87 @@ const BUSY_CONVERSATION_STATUSES = new Set([
   "compacting",
   "verifying",
 ]);
+const COMPACTION_STATUSES = new Set([
+  "idle",
+  "running",
+  "completed",
+  "failed",
+  "aborted",
+]);
+const COMPACTION_REASONS = new Set([
+  "manual",
+  "threshold",
+  "overflow",
+]);
+
+function nullableNonNegativeNumber(value) {
+  if (value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function defaultContextUsage(updatedAt = null) {
+  return {
+    tokens: null,
+    contextWindow: null,
+    percent: null,
+    status: "awaiting_measurement",
+    updatedAt,
+  };
+}
+
+function normalizedContextUsage(value, updatedAt = null, {
+  awaitingMeasurement = false,
+} = {}) {
+  const rawContextWindow = nullableNonNegativeNumber(value?.contextWindow);
+  const contextWindow = rawContextWindow > 0 ? rawContextWindow : null;
+  const tokens = awaitingMeasurement
+    ? null
+    : nullableNonNegativeNumber(value?.tokens);
+  const percent = awaitingMeasurement
+    ? null
+    : nullableNonNegativeNumber(value?.percent);
+  const status = awaitingMeasurement || tokens === null || percent === null
+    ? "awaiting_measurement"
+    : "estimated";
+  return {
+    tokens,
+    contextWindow,
+    percent,
+    status,
+    updatedAt: updatedAt ?? value?.updatedAt ?? null,
+  };
+}
+
+function defaultCompactionState(autoEnabled = true) {
+  return {
+    autoEnabled,
+    status: "idle",
+    reason: null,
+    tokensBefore: null,
+    estimatedTokensAfter: null,
+    willRetry: false,
+    completedAt: null,
+  };
+}
+
+function normalizedCompactionState(value, {
+  autoEnabled = true,
+} = {}) {
+  return {
+    autoEnabled: typeof value?.autoEnabled === "boolean"
+      ? value.autoEnabled
+      : autoEnabled,
+    status: COMPACTION_STATUSES.has(value?.status) ? value.status : "idle",
+    reason: COMPACTION_REASONS.has(value?.reason) ? value.reason : null,
+    tokensBefore: nullableNonNegativeNumber(value?.tokensBefore),
+    estimatedTokensAfter: nullableNonNegativeNumber(value?.estimatedTokensAfter),
+    willRetry: value?.willRetry === true,
+    completedAt: typeof value?.completedAt === "string"
+      ? value.completedAt
+      : null,
+  };
+}
 
 function compactText(value, maxLength, fallback = "") {
   const normalized = String(value ?? "")
@@ -153,6 +234,8 @@ function publicConversationState(conversation, lastEventSeq) {
     workspaceSnapshot: conversation.workspaceSnapshot
       ? structuredClone(conversation.workspaceSnapshot)
       : null,
+    contextUsage: normalizedContextUsage(conversation.contextUsage),
+    compaction: normalizedCompactionState(conversation.compaction),
     lastError: conversation.lastError ? structuredClone(conversation.lastError) : null,
   };
 }
@@ -604,6 +687,132 @@ export function createProjectWorkService({
     }));
   }
 
+  function runtimeAutoCompactionEnabled(runtime, currentValue = true) {
+    try {
+      return typeof runtime?.host?.autoCompactionEnabled === "boolean"
+        ? runtime.host.autoCompactionEnabled
+        : currentValue;
+    } catch {
+      return currentValue;
+    }
+  }
+
+  function runtimeContextUsage(runtime) {
+    if (typeof runtime?.host?.getContextUsage !== "function") {
+      return { available: false, value: undefined };
+    }
+    try {
+      return {
+        available: true,
+        value: runtime.host.getContextUsage(),
+      };
+    } catch {
+      return { available: false, value: undefined };
+    }
+  }
+
+  async function refreshRuntimeContext(runtime, {
+    awaitingMeasurement = false,
+  } = {}) {
+    const measuredAt = timestamp();
+    const observedUsage = runtimeContextUsage(runtime);
+    return updateConversation(runtime.conversationId, (current) => {
+      const currentCompaction = normalizedCompactionState(current.compaction);
+      const contextUsage = observedUsage.available
+        ? normalizedContextUsage(observedUsage.value, measuredAt, {
+            awaitingMeasurement,
+          })
+        : awaitingMeasurement
+          ? normalizedContextUsage(current.contextUsage, measuredAt, {
+              awaitingMeasurement: true,
+            })
+          : normalizedContextUsage(current.contextUsage);
+      return {
+        contextUsage,
+        compaction: {
+          ...currentCompaction,
+          autoEnabled: runtimeAutoCompactionEnabled(
+            runtime,
+            currentCompaction.autoEnabled,
+          ),
+        },
+      };
+    });
+  }
+
+  async function recordCompactionStart(runtime, event) {
+    const reason = COMPACTION_REASONS.has(event?.reason) ? event.reason : null;
+    let publicCompaction;
+    await updateConversation(runtime.conversationId, (current) => {
+      const currentCompaction = normalizedCompactionState(current.compaction);
+      publicCompaction = {
+        ...defaultCompactionState(
+          runtimeAutoCompactionEnabled(runtime, currentCompaction.autoEnabled),
+        ),
+        status: "running",
+        reason,
+      };
+      return { compaction: publicCompaction };
+    });
+    await appendEvent(runtime.conversationId, "compaction.started", {
+      reason,
+      autoEnabled: publicCompaction.autoEnabled,
+    });
+  }
+
+  async function recordCompactionEnd(runtime, event) {
+    const completedAt = timestamp();
+    const reason = COMPACTION_REASONS.has(event?.reason) ? event.reason : null;
+    const status = event?.aborted === true
+      ? "aborted"
+      : event?.errorMessage
+        ? "failed"
+        : "completed";
+    const tokensBefore = nullableNonNegativeNumber(event?.result?.tokensBefore);
+    const estimatedTokensAfter = nullableNonNegativeNumber(
+      event?.result?.estimatedTokensAfter,
+    );
+    const willRetry = event?.willRetry === true;
+    const observedUsage = runtimeContextUsage(runtime);
+    let publicCompaction;
+    await updateConversation(runtime.conversationId, (current) => {
+      const currentCompaction = normalizedCompactionState(current.compaction);
+      const contextUsage = status === "completed"
+        ? normalizedContextUsage(
+            observedUsage.available ? observedUsage.value : current.contextUsage,
+            completedAt,
+            { awaitingMeasurement: true },
+          )
+        : observedUsage.available
+          ? normalizedContextUsage(observedUsage.value, completedAt)
+          : normalizedContextUsage(current.contextUsage);
+      publicCompaction = {
+        autoEnabled: runtimeAutoCompactionEnabled(
+          runtime,
+          currentCompaction.autoEnabled,
+        ),
+        status,
+        reason,
+        tokensBefore,
+        estimatedTokensAfter,
+        willRetry,
+        completedAt,
+      };
+      return {
+        contextUsage,
+        compaction: publicCompaction,
+      };
+    });
+    await appendEvent(runtime.conversationId, "compaction.completed", {
+      reason,
+      status,
+      aborted: event?.aborted === true,
+      willRetry,
+      tokensBefore,
+      estimatedTokensAfter,
+    });
+  }
+
   async function recordPlan(conversationId, plan) {
     const updatedAt = timestamp();
     const normalized = {
@@ -768,6 +977,7 @@ export function createProjectWorkService({
       case "agent_settled":
         await finishRuntimeThinking(runtime);
         try {
+          await refreshRuntimeContext(runtime);
           const changeSet = await refreshChangeSet(conversationId);
           const settledStatus = changeSet.files.length > 0
             ? "awaiting_confirmation"
@@ -876,16 +1086,10 @@ export function createProjectWorkService({
         );
         break;
       case "compaction_start":
-        await appendEvent(conversationId, "compaction.started", {
-          reason: event.reason ?? "manual",
-        });
+        await recordCompactionStart(runtime, event);
         break;
       case "compaction_end":
-        await appendEvent(conversationId, "compaction.completed", {
-          reason: event.reason ?? "manual",
-          aborted: event.aborted === true,
-          status: event.errorMessage ? "failed" : "completed",
-        });
+        await recordCompactionEnd(runtime, event);
         break;
       case "auto_retry_start":
         await appendEvent(conversationId, "agent.retry", {
@@ -967,6 +1171,7 @@ export function createProjectWorkService({
       queueRuntimeEvent(runtime, event);
     });
     runtimes.set(conversationId, runtime);
+    await refreshRuntimeContext(runtime);
     return runtime;
   }
 
@@ -995,18 +1200,31 @@ export function createProjectWorkService({
       }));
       await appendEvent(conversationId, "agent.status", { status: "interrupted" });
     }
+    const staleCompaction = conversation.status === "compacting"
+      || normalizedCompactionState(conversation.compaction).status === "running";
     if (
-      ["running", "compacting"].includes(conversation.status)
+      (conversation.status === "running" || staleCompaction)
       && !runtimes.has(conversationId)
     ) {
-      conversation = await updateConversation(conversationId, {
+      const interruptedAt = timestamp();
+      conversation = await updateConversation(conversationId, (current) => ({
         status: "interrupted",
+        ...(current.status === "compacting"
+          || normalizedCompactionState(current.compaction).status === "running"
+          ? {
+              compaction: {
+                ...normalizedCompactionState(current.compaction),
+                status: "aborted",
+                completedAt: interruptedAt,
+              },
+            }
+          : {}),
         lastError: {
           code: "PROJECT_WORK_SESSION_INTERRUPTED",
           message: "上一次 Agent 操作未正常结束，可以重新发送任务继续",
           retryable: true,
         },
-      });
+      }));
       await appendEvent(conversationId, "agent.status", { status: "interrupted" });
     }
     const eventPage = await conversationStore.readEvents(conversationId, {
@@ -1278,6 +1496,8 @@ export function createProjectWorkService({
           skippedOversizedFiles: 0,
           truncated: false,
         },
+        contextUsage: defaultContextUsage(),
+        compaction: defaultCompactionState(),
         lastError: null,
         lastEventSeq: 0,
         createdAt,
@@ -1440,6 +1660,7 @@ export function createProjectWorkService({
           providerId: selectedModel.providerId,
           modelId: selectedModel.modelId,
         });
+        await refreshRuntimeContext(runtime);
       }
     }
     const promptContext = await buildPromptContext(conversationId, context);
@@ -1551,14 +1772,51 @@ export function createProjectWorkService({
       );
     }
     const runtime = await getRuntime(conversationId);
-    await updateConversation(conversationId, { status: "compacting" });
+    await updateConversation(conversationId, (current) => {
+      const currentCompaction = normalizedCompactionState(current.compaction);
+      return {
+        status: "compacting",
+        compaction: {
+          ...defaultCompactionState(
+            runtimeAutoCompactionEnabled(runtime, currentCompaction.autoEnabled),
+          ),
+          status: "running",
+          reason: "manual",
+        },
+      };
+    });
     try {
-      await runtime.host.compact(
+      const result = await runtime.host.compact(
         instructions ? String(instructions).slice(0, 2_000) : undefined,
       );
       await runtime.eventQueue;
-      await updateConversation(conversationId, { status: "idle" });
+      const latest = await conversationStore.get(conversationId);
+      if (latest.compaction?.status === "running") {
+        await recordCompactionEnd(runtime, {
+          type: "compaction_end",
+          reason: "manual",
+          result,
+          aborted: false,
+          willRetry: false,
+        });
+      }
+      await updateConversation(conversationId, {
+        status: "idle",
+        lastError: null,
+      });
     } catch (error) {
+      await runtime.eventQueue;
+      const latest = await conversationStore.get(conversationId);
+      if (latest.compaction?.status === "running") {
+        await recordCompactionEnd(runtime, {
+          type: "compaction_end",
+          reason: "manual",
+          result: undefined,
+          aborted: false,
+          willRetry: false,
+          errorMessage: "failed",
+        });
+      }
       const safeError = safeProjectWorkError(error);
       await updateConversation(conversationId, {
         status: "error",

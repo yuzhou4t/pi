@@ -133,7 +133,7 @@ function projectWorkConversationLabel(status) {
   return {
     idle: "等待任务",
     running: "正在工作",
-    compacting: "正在整理上下文",
+    compacting: "正在压缩上下文",
     awaiting_confirmation: "修改待审阅",
     applied: "修改已应用",
     verifying: "正在验证",
@@ -597,19 +597,36 @@ export function App() {
   const selectedModel = selectedProvider?.models.includes(providerConfig.model)
     ? providerConfig.model
     : selectedProvider?.models[0] ?? "";
-  const projectWorkProviders = projectWorkModelCatalog.providers.map((provider) => ({
-    id: provider.id,
-    name: provider.name,
-    available: true,
-    authLabel: "由 Pi 本机配置提供",
-    description: "Pi SDK 可用模型",
-    models: provider.models.map((model) => model.id),
-  }));
+  const hasProjectWorkCodexProvider = projectWorkModelCatalog.providers.some(
+    (provider) => provider.id === "openai-codex",
+  );
+  const projectWorkProviders = [
+    ...projectWorkModelCatalog.providers.map((provider) => ({
+      id: provider.id,
+      name: provider.id === "openai-codex"
+        ? "GPT · ChatGPT 订阅"
+        : provider.name,
+      available: true,
+      authLabel: "由 Pi 本机配置提供",
+      description: "Pi SDK 可用模型",
+      hint: "已连接 · 下轮消息生效",
+      models: provider.models.map((model) => model.id),
+    })),
+    ...(projectWorkModelCatalog.status === "ready" && !hasProjectWorkCodexProvider ? [{
+      id: "openai-codex",
+      name: "GPT · ChatGPT 订阅",
+      available: false,
+      status: "尚未连接",
+      hint: "需在 Pi 中单独连接 ChatGPT 订阅",
+      models: [],
+    }] : []),
+  ];
   const selectedProjectWorkProvider = projectWorkProviders.find(
-    (item) => item.id === projectWorkProviderConfig.providerId,
+    (item) => item.id === projectWorkProviderConfig.providerId && item.available,
   ) ?? projectWorkProviders.find(
-    (item) => item.id === projectWorkModelCatalog.defaultProviderId,
-  ) ?? projectWorkProviders[0];
+    (item) => item.id === projectWorkModelCatalog.defaultProviderId && item.available,
+  ) ?? projectWorkProviders.find((item) => item.available)
+    ?? projectWorkProviders[0];
   const selectedProjectWorkModel = selectedProjectWorkProvider?.models.includes(
     projectWorkProviderConfig.model,
   )
@@ -618,6 +635,9 @@ export function App() {
       && selectedProjectWorkProvider?.models.includes(projectWorkModelCatalog.defaultModelId)
       ? projectWorkModelCatalog.defaultModelId
       : selectedProjectWorkProvider?.models[0] ?? "";
+  const selectedProjectWorkModelInfo = projectWorkModelCatalog.providers
+    .find((provider) => provider.id === selectedProjectWorkProvider?.id)
+    ?.models.find((model) => model.id === selectedProjectWorkModel);
   const installedSkillCount = useMemo(
     () => skillCatalog.filter((skill) => skillState[skill.id]?.installed).length,
     [skillState],
@@ -2720,6 +2740,7 @@ export function App() {
             providers={projectWorkProviders}
             providerId={selectedProjectWorkProvider?.id}
             modelId={selectedProjectWorkModel}
+            modelContextWindow={selectedProjectWorkModelInfo?.contextWindow ?? null}
             providerOpen={providerOpen}
             onProviderOpenChange={(open) => {
               setProviderOpen(open);

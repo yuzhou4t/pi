@@ -6,10 +6,12 @@ import {
   useRef,
   useState,
 } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
-  Broom,
   CaretDown,
   CaretRight,
+  CaretUp,
   Check,
   CheckCircle,
   CircleNotch,
@@ -17,6 +19,7 @@ import {
   FileCode,
   Files,
   Folder,
+  Gauge,
   GitDiff,
   Package,
   PaperPlaneTilt,
@@ -65,7 +68,7 @@ const STATUS_LABELS = {
   changes_ready: "修改待审阅",
   applied: "修改已应用",
   verifying: "正在验证",
-  compacting: "正在整理上下文",
+  compacting: "正在压缩上下文",
   aborting: "正在停止",
   aborted: "已停止",
   completed: "本轮已完成",
@@ -110,6 +113,21 @@ const QUIET_EVENT_TYPES = new Set([
 ]);
 
 const ARTIFACT_STORAGE_KEY = "pi-agent-project-work-artifacts-v1";
+
+const PROJECT_MARKDOWN_COMPONENTS = {
+  a: ({ node: _node, href, children, ...props }) => {
+    const opensNewTab = /^https?:\/\//i.test(href ?? "");
+    return (
+      <a
+        {...props}
+        href={href}
+        {...(opensNewTab ? { target: "_blank", rel: "noreferrer" } : {})}
+      >
+        {children}
+      </a>
+    );
+  },
+};
 
 function readLastArtifact(conversationId, fallback = "files") {
   if (!conversationId || typeof window === "undefined") return fallback;
@@ -183,6 +201,32 @@ function messageText(content) {
     .join("\n");
 }
 
+function ProjectAgentMarkdown({ children }) {
+  return (
+    <div className="project-agent-markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={PROJECT_MARKDOWN_COMPONENTS}
+        skipHtml
+      >
+        {children}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+export function handleProjectComposerKeyDown(event) {
+  if (event.key !== "Enter") return;
+
+  const nativeEvent = event.nativeEvent ?? event;
+  if (nativeEvent.isComposing || nativeEvent.keyCode === 229) return;
+  if (event.shiftKey) return;
+
+  event.preventDefault();
+  if (event.repeat) return;
+  event.currentTarget.form?.requestSubmit();
+}
+
 function eventTitle(event) {
   if (event.title) return event.title;
   const type = String(event.type || "");
@@ -196,6 +240,18 @@ function eventTitle(event) {
   if (type === "message.completed") return "Agent 回复已完成";
   if (type === "agent.status") return "Agent 状态已更新";
   if (type === "workspace.snapshot_limited") return "大型项目已按安全范围载入";
+  if (type === "compaction.started") {
+    const trigger = event.reason
+      ?? event.trigger
+      ?? event.data?.reason
+      ?? event.data?.trigger;
+    return trigger && trigger !== "manual"
+      ? "Pi 正在自动压缩上下文"
+      : "开始压缩上下文";
+  }
+  if (type === "compaction.completed") {
+    return event.status === "failed" ? "上下文压缩失败" : "上下文压缩完成";
+  }
   if (/tool.*(?:start|call)|tool_call/.test(type)) {
     return TOOL_LABELS[event.toolName] ?? `调用 ${tool}`;
   }
@@ -498,6 +554,177 @@ function EmptyConversationPane({ project, preparing = false, standalone = false 
   );
 }
 
+export function formatContextTokens(value) {
+  if (!Number.isFinite(value) || value < 0) return "—";
+  if (value < 1_000) return String(Math.round(value));
+  if (value < 100_000) return `${(value / 1_000).toFixed(1)}k`;
+  if (value < 1_000_000) return `${Math.round(value / 1_000)}k`;
+  return `${(value / 1_000_000).toFixed(1)}M`;
+}
+
+export function ProjectContextUsageMenu({
+  open,
+  onOpenChange,
+  contextUsage,
+  modelContextWindow,
+  compaction,
+  hasAssistantReply,
+  running,
+  compacting,
+  onCompact,
+}) {
+  const tokens = Number.isFinite(contextUsage?.tokens)
+    ? contextUsage.tokens
+    : null;
+  const contextWindow = Number.isFinite(contextUsage?.contextWindow)
+    && contextUsage.contextWindow > 0
+    ? contextUsage.contextWindow
+    : Number.isFinite(modelContextWindow) && modelContextWindow > 0
+      ? modelContextWindow
+      : null;
+  const percent = Number.isFinite(contextUsage?.percent)
+    ? contextUsage.percent
+    : null;
+  const boundedPercent = percent === null
+    ? null
+    : Math.min(100, Math.max(0, percent));
+  const displayPercent = boundedPercent === null
+    ? null
+    : Math.round(boundedPercent);
+  const recalculating = tokens === null
+    && contextUsage?.status === "awaiting_measurement"
+    && (
+      compaction?.status === "completed"
+      || Boolean(compaction?.completedAt)
+    );
+  const autoEnabled = compaction?.autoEnabled !== false;
+  const manualDisabled = !hasAssistantReply || running || compacting || recalculating;
+  const manualHint = compacting
+    ? "正在压缩上下文"
+    : running
+      ? "Agent 工作期间不能手动压缩"
+      : !hasAssistantReply
+        ? "产生首轮回复后可手动压缩"
+        : recalculating
+          ? "等待下一次模型响应后重新计算"
+          : "不必手动操作，也可以等待 Pi 自动压缩";
+  const triggerLabel = compacting
+    ? "正在压缩"
+    : recalculating
+      ? "上下文 · 重新计算中"
+      : displayPercent === null
+        ? "上下文 —"
+        : `上下文 ${displayPercent}%`;
+  const usageLabel = `${formatContextTokens(tokens)} / ${formatContextTokens(contextWindow)} tokens`;
+  const riskClass = boundedPercent !== null && boundedPercent >= 90
+    ? " is-critical"
+    : boundedPercent !== null && boundedPercent >= 70
+      ? " is-warning"
+      : "";
+
+  return (
+    <div className="provider-menu-wrap project-context-usage-menu">
+      {open ? (
+        <button
+          className="popover-scrim"
+          type="button"
+          aria-label="关闭上下文用量"
+          onClick={() => onOpenChange(false)}
+        />
+      ) : null}
+
+      <button
+        className={`project-composer-tool project-context-usage-trigger${riskClass}`}
+        type="button"
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-controls="project-context-usage-popover"
+        aria-label={recalculating
+          ? "上下文用量正在重新计算"
+          : displayPercent === null
+            ? "打开上下文用量"
+            : `上下文已使用 ${displayPercent}%`}
+        onClick={() => onOpenChange(!open)}
+      >
+        {compacting ? (
+          <CircleNotch className="spin" size={13} weight="bold" aria-hidden="true" />
+        ) : (
+          <Gauge size={13} weight="regular" aria-hidden="true" />
+        )}
+        <span>{triggerLabel}</span>
+        <CaretUp size={11} weight="bold" aria-hidden="true" />
+      </button>
+
+      {open ? (
+        <section
+          id="project-context-usage-popover"
+          className="provider-popover project-context-usage-popover"
+          role="dialog"
+          aria-labelledby="project-context-usage-title"
+        >
+          <header className="popover-header">
+            <div>
+              <strong id="project-context-usage-title">上下文用量</strong>
+              <span>当前工作会话</span>
+            </div>
+            <strong className="project-context-usage-percent">
+              {displayPercent === null ? "—" : `${displayPercent}%`}
+            </strong>
+          </header>
+
+          <div className="project-context-usage-summary">
+            <span>{usageLabel}</span>
+            <div
+              className="project-context-usage-progress"
+              role="progressbar"
+              aria-label="上下文占用比例"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              {...(displayPercent === null
+                ? { "aria-valuetext": recalculating ? "重新计算中" : "尚未计算" }
+                : { "aria-valuenow": displayPercent })}
+            >
+              <span style={{ width: `${boundedPercent ?? 0}%` }} />
+            </div>
+            {recalculating ? <small>压缩已完成，下一次模型响应后重新计算。</small> : null}
+          </div>
+
+          <div className="project-context-auto-row">
+            <div>
+              <strong>自动压缩</strong>
+              <span>接近当前模型上限时，Pi 会自动压缩较早内容。</span>
+            </div>
+            <span className={autoEnabled ? "is-enabled" : ""}>
+              {autoEnabled ? "已开启" : "已关闭"}
+            </span>
+          </div>
+
+          <p className="project-context-compaction-note">
+            不会删除你看到的聊天记录；当前模型会把较早内容总结为有损摘要，
+            供后续对话继续使用，并产生一次模型调用。
+          </p>
+          <button
+            className="project-context-compact-button"
+            type="button"
+            disabled={manualDisabled}
+            onClick={() => {
+              if (manualDisabled) return;
+              onOpenChange(false);
+              onCompact();
+            }}
+          >
+            {compacting ? (
+              <CircleNotch className="spin" size={14} weight="bold" aria-hidden="true" />
+            ) : null}
+            {compacting ? "正在压缩上下文" : "立即压缩上下文"}
+          </button>
+          <small className="project-context-compact-hint">{manualHint}</small>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
 function ProjectAgentPane({
   conversation,
   draft,
@@ -506,11 +733,11 @@ function ProjectAgentPane({
   onRemoveContext,
   onSubmit,
   onAbort,
-  onCompact,
   onOpenArtifact,
   action,
   error,
   modelLabel,
+  contextUsageControl,
   standalone = false,
 }) {
   const running = isConversationRunning(conversation);
@@ -563,17 +790,7 @@ function ProjectAgentPane({
               <StopCircle size={13} aria-hidden="true" />
               停止
             </button>
-          ) : (
-            <button
-              className="header-meta-pill"
-              type="button"
-              onClick={onCompact}
-              disabled={Boolean(action) || conversation.messages.length === 0}
-            >
-              <Broom size={13} aria-hidden="true" />
-              整理上下文
-            </button>
-          )}
+          ) : null}
           <span className={`project-agent-status is-${statusClass(conversation)}`}>
             <span aria-hidden="true" />
             {statusLabel}
@@ -627,7 +844,11 @@ function ProjectAgentPane({
                   className={`project-agent-message is-${message.role} is-${message.kind}`}
                 >
                   <small>{message.role === "user" ? "你" : "Pi Agent"}</small>
-                  <div>{text}</div>
+                  {message.role === "assistant" ? (
+                    <ProjectAgentMarkdown>{text}</ProjectAgentMarkdown>
+                  ) : (
+                    <div className="project-agent-plain-text">{text}</div>
+                  )}
                 </article>
               </Fragment>
             );
@@ -697,6 +918,8 @@ function ProjectAgentPane({
             value={draft}
             disabled={action === "abort" || action === "compact"}
             onChange={(event) => onDraftChange(event.target.value)}
+            onKeyDown={handleProjectComposerKeyDown}
+            aria-keyshortcuts="Enter"
             placeholder={running
               ? "补充方向，会作为 steer 发送给当前 Agent"
               : standalone
@@ -705,11 +928,17 @@ function ProjectAgentPane({
           />
         </label>
         <footer>
-          <div>
-            <span className="project-composer-model">
-              {modelLabel || (standalone ? "跟随默认模型" : "跟随项目默认模型")}
-            </span>
-            <small>{running ? "发送会调整当前 Agent 的方向" : "只有显式发送才开始工作"}</small>
+          <div className="project-composer-meta">
+            <div className="project-composer-tools">
+              <span className="project-composer-model">
+                {modelLabel || (standalone ? "跟随默认模型" : "跟随项目默认模型")}
+              </span>
+              {contextUsageControl}
+            </div>
+            <small>
+              {running ? "发送会调整当前 Agent 的方向" : "只有显式发送才开始工作"}
+              {" · Enter 发送 · Shift+Enter 换行"}
+            </small>
           </div>
           <button
             type="submit"
@@ -1337,6 +1566,7 @@ export function LiveProjectWorkbench({
   providers = [],
   providerId = "",
   modelId = "",
+  modelContextWindow = null,
   providerOpen = false,
   onProviderOpenChange,
   onProviderChange,
@@ -1354,6 +1584,7 @@ export function LiveProjectWorkbench({
   const [draft, setDraft] = useState("");
   const [contextChips, setContextChips] = useState([]);
   const [artifactOpen, setArtifactOpen] = useState(false);
+  const [contextUsageOpen, setContextUsageOpen] = useState(false);
   const [activeArtifactId, setActiveArtifactId] = useState(
     readLastArtifact(
       conversation?.id,
@@ -1381,6 +1612,7 @@ export function LiveProjectWorkbench({
     setDraft("");
     setContextChips([]);
     setArtifactOpen(false);
+    setContextUsageOpen(false);
     setActiveArtifactId(readLastArtifact(
       conversation?.id,
       conversation?.activeArtifactId ?? "files",
@@ -1401,6 +1633,15 @@ export function LiveProjectWorkbench({
   useEffect(() => {
     writeLastArtifact(snapshot?.id, activeArtifactId);
   }, [activeArtifactId, snapshot?.id]);
+
+  useEffect(() => {
+    if (!contextUsageOpen) return undefined;
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setContextUsageOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [contextUsageOpen]);
 
   const publishSnapshot = useCallback((nextSnapshot) => {
     if (!nextSnapshot) return;
@@ -1550,6 +1791,12 @@ export function LiveProjectWorkbench({
     }), setVerificationError);
   }, [api, executeAction, openArtifact, snapshot]);
 
+  const compactContext = useCallback(() => (
+    executeAction("compact", () => api.compactConversation({
+      conversationId: snapshot.id,
+    }))
+  ), [api, executeAction, snapshot?.id]);
+
   const activeProviderId = providerId || snapshot?.providerId;
   const activeProvider = providers.find((provider) => provider.id === activeProviderId)
     ?? providers.find((provider) => provider.available)
@@ -1558,6 +1805,13 @@ export function LiveProjectWorkbench({
   const standalone = snapshot?.scope === "standalone"
     || snapshot?.workspaceKind === "scratch"
     || snapshot?.projectId === null;
+  const compacting = action === "compact"
+    || activeStatus(snapshot) === "compacting"
+    || snapshot?.compaction?.status === "running";
+  const hasAssistantReply = snapshot?.messages?.some(
+    (message) => message.role === "assistant" && Boolean(messageText(message.content)),
+  ) === true;
+  const conversationRunning = snapshot ? isConversationRunning(snapshot) : false;
   const headerTitle = (
     <div className="workflow-title-block">
       <button
@@ -1582,7 +1836,10 @@ export function LiveProjectWorkbench({
       {providers.length > 0 ? (
         <ProviderMenu
           open={providerOpen}
-          onOpenChange={onProviderOpenChange}
+          onOpenChange={(open) => {
+            if (open) setContextUsageOpen(false);
+            onProviderOpenChange?.(open);
+          }}
           providers={providers}
           providerId={activeProvider?.id}
           model={activeModelId}
@@ -1591,7 +1848,14 @@ export function LiveProjectWorkbench({
         />
       ) : null}
       {onOpenSkills ? (
-        <button className="header-meta-pill header-skill-pill" type="button" onClick={onOpenSkills}>
+        <button
+          className="header-meta-pill header-skill-pill"
+          type="button"
+          onClick={() => {
+            setContextUsageOpen(false);
+            onOpenSkills();
+          }}
+        >
           <Package size={13} weight="regular" aria-hidden="true" />
           <span>技能 · {installedSkillCount}</span>
         </button>
@@ -1646,13 +1910,26 @@ export function LiveProjectWorkbench({
           onAbort={() => executeAction("abort", () => api.abortConversation({
             conversationId: snapshot.id,
           }))}
-          onCompact={() => executeAction("compact", () => api.compactConversation({
-            conversationId: snapshot.id,
-          }))}
           onOpenArtifact={openArtifact}
           action={action}
           error={actionError}
           modelLabel={activeModelId}
+          contextUsageControl={(
+            <ProjectContextUsageMenu
+              open={contextUsageOpen}
+              onOpenChange={(open) => {
+                setContextUsageOpen(open);
+                if (open) onProviderOpenChange?.(false);
+              }}
+              contextUsage={snapshot.contextUsage}
+              modelContextWindow={modelContextWindow}
+              compaction={snapshot.compaction}
+              hasAssistantReply={hasAssistantReply}
+              running={conversationRunning}
+              compacting={compacting}
+              onCompact={compactContext}
+            />
+          )}
           standalone={standalone}
         />
       )}

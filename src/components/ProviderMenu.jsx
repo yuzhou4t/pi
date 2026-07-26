@@ -8,6 +8,7 @@ import { getModelDisplayName } from "../data.js";
 
 const providerIcons = {
   "codex-subscription": Sparkle,
+  "openai-codex": Sparkle,
   deepseek: Cloud,
 };
 
