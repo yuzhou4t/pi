@@ -1937,6 +1937,53 @@ export function createApiServer({
     return;
   }
 
+  const journalTranslationMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/papers\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,119})\/translation$/,
+  );
+  if (request.method === "GET" && journalTranslationMatch) {
+    try {
+      sendJson(
+        response,
+        200,
+        await journalWorkflowService.getPaperTranslation(
+          journalTranslationMatch[1],
+          journalTranslationMatch[2],
+        ),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法读取全文翻译");
+    }
+    return;
+  }
+  if (request.method === "POST" && journalTranslationMatch) {
+    try {
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (body?.schema_version !== 1) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "全文翻译请求版本无效", 400);
+      }
+      sendJson(
+        response,
+        202,
+        await journalWorkflowService.generatePaperTranslation(
+          journalTranslationMatch[1],
+          journalTranslationMatch[2],
+          {
+            providerId: body.provider_id,
+            modelId: body.model_id,
+          },
+        ),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法启动全文翻译");
+    }
+    return;
+  }
+
   const journalPdfMatch = url.pathname.match(
     /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/papers\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,119})\/pdf$/,
   );

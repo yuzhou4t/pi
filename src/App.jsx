@@ -430,9 +430,12 @@ export function App() {
       if (rafId) cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(() => {
         const deltaX = side === "left" ? moveEvent.clientX - startX : startX - moveEvent.clientX;
+        // The right rail is a free split: it may grow to roughly two thirds of
+        // the window so the paper and the Agent can share the space evenly.
+        const rightMax = Math.max(640, Math.round(window.innerWidth * 0.68));
         const nextWidth = side === "left"
           ? Math.min(360, Math.max(200, startWidth + deltaX))
-          : Math.min(640, Math.max(200, startWidth + deltaX));
+          : Math.min(rightMax, Math.max(200, startWidth + deltaX));
         if (side === "left") setLeftRailWidth(nextWidth);
         else setRightRailWidth(nextWidth);
       });
@@ -1630,6 +1633,9 @@ export function App() {
             blockId: null,
             purpose: "close-reading",
           });
+          // Switching to the paper conversation is what moves the shell into the
+          // Agent-centered reading workbench instead of the workflow layout.
+          setActiveConversationId(`paper:${firstReadingPaperId}`);
         }
       }
       showToast(
@@ -1652,6 +1658,7 @@ export function App() {
     run.guideChoices,
     run.preparedGuideIds,
     run.source,
+    setActiveConversationId,
     showToast,
     syncJournalRun,
   ]);

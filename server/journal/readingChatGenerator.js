@@ -307,7 +307,7 @@ function validateOutput(value, paperId, allowedReferenceIds) {
   if (value.paper_id !== paperId) throw outputError("模型返回了错误的论文 ID");
   if (typeof value.answer !== "string") throw outputError("answer 必须是字符串");
   const answer = value.answer.trim();
-  if (answer.length < 2 || answer.length > 3_000) {
+  if (answer.length < 2 || answer.length > 6_000) {
     throw outputError("answer 长度不符合论文对话合同");
   }
   if (!Array.isArray(value.citations) || value.citations.length > 8) {

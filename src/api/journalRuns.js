@@ -372,7 +372,7 @@ export function mapJournalPaperReading(body) {
       canonicalUrl: body.paper?.canonical_url ?? null,
     },
     status: body.status,
-    documentRevision: body.document_revision,
+    documentRevision: body.document_revision ?? null,
     currentStage: body.current_stage,
     position: mapReadingPosition(body.position),
     stageOrder: [...body.stage_order],
@@ -1224,6 +1224,7 @@ export function mapJournalPaperDocument(body) {
     || typeof body !== "object"
     || typeof body.run_id !== "string"
     || typeof body.paper_id !== "string"
+    || typeof body.revision !== "string"
     || !Array.isArray(body.sections)
     || !Array.isArray(body.blocks)
   ) {
@@ -1268,4 +1269,78 @@ export async function fetchJournalPaperDocument(runId, paperId, { signal } = {})
   const body = await jsonResponse(response, "本地论文服务返回了无法解析的正文");
   if (!response.ok) throw requestError(response, body, "无法读取论文正文");
   return mapJournalPaperDocument(body);
+}
+
+const TRANSLATION_STATUSES = new Set([
+  "not_started",
+  "running",
+  "partial",
+  "ready",
+  "stale",
+]);
+
+export function mapJournalPaperTranslation(body) {
+  if (
+    !body
+    || typeof body !== "object"
+    || typeof body.run_id !== "string"
+    || typeof body.paper_id !== "string"
+    || typeof body.document_revision !== "string"
+    || !TRANSLATION_STATUSES.has(body.status)
+    || !body.blocks
+    || typeof body.blocks !== "object"
+    || Array.isArray(body.blocks)
+  ) {
+    throw new Error("全文翻译格式无效");
+  }
+  return {
+    runId: body.run_id,
+    paperId: body.paper_id,
+    documentRevision: body.document_revision,
+    status: body.status,
+    providerId: body.provider_id ?? null,
+    modelId: body.model_id ?? null,
+    totalBlocks: Number.isSafeInteger(body.total_blocks) ? body.total_blocks : 0,
+    translatedBlocks: Number.isSafeInteger(body.translated_blocks) ? body.translated_blocks : 0,
+    blocks: Object.fromEntries(
+      Object.entries(body.blocks).filter(([, zh]) => typeof zh === "string" && zh),
+    ),
+    error: body.error ?? null,
+    updatedAt: body.updated_at ?? null,
+  };
+}
+
+export async function fetchJournalPaperTranslation(runId, paperId, { signal } = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/translation`,
+    { signal },
+  );
+  const body = await jsonResponse(response, "本地翻译服务返回了无法解析的内容");
+  if (!response.ok) throw requestError(response, body, "无法读取全文翻译");
+  return mapJournalPaperTranslation(body);
+}
+
+export async function startJournalPaperTranslation({
+  runId,
+  paperId,
+  providerId,
+  modelId,
+  signal,
+} = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/translation`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: 1,
+        provider_id: providerId,
+        model_id: modelId,
+      }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地翻译服务返回了无法解析的内容");
+  if (!response.ok) throw requestError(response, body, "无法启动全文翻译");
+  return mapJournalPaperTranslation(body);
 }

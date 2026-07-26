@@ -72,7 +72,7 @@ test("an explicit selection is derived from one canonical block with UTF-16 offs
   assert.equal(providerRequest.input.references[0].block_id, document().blocks[3].block_id);
   assert.equal(generated.references[0].start_offset, start);
   assert.equal(generated.result.citations[0].reference_id, "reference-1");
-  assert.equal(generated.prompt_version, "reading-chat.v1");
+  assert.equal(generated.prompt_version, "reading-chat.v2");
   assert.match(generated.input_hash, /^sha256:[a-f0-9]{64}$/);
 });
 

@@ -959,3 +959,121 @@ test("resumeRun validates an in-progress Zotero commit before MinerU early retur
   assert.equal(resumed.zotero.last_error.code, "ZOTERO_PROPOSAL_CORRUPT");
   assert.equal((await service.waitForZoteroCommit(run.run_id)).status, "partial");
 });
+
+test("full-text translation runs in bounded batches and stays durable per revision", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-translation-");
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+    modelProviders: supportedModelRegistry(),
+  });
+
+  const initial = await service.getPaperTranslation(runId, "paper-1");
+  assert.equal(initial.status, "not_started");
+  assert.ok(initial.total_blocks > 0);
+
+  const started = await service.generatePaperTranslation(runId, "paper-1", {
+    providerId: "codex-subscription",
+    modelId: "account-default",
+  });
+  assert.ok(["running", "ready"].includes(started.status));
+  await service.waitForTranslation(runId, "paper-1");
+
+  const done = await service.getPaperTranslation(runId, "paper-1");
+  assert.equal(done.status, "ready");
+  assert.equal(done.translated_blocks, done.total_blocks);
+  assert.equal(done.provider_id, "codex-subscription");
+  const document = await service.getPaperDocument(runId, "paper-1");
+  assert.equal(done.document_revision, document.revision);
+  for (const zh of Object.values(done.blocks)) assert.ok(zh.length > 0);
+
+  await assert.rejects(
+    service.generatePaperTranslation(runId, "paper-1", {
+      providerId: "unknown",
+      modelId: "nope",
+    }),
+    (error) => error.code === "TRANSLATION_PROVIDER_UNSUPPORTED",
+  );
+});
+
+test("a failed translation batch stays retryable without losing finished blocks", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-translation-retry-");
+  let calls = 0;
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+    modelProviders: supportedModelRegistry(),
+    translationGenerator: async ({ paperId, batch }) => {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error("批次超时");
+        error.code = "TRANSLATION_OUTPUT_INVALID";
+        throw error;
+      }
+      return {
+        translations: Object.fromEntries(batch.map((block) => [
+          block.block_id,
+          `【译】${block.source}`,
+        ])),
+        source: "fixture",
+        prompt_id: "translation",
+        prompt_version: "translation.v1",
+        prompt_hash: "sha256:prompt",
+        input_hash: `sha256:${paperId}`,
+        provider_id: null,
+        model_id: null,
+        usage: null,
+      };
+    },
+  });
+
+  await service.generatePaperTranslation(runId, "paper-1", {
+    providerId: "codex-subscription",
+    modelId: "account-default",
+  });
+  await service.waitForTranslation(runId, "paper-1");
+  const partial = await service.getPaperTranslation(runId, "paper-1");
+  assert.equal(partial.status, "partial");
+  assert.equal(partial.error.code, "TRANSLATION_OUTPUT_INVALID");
+
+  await service.generatePaperTranslation(runId, "paper-1", {
+    providerId: "codex-subscription",
+    modelId: "account-default",
+  });
+  await service.waitForTranslation(runId, "paper-1");
+  const done = await service.getPaperTranslation(runId, "paper-1");
+  assert.equal(done.status, "ready");
+  assert.equal(done.translated_blocks, done.total_blocks);
+});
+
+test("a translation for an older document revision reports stale", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-translation-stale-");
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+    modelProviders: supportedModelRegistry(),
+  });
+  await service.generatePaperTranslation(runId, "paper-1", {
+    providerId: "codex-subscription",
+    modelId: "account-default",
+  });
+  await service.waitForTranslation(runId, "paper-1");
+
+  const artifact = await runStore.readArtifact(runId, "translation/paper-1.json");
+  await runStore.writeArtifact(runId, "translation/paper-1.json", {
+    ...artifact,
+    document_revision: "sha256:outdated",
+  });
+  const stale = await service.getPaperTranslation(runId, "paper-1");
+  assert.equal(stale.status, "stale");
+  assert.deepEqual(stale.blocks, {});
+});

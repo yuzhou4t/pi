@@ -263,3 +263,169 @@ test("context rail without an active close-reading session stays unchanged", asy
     await vite.close();
   }
 });
+
+test("reading sections merge to real top-level chapters and one appendix", async () => {
+  const vite = await createServer({
+    root: process.cwd(),
+    appType: "custom",
+    logLevel: "silent",
+    server: { middlewareMode: true },
+  });
+  try {
+    const {
+      readingSections,
+      READING_ROUNDS,
+      readingRoundReference,
+    } = await vite.ssrLoadModule("/src/components/WorkflowContextRail.jsx");
+
+    const paperTitle = "Memory Management Paper";
+    let counter = 0;
+    const block = (chapter) => {
+      counter += 1;
+      return {
+        id: `block-${String(counter).padStart(3, "0")}`,
+        kind: "paragraph",
+        text: `Paragraph ${counter}.`,
+        path: chapter ? [paperTitle, chapter] : [paperTitle],
+      };
+    };
+    const document = {
+      revision: "sha256:doc",
+      blocks: [
+        block(null),
+        block("Abstract"),
+        block("1 Introduction"),
+        block("2 Background and Related Works"),
+        block("2.1 Memory Module"),
+        block("3 Addition of Memory"),
+        block("3.1 Setup"),
+        block("4 Deletion of Memory"),
+        block("5 Challenging Scenarios"),
+        block("6 Conclusion"),
+        block("Limitations"),
+        block("References"),
+        block("A Detailed experimental setups."),
+        block("A.1 Agent details"),
+        block("User Prompt"),
+        block("A.2 RegAgent design"),
+        block("User Prompt"),
+        block("B Additional results"),
+      ],
+    };
+
+    const sections = readingSections(document);
+    assert.deepEqual(
+      sections.map((section) => section.title),
+      [
+        "Abstract",
+        "1 Introduction",
+        "2 Background and Related Works",
+        "3 Addition of Memory",
+        "4 Deletion of Memory",
+        "5 Challenging Scenarios",
+        "6 Conclusion",
+        "Limitations",
+        "附录",
+      ],
+    );
+    // References blocks never appear in any walkable chapter.
+    const walkableIds = new Set(sections.flatMap((section) => section.blockIds));
+    assert.equal(walkableIds.has("block-012"), false);
+    // Interleaved "User Prompt" headings stay inside the single appendix chapter.
+    const appendix = sections.at(-1);
+    assert.equal(appendix.blockIds.length, 6);
+
+    // Ten guided rounds bind bounded references to matching chapters.
+    assert.equal(READING_ROUNDS.length, 10);
+    const methodRound = READING_ROUNDS.find((round) => round.id === "overview");
+    const methodReference = readingRoundReference(methodRound, sections);
+    assert.ok(methodReference.blockIds.length > 0);
+    assert.ok(methodReference.blockIds.length <= 40);
+    const noMatchReference = readingRoundReference(
+      { id: "x", label: "x", match: /nonexistent-chapter/, prompt: "x" },
+      sections,
+    );
+    // Unmatched rounds fall back to the opening chapters instead of failing.
+    assert.deepEqual(
+      noMatchReference.blockIds,
+      [...sections[0].blockIds, ...sections[1].blockIds],
+    );
+  } finally {
+    await vite.close();
+  }
+});
+
+test("answered paper chat turns render Markdown paragraphs and lists", async () => {
+  const vite = await createServer({
+    root: process.cwd(),
+    appType: "custom",
+    logLevel: "silent",
+    server: { middlewareMode: true },
+  });
+  try {
+    const { WorkflowContextRail } = await vite.ssrLoadModule("/src/components/WorkflowContextRail.jsx");
+    const paper = { id: "paper-md", title: "Paper", venue: "ACL" };
+    const html = renderToStaticMarkup(React.createElement(WorkflowContextRail, {
+      run: { status: "reading", selectedPaperIds: [paper.id], activePaperId: paper.id },
+      papers: [paper],
+      preferredPaperId: paper.id,
+      activeView: "agent",
+      providers: [{ id: "deepseek", name: "DeepSeek", available: true, models: ["deepseek-v4-pro"] }],
+      providerId: "deepseek",
+      modelId: "deepseek-v4-pro",
+      projectContextState: { status: "ready", data: null, error: null },
+      onActiveViewChange() {},
+      onOpenReaderBlock() {},
+      onReaderReadingChange() {},
+      readerContext: {
+        key: "run-1:paper-md",
+        runId: "run-1",
+        paperId: paper.id,
+        purpose: "close-reading",
+        status: "ready",
+        paper,
+        activeBlockId: "block-1",
+        document: {
+          revision: "sha256:doc",
+          title: paper.title,
+          sections: [],
+          blocks: [{
+            id: "block-1",
+            sectionId: "s1",
+            kind: "paragraph",
+            text: "Body paragraph.",
+            path: ["Introduction"],
+            ordinal: 1,
+          }],
+        },
+        reading: {
+          documentRevision: "sha256:doc",
+          stages: {},
+          chat: {
+            status: "ready",
+            turns: [{
+              id: "turn-md",
+              clientRequestId: "client-md",
+              question: "讲讲要点",
+              status: "answered",
+              reference: null,
+              answer: "## 小结\n\n- 第一点\n- 第二点\n\n**结论**成立。",
+              citations: [],
+              providerId: "deepseek",
+              modelId: "deepseek-v4-pro",
+              projectContextStatus: "not_requested",
+              includeProjectContext: false,
+            }],
+          },
+        },
+      },
+    }));
+    assert.match(html, /<li[^>]*>.*第一点/);
+    assert.match(html, /<strong[^>]*>.*结论/);
+    assert.match(html, /小结/);
+    assert.match(html, /十步导读/);
+    assert.match(html, /按章节读/);
+  } finally {
+    await vite.close();
+  }
+});

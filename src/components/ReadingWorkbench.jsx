@@ -1,6 +1,7 @@
 import { useCallback, useState } from "react";
 import { ArrowCounterClockwise, BookOpenText, Package, SidebarSimple } from "@phosphor-icons/react";
 import { AgentArtifactLayout } from "./AgentArtifactLayout.jsx";
+import { usePersistentState } from "../hooks/usePersistentState.js";
 import { PaperReader } from "./PaperReader.jsx";
 import { ProviderMenu } from "./ProviderMenu.jsx";
 import {
@@ -56,7 +57,8 @@ export function ReadingWorkbench({
   mobileView = "run",
 }) {
   const [artifactTab, setArtifactTab] = useState("doc");
-  const [artifactOpen, setArtifactOpen] = useState(false);
+  // Close reading starts split: paper on the right, Agent on the left (~50/50).
+  const [artifactOpen, setArtifactOpen] = usePersistentState("pi-reading-artifact-open", true);
   const [restart, setRestart] = useState({ open: false, pending: false, error: null });
 
   const confirmRestart = useCallback(async () => {

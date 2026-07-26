@@ -22,6 +22,7 @@ import {
   switchJournalReadingConversation,
 } from "../api/journalRuns.js";
 import { getModelDisplayName } from "../data.js";
+import { usePersistentState } from "../hooks/usePersistentState.js";
 import { workflowFixture } from "../workflow/fixtures.js";
 import { PaperRichText } from "./PaperRichText.jsx";
 
@@ -51,7 +52,12 @@ function sectionChapterKey(title) {
   return match ? match[1].toUpperCase() : null;
 }
 
-function readingSections(document) {
+// Unnumbered headings may open a walkable chapter only when they are a real
+// top-level section name; anything else ("User Prompt"…) stays in the current one.
+const SECTION_TITLE_WHITELIST = /^(abstract|introduction|background|related\s+works?|preliminar|motivation|method|approach|framework|architecture|experiment|result|evaluation|analysis|discussion|conclusion|limitation|acknowledg|appendix|摘要|引言|背景|相关工作|方法|实验|结果|讨论|结论|局限|致谢|附录)/i;
+const REFERENCES_TITLE_PATTERN = /^(references?|bibliography|参考文献)\b/i;
+
+export function readingSections(document) {
   const blocks = readableReaderBlocks(document?.blocks);
   const bodyBlocks = blocks.filter(
     (block) => (Array.isArray(block.path) ? block.path.filter(Boolean) : []).length >= 1,
@@ -62,20 +68,140 @@ function readingSections(document) {
 
   const sections = [];
   let current = null;
+  let afterReferences = false;
+  let appendixSection = null;
   for (const block of blocks) {
     const path = Array.isArray(block.path) ? block.path.filter(Boolean) : [];
     // Skip front-matter / title / author blocks — they are not a walkable chapter.
     if (path.length <= chapterDepth) continue;
-    const rawTitle = path[chapterDepth];
+    const rawTitle = String(path[chapterDepth] ?? "");
+    // References carry no teachable body; they also mark the start of back matter.
+    if (REFERENCES_TITLE_PATTERN.test(rawTitle)) {
+      afterReferences = true;
+      current = null;
+      continue;
+    }
+    if (afterReferences) {
+      // Everything after References (lettered appendices, prompt dumps…)
+      // collapses into one walkable appendix chapter.
+      if (!appendixSection) {
+        appendixSection = {
+          groupKey: "__appendix__",
+          title: "附录",
+          firstBlockId: block.id,
+          blockIds: [],
+        };
+        sections.push(appendixSection);
+      }
+      current = appendixSection;
+      current.blockIds.push(block.id);
+      continue;
+    }
     // Collapse numbered subsections (3.1, 3.2, B.8…) into their top-level chapter.
-    const groupKey = sectionChapterKey(rawTitle) ?? rawTitle;
-    if (!current || current.groupKey !== groupKey) {
+    const chapterKey = sectionChapterKey(rawTitle);
+    const startsNewGroup = chapterKey != null || SECTION_TITLE_WHITELIST.test(rawTitle);
+    const groupKey = chapterKey ?? rawTitle;
+    if (!current) {
+      // Before the first real chapter begins, stray titles are front matter.
+      if (!startsNewGroup) continue;
+      current = { groupKey, title: rawTitle, firstBlockId: block.id, blockIds: [] };
+      sections.push(current);
+    } else if (startsNewGroup && current.groupKey !== groupKey) {
       current = { groupKey, title: rawTitle, firstBlockId: block.id, blockIds: [] };
       sections.push(current);
     }
     current.blockIds.push(block.id);
   }
   return sections;
+}
+
+// The ten-round guided reading spine distilled from the validated BLT session:
+// orientation-first rounds, each with a fixed teaching format and a self-check.
+export const READING_ROUNDS = [
+  {
+    id: "field",
+    label: "领域定位",
+    goal: "知道它在解决哪类问题",
+    match: /abstract|introduction|摘要|引言/i,
+    prompt: "第 1 步 · 领域定位。只回答一个问题：这篇论文属于哪个研究领域、在解决哪类问题？先给出精确定位（领域/子方向），再说明它在哪条技术路线上，以及它不是在研究什么（避免混淆）。",
+  },
+  {
+    id: "background",
+    label: "技术背景",
+    goal: "搞清它之前的主流做法与前史",
+    match: /introduction|background|related|preliminar|引言|背景|相关工作/i,
+    prompt: "第 2 步 · 技术背景。讲清这篇论文之前的技术前史：现有主流做法是什么、各自的优缺点、有哪几条代表性路线（适合时用对比表格）。",
+  },
+  {
+    id: "gap",
+    label: "发现的 gap",
+    goal: "明白作者为什么要做这个工作",
+    match: /abstract|introduction|background|related|motivation|摘要|引言|背景/i,
+    prompt: "第 3 步 · 发现的 gap。这篇论文发现了什么 gap？逐条列出现有方法的不足与作者的切入点，并解释为什么这些 gap 值得解决、以前为什么没被解决。",
+  },
+  {
+    id: "overview",
+    label: "方法总图",
+    goal: "建立整体架构地图",
+    match: /method|approach|framework|architecture|model|方法/i,
+    prompt: "第 4 步 · 方法总图。给我方法的整体地图：从输入到输出的完整流程怎么走、有哪几个关键组件、各自职责是什么，用分步列表或文字流程图表达，先不钻细节。",
+  },
+  {
+    id: "modules",
+    label: "核心模块",
+    goal: "理解关键模块怎么工作",
+    match: /method|approach|framework|architecture|model|方法/i,
+    prompt: "第 5 步 · 核心模块。把核心模块逐个拆开讲：每个关键模块解决什么、具体怎么工作、关键假设是什么，模块之间怎么衔接；适当用类比帮我理解。",
+  },
+  {
+    id: "experiments",
+    label: "实验设计",
+    goal: "看作者怎么证明方法有效",
+    match: /experiment|evaluation|result|setup|benchmark|实验|结果|评估/i,
+    prompt: "第 6 步 · 实验设计。作者用什么实验证明方法有效？讲清数据集、基线、指标、对照设置和主要结果，并判断实验逻辑是否公平、哪些结论真的被实验支持。",
+  },
+  {
+    id: "novelty",
+    label: "创新点",
+    goal: "分清真贡献与工程组合",
+    match: /abstract|introduction|conclusion|contribution|discussion|摘要|结论/i,
+    prompt: "第 7 步 · 创新点。总结这篇论文的创新点：哪些是真正的新贡献、哪些只是工程组合？按重要性排序，并说明每条创新点对应的证据。",
+  },
+  {
+    id: "limitations",
+    label: "局限",
+    goal: "知道哪些结论要保持怀疑",
+    match: /limitation|discussion|conclusion|future|局限|讨论|结论/i,
+    prompt: "第 8 步 · 局限。论文自己承认的局限有哪些？从方法和实验设计里还能看出哪些没明说的局限？逐条列出并说明影响范围。",
+  },
+  {
+    id: "relations",
+    label: "与其他论文的关系",
+    goal: "把它放进技术路线地图",
+    match: /related|background|introduction|相关工作|背景/i,
+    prompt: "第 9 步 · 与其他论文的关系。它在挑战谁、继承谁、和哪些相近工作最容易混淆？用对比表或关系图把它放进技术路线地图里。",
+  },
+  {
+    id: "transfer",
+    label: "迁移运用与沉淀",
+    goal: "把它变成自己的知识",
+    match: /conclusion|discussion|abstract|future|结论|讨论/i,
+    prompt: "第 10 步 · 迁移运用。这篇论文最值得带走的思想是什么？给出 2-3 个具体的迁移方向（可以用在什么场景、怎么用），最后给一句最值得记住的迁移句，并把本步要点整理成一段可以直接存进笔记的小结。",
+  },
+];
+
+const ROUND_OUTPUT_FORMAT = "请按固定结构输出：先用一两句说明「本轮读什么」；然后分段讲解（短段落，需要时用列表、表格或类比）；接着用「关键概念」小节把本轮最重要的名词逐个一句话点破；再给出「你需要记住的一句话」；最后出一道 A/B/C/D 单选小问题检验理解（只给题目和选项，先不给答案，我回答后你再点评）。";
+const ROUND_REFERENCE_BLOCK_LIMIT = 40;
+
+export function readingRoundReference(round, sections) {
+  if (!round || !Array.isArray(sections) || sections.length === 0) return null;
+  const matched = sections.filter((section) => round.match.test(String(section.title ?? "")));
+  const chosen = matched.length > 0 ? matched : sections.slice(0, 2);
+  const blockIds = chosen
+    .flatMap((section) => section.blockIds)
+    .slice(0, ROUND_REFERENCE_BLOCK_LIMIT);
+  if (blockIds.length === 0) return null;
+  return { blockIds, firstBlockId: chosen[0]?.firstBlockId ?? null };
 }
 
 function getStageIndex(run, stages) {
@@ -270,6 +396,11 @@ function selectionBlock(node) {
   return element?.closest?.("[data-reader-block-id]") ?? null;
 }
 
+function selectionInsideTranslation(node) {
+  const element = node?.nodeType === 1 ? node : node?.parentElement;
+  return Boolean(element?.closest?.("[data-reader-zh]"));
+}
+
 function selectionSourceMarker(node, block) {
   const element = node?.nodeType === 1 ? node : node?.parentElement;
   const marker = element?.closest?.("[data-source-start][data-source-end]") ?? null;
@@ -311,6 +442,12 @@ export function selectionReferenceFromDom(
     return { reference: null, error: null };
   }
   const range = selection.getRangeAt(0);
+  if (
+    selectionInsideTranslation(range.startContainer)
+    || selectionInsideTranslation(range.endContainer)
+  ) {
+    return { reference: null, error: "引用需要选择英文原文；中文译文仅供阅读。" };
+  }
   const startBlock = selectionBlock(range.startContainer);
   const endBlock = selectionBlock(range.endContainer);
   if (!startBlock || !endBlock || !root?.contains(startBlock) || !root?.contains(endBlock)) {
@@ -921,10 +1058,18 @@ export function ReaderAgentComposer({
   };
 
   const [readingDepth, setReadingDepth] = useState("normal");
-  const [walkOpen, setWalkOpen] = useState(true);
+  const [walkOpen, setWalkOpen] = usePersistentState("pi-reading-walk-open", true);
+  const [walkMode, setWalkMode] = usePersistentState("pi-reading-walk-mode", "rounds");
+  const [roundProgress, setRoundProgress] = usePersistentState("pi-reading-round-progress", {});
+  const [roundSelection, setRoundSelection] = useState(null);
   const [conversationBusy, setConversationBusy] = useState(false);
   const conversations = readerContext?.reading?.conversations ?? [];
   const activeConversationId = readerContext?.reading?.activeConversationId ?? "current";
+  const roundKey = `${sessionKey ?? "unknown"}:${activeConversationId}`;
+
+  useEffect(() => {
+    setRoundSelection(null);
+  }, [roundKey]);
 
   const handleNewConversation = async () => {
     if (conversationBusy) return;
@@ -1020,6 +1165,60 @@ export function ReaderAgentComposer({
   const readCurrentSection = () => teachSection(activeSectionIndex, "read");
   const readNextSection = () => teachSection(activeSectionIndex + 1, "read");
 
+  // Ten-round guided reading: progress is a client-side reading aid keyed by
+  // paper conversation; it never advances the durable Run or reading stages.
+  const roundsTaught = Math.min(
+    Number.isSafeInteger(roundProgress[roundKey]) ? roundProgress[roundKey] : 0,
+    READING_ROUNDS.length,
+  );
+  const activeRoundIndex = Math.min(
+    roundSelection ?? Math.min(roundsTaught, READING_ROUNDS.length - 1),
+    READING_ROUNDS.length - 1,
+  );
+  const roundsCompleted = roundsTaught >= READING_ROUNDS.length;
+  const roundHasNext = activeRoundIndex < READING_ROUNDS.length - 1;
+
+  const teachRound = (index, intent = "read") => {
+    if (walkDisabled) return;
+    const round = READING_ROUNDS[index];
+    if (!round || !walkDocument?.revision) return;
+    const reference = readingRoundReference(round, walkSections);
+    if (intent === "read" && reference?.firstBlockId) onOpenCitation(reference.firstBlockId);
+    let text;
+    if (intent === "simpler") {
+      text = `我还是没太懂「${round.label}」这一步。请用更基础、更口语化的方式重讲一遍，多打比方，并把关键专业名词都用大白话解释清楚。`;
+    } else if (intent === "rephrase") {
+      text = `「${round.label}」这一步请换一个角度、换一种说法再讲一遍，帮我加深理解。${inlineTermsInstruction}`;
+    } else if (intent === "terms") {
+      text = `请列出「${round.label}」这一步涉及的最关键专业名词（挑最重要的 5 个以内），每个用一句话大白话解释，并说明它在这篇论文里为什么重要。`;
+    } else if (intent === "quiz") {
+      text = `基于我们刚读的「${round.label}」，再出 2-3 道能检验我是否真的读懂的选择题（先只给题目和选项，不要给答案）。我回答后你再逐条点评。`;
+    } else {
+      text = `${round.prompt}${ROUND_OUTPUT_FORMAT}${inlineTermsInstruction}${depthInstruction}`;
+    }
+    void submit({
+      clientRequestId: createChatRequestId(),
+      text,
+      reference: reference
+        ? { documentRevision: walkDocument.revision, blockIds: reference.blockIds }
+        : null,
+      includeProjectContext,
+    });
+    if (intent === "read") {
+      setRoundSelection(index);
+      setRoundProgress((current) => ({
+        ...current,
+        [roundKey]: Math.max(
+          Number.isSafeInteger(current[roundKey]) ? current[roundKey] : 0,
+          index + 1,
+        ),
+      }));
+    }
+  };
+
+  const readCurrentRound = () => teachRound(activeRoundIndex, "read");
+  const readNextRound = () => teachRound(activeRoundIndex + 1, "read");
+
   useEffect(() => {
     if (!sessionKey || overviewFiredRef.current === sessionKey) return;
     if (chatState.status === "running") return;
@@ -1103,7 +1302,11 @@ export function ReaderAgentComposer({
                   Agent 正在思考…
                 </p>
               ) : null}
-              {turn.status === "answered" ? <p className="reader-agent-answer">{turn.answer}</p> : null}
+              {turn.status === "answered" ? (
+                <div className="reader-agent-answer">
+                  <PaperRichText content={turn.answer ?? ""} />
+                </div>
+              ) : null}
               {turn.status === "failed" ? (
                 <div className="reader-agent-turn-failed">
                   <p className="reader-agent-turn-state is-error">
@@ -1206,6 +1409,33 @@ export function ReaderAgentComposer({
             <span className="reader-agent-walk-label">
               <BookOpenText size={14} weight="fill" aria-hidden="true" />带读
             </span>
+            {walkOpen ? (
+              <div className="reader-agent-walk-modes" role="tablist" aria-label="带读方式">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={walkMode === "rounds"}
+                  className={walkMode === "rounds" ? "is-active" : ""}
+                  onClick={() => setWalkMode("rounds")}
+                >
+                  十步导读
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={walkMode === "sections"}
+                  className={walkMode === "sections" ? "is-active" : ""}
+                  onClick={() => setWalkMode("sections")}
+                >
+                  按章节读
+                </button>
+              </div>
+            ) : null}
+            {walkOpen && walkMode === "rounds" ? (
+              <span className="reader-agent-walk-progress" aria-label="十步进度">
+                {roundsTaught}/{READING_ROUNDS.length}
+              </span>
+            ) : null}
             <button
               type="button"
               className="reader-agent-walk-toggle"
@@ -1215,58 +1445,126 @@ export function ReaderAgentComposer({
               {walkOpen ? "收起" : "展开"}
             </button>
           </div>
-          {walkOpen ? (
+          {walkOpen && walkMode === "rounds" ? (
             <>
-          <div className="reader-agent-walk-head">
-            <label className="reader-agent-walk-pick">
-              <BookOpenText size={14} weight="fill" aria-hidden="true" />
-              <select
-                aria-label="选择要读的部分"
-                value={activeSectionIndex}
-                onChange={(event) => {
-                  const target = walkSections[Number(event.target.value)];
-                  if (target?.firstBlockId) onOpenCitation(target.firstBlockId);
-                }}
-              >
-                {walkSections.map((section, index) => (
-                  <option value={index} key={section.firstBlockId ?? index}>
-                    {index + 1}. {section.title}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="reader-agent-walk-depth">
-              讲解深浅
-              <select
-                aria-label="讲解深浅"
-                value={readingDepth}
-                onChange={(event) => setReadingDepth(event.target.value)}
-              >
-                <option value="novice">小白</option>
-                <option value="normal">一般</option>
-                <option value="expert">进阶</option>
-              </select>
-            </label>
-          </div>
-          <div className="reader-agent-walk-actions">
-            <button type="button" disabled={walkDisabled} onClick={askOverview}>讲讲整体脉络</button>
-            <button type="button" className="is-primary" disabled={walkDisabled} onClick={readCurrentSection}>带我读这部分</button>
-            <button
-              type="button"
-              disabled={walkDisabled || !sectionHasNext}
-              onClick={readNextSection}
-            >
-              读下一部分<ArrowRight size={14} weight="bold" aria-hidden="true" />
-            </button>
-          </div>
-          <div className="reader-agent-walk-actions is-secondary">
-            <button type="button" disabled={walkDisabled} onClick={() => teachSection(activeSectionIndex, "simpler")}>再浅一点</button>
-            <button type="button" disabled={walkDisabled} onClick={() => teachSection(activeSectionIndex, "rephrase")}>换个说法</button>
-            <button type="button" disabled={walkDisabled} onClick={() => teachSection(activeSectionIndex, "terms")}>本部分术语</button>
-            <button type="button" disabled={walkDisabled} onClick={() => teachSection(activeSectionIndex, "translate")}>翻译本部分</button>
-            <button type="button" disabled={walkDisabled} onClick={() => teachSection(activeSectionIndex, "quiz")}>考考我</button>
-          </div>
+              <div className="reader-agent-walk-row">
+                <label className="reader-agent-walk-pick">
+                  <BookOpenText size={14} weight="fill" aria-hidden="true" />
+                  <select
+                    aria-label="选择要读的步骤"
+                    value={activeRoundIndex}
+                    onChange={(event) => setRoundSelection(Number(event.target.value))}
+                  >
+                    {READING_ROUNDS.map((round, index) => (
+                      <option value={index} key={round.id}>
+                        {index < roundsTaught ? "✓ " : ""}第 {index + 1} 步 · {round.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  className="is-primary"
+                  disabled={walkDisabled}
+                  onClick={readCurrentRound}
+                >
+                  读这一步
+                </button>
+                <button
+                  type="button"
+                  disabled={walkDisabled || !roundHasNext}
+                  onClick={readNextRound}
+                >
+                  下一步<ArrowRight size={14} weight="bold" aria-hidden="true" />
+                </button>
+                <details className="reader-agent-walk-more">
+                  <summary aria-label="更多带读操作">⋯</summary>
+                  <div className="reader-agent-walk-more-menu">
+                    <button type="button" disabled={walkDisabled} onClick={askOverview}>讲讲整体脉络</button>
+                    <button type="button" disabled={walkDisabled} onClick={() => teachRound(activeRoundIndex, "simpler")}>再浅一点</button>
+                    <button type="button" disabled={walkDisabled} onClick={() => teachRound(activeRoundIndex, "rephrase")}>换个说法</button>
+                    <button type="button" disabled={walkDisabled} onClick={() => teachRound(activeRoundIndex, "terms")}>本步术语</button>
+                    <button type="button" disabled={walkDisabled} onClick={() => teachRound(activeRoundIndex, "quiz")}>考考我</button>
+                    <label className="reader-agent-walk-depth">
+                      讲解深浅
+                      <select
+                        aria-label="讲解深浅"
+                        value={readingDepth}
+                        onChange={(event) => setReadingDepth(event.target.value)}
+                      >
+                        <option value="novice">小白</option>
+                        <option value="normal">一般</option>
+                        <option value="expert">进阶</option>
+                      </select>
+                    </label>
+                  </div>
+                </details>
+              </div>
+              {roundsCompleted ? (
+                <p className="reader-agent-walk-complete" role="status">
+                  十步已完成 · 可把关键回答逐条「整理到 Obsidian 笔记」，或进入归档整理。
+                </p>
+              ) : null}
             </>
+          ) : null}
+          {walkOpen && walkMode === "sections" ? (
+            <div className="reader-agent-walk-row">
+              <label className="reader-agent-walk-pick">
+                <BookOpenText size={14} weight="fill" aria-hidden="true" />
+                <select
+                  aria-label="选择要读的部分"
+                  value={activeSectionIndex}
+                  onChange={(event) => {
+                    const target = walkSections[Number(event.target.value)];
+                    if (target?.firstBlockId) onOpenCitation(target.firstBlockId);
+                  }}
+                >
+                  {walkSections.map((section, index) => (
+                    <option value={index} key={section.firstBlockId ?? index}>
+                      {index + 1}. {section.title}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="is-primary"
+                disabled={walkDisabled}
+                onClick={readCurrentSection}
+              >
+                带我读这部分
+              </button>
+              <button
+                type="button"
+                disabled={walkDisabled || !sectionHasNext}
+                onClick={readNextSection}
+              >
+                读下一部分<ArrowRight size={14} weight="bold" aria-hidden="true" />
+              </button>
+              <details className="reader-agent-walk-more">
+                <summary aria-label="更多带读操作">⋯</summary>
+                <div className="reader-agent-walk-more-menu">
+                  <button type="button" disabled={walkDisabled} onClick={askOverview}>讲讲整体脉络</button>
+                  <button type="button" disabled={walkDisabled} onClick={() => teachSection(activeSectionIndex, "simpler")}>再浅一点</button>
+                  <button type="button" disabled={walkDisabled} onClick={() => teachSection(activeSectionIndex, "rephrase")}>换个说法</button>
+                  <button type="button" disabled={walkDisabled} onClick={() => teachSection(activeSectionIndex, "terms")}>本部分术语</button>
+                  <button type="button" disabled={walkDisabled} onClick={() => teachSection(activeSectionIndex, "translate")}>翻译本部分</button>
+                  <button type="button" disabled={walkDisabled} onClick={() => teachSection(activeSectionIndex, "quiz")}>考考我</button>
+                  <label className="reader-agent-walk-depth">
+                    讲解深浅
+                    <select
+                      aria-label="讲解深浅"
+                      value={readingDepth}
+                      onChange={(event) => setReadingDepth(event.target.value)}
+                    >
+                      <option value="novice">小白</option>
+                      <option value="normal">一般</option>
+                      <option value="expert">进阶</option>
+                    </select>
+                  </label>
+                </div>
+              </details>
+            </div>
           ) : null}
         </div>
       ) : null}

@@ -1,5 +1,14 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { SidebarSimple } from "@phosphor-icons/react";
+import { usePersistentState } from "../hooks/usePersistentState.js";
+
+const MIN_AGENT_RATIO = 0.25;
+const MAX_AGENT_RATIO = 0.75;
+
+function clampRatio(value, fallback = 0.5) {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(MAX_AGENT_RATIO, Math.max(MIN_AGENT_RATIO, value));
+}
 
 export function AgentArtifactLayout({
   ariaLabel,
@@ -13,36 +22,34 @@ export function AgentArtifactLayout({
   overlay = null,
   artifactOpen: controlledArtifactOpen,
   onArtifactOpenChange,
-  initialAgentWidth = 460,
-  minAgentWidth = 360,
-  maxAgentWidth = 560,
   closedLabel = "打开右侧",
   openLabel = "收起右侧",
   closedTitle = "打开右侧工件",
   openTitle = "收起右侧工件",
   resizeLabel = "拖拽调整对话与工件的宽度",
 }) {
-  const [agentWidth, setAgentWidth] = useState(initialAgentWidth);
+  // The agent/artifact split is a free ratio (25%–75%) so the reader can give
+  // either column roughly half of the workspace; it persists across sessions.
+  const [agentRatio, setAgentRatio] = usePersistentState("pi-agent-artifact-ratio", 0.5);
   const [resizing, setResizing] = useState(false);
   const [internalArtifactOpen, setInternalArtifactOpen] = useState(false);
+  const bodyRef = useRef(null);
   const artifactOpen = controlledArtifactOpen ?? internalArtifactOpen;
   const setArtifactOpen = onArtifactOpenChange ?? setInternalArtifactOpen;
 
   const startAgentResizing = useCallback((event) => {
     event.preventDefault();
+    const bodyWidth = bodyRef.current?.getBoundingClientRect()?.width;
+    if (!bodyWidth) return;
     setResizing(true);
     const startX = event.clientX;
-    const startWidth = agentWidth;
+    const startRatio = clampRatio(agentRatio);
     let rafId = null;
 
     const onMove = (moveEvent) => {
       if (rafId) cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(() => {
-        const nextWidth = Math.min(
-          maxAgentWidth,
-          Math.max(minAgentWidth, startWidth + (moveEvent.clientX - startX)),
-        );
-        setAgentWidth(nextWidth);
+        setAgentRatio(clampRatio(startRatio + (moveEvent.clientX - startX) / bodyWidth));
       });
     };
 
@@ -55,7 +62,7 @@ export function AgentArtifactLayout({
 
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
-  }, [agentWidth, maxAgentWidth, minAgentWidth]);
+  }, [agentRatio, setAgentRatio]);
 
   const agentMobileActive = mobileView === agentMobileView;
   const artifactMobileActive = mobileView !== agentMobileView;
@@ -87,10 +94,13 @@ export function AgentArtifactLayout({
         </div>
       </header>
 
-      <div className={`reading-workbench-body${artifactOpen ? " is-artifact-open" : ""}`}>
+      <div
+        ref={bodyRef}
+        className={`reading-workbench-body${artifactOpen ? " is-artifact-open" : ""}`}
+      >
         <div
           className={`reading-agent-pane${agentMobileActive ? " is-mobile-active" : ""}`}
-          style={artifactOpen ? { width: `${agentWidth}px` } : undefined}
+          style={artifactOpen ? { width: `${clampRatio(agentRatio) * 100}%` } : undefined}
         >
           {agent}
         </div>

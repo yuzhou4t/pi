@@ -9,6 +9,12 @@ import { deterministicCandidateRanking, rankCandidates } from "./candidateRankin
 import { buildDocumentIndex } from "./documentIndex.js";
 import { downloadPdf, readPdfManifest } from "./pdfDownloader.js";
 import { generateFiveMinuteGuide } from "./guideGenerator.js";
+import {
+  isMathOnlyBlock,
+  isTranslatableBlock,
+  translatePaperBatch,
+  translationBatches,
+} from "./translationGenerator.js";
 import { createObsidianPreviewService } from "./obsidianPreview.js";
 import { createProjectContextReader } from "./projectContext.js";
 import { createProjectStatePreviewService } from "./projectStatePreview.js";
@@ -166,6 +172,7 @@ export function createJournalWorkflowService({
   sourceScanner = scanJournalSources,
   candidateRanker = rankCandidates,
   guideGenerator = generateFiveMinuteGuide,
+  translationGenerator = translatePaperBatch,
   modelProviders = createModelProviderRegistry({ env, fetchImpl }),
   pdfDownloader = downloadPdf,
   mineruAdapter = env.PI_MINERU_API_TOKEN
@@ -184,6 +191,7 @@ export function createJournalWorkflowService({
   const inFlight = new Map();
   const guideInFlight = new Map();
   const guideStartLocks = new Map();
+  const translationInFlight = new Map();
   let reading;
   let readingNoteAction;
   let obsidianPreview;
@@ -1298,6 +1306,179 @@ export function createJournalWorkflowService({
     return inFlight.get(runId) ?? Promise.resolve(runStore.getRun(runId));
   }
 
+  function translationArtifactName(paperId) {
+    return `translation/${safeName(paperId)}.json`;
+  }
+
+  function translationKey(runId, paperId) {
+    return `${runId}::${paperId}`;
+  }
+
+  async function readTranslationArtifact(runId, paperId) {
+    try {
+      const artifact = await runStore.readArtifact(runId, translationArtifactName(paperId));
+      if (
+        !artifact
+        || artifact.schema_version !== 1
+        || artifact.run_id !== runId
+        || artifact.paper_id !== paperId
+        || typeof artifact.document_revision !== "string"
+        || !artifact.blocks
+        || typeof artifact.blocks !== "object"
+        || Array.isArray(artifact.blocks)
+      ) return null;
+      return artifact;
+    } catch {
+      return null;
+    }
+  }
+
+  function publicTranslation(runId, paperId, document, artifact, job) {
+    const total = document.blocks.filter(isTranslatableBlock).length;
+    const matching = artifact && artifact.document_revision === document.revision
+      ? artifact
+      : null;
+    const blocks = matching ? { ...matching.blocks } : {};
+    const translated = Math.min(Object.keys(blocks).length, total);
+    const running = Boolean(job && job.revision === document.revision);
+    const status = running
+      ? "running"
+      : !matching
+        ? artifact ? "stale" : "not_started"
+        : total > 0 && translated >= total
+          ? "ready"
+          : translated > 0 || matching.last_error
+            ? "partial"
+            : "not_started";
+    return {
+      schema_version: 1,
+      run_id: runId,
+      paper_id: paperId,
+      document_revision: document.revision,
+      status,
+      provider_id: matching?.provider_id ?? job?.providerId ?? null,
+      model_id: matching?.model_id ?? job?.modelId ?? null,
+      total_blocks: total,
+      translated_blocks: translated,
+      blocks,
+      error: matching?.last_error ?? null,
+      updated_at: matching?.updated_at ?? null,
+    };
+  }
+
+  async function getPaperTranslation(runId, paperId) {
+    const document = await getPaperDocument(runId, paperId);
+    return publicTranslation(
+      runId,
+      paperId,
+      document,
+      await readTranslationArtifact(runId, paperId),
+      translationInFlight.get(translationKey(runId, paperId)),
+    );
+  }
+
+  async function generatePaperTranslation(runId, paperId, {
+    providerId = defaults.providerId,
+    modelId = defaults.modelId,
+  } = {}) {
+    const document = await getPaperDocument(runId, paperId);
+    if (
+      !isNonEmptyString(providerId)
+      || !isNonEmptyString(modelId)
+      || typeof modelProviders?.supports !== "function"
+      || !modelProviders.supports(providerId, modelId)
+    ) {
+      throw artifactError("TRANSLATION_PROVIDER_UNSUPPORTED", "服务商或模型不支持全文翻译", 400);
+    }
+    const key = translationKey(runId, paperId);
+    const existing = translationInFlight.get(key);
+    if (existing) {
+      return publicTranslation(
+        runId,
+        paperId,
+        document,
+        await readTranslationArtifact(runId, paperId),
+        existing,
+      );
+    }
+    let artifact = await readTranslationArtifact(runId, paperId);
+    // A translation for an older body is discarded; the reader never mixes revisions.
+    if (artifact && artifact.document_revision !== document.revision) artifact = null;
+    const startedAt = new Date().toISOString();
+    const nextArtifact = artifact ?? {
+      schema_version: 1,
+      run_id: runId,
+      paper_id: paperId,
+      document_revision: document.revision,
+      provider_id: providerId,
+      model_id: modelId,
+      status: "running",
+      blocks: {},
+      last_error: null,
+      generated_at: startedAt,
+      updated_at: startedAt,
+    };
+    // Formula-only blocks pass through unchanged without spending a model call.
+    for (const block of document.blocks) {
+      if (!isTranslatableBlock(block) || !isMathOnlyBlock(block)) continue;
+      if (nextArtifact.blocks[block.block_id]) continue;
+      nextArtifact.blocks[block.block_id] = String(block.text ?? block.markdown ?? "").trim();
+    }
+    const batches = translationBatches(
+      document.blocks,
+      new Set(Object.keys(nextArtifact.blocks)),
+    );
+    const total = document.blocks.filter(isTranslatableBlock).length;
+    if (batches.length === 0) {
+      nextArtifact.status = Object.keys(nextArtifact.blocks).length >= total ? "ready" : "partial";
+      nextArtifact.last_error = null;
+      nextArtifact.updated_at = new Date().toISOString();
+      await runStore.writeArtifact(runId, translationArtifactName(paperId), nextArtifact);
+      return publicTranslation(runId, paperId, document, nextArtifact, null);
+    }
+    nextArtifact.status = "running";
+    nextArtifact.provider_id = providerId;
+    nextArtifact.model_id = modelId;
+    nextArtifact.last_error = null;
+    nextArtifact.updated_at = startedAt;
+    await runStore.writeArtifact(runId, translationArtifactName(paperId), nextArtifact);
+    const job = { revision: document.revision, providerId, modelId, promise: null };
+    job.promise = (async () => {
+      let lastError = null;
+      for (const batch of batches) {
+        try {
+          const generated = await translationGenerator({
+            paperId,
+            batch,
+            providerId,
+            modelId,
+            modelProviders,
+            modelMode,
+          });
+          Object.assign(nextArtifact.blocks, generated.translations);
+        } catch (error) {
+          // A failed batch is recorded and skipped; finished batches stay durable.
+          lastError = publicError(error);
+        }
+        nextArtifact.updated_at = new Date().toISOString();
+        await runStore.writeArtifact(runId, translationArtifactName(paperId), nextArtifact);
+      }
+      nextArtifact.status = Object.keys(nextArtifact.blocks).length >= total ? "ready" : "partial";
+      nextArtifact.last_error = lastError;
+      nextArtifact.updated_at = new Date().toISOString();
+      await runStore.writeArtifact(runId, translationArtifactName(paperId), nextArtifact);
+    })().finally(() => {
+      if (translationInFlight.get(key) === job) translationInFlight.delete(key);
+    });
+    translationInFlight.set(key, job);
+    return publicTranslation(runId, paperId, document, nextArtifact, job);
+  }
+
+  function waitForTranslation(runId, paperId) {
+    return translationInFlight.get(translationKey(runId, paperId))?.promise
+      ?? Promise.resolve();
+  }
+
   function waitForGuides(runId) {
     return guideInFlight.get(runId)?.promise ?? Promise.resolve(runStore.getRun(runId));
   }
@@ -1436,6 +1617,9 @@ export function createJournalWorkflowService({
     getPaperImage,
     getPaperPdf,
     getPaperReading: reading.getReading,
+    getPaperTranslation,
+    generatePaperTranslation,
+    waitForTranslation,
     getProjectContext: projectContext.read,
     getReadingNoteProposal,
     getObsidianPreview,

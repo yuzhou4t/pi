@@ -14,7 +14,8 @@
     "evidence": "evidence.v3",
     "project-relation": "project-relation.v3",
     "reading-follow-up": "reading-follow-up.v1",
-    "reading-chat": "reading-chat.v1"
+    "reading-chat": "reading-chat.v2",
+    "translation": "translation.v1"
   },
   "versions": {
     "candidate-ranking.v1": {
@@ -88,6 +89,14 @@
     "reading-chat.v1": {
       "file": "reading-chat.v1.md",
       "schema": "reading-chat.v1.json"
+    },
+    "reading-chat.v2": {
+      "file": "reading-chat.v2.md",
+      "schema": "reading-chat.v2.json"
+    },
+    "translation.v1": {
+      "file": "translation.v1.md",
+      "schema": "translation.v1.json"
     }
   }
 }

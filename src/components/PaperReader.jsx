@@ -11,13 +11,17 @@ import {
   ListBullets,
   Quotes,
   Sparkle,
+  Translate,
 } from "@phosphor-icons/react";
 import {
   fetchJournalPaperDocument,
   fetchJournalPaperReading,
+  fetchJournalPaperTranslation,
   generateJournalReadingStage,
   saveJournalReadingPosition,
+  startJournalPaperTranslation,
 } from "../api/journalRuns.js";
+import { usePersistentState } from "../hooks/usePersistentState.js";
 import { PaperRichText } from "./PaperRichText.jsx";
 import { selectionReferenceFromDom } from "./WorkflowContextRail.jsx";
 
@@ -80,6 +84,8 @@ function FullBlock({
   active,
   activeRef,
   onActivate,
+  zh = null,
+  language = "original",
 }) {
   const copy = blockCopy(block);
   if (block.kind === "heading") {
@@ -141,7 +147,20 @@ function FullBlock({
       onClick={() => onActivate(block.id)}
       onKeyDown={(event) => activateOnKeyboard(event, () => onActivate(block.id))}
     >
-      <PaperRichText content={copy} />
+      {language === "zh" && zh ? (
+        <div className="paper-reader-zh is-only" data-reader-zh="true">
+          <PaperRichText content={zh} />
+        </div>
+      ) : (
+        <>
+          <PaperRichText content={copy} />
+          {language === "bilingual" && zh ? (
+            <div className="paper-reader-zh" data-reader-zh="true">
+              <PaperRichText content={zh} />
+            </div>
+          ) : null}
+        </>
+      )}
     </article>
   );
 }
@@ -296,6 +315,14 @@ export function PaperReader({
   const [compileStatus, setCompileStatus] = useState("idle");
   const [compileError, setCompileError] = useState(null);
   const [positionStatus, setPositionStatus] = useState("idle");
+  const [language, setLanguage] = usePersistentState("pi-reader-language", "original");
+  const [translationState, setTranslationState] = useState({
+    status: "idle",
+    translation: null,
+    starting: false,
+    error: null,
+  });
+  const [translationRefreshKey, setTranslationRefreshKey] = useState(0);
   const contentTitleRef = useRef(null);
   const focusedTabRef = useRef(null);
   const fullTabRef = useRef(null);
@@ -361,6 +388,59 @@ export function PaperReader({
 
   const paperDocument = request.document;
   const reading = readingRequest.reading;
+
+  useEffect(() => {
+    if (request.status !== "ready") return undefined;
+    const controller = new AbortController();
+    let cancelled = false;
+    let timer = null;
+    const load = async () => {
+      try {
+        const translation = await fetchJournalPaperTranslation(runId, paper.id, {
+          signal: controller.signal,
+        });
+        if (cancelled) return;
+        setTranslationState((current) => ({
+          status: "ready",
+          translation,
+          starting: current.starting && translation.status === "running",
+          error: null,
+        }));
+        if (translation.status === "running") {
+          timer = window.setTimeout(load, 2500);
+        }
+      } catch (error) {
+        if (cancelled || controller.signal.aborted) return;
+        setTranslationState((current) => ({
+          status: "error",
+          translation: current.translation,
+          starting: false,
+          error: errorMessage(error, "无法读取全文翻译"),
+        }));
+      }
+    };
+    setTranslationState((current) => ({
+      status: "loading",
+      translation: current.translation,
+      starting: current.starting,
+      error: null,
+    }));
+    void load();
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [paper.id, request.status, runId, translationRefreshKey]);
+
+  const translation = translationState.translation;
+  const translationBlocks = useMemo(() => (
+    translation && translation.documentRevision === paperDocument?.revision
+      ? translation.blocks
+      : {}
+  ), [paperDocument?.revision, translation]);
+  const translationUsable = Object.keys(translationBlocks).length > 0;
+  const effectiveLanguage = translationUsable ? language : "original";
   const readable = useMemo(
     () => readingBlocks(paperDocument?.blocks ?? []),
     [paperDocument?.blocks],
@@ -591,6 +671,33 @@ export function PaperReader({
     if (result.reference || result.error) onSelectionChange?.(result);
   };
 
+  const startTranslation = async () => {
+    if (!modelAvailable || translationState.starting) return;
+    setTranslationState((current) => ({ ...current, starting: true, error: null }));
+    try {
+      const nextTranslation = await startJournalPaperTranslation({
+        runId,
+        paperId: paper.id,
+        providerId,
+        modelId,
+      });
+      setTranslationState({
+        status: "ready",
+        translation: nextTranslation,
+        starting: nextTranslation.status === "running",
+        error: null,
+      });
+      setTranslationRefreshKey((current) => current + 1);
+    } catch (error) {
+      setTranslationState((current) => ({
+        status: "error",
+        translation: current.translation,
+        starting: false,
+        error: errorMessage(error, "无法启动全文翻译"),
+      }));
+    }
+  };
+
   const handleModeKeyDown = (event) => {
     let nextMode = null;
     if (event.key === "ArrowLeft" || event.key === "Home") nextMode = "full";
@@ -789,6 +896,72 @@ export function PaperReader({
             </section>
           ) : null}
 
+          <div className="paper-reader-language-bar">
+            <div className="paper-reader-language-modes" role="group" aria-label="正文语言">
+              <button
+                type="button"
+                className={effectiveLanguage === "original" ? "is-active" : ""}
+                aria-pressed={effectiveLanguage === "original"}
+                onClick={() => setLanguage("original")}
+              >
+                原文
+              </button>
+              <button
+                type="button"
+                className={effectiveLanguage === "zh" ? "is-active" : ""}
+                aria-pressed={effectiveLanguage === "zh"}
+                disabled={!translationUsable}
+                onClick={() => setLanguage("zh")}
+              >
+                中文
+              </button>
+              <button
+                type="button"
+                className={effectiveLanguage === "bilingual" ? "is-active" : ""}
+                aria-pressed={effectiveLanguage === "bilingual"}
+                disabled={!translationUsable}
+                onClick={() => setLanguage("bilingual")}
+              >
+                对照
+              </button>
+            </div>
+            <div className="paper-reader-language-status" aria-live="polite">
+              {translation?.status === "running" ? (
+                <span role="status">
+                  <CircleNotch className="is-spinning" size={14} aria-hidden="true" />
+                  正在翻译 {translation.translatedBlocks}/{translation.totalBlocks} 段
+                </span>
+              ) : null}
+              {translation && ["not_started", "stale"].includes(translation.status) ? (
+                <button
+                  type="button"
+                  disabled={!modelAvailable || translationState.starting}
+                  onClick={startTranslation}
+                >
+                  {translationState.starting
+                    ? <CircleNotch className="is-spinning" size={14} aria-hidden="true" />
+                    : <Translate size={14} aria-hidden="true" />}
+                  {translation.status === "stale" ? "重新翻译全文" : "翻译全文"}
+                </button>
+              ) : null}
+              {translation?.status === "partial" ? (
+                <button
+                  type="button"
+                  disabled={!modelAvailable || translationState.starting}
+                  onClick={startTranslation}
+                >
+                  {translationState.starting
+                    ? <CircleNotch className="is-spinning" size={14} aria-hidden="true" />
+                    : <Translate size={14} aria-hidden="true" />}
+                  继续翻译（已完成 {translation.translatedBlocks}/{translation.totalBlocks}）
+                </button>
+              ) : null}
+              {translationState.error ? (
+                <span className="paper-reader-language-error">{translationState.error}</span>
+              ) : null}
+            </div>
+          </div>
+
           {mode === "focused" ? (
             <div
               id="paper-reader-panel-focused"
@@ -809,6 +982,11 @@ export function PaperReader({
               >
                 <h3 ref={contentTitleRef} tabIndex="-1">当前原文</h3>
                 <PaperRichText content={blockCopy(activeBlock)} />
+                {effectiveLanguage !== "original" && translationBlocks[activeBlock?.id] ? (
+                  <div className="paper-reader-zh" data-reader-zh="true">
+                    <PaperRichText content={translationBlocks[activeBlock.id]} />
+                  </div>
+                ) : null}
               </article>
 
               <button
@@ -861,6 +1039,8 @@ export function PaperReader({
                   active={block.id === activeBlockId}
                   activeRef={activeFullBlockRef}
                   onActivate={(blockId) => activateBlock(blockId)}
+                  zh={translationBlocks[block.id] ?? null}
+                  language={effectiveLanguage}
                   key={block.id}
                 />
               ))}

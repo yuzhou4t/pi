@@ -13,6 +13,7 @@ import {
   fetchJournalPaperReading,
   fetchJournalPaperGuide,
   fetchJournalPaperDocument,
+  fetchJournalPaperTranslation,
   fetchJournalRun,
   fetchJournalRuns,
   fetchProjectContext,
@@ -23,6 +24,7 @@ import {
   journalGuideNeedsRefresh,
   mapJournalPaperGuide,
   mapJournalPaperDocument,
+  mapJournalPaperTranslation,
   mapJournalPaperReading,
   mapJournalRun,
   mapObsidianPreview,
@@ -35,6 +37,7 @@ import {
   sendJournalReadingChatMessage,
   selectZoteroCommitOperations,
   startJournalGuides,
+  startJournalPaperTranslation,
   startJournalRun,
 } from "./journalRuns.js";
 
@@ -1169,5 +1172,89 @@ test("Zotero retry operations exclude blocked and non-retryable failures", () =>
   assert.deepEqual(
     selectZoteroCommitOperations(proposals).map((operation) => operation.proposalId),
     ["retryable"],
+  );
+});
+
+test("full-text translation maps status, progress, and per-block Chinese text", async () => {
+  const body = {
+    schema_version: 1,
+    run_id: "journal-run-1",
+    paper_id: "paper-1",
+    document_revision: "sha256:abc",
+    status: "partial",
+    provider_id: "deepseek",
+    model_id: "deepseek-v4-pro",
+    total_blocks: 3,
+    translated_blocks: 2,
+    blocks: {
+      "block-1": "第一段译文。",
+      "block-2": "第二段译文。",
+      "block-3": 42,
+    },
+    error: { code: "TRANSLATION_OUTPUT_INVALID", message: "批次失败" },
+    updated_at: "2026-07-25T00:00:00.000Z",
+  };
+  const mapped = mapJournalPaperTranslation(body);
+  assert.equal(mapped.status, "partial");
+  assert.equal(mapped.documentRevision, "sha256:abc");
+  assert.equal(mapped.translatedBlocks, 2);
+  assert.equal(mapped.totalBlocks, 3);
+  assert.deepEqual(Object.keys(mapped.blocks).sort(), ["block-1", "block-2"]);
+  assert.equal(mapped.error.code, "TRANSLATION_OUTPUT_INVALID");
+
+  assert.throws(
+    () => mapJournalPaperTranslation({ ...body, document_revision: null }),
+    /全文翻译格式无效/,
+  );
+  assert.throws(
+    () => mapJournalPaperTranslation({ ...body, status: "unknown" }),
+    /全文翻译格式无效/,
+  );
+
+  const calls = [];
+  const fetched = await withFetch(async (url, options = {}) => {
+    calls.push({ url, options });
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }, () => fetchJournalPaperTranslation("journal-run-1", "paper-1"));
+  assert.equal(fetched.paperId, "paper-1");
+  assert.equal(
+    calls[0].url,
+    "/api/v1/journal-runs/journal-run-1/papers/paper-1/translation",
+  );
+  assert.notEqual(calls[0].options.method, "POST");
+
+  await withFetch(async (url, options = {}) => {
+    calls.push({ url, options });
+    return new Response(JSON.stringify({ ...body, status: "running" }), {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  }, () => startJournalPaperTranslation({
+    runId: "journal-run-1",
+    paperId: "paper-1",
+    providerId: "deepseek",
+    modelId: "deepseek-v4-pro",
+  }));
+  assert.equal(calls[1].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    schema_version: 1,
+    provider_id: "deepseek",
+    model_id: "deepseek-v4-pro",
+  });
+});
+
+test("paper documents without a string revision are rejected", () => {
+  assert.throws(
+    () => mapJournalPaperDocument({
+      schema_version: 1,
+      run_id: "journal-run-1",
+      paper_id: "paper-1",
+      sections: [],
+      blocks: [],
+    }),
+    /论文正文格式无效/,
   );
 });
