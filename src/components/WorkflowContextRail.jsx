@@ -1115,7 +1115,6 @@ export function ReaderAgentComposer({
   const sectionTotal = walkSections.length;
   const sectionHasNext = activeSectionIndex < sectionTotal - 1;
   const walkDisabled = !modelAvailable || chatState.status === "running";
-  const overviewFiredRef = useRef(null);
 
   const askOverview = () => {
     if (walkDisabled) return;
@@ -1218,18 +1217,6 @@ export function ReaderAgentComposer({
 
   const readCurrentRound = () => teachRound(activeRoundIndex, "read");
   const readNextRound = () => teachRound(activeRoundIndex + 1, "read");
-
-  useEffect(() => {
-    if (!sessionKey || overviewFiredRef.current === sessionKey) return;
-    if (chatState.status === "running") return;
-    if (chatState.turns.length > 0) {
-      overviewFiredRef.current = sessionKey;
-      return;
-    }
-    if (!modelAvailable || sectionTotal === 0) return;
-    overviewFiredRef.current = sessionKey;
-    askOverview();
-  }, [sessionKey, chatState.turns.length, chatState.status, modelAvailable, sectionTotal]);
 
   return (
     <section className="reader-agent" aria-label="论文 Agent 对话">

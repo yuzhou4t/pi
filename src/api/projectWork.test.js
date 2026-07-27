@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  configureProjectWorkConversation,
   createStandaloneProjectWorkConversation,
   deleteProjectWorkConversation,
   fetchProjectWorkFile,
@@ -8,7 +9,12 @@ import {
   fetchProjectWorkTree,
   listStandaloneProjectWorkConversations,
   mapProjectWorkConversation,
+  removeProjectWorkPdf,
   renameProjectWorkConversation,
+  retryProjectWorkPdf,
+  sendProjectWorkMessage,
+  serializeProjectWorkImage,
+  uploadProjectWorkPdf,
 } from "./projectWork.js";
 
 function jsonResponse(body, status = 200) {
@@ -107,6 +113,45 @@ test("standalone conversation mapping preserves its explicit scratch scope", () 
   assert.equal(mapped.rootLabel, "未连接文件夹");
 });
 
+test("conversation mapping keeps only safe PDF document state", () => {
+  const mapped = mapProjectWorkConversation({
+    conversation: {
+      id: "conversation-documents",
+      project_id: "project-1",
+      documents: [{
+        id: "document-1",
+        file_name: "开发手册.pdf",
+        byte_length: 1024,
+        status: "parsing",
+        parser: "MinerU Cloud v4",
+        parser_state: "running",
+        batch_id: "private-batch",
+        source_path: "/private/source.pdf",
+      }],
+    },
+  });
+
+  assert.deepEqual(mapped.documents, [{
+    id: "document-1",
+    fileName: "开发手册.pdf",
+    byteLength: 1024,
+    status: "parsing",
+    parser: "MinerU Cloud v4",
+    parserState: "running",
+    sha256: null,
+    revision: null,
+    title: null,
+    blockCount: null,
+    imageCount: null,
+    error: null,
+    createdAt: null,
+    updatedAt: null,
+    readyAt: null,
+  }]);
+  assert.equal("batchId" in mapped.documents[0], false);
+  assert.equal("sourcePath" in mapped.documents[0], false);
+});
+
 test("conversation mapping preserves known and recalculating context usage", () => {
   const known = mapProjectWorkConversation({
     conversation: {
@@ -183,14 +228,142 @@ test("project-work model catalog keeps the real context window metadata", async 
           id: "deepseek-v4-flash",
           name: "DeepSeek V4 Flash",
           context_window: 131_072,
+          supports_thinking: true,
+          supports_images: true,
+          thinking_levels: ["low", "medium", "high"],
+          default_thinking_level: "medium",
         }],
       }],
       default_provider_id: "deepseek",
       default_model_id: "deepseek-v4-flash",
+      default_thinking_level: "medium",
+      capabilities: {
+        web_search: { available: false, reason: "Tavily 尚未配置" },
+      },
     }),
   });
 
   assert.equal(catalog.providers[0].models[0].contextWindow, 131_072);
+  assert.equal(catalog.providers[0].models[0].supportsImages, true);
+  assert.deepEqual(catalog.providers[0].models[0].thinkingLevels, [
+    "low",
+    "medium",
+    "high",
+  ]);
+  assert.equal(catalog.providers[0].models[0].defaultThinkingLevel, "medium");
+  assert.equal(catalog.defaultThinkingLevel, "medium");
+  assert.equal(catalog.capabilities.web_search.available, false);
+});
+
+test("thinking level maps in conversation messages and uses snake-case mutation payloads", async () => {
+  const mapped = mapProjectWorkConversation({
+    conversation: {
+      id: "conversation-thinking",
+      project_id: "project-1",
+      provider_id: "openai-codex",
+      model_id: "gpt-5.3-codex",
+      thinking_level: "high",
+      messages: [{
+        id: "message-1",
+        role: "assistant",
+        text: "完成",
+        provider_id: "openai-codex",
+        model_id: "gpt-5.3-codex",
+        thinking_level: "high",
+      }],
+    },
+    events: [{
+      seq: 1,
+      type: "turn.started",
+      data: {
+        providerId: "openai-codex",
+        modelId: "gpt-5.3-codex",
+        thinkingLevel: "high",
+      },
+    }],
+  });
+  assert.equal(mapped.thinkingLevel, "high");
+  assert.equal(mapped.messages[0].thinkingLevel, "high");
+  assert.equal(mapped.events[0].thinkingLevel, "high");
+
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return jsonResponse({
+      conversation: {
+        id: "conversation-thinking",
+        project_id: "project-1",
+        thinking_level: "high",
+      },
+    });
+  };
+  await configureProjectWorkConversation({
+    conversationId: "conversation-thinking",
+    providerId: "openai-codex",
+    modelId: "gpt-5.3-codex",
+    thinkingLevel: "high",
+    fetchImpl,
+  });
+  await sendProjectWorkMessage({
+    conversationId: "conversation-thinking",
+    text: "检查项目",
+    clientRequestId: "project-message:test-thinking",
+    workflowId: "code_review",
+    capabilities: ["web_search"],
+    images: [new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47])],
+      "界面.png",
+      { type: "image/png" },
+    )],
+    providerId: "openai-codex",
+    modelId: "gpt-5.3-codex",
+    thinkingLevel: "high",
+    fetchImpl,
+  });
+
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/conversations/conversation-thinking/configuration",
+  );
+  assert.equal(JSON.parse(calls[0].options.body).thinking_level, "high");
+  assert.equal(
+    calls[1].url,
+    "/api/v1/project-work/conversations/conversation-thinking/messages",
+  );
+  const messagePayload = JSON.parse(calls[1].options.body);
+  assert.equal(
+    messagePayload.client_request_id,
+    "project-message:test-thinking",
+  );
+  assert.equal(messagePayload.thinking_level, "high");
+  assert.equal(messagePayload.workflow_id, "code_review");
+  assert.deepEqual(messagePayload.capabilities, ["web_search"]);
+  assert.deepEqual(messagePayload.images, [{
+    file_name: "界面.png",
+    mime_type: "image/png",
+    byte_length: 4,
+    data: "iVBORw==",
+  }]);
+});
+
+test("project-work image serialization keeps only bounded image data", async () => {
+  const serialized = await serializeProjectWorkImage(new File(
+    [new Uint8Array([0xff, 0xd8, 0xff, 0xd9])],
+    "screenshot.jpg",
+    { type: "image/jpeg" },
+  ));
+  assert.deepEqual(serialized, {
+    file_name: "screenshot.jpg",
+    mime_type: "image/jpeg",
+    byte_length: 4,
+    data: "/9j/2Q==",
+  });
+  await assert.rejects(
+    serializeProjectWorkImage(new File(["<svg/>"], "unsafe.svg", {
+      type: "image/svg+xml",
+    })),
+    /PNG、JPEG 或 WebP/,
+  );
 });
 
 test("standalone conversations use global list and create routes", async () => {
@@ -575,4 +748,169 @@ test("conversation rename normalizes the title and uses the project-scoped endpo
   assert.equal(result.id, "conversation-1");
   assert.equal(result.title, "检查 登录页");
   assert.equal(result.pendingChangeFileCount, 3);
+});
+
+test("PDF upload uses JSON metadata followed by a raw application/pdf body", async () => {
+  const calls = [];
+  const file = {
+    name: "开发 手册.pdf",
+    size: 18,
+  };
+  const snapshot = await uploadProjectWorkPdf({
+    conversationId: "conversation-pdf-1",
+    file,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (calls.length === 1) {
+        return jsonResponse({
+          schema_version: 1,
+          document: {
+            id: "document-pdf-1",
+            file_name: file.name,
+            byte_length: file.size,
+            status: "awaiting_upload",
+          },
+        }, 201);
+      }
+      return jsonResponse({
+        schema_version: 1,
+        conversation: {
+          id: "conversation-pdf-1",
+          project_id: "project-1",
+          status: "idle",
+          documents: [{
+            id: "document-pdf-1",
+            file_name: file.name,
+            byte_length: file.size,
+            status: "local_ready",
+          }],
+        },
+      }, 202);
+    },
+  });
+
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/conversations/conversation-pdf-1/documents",
+  );
+  assert.equal(calls[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
+    file_name: file.name,
+    byte_length: file.size,
+  });
+  assert.equal(
+    calls[1].url,
+    "/api/v1/project-work/conversations/conversation-pdf-1/documents/document-pdf-1/content",
+  );
+  assert.equal(calls[1].options.method, "PUT");
+  assert.equal(calls[1].options.headers["content-type"], "application/pdf");
+  assert.equal(calls[1].options.body, file);
+  assert.equal(snapshot.documents[0].status, "local_ready");
+});
+
+test("failed PDF content upload makes a best-effort cleanup request", async () => {
+  const calls = [];
+  const file = { name: "失败.pdf", size: 12 };
+  await assert.rejects(
+    uploadProjectWorkPdf({
+      conversationId: "conversation-pdf-failed",
+      file,
+      fetchImpl: async (url, options) => {
+        calls.push({ url, options });
+        if (calls.length === 1) {
+          return jsonResponse({
+            document: {
+              id: "document-failed",
+              file_name: file.name,
+              byte_length: file.size,
+              status: "awaiting_upload",
+            },
+          }, 201);
+        }
+        if (calls.length === 2) {
+          return jsonResponse({
+            error: {
+              code: "PROJECT_WORK_DOCUMENT_SIGNATURE_INVALID",
+              message: "上传内容不是有效的 PDF 文件",
+            },
+          }, 415);
+        }
+        return jsonResponse({
+          conversation: {
+            id: "conversation-pdf-failed",
+            project_id: "project-1",
+            documents: [],
+          },
+        });
+      },
+    }),
+    (error) => error.code === "PROJECT_WORK_DOCUMENT_SIGNATURE_INVALID",
+  );
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].options.method, "DELETE");
+  assert.match(calls[2].url, /documents\/document-failed$/);
+});
+
+test("PDF retry uses the exact conversation and document route", async () => {
+  const calls = [];
+  const snapshot = await retryProjectWorkPdf({
+    conversationId: "conversation-pdf-1",
+    documentId: "document-pdf-1",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        schema_version: 1,
+        conversation: {
+          id: "conversation-pdf-1",
+          project_id: "project-1",
+          status: "idle",
+          documents: [{
+            id: "document-pdf-1",
+            file_name: "开发手册.pdf",
+            byte_length: 18,
+            status: "local_ready",
+          }],
+        },
+      }, 202);
+    },
+  });
+
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/conversations/conversation-pdf-1/documents/document-pdf-1/retry",
+  );
+  assert.equal(calls[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
+  });
+  assert.equal(snapshot.documents[0].status, "local_ready");
+});
+
+test("removing a PDF uses a bodyless conversation-owned delete", async () => {
+  const calls = [];
+  const snapshot = await removeProjectWorkPdf({
+    conversationId: "conversation-pdf-1",
+    documentId: "document-pdf-1",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        schema_version: 1,
+        conversation: {
+          id: "conversation-pdf-1",
+          project_id: "project-1",
+          status: "idle",
+          documents: [],
+        },
+      });
+    },
+  });
+
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/conversations/conversation-pdf-1/documents/document-pdf-1",
+  );
+  assert.equal(calls[0].options.method, "DELETE");
+  assert.equal(calls[0].options.body, undefined);
+  assert.deepEqual(snapshot.documents, []);
 });

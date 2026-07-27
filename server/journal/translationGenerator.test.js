@@ -53,6 +53,35 @@ test("fixture mode translates a batch without a model provider", async () => {
   assert.match(generated.input_hash, /^sha256:[a-f0-9]{64}$/);
 });
 
+test("translation forwards and audits the selected reasoning profile", async () => {
+  let received;
+  const generated = await translatePaperBatch({
+    paperId: "paper-1",
+    batch: [{ block_id: blockId(1), kind: "text", source: "Hello world." }],
+    providerId: "codex-subscription",
+    modelId: "gpt-5.3-codex-spark",
+    reasoningEffort: "low",
+    modelProviders: {
+      completeStructured: async (request) => {
+        received = request;
+        return {
+          value: {
+            paper_id: "paper-1",
+            blocks: [{ block_id: blockId(1), zh: "你好，世界。" }],
+          },
+          provider_id: request.providerId,
+          model_id: request.modelId,
+          reasoning_effort: request.reasoningEffort,
+        };
+      },
+    },
+    modelMode: "live",
+  });
+  assert.equal(received.reasoningEffort, "low");
+  assert.equal(generated.model_id, "gpt-5.3-codex-spark");
+  assert.equal(generated.reasoning_effort, "low");
+});
+
 test("live mode validates coverage and rejects untranslated prose", async () => {
   const batch = [
     { block_id: blockId(1), kind: "text", source: "This paragraph explains the entropy patching mechanism." },
@@ -98,6 +127,43 @@ test("live mode validates coverage and rejects untranslated prose", async () => 
   });
   assert.match(good.translations[blockId(1)], /熵切分/);
   assert.equal(good.provider_id, "deepseek");
+});
+
+test("live mode permits faithful author and link metadata passthrough", async () => {
+  const batch = [
+    {
+      block_id: blockId(1),
+      kind: "text",
+      source: "Song Jin<sup>1</sup>, Shuqi Li<sup>2</sup>, Rui Yan<sup>3</sup>",
+    },
+    {
+      block_id: blockId(2),
+      kind: "text",
+      source: "Code — https://example.com/research/project",
+    },
+  ];
+  const generated = await translatePaperBatch({
+    paperId: "paper-1",
+    batch,
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+    modelProviders: {
+      completeStructured: async () => ({
+        value: {
+          paper_id: "paper-1",
+          blocks: batch.map((block) => ({
+            block_id: block.block_id,
+            zh: block.source,
+          })),
+        },
+        provider_id: "deepseek",
+        model_id: "deepseek-v4-flash",
+      }),
+    },
+    modelMode: "live",
+  });
+  assert.equal(generated.translations[blockId(1)], batch[0].source);
+  assert.equal(generated.translations[blockId(2)], batch[1].source);
 });
 
 test("live mode rejects missing or unknown block coverage", async () => {

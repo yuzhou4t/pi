@@ -31,7 +31,9 @@ import {
   mapProjectStatePreview,
   mapZoteroProposal,
   mapZoteroTargets,
+  pauseJournalPaperTranslation,
   restartJournalReadingFromGuide,
+  resetJournalPaperReading,
   saveJournalPaperDecisions,
   saveJournalReadingPosition,
   sendJournalReadingChatMessage,
@@ -51,8 +53,10 @@ function withFetch(handler, task) {
 
 const runBody = {
   run_id: "journal-run-1",
+  project_id: "pi-agent-product",
   status: "review_ready",
   phase: "candidate_review",
+  created_at: "2026-07-23T07:00:00.000Z",
   updated_at: "2026-07-23T08:00:00.000Z",
   scan_summary: { source_count: 11 },
   mineru: {
@@ -106,8 +110,50 @@ test("journal runs keep classic origin and MinerU state visible", () => {
   assert.equal(run.guides.papers["paper-1"].inputHash, "sha256:guide-input");
   assert.equal(run.candidates[0].evidenceScope, "全文已解析，尚未完成精读核验");
   assert.equal(run.candidates[0].isDemo, false);
+  assert.equal(run.projectId, "pi-agent-product");
+  assert.equal(run.createdAt, "2026-07-23T07:00:00.000Z");
   assert.equal(run.phase, "candidate_review");
   assert.equal(run.scanSummary.source_count, 11);
+});
+
+test("journal run summaries keep the active paper conversation for read-only resume", () => {
+  const run = mapJournalRun({
+    ...runBody,
+    paper_decisions: { "paper-1": "read" },
+    readings: {
+      status: "reading",
+      paper_ids: ["paper-1"],
+      papers: {
+        "paper-1": {
+          status: "reading",
+          position: {
+            mode: "full",
+            block_id: "block-7",
+            updated_at: "2026-07-23T09:00:00.000Z",
+          },
+          chat: {
+            id: "reading-conversation-1",
+            status: "ready",
+            turns: [],
+          },
+          active_conversation_id: "reading-conversation-1",
+          conversations: [{
+            id: "reading-conversation-1",
+            title: "主研读",
+            turn_count: 0,
+            active: true,
+          }],
+        },
+      },
+    },
+  });
+
+  assert.equal(
+    run.readings.papers["paper-1"].activeConversationId,
+    "reading-conversation-1",
+  );
+  assert.equal(run.readings.papers["paper-1"].position.blockId, "block-7");
+  assert.equal(run.readings.papers["paper-1"].conversations[0].title, "主研读");
 });
 
 test("start and poll use the local journal endpoints", async () => {
@@ -1182,10 +1228,14 @@ test("full-text translation maps status, progress, and per-block Chinese text", 
     paper_id: "paper-1",
     document_revision: "sha256:abc",
     status: "partial",
-    provider_id: "deepseek",
-    model_id: "deepseek-v4-pro",
+    provider_id: "codex-subscription",
+    model_id: "gpt-5.3-codex-spark",
+    reasoning_effort: "low",
+    prompt_id: "translation",
+    prompt_version: "translation.v1",
     total_blocks: 3,
     translated_blocks: 2,
+    passthrough_blocks: 1,
     blocks: {
       "block-1": "第一段译文。",
       "block-2": "第二段译文。",
@@ -1199,6 +1249,10 @@ test("full-text translation maps status, progress, and per-block Chinese text", 
   assert.equal(mapped.documentRevision, "sha256:abc");
   assert.equal(mapped.translatedBlocks, 2);
   assert.equal(mapped.totalBlocks, 3);
+  assert.equal(mapped.passthroughBlocks, 1);
+  assert.equal(mapped.modelId, "gpt-5.3-codex-spark");
+  assert.equal(mapped.reasoningEffort, "low");
+  assert.equal(mapped.promptVersion, "translation.v1");
   assert.deepEqual(Object.keys(mapped.blocks).sort(), ["block-1", "block-2"]);
   assert.equal(mapped.error.code, "TRANSLATION_OUTPUT_INVALID");
 
@@ -1235,15 +1289,28 @@ test("full-text translation maps status, progress, and per-block Chinese text", 
   }, () => startJournalPaperTranslation({
     runId: "journal-run-1",
     paperId: "paper-1",
-    providerId: "deepseek",
-    modelId: "deepseek-v4-pro",
   }));
   assert.equal(calls[1].options.method, "POST");
   assert.deepEqual(JSON.parse(calls[1].options.body), {
     schema_version: 1,
-    provider_id: "deepseek",
-    model_id: "deepseek-v4-pro",
   });
+
+  const paused = await withFetch(async (url, options = {}) => {
+    calls.push({ url, options });
+    return new Response(JSON.stringify({ ...body, status: "paused" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }, () => pauseJournalPaperTranslation({
+    runId: "journal-run-1",
+    paperId: "paper-1",
+  }));
+  assert.equal(paused.status, "paused");
+  assert.equal(
+    calls[2].url,
+    "/api/v1/journal-runs/journal-run-1/papers/paper-1/translation/pause",
+  );
+  assert.deepEqual(JSON.parse(calls[2].options.body), { schema_version: 1 });
 });
 
 test("paper documents without a string revision are rejected", () => {
@@ -1257,4 +1324,26 @@ test("paper documents without a string revision are rejected", () => {
     }),
     /论文正文格式无效/,
   );
+});
+
+test("clearing one paper's reading progress posts the reset endpoint", async () => {
+  const calls = [];
+  const run = await withFetch(async (url, options = {}) => {
+    calls.push({ url, options });
+    return new Response(JSON.stringify(runBody), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }, () => resetJournalPaperReading({
+    runId: "journal-run-1",
+    paperId: "paper-1",
+  }));
+
+  assert.equal(run.id, "journal-run-1");
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(
+    calls[0].url,
+    "/api/v1/journal-runs/journal-run-1/papers/paper-1/reading/reset",
+  );
+  assert.deepEqual(JSON.parse(calls[0].options.body), { schema_version: 1 });
 });

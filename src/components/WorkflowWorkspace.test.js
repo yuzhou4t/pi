@@ -340,10 +340,10 @@ test("live guide, paper workbench, and archive handoff render in the validated o
       onOpenCloseReading() {},
       run: readingRun,
     }));
-    assert.match(readingHtml, /选择一篇论文继续阅读/);
-    assert.match(readingHtml, /直接回到上次位置/);
-    assert.match(readingHtml, /继续阅读/);
-    assert.match(readingHtml, /返回本周文章/);
+    // 精读进行中的默认落点现在是候选审阅页；研读入口在左栏论文列表。
+    assert.match(readingHtml, /本周推荐的论文都在这里/);
+    assert.match(readingHtml, /查看精读进度/);
+    assert.doesNotMatch(readingHtml, /选择一篇论文继续阅读/);
     assert.doesNotMatch(readingHtml, /Zotero collection/);
 
     const readerHtml = renderToStaticMarkup(React.createElement(WorkflowWorkspace, {
@@ -483,6 +483,62 @@ test("live guide, paper workbench, and archive handoff render in the validated o
     );
     assert.match(approvalHtml, /等待接入联合写入/);
     assert.match(approvalHtml, /Zotero、Obsidian 与项目状态都不会发生变化/);
+  } finally {
+    await vite.close();
+  }
+});
+
+test("a reading run lands on the weekly candidate page instead of the reading stage", async () => {
+  const vite = await createServer({
+    root: process.cwd(),
+    appType: "custom",
+    logLevel: "silent",
+    server: { middlewareMode: true },
+  });
+  try {
+    const { WorkflowWorkspace } = await vite.ssrLoadModule(
+      "/src/components/WorkflowWorkspace.jsx",
+    );
+    const paper = {
+      id: "paper-live-reading",
+      title: "Memory Management for Reading Runs",
+      authors: ["Author"],
+      venue: "arXiv",
+      isDemo: false,
+      mineruStatus: "ready",
+      selectionSummary: "研究 Agent 记忆管理。",
+      projectImpact: "用于验证长期记忆策略。",
+    };
+    const html = renderToStaticMarkup(React.createElement(WorkflowWorkspace, {
+      papers: [paper],
+      run: {
+        source: "live",
+        runId: "run-live-reading",
+        status: "reading",
+        selectedPaperIds: [paper.id],
+        selectablePaperIds: [paper.id],
+        preparedGuideIds: [paper.id],
+        guideChoices: { [paper.id]: "read" },
+        readingStatusByPaperId: { [paper.id]: "reading" },
+        proposals: [],
+      },
+      journalRunState: {
+        status: "ready",
+        run: {
+          status: "reading",
+          phase: "close_reading",
+          candidates: [paper],
+          readings: { paperIds: [paper.id] },
+        },
+      },
+      candidateSummaryState: { items: [] },
+    }));
+
+    // 固定落点：候选审阅页 + 引导提示，而不是研读阶段画面。
+    assert.match(html, /本周推荐的论文都在这里/);
+    assert.match(html, /查看精读进度/);
+    assert.match(html, /Memory Management for Reading Runs/);
+    assert.doesNotMatch(html, /选择一篇论文继续阅读/);
   } finally {
     await vite.close();
   }

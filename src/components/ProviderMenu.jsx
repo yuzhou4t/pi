@@ -36,6 +36,16 @@ const reasonLabels = {
   PROVIDER_NOT_REPORTED: "本机服务未报告状态",
 };
 
+export const THINKING_LEVEL_LABELS = {
+  off: "关闭",
+  minimal: "极低",
+  low: "低",
+  medium: "中",
+  high: "高",
+  xhigh: "很高",
+  max: "最高",
+};
+
 function getProviderStatus(item) {
   if (item.available) return statusLabels[item.status] ?? item.status ?? "可用";
   return reasonLabels[item.reasonCode] ?? statusLabels[item.status] ?? item.status ?? "不可用";
@@ -49,8 +59,30 @@ export function ProviderMenu({
   model,
   onProviderChange,
   onModelChange,
+  thinkingLevels = null,
+  thinkingLevel = null,
+  supportsThinking = false,
+  thinkingDisabled = false,
+  thinkingHint = "选择下一轮使用的思考强度",
+  onThinkingLevelChange,
 }) {
   const activeProvider = providers.find((item) => item.id === providerId) ?? providers[0];
+  const levels = Array.isArray(thinkingLevels)
+    ? thinkingLevels.filter((level) => typeof level === "string" && level)
+    : null;
+  const showThinking = levels !== null;
+  const activeThinkingLevel = levels?.includes(thinkingLevel)
+    ? thinkingLevel
+    : levels?.[0] ?? "off";
+  const thinkingLabel = supportsThinking
+    ? THINKING_LEVEL_LABELS[activeThinkingLevel] ?? activeThinkingLevel
+    : "不支持";
+  const thinkingControlDisabled = !supportsThinking
+    || levels?.length === 0
+    || thinkingDisabled;
+  const triggerLabel = showThinking
+    ? `${activeProvider.name} · 思考 · ${thinkingLabel}`
+    : activeProvider.name;
 
   return (
     <div className="provider-menu-wrap">
@@ -71,7 +103,7 @@ export function ProviderMenu({
         onClick={() => onOpenChange(!open)}
       >
         <Sparkle size={13} weight="fill" aria-hidden="true" />
-        <span>{activeProvider.name}</span>
+        <span>{triggerLabel}</span>
         <CaretDown size={11} weight="bold" aria-hidden="true" />
       </button>
 
@@ -124,6 +156,31 @@ export function ProviderMenu({
               ))}
             </select>
           </label>
+
+          {showThinking ? (
+            <label
+              className="model-select-label provider-thinking-select"
+              htmlFor="provider-thinking-select"
+              title={thinkingHint}
+            >
+              <span>思考强度</span>
+              <select
+                id="provider-thinking-select"
+                aria-label="GPT 订阅思考强度"
+                value={activeThinkingLevel}
+                disabled={thinkingControlDisabled}
+                onChange={(event) => onThinkingLevelChange?.(event.target.value)}
+              >
+                {!supportsThinking || levels.length === 0 ? (
+                  <option value="off">思考 · 不支持</option>
+                ) : levels.map((level) => (
+                  <option value={level} key={level}>
+                    {`思考 · ${THINKING_LEVEL_LABELS[level] ?? level}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
 
           <p className="provider-safety-note">
             凭据只由本机服务读取，不会进入浏览器或项目记录。

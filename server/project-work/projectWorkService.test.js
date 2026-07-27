@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { createProjectWorkService } from "./projectWorkService.js";
@@ -122,6 +123,8 @@ function createBlockingSessionFactory() {
     let releasePrompt;
     const record = {
       aborts: 0,
+      prompts: [],
+      activeToolCalls: [],
       release() {
         releasePrompt?.();
       },
@@ -130,7 +133,12 @@ function createBlockingSessionFactory() {
       subscribe() {
         return () => {};
       },
-      prompt() {
+      setActiveToolsByName(names) {
+        record.activeToolCalls.push([...names]);
+        return [...names];
+      },
+      prompt(prompt) {
+        record.prompts.push(prompt);
         return new Promise((resolve) => {
           releasePrompt = resolve;
         });
@@ -364,6 +372,89 @@ function createContextSessionFactory() {
   return factory;
 }
 
+function createThinkingLevelSessionFactory() {
+  const sessions = [];
+  const catalog = {
+    defaultProviderId: "openai-codex",
+    defaultModelId: "gpt-5.3-codex",
+    defaultThinkingLevel: "medium",
+    providers: [{
+      id: "openai-codex",
+      name: "OpenAI Codex",
+      models: [{
+        id: "gpt-5.3-codex",
+        name: "GPT-5.3 Codex",
+        supportsThinking: true,
+        thinkingLevels: ["low", "medium", "high"],
+        defaultThinkingLevel: "medium",
+      }, {
+        id: "gpt-5.3-fixed",
+        name: "GPT-5.3 Fixed",
+        supportsThinking: true,
+        thinkingLevels: ["high", "max"],
+        defaultThinkingLevel: "high",
+      }],
+    }],
+  };
+  const factory = async (options) => {
+    let subscriber = null;
+    const record = {
+      options,
+      thinkingLevel: options.thinkingLevel,
+      thinkingLevelCalls: [],
+      modelCalls: [],
+      prompts: [],
+    };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      setThinkingLevel(level) {
+        record.thinkingLevelCalls.push(level);
+        record.thinkingLevel = level;
+        return level;
+      },
+      async setModel(modelRef) {
+        record.modelCalls.push(modelRef);
+      },
+      async prompt(prompt) {
+        record.prompts.push(prompt);
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({ type: "turn_start" });
+        subscriber?.({
+          type: "message_start",
+          message: { role: "assistant" },
+        });
+        subscriber?.({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "已完成" }],
+            stopReason: "stop",
+          },
+        });
+        subscriber?.({ type: "turn_end" });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        subscriber?.({ type: "agent_settled" });
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => structuredClone(catalog);
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
 async function eventually(read, predicate, message) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const value = await read();
@@ -372,6 +463,124 @@ async function eventually(read, predicate, message) {
   }
   assert.fail(message);
 }
+
+test("thinking strength is model-aware, persisted, and applied to each Pi turn", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-thinking-level-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "export const value = 1;\n");
+  const sessionFactory = createThinkingLevelSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("thinking"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id, {
+    providerId: "openai-codex",
+    modelId: "gpt-5.3-codex",
+  });
+  assert.equal(conversation.thinkingLevel, "medium");
+
+  const configured = await service.configureConversation(conversation.id, {
+    providerId: "openai-codex",
+    modelId: "gpt-5.3-codex",
+    thinkingLevel: "high",
+  });
+  assert.equal(configured.conversation.thinkingLevel, "high");
+  assert.equal(sessionFactory.sessions.length, 0);
+
+  await service.sendMessage(conversation.id, {
+    text: "检查项目",
+    providerId: "openai-codex",
+    modelId: "gpt-5.3-codex",
+    thinkingLevel: "high",
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status !== "running"
+      && snapshot.conversation.messages.some(
+        (message) => message.role === "assistant",
+      )
+    ),
+    "thinking-level turn did not settle",
+  );
+  assert.deepEqual(sessionFactory.sessions[0].thinkingLevelCalls, ["high"]);
+  assert.equal(sessionFactory.sessions[0].options.thinkingLevel, "high");
+  assert.deepEqual(
+    settled.conversation.messages.map((message) => ({
+      role: message.role,
+      providerId: message.providerId,
+      modelId: message.modelId,
+      thinkingLevel: message.thinkingLevel,
+    })),
+    [{
+      role: "user",
+      providerId: "openai-codex",
+      modelId: "gpt-5.3-codex",
+      thinkingLevel: "high",
+    }, {
+      role: "assistant",
+      providerId: "openai-codex",
+      modelId: "gpt-5.3-codex",
+      thinkingLevel: "high",
+    }],
+  );
+  assert.ok(settled.events.some((event) => (
+    event.type === "turn.started"
+    && event.data.thinkingLevel === "high"
+  )));
+
+  await assert.rejects(
+    service.configureConversation(conversation.id, {
+      providerId: "openai-codex",
+      modelId: "gpt-5.3-codex",
+      thinkingLevel: "max",
+    }),
+    (error) => error?.code === "PROJECT_WORK_THINKING_LEVEL_UNSUPPORTED",
+  );
+
+  const fixed = await service.createConversation(project.id, {
+    providerId: "openai-codex",
+    modelId: "gpt-5.3-fixed",
+  });
+  assert.equal(fixed.thinkingLevel, "high");
+});
+
+test("standalone conversation creation stays lightweight when Pi has no available model", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-empty-catalog-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const factory = async () => {
+    throw new Error("a lightweight empty conversation must not start Pi");
+  };
+  factory.listModels = async () => ({
+    defaultProviderId: null,
+    defaultModelId: null,
+    providers: [],
+  });
+  factory.dispose = async () => {};
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: factory,
+    idFactory: incrementalId("empty-catalog"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  assert.equal(conversation.projectId, null);
+  assert.equal(conversation.providerId, null);
+  assert.equal(conversation.modelId, null);
+  assert.equal(conversation.thinkingLevel, "medium");
+});
 
 test("context usage stays read-only until a turn and compaction persists only safe metrics", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-context-usage-"));
@@ -1155,7 +1364,7 @@ test("real project-work chain binds context and changes, applies by hash, and pr
       return true;
     },
   );
-  assert.equal(sessionFactory.sessions[0].prompts.length, 0);
+  assert.equal(sessionFactory.sessions.length, 0);
 
   await writeFile(path.join(projectRoot, "created-after-snapshot.js"), "late\n");
   const liveContextFile = await service.readProjectFile(project.id, {
@@ -1487,6 +1696,60 @@ test("deleting conversations removes only their private state and updates projec
   );
 });
 
+test("project deletion cannot overtake an in-flight conversation creation", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(
+    os.tmpdir(),
+    "pi-project-create-delete-race-",
+  ));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "project\n", "utf8");
+  const sessionFactory = createFakeSessionFactory();
+  let releaseCatalog;
+  let markCatalogStarted;
+  const catalogStarted = new Promise((resolve) => {
+    markCatalogStarted = resolve;
+  });
+  sessionFactory.listModels = async () => {
+    markCatalogStarted();
+    await new Promise((resolve) => {
+      releaseCatalog = resolve;
+    });
+    return modelCatalog();
+  };
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("create-delete"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const creation = service.createConversation(project.id);
+  await catalogStarted;
+
+  await assert.rejects(
+    service.removeProject(project.id),
+    (error) => (
+      error.code === "PROJECT_WORK_PROJECT_BUSY"
+      && error.status === 409
+    ),
+  );
+  releaseCatalog();
+  const conversation = await creation;
+  assert.equal(conversation.projectId, project.id);
+  assert.equal((await service.listProjects())[0].id, project.id);
+  assert.equal(
+    (await service.listConversations(project.id))[0].id,
+    conversation.id,
+  );
+});
+
 test("renaming a conversation updates only safe scoped metadata", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-conversation-rename-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
@@ -1667,4 +1930,481 @@ test("deleting a running conversation is rejected without aborting it", async (t
     (snapshot) => snapshot.conversation.status === "idle",
     "conversation did not settle after release",
   );
+});
+
+test("message admission is atomic and client request ids are idempotent", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-message-admission-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "project\n", "utf8");
+  const sessionFactory = createBlockingSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("message-admission"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const competingConversation = await service.createConversation(project.id);
+  const competing = await Promise.allSettled([
+    service.sendMessage(competingConversation.id, {
+      text: "先做代码审查",
+      workflowId: "code_review",
+      clientRequestId: "message-request:one",
+    }),
+    service.sendMessage(competingConversation.id, {
+      text: "同时开始另一个任务",
+      clientRequestId: "message-request:two",
+    }),
+  ]);
+  assert.equal(
+    competing.filter((result) => result.status === "fulfilled").length,
+    1,
+  );
+  const busy = competing.find((result) => result.status === "rejected");
+  assert.equal(busy?.reason?.code, "PROJECT_WORK_CONVERSATION_BUSY");
+  assert.equal(busy?.reason?.status, 409);
+  await eventually(
+    async () => sessionFactory.sessions[0],
+    (session) => session?.prompts.length === 1,
+    "exactly one competing prompt was not started",
+  );
+  const competingSnapshot = await service.getConversation(competingConversation.id);
+  assert.equal(competingSnapshot.conversation.status, "running");
+  assert.equal(competingSnapshot.conversation.messages.length, 1);
+  assert.equal(sessionFactory.sessions[0].activeToolCalls.length, 1);
+  sessionFactory.sessions[0].release();
+  await eventually(
+    () => service.getConversation(competingConversation.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "competing message did not settle",
+  );
+
+  const duplicateConversation = await service.createConversation(project.id);
+  const duplicateRequest = {
+    text: "只执行一次",
+    workflowId: "bug_diagnosis",
+    clientRequestId: "message-request:duplicate",
+  };
+  const duplicates = await Promise.all([
+    service.sendMessage(duplicateConversation.id, duplicateRequest),
+    service.sendMessage(duplicateConversation.id, duplicateRequest),
+  ]);
+  assert.equal(duplicates.length, 2);
+  await eventually(
+    async () => sessionFactory.sessions[1],
+    (session) => session?.prompts.length === 1,
+    "duplicate request started more than one prompt",
+  );
+  const duplicateSnapshot = await service.getConversation(duplicateConversation.id);
+  assert.equal(duplicateSnapshot.conversation.status, "running");
+  assert.equal(duplicateSnapshot.conversation.messages.length, 1);
+  assert.equal(sessionFactory.sessions[1].activeToolCalls.length, 1);
+
+  await assert.rejects(
+    service.sendMessage(duplicateConversation.id, {
+      ...duplicateRequest,
+      text: "复用标识但改变消息",
+    }),
+    (error) => (
+      error.code === "PROJECT_WORK_CLIENT_REQUEST_CONFLICT"
+      && error.status === 409
+    ),
+  );
+  assert.equal(sessionFactory.sessions[1].prompts.length, 1);
+  sessionFactory.sessions[1].release();
+  await eventually(
+    () => service.getConversation(duplicateConversation.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "duplicate request did not settle",
+  );
+
+  await service.sendMessage(duplicateConversation.id, duplicateRequest);
+  const replayedSnapshot = await service.getConversation(duplicateConversation.id);
+  assert.equal(replayedSnapshot.conversation.messages.length, 1);
+  assert.equal(sessionFactory.sessions[1].prompts.length, 1);
+});
+
+test("PDF upload stays outside the project overlay and becomes a dynamic Pi read tool", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-conversation-pdf-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "export const version = 1;\n");
+  const sessionFactory = createFakeSessionFactory();
+  let submittedDataId = null;
+  const documentParser = {
+    async submitBatch(files, { onBatchAllocated }) {
+      submittedDataId = files[0].dataId;
+      await onBatchAllocated({
+        batchId: "batch-project-work-pdf",
+        traceId: "trace-project-work-pdf",
+      });
+      return {
+        batchId: "batch-project-work-pdf",
+        state: "uploaded",
+        uploads: [{
+          fileName: files[0].fileName,
+          dataId: files[0].dataId,
+          state: "uploaded",
+          error: null,
+        }],
+      };
+    },
+    async getBatch(batchId) {
+      return {
+        batchId,
+        state: "done",
+        items: [{
+          dataId: submittedDataId,
+          fileName: "开发手册.pdf",
+          state: "done",
+          fullZipUrl: "https://downloads.example.test/manual.zip",
+        }],
+      };
+    },
+    async downloadResult() {
+      return {
+        markdown: [
+          "# 开发手册",
+          "",
+          "## 缓存",
+          "",
+          "缓存键必须包含项目版本与输入哈希。",
+        ].join("\n"),
+        markdownFileName: "full.md",
+        images: [],
+      };
+    },
+  };
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    documentParser,
+    documentPollIntervalMs: 1,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("conversation-pdf"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const conversation = await service.createConversation(project.id);
+  const pdf = Buffer.from("%PDF-1.7\nmanual\n", "utf8");
+  const created = await service.createConversationDocument(conversation.id, {
+    fileName: "开发手册.pdf",
+    byteLength: pdf.length,
+  });
+  await service.uploadConversationDocument(
+    conversation.id,
+    created.document.id,
+    Readable.from([pdf]),
+    {
+      contentType: "application/pdf",
+      declaredLength: String(pdf.length),
+    },
+  );
+
+  assert.equal(sessionFactory.sessions.length, 0);
+  const ready = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.documents[0]?.status === "ready",
+    "conversation PDF did not become ready",
+  );
+  assert.equal(ready.conversation.messages.length, 0);
+  assert.equal(ready.conversation.documents[0].parser, "MinerU Cloud v4");
+  assert.equal(
+    "batchId" in ready.conversation.documents[0],
+    false,
+  );
+  await assert.rejects(
+    access(path.join(projectRoot, "开发手册.pdf")),
+    (error) => error.code === "ENOENT",
+  );
+
+  await service.sendMessage(conversation.id, {
+    text: "根据刚上传的开发手册检查缓存实现",
+  });
+  const documentAccess = sessionFactory.sessions[0].options.documentAccess;
+  const listed = await documentAccess.list();
+  assert.equal(listed[0].file_name, "开发手册.pdf");
+  const matches = await documentAccess.search({ query: "输入哈希" });
+  assert.equal(matches.length, 1);
+  const read = await documentAccess.read({
+    documentId: listed[0].document_id,
+    revision: listed[0].document_revision,
+    blockIds: [matches[0].block_id],
+  });
+  assert.match(read.blocks[0].content, /项目版本与输入哈希/);
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status !== "running",
+    "conversation did not settle after document-tool access check",
+  );
+});
+
+test("a conversation with an active MinerU parse cannot be deleted", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-conversation-pdf-busy-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "project\n", "utf8");
+  let submittedDataId = null;
+  const documentParser = {
+    async submitBatch(files, { onBatchAllocated }) {
+      submittedDataId = files[0].dataId;
+      await onBatchAllocated({ batchId: "batch-pending" });
+      return {
+        batchId: "batch-pending",
+        state: "uploaded",
+        uploads: [{
+          fileName: files[0].fileName,
+          dataId: files[0].dataId,
+          state: "uploaded",
+          error: null,
+        }],
+      };
+    },
+    async getBatch(batchId) {
+      return {
+        batchId,
+        state: "running",
+        items: [{
+          dataId: submittedDataId,
+          fileName: "解析中.pdf",
+          state: "running",
+          fullZipUrl: null,
+        }],
+      };
+    },
+    async downloadResult() {
+      throw new Error("not reached");
+    },
+  };
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory(),
+    documentParser,
+    documentPollIntervalMs: 20,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("conversation-pdf-busy"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const conversation = await service.createConversation(project.id);
+  const pdf = Buffer.from("%PDF-1.7\npending\n", "utf8");
+  const created = await service.createConversationDocument(conversation.id, {
+    fileName: "解析中.pdf",
+    byteLength: pdf.length,
+  });
+  await service.uploadConversationDocument(
+    conversation.id,
+    created.document.id,
+    Readable.from([pdf]),
+    {
+      contentType: "application/pdf",
+      declaredLength: String(pdf.length),
+    },
+  );
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.documents[0]?.status === "parsing",
+    "conversation PDF did not enter parsing",
+  );
+
+  await assert.rejects(
+    service.removeConversation(project.id, conversation.id),
+    (error) => (
+      error.code === "PROJECT_WORK_CONVERSATION_DELETE_BUSY"
+      && error.status === 409
+    ),
+  );
+});
+
+test("one-turn screenshot review passes a bounded image to Pi without persisting base64", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-project-image-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "export const value = 1;\n");
+
+  const sessions = [];
+  const catalog = {
+    defaultProviderId: "test",
+    defaultModelId: "vision",
+    capabilities: {
+      web_search: { available: true, reason: "Tavily 已配置" },
+      docs_search: { available: true, reason: "Context7 已配置" },
+    },
+    providers: [{
+      id: "test",
+      models: [{
+        id: "vision",
+        supportsImages: true,
+        supportsThinking: false,
+        thinkingLevels: ["off"],
+        defaultThinkingLevel: "off",
+      }, {
+        id: "text-only",
+        supportsImages: false,
+        supportsThinking: false,
+        thinkingLevels: ["off"],
+        defaultThinkingLevel: "off",
+      }],
+    }],
+  };
+  const sessionFactory = async (options) => {
+    let subscriber = null;
+    const record = {
+      options,
+      prompts: [],
+      activeToolCalls: [],
+    };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      setActiveToolsByName(names) {
+        record.activeToolCalls.push([...names]);
+        return [...names];
+      },
+      async prompt(prompt, promptOptions) {
+        record.prompts.push({ prompt, promptOptions });
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({ type: "turn_start" });
+        subscriber?.({
+          type: "message_start",
+          message: { role: "assistant" },
+        });
+        subscriber?.({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "截图验收完成" }],
+            stopReason: "stop",
+          },
+        });
+        subscriber?.({ type: "turn_end" });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        subscriber?.({ type: "agent_settled" });
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  sessionFactory.listModels = async () => structuredClone(catalog);
+  sessionFactory.dispose = async () => {};
+
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("image"),
+  });
+  t.after(() => service.dispose());
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id, {
+    providerId: "test",
+    modelId: "vision",
+  });
+  const bytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+
+  await service.sendMessage(conversation.id, {
+    text: "检查这张设置页截图",
+    workflowId: "screenshot_review",
+    images: [{
+      fileName: "设置页.png",
+      mimeType: "image/png",
+      byteLength: bytes.length,
+      data: bytes.toString("base64"),
+    }],
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status !== "running"
+      && snapshot.conversation.messages.some(
+        (message) => message.role === "assistant",
+      )
+    ),
+    "image turn did not settle",
+  );
+
+  assert.equal(sessions.length, 1);
+  assert.equal(
+    sessions[0].prompts[0].prompt,
+    "检查这张设置页截图",
+  );
+  assert.match(
+    sessions[0].prompts[0].promptOptions.turnGuidance,
+    /Review the attached screenshot/,
+  );
+  assert.deepEqual(sessions[0].prompts[0].promptOptions.images, [{
+    type: "image",
+    data: bytes.toString("base64"),
+    mimeType: "image/png",
+  }]);
+  assert.equal(sessions[0].activeToolCalls[0].includes("edit"), false);
+  assert.ok(sessions[0].activeToolCalls.at(-1).includes("edit"));
+  const userMessage = settled.conversation.messages.find(
+    (message) => message.role === "user",
+  );
+  assert.equal(userMessage.text, "检查这张设置页截图");
+  assert.equal(userMessage.workflowId, "screenshot_review");
+  assert.deepEqual(userMessage.capabilities, []);
+  assert.deepEqual(userMessage.images, [{
+    fileName: "设置页.png",
+    mimeType: "image/png",
+    byteLength: bytes.length,
+  }]);
+  assert.doesNotMatch(
+    JSON.stringify(settled.conversation),
+    new RegExp(bytes.toString("base64")),
+  );
+
+  const textConversation = await service.createConversation(project.id, {
+    providerId: "test",
+    modelId: "text-only",
+  });
+  const sessionsBeforeRejectedImage = sessions.length;
+  await assert.rejects(
+    service.sendMessage(textConversation.id, {
+      text: "检查图片",
+      images: [{
+        fileName: "设置页.png",
+        mimeType: "image/png",
+        byteLength: bytes.length,
+        data: bytes.toString("base64"),
+      }],
+    }),
+    { code: "PROJECT_WORK_MODEL_VISION_UNSUPPORTED" },
+  );
+  assert.equal(sessions.length, sessionsBeforeRejectedImage);
+  const rejectedSnapshot = await service.getConversation(textConversation.id);
+  assert.equal(rejectedSnapshot.conversation.messages.length, 0);
 });

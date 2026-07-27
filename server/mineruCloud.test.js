@@ -90,6 +90,44 @@ test("submitBatch keeps a partial upload result and sends no headers on signed P
   }
 });
 
+test("submitBatch persists the allocated batch before uploading signed PDF bodies", async (t) => {
+  const [file] = await createPdfs(t, ["durable.pdf"]);
+  const order = [];
+  const adapter = createMineruCloudAdapter({
+    apiToken: "server-secret",
+    fetchImpl: async (_url, init) => {
+      if (init.method === "POST") {
+        order.push("allocate");
+        return jsonResponse({
+          code: 0,
+          data: {
+            batch_id: "batch-durable",
+            file_urls: ["https://uploads.example.test/durable"],
+          },
+          msg: "ok",
+        });
+      }
+      order.push("put");
+      return jsonResponse({}, 200);
+    },
+  });
+
+  await adapter.submitBatch([file], {
+    async onBatchAllocated(allocation) {
+      order.push("persist");
+      assert.equal(allocation.batchId, "batch-durable");
+      assert.equal(allocation.files[0].dataId, file.dataId);
+    },
+    async onUploadCompleted(upload) {
+      order.push("confirm-upload");
+      assert.equal(upload.batchId, "batch-durable");
+      assert.equal(upload.dataId, file.dataId);
+    },
+  });
+
+  assert.deepEqual(order, ["allocate", "persist", "put", "confirm-upload"]);
+});
+
 test("quota responses are classified separately from retryable and token errors", async (t) => {
   const [file] = await createPdfs(t, ["quota.pdf"]);
   const quotaAdapter = createMineruCloudAdapter({

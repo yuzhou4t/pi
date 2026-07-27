@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { promptRegistry } from "../promptRegistry.js";
 import { createRunStore } from "./runStore.js";
 import { createSourceStateStore } from "./sourceStateStore.js";
 import { createJournalWorkflowService } from "./workflowService.js";
@@ -111,8 +112,25 @@ function fixtureGuideResult({ paper, document }) {
 function supportedModelRegistry() {
   return {
     supports: (providerId, modelId) => (
-      providerId === "codex-subscription" && modelId === "account-default"
+      providerId === "codex-subscription"
+      && ["account-default", "gpt-5.3-codex-spark"].includes(modelId)
     ),
+  };
+}
+
+function translationResult(translations) {
+  const prompt = promptRegistry.loadPrompt("translation");
+  return {
+    translations,
+    source: "fixture",
+    prompt_id: prompt.id,
+    prompt_version: prompt.version,
+    prompt_hash: prompt.prompt_hash,
+    input_hash: "sha256:test",
+    provider_id: "codex-subscription",
+    model_id: "gpt-5.3-codex-spark",
+    reasoning_effort: "low",
+    usage: null,
   };
 }
 
@@ -975,10 +993,7 @@ test("full-text translation runs in bounded batches and stays durable per revisi
   assert.equal(initial.status, "not_started");
   assert.ok(initial.total_blocks > 0);
 
-  const started = await service.generatePaperTranslation(runId, "paper-1", {
-    providerId: "codex-subscription",
-    modelId: "account-default",
-  });
+  const started = await service.generatePaperTranslation(runId, "paper-1");
   assert.ok(["running", "ready"].includes(started.status));
   await service.waitForTranslation(runId, "paper-1");
 
@@ -986,17 +1001,266 @@ test("full-text translation runs in bounded batches and stays durable per revisi
   assert.equal(done.status, "ready");
   assert.equal(done.translated_blocks, done.total_blocks);
   assert.equal(done.provider_id, "codex-subscription");
+  assert.equal(done.model_id, "gpt-5.3-codex-spark");
+  assert.equal(done.reasoning_effort, "low");
+  assert.equal(done.prompt_id, "translation");
+  assert.match(done.prompt_version, /^translation\./);
   const document = await service.getPaperDocument(runId, "paper-1");
   assert.equal(done.document_revision, document.revision);
   for (const zh of Object.values(done.blocks)) assert.ok(zh.length > 0);
 
-  await assert.rejects(
-    service.generatePaperTranslation(runId, "paper-1", {
-      providerId: "unknown",
-      modelId: "nope",
-    }),
-    (error) => error.code === "TRANSLATION_PROVIDER_UNSUPPORTED",
+});
+
+test("full-text translation reports formula passthrough separately from model progress", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-translation-formula-");
+  const markdown = [
+    "# Paper 1",
+    "",
+    "## Method",
+    "",
+    "The first paragraph explains the objective.",
+    "",
+    "$$",
+    "x = y + 1",
+    "$$",
+    "",
+    "The second paragraph explains the evidence.",
+    "",
+  ].join("\n");
+  await runStore.writeArtifact(runId, "extraction/paper-1/paper.md", markdown);
+  await runStore.writeArtifact(runId, "extraction/paper-1/manifest.json", {
+    schema_version: 1,
+    paper_id: "paper-1",
+    markdown_chars: markdown.length,
+    image_count: 0,
+  });
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+    modelProviders: supportedModelRegistry(),
+  });
+
+  const initial = await service.getPaperTranslation(runId, "paper-1");
+  assert.equal(initial.total_blocks, 2);
+  assert.equal(initial.translated_blocks, 0);
+  assert.equal(initial.passthrough_blocks, 1);
+
+  await service.generatePaperTranslation(runId, "paper-1");
+  await service.waitForTranslation(runId, "paper-1");
+  const done = await service.getPaperTranslation(runId, "paper-1");
+  assert.equal(done.status, "ready");
+  assert.equal(done.total_blocks, 2);
+  assert.equal(done.translated_blocks, 2);
+  assert.equal(done.passthrough_blocks, 1);
+  assert.equal(Object.keys(done.blocks).length, 3);
+});
+
+test("full-text translation pauses after the active batch and resumes with the locked profile", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-translation-pause-");
+  const markdown = [
+    "# Paper 1",
+    "",
+    "## Body",
+    "",
+    ...Array.from({ length: 30 }, (_, index) => `Paragraph ${index + 1} explains one result.\n`),
+  ].join("\n");
+  await runStore.writeArtifact(runId, "extraction/paper-1/paper.md", markdown);
+  await runStore.writeArtifact(runId, "extraction/paper-1/manifest.json", {
+    schema_version: 1,
+    paper_id: "paper-1",
+    markdown_chars: markdown.length,
+    image_count: 0,
+  });
+
+  let releaseFirstBatch;
+  let markFirstBatchStarted;
+  const firstBatchStarted = new Promise((resolve) => {
+    markFirstBatchStarted = resolve;
+  });
+  const firstBatchGate = new Promise((resolve) => {
+    releaseFirstBatch = resolve;
+  });
+  const requests = [];
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+    modelProviders: supportedModelRegistry(),
+    translationGenerator: async (request) => {
+      requests.push(request);
+      if (requests.length === 1) {
+        markFirstBatchStarted();
+        await firstBatchGate;
+      }
+      return translationResult(
+        Object.fromEntries(request.batch.map((block) => [
+          block.block_id,
+          `【译】${block.source}`,
+        ])),
+      );
+    },
+  });
+
+  const started = await service.generatePaperTranslation(runId, "paper-1");
+  assert.equal(started.status, "running");
+  await firstBatchStarted;
+  const pausing = await service.pausePaperTranslation(runId, "paper-1");
+  assert.equal(pausing.status, "pausing");
+  assert.equal((await service.pausePaperTranslation(runId, "paper-1")).status, "pausing");
+  releaseFirstBatch();
+  await service.waitForTranslation(runId, "paper-1");
+
+  const paused = await service.getPaperTranslation(runId, "paper-1");
+  assert.equal(paused.status, "paused");
+  assert.ok(paused.translated_blocks > 0);
+  assert.ok(paused.translated_blocks < paused.total_blocks);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].providerId, "codex-subscription");
+  assert.equal(requests[0].modelId, "gpt-5.3-codex-spark");
+  assert.equal(requests[0].reasoningEffort, "low");
+  assert.equal((await service.pausePaperTranslation(runId, "paper-1")).status, "paused");
+
+  const resumed = await service.generatePaperTranslation(runId, "paper-1");
+  assert.equal(resumed.status, "running");
+  await service.waitForTranslation(runId, "paper-1");
+  const done = await service.getPaperTranslation(runId, "paper-1");
+  assert.equal(done.status, "ready");
+  assert.equal(done.translated_blocks, done.total_blocks);
+  assert.equal(requests.length, 2);
+});
+
+test("orphaned active jobs pause and legacy translation profiles restart cleanly", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-translation-profile-");
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+    modelProviders: supportedModelRegistry(),
+  });
+  await service.generatePaperTranslation(runId, "paper-1");
+  await service.waitForTranslation(runId, "paper-1");
+
+  const artifact = await runStore.readArtifact(runId, "translation/paper-1.json");
+  const [removedBlockId] = Object.keys(artifact.blocks);
+  const orphanedBlocks = { ...artifact.blocks };
+  delete orphanedBlocks[removedBlockId];
+  await runStore.writeArtifact(runId, "translation/paper-1.json", {
+    ...artifact,
+    status: "pausing",
+    blocks: orphanedBlocks,
+  });
+
+  const restartedService = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+    modelProviders: supportedModelRegistry(),
+  });
+  const recovered = await restartedService.getPaperTranslation(runId, "paper-1");
+  assert.equal(recovered.status, "paused");
+  assert.equal(
+    (await runStore.readArtifact(runId, "translation/paper-1.json")).status,
+    "paused",
   );
+
+  await runStore.writeArtifact(runId, "translation/paper-1.json", {
+    ...artifact,
+    model_id: "account-default",
+    blocks: Object.fromEntries(
+      Object.keys(artifact.blocks).map((blockId) => [blockId, `legacy:${blockId}`]),
+    ),
+  });
+  const legacy = await restartedService.getPaperTranslation(runId, "paper-1");
+  assert.equal(legacy.model_id, "account-default");
+  assert.ok(Object.values(legacy.blocks).every((value) => value.startsWith("legacy:")));
+
+  const restarted = await restartedService.generatePaperTranslation(runId, "paper-1");
+  assert.equal(restarted.status, "running");
+  assert.equal(restarted.model_id, "gpt-5.3-codex-spark");
+  await restartedService.waitForTranslation(runId, "paper-1");
+  const regenerated = await restartedService.getPaperTranslation(runId, "paper-1");
+  assert.equal(regenerated.status, "ready");
+  assert.equal(regenerated.model_id, "gpt-5.3-codex-spark");
+  assert.equal(regenerated.reasoning_effort, "low");
+  assert.ok(Object.values(regenerated.blocks).every((value) => !value.startsWith("legacy:")));
+});
+
+test("a batch with mismatched model provenance is never merged", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-translation-mismatch-");
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+    modelProviders: supportedModelRegistry(),
+    translationGenerator: async ({ batch }) => ({
+      ...translationResult(Object.fromEntries(batch.map((block) => [
+        block.block_id,
+        `【译】${block.source}`,
+      ]))),
+      model_id: "account-default",
+    }),
+  });
+
+  await service.generatePaperTranslation(runId, "paper-1");
+  await service.waitForTranslation(runId, "paper-1");
+  const result = await service.getPaperTranslation(runId, "paper-1");
+  assert.equal(result.status, "partial");
+  assert.equal(result.translated_blocks, 0);
+  assert.equal(result.error.code, "TRANSLATION_PROFILE_MISMATCH");
+});
+
+test("a non-retryable translation failure stops before the next batch", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-translation-stop-");
+  const markdown = [
+    "# Paper 1",
+    "",
+    "## Body",
+    "",
+    ...Array.from({ length: 30 }, (_, index) => `Paragraph ${index + 1} explains one result.\n`),
+  ].join("\n");
+  await runStore.writeArtifact(runId, "extraction/paper-1/paper.md", markdown);
+  await runStore.writeArtifact(runId, "extraction/paper-1/manifest.json", {
+    schema_version: 1,
+    paper_id: "paper-1",
+    markdown_chars: markdown.length,
+    image_count: 0,
+  });
+  let calls = 0;
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+    modelProviders: supportedModelRegistry(),
+    translationGenerator: async () => {
+      calls += 1;
+      const error = new Error("Codex 未使用可用的 ChatGPT 订阅登录");
+      error.code = "CODEX_AUTH_NOT_CHATGPT";
+      error.retryable = false;
+      throw error;
+    },
+  });
+
+  await service.generatePaperTranslation(runId, "paper-1");
+  await service.waitForTranslation(runId, "paper-1");
+  const result = await service.getPaperTranslation(runId, "paper-1");
+  assert.equal(calls, 1);
+  assert.equal(result.status, "partial");
+  assert.equal(result.translated_blocks, 0);
+  assert.equal(result.error.code, "CODEX_AUTH_NOT_CHATGPT");
+  assert.equal(result.error.retryable, false);
 });
 
 test("a failed translation batch stays retryable without losing finished blocks", async () => {
@@ -1009,43 +1273,30 @@ test("a failed translation batch stays retryable without losing finished blocks"
     sourceStateStore: createSourceStateStore({ dataDir }),
     mineruAdapter: null,
     modelProviders: supportedModelRegistry(),
-    translationGenerator: async ({ paperId, batch }) => {
+    translationGenerator: async ({ batch }) => {
       calls += 1;
       if (calls === 1) {
         const error = new Error("批次超时");
         error.code = "TRANSLATION_OUTPUT_INVALID";
+        error.retryable = true;
         throw error;
       }
-      return {
-        translations: Object.fromEntries(batch.map((block) => [
+      return translationResult(
+        Object.fromEntries(batch.map((block) => [
           block.block_id,
           `【译】${block.source}`,
         ])),
-        source: "fixture",
-        prompt_id: "translation",
-        prompt_version: "translation.v1",
-        prompt_hash: "sha256:prompt",
-        input_hash: `sha256:${paperId}`,
-        provider_id: null,
-        model_id: null,
-        usage: null,
-      };
+      );
     },
   });
 
-  await service.generatePaperTranslation(runId, "paper-1", {
-    providerId: "codex-subscription",
-    modelId: "account-default",
-  });
+  await service.generatePaperTranslation(runId, "paper-1");
   await service.waitForTranslation(runId, "paper-1");
   const partial = await service.getPaperTranslation(runId, "paper-1");
   assert.equal(partial.status, "partial");
   assert.equal(partial.error.code, "TRANSLATION_OUTPUT_INVALID");
 
-  await service.generatePaperTranslation(runId, "paper-1", {
-    providerId: "codex-subscription",
-    modelId: "account-default",
-  });
+  await service.generatePaperTranslation(runId, "paper-1");
   await service.waitForTranslation(runId, "paper-1");
   const done = await service.getPaperTranslation(runId, "paper-1");
   assert.equal(done.status, "ready");
@@ -1062,10 +1313,7 @@ test("a translation for an older document revision reports stale", async () => {
     mineruAdapter: null,
     modelProviders: supportedModelRegistry(),
   });
-  await service.generatePaperTranslation(runId, "paper-1", {
-    providerId: "codex-subscription",
-    modelId: "account-default",
-  });
+  await service.generatePaperTranslation(runId, "paper-1");
   await service.waitForTranslation(runId, "paper-1");
 
   const artifact = await runStore.readArtifact(runId, "translation/paper-1.json");

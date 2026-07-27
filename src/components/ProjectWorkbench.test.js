@@ -219,7 +219,6 @@ test("normal work rail exposes first-class standalone conversations before proje
     }));
 
     assert.match(html, /新建对话/);
-    assert.match(html, /无需选择文件夹/);
     assert.match(html, /独立对话/);
     assert.match(html, /整理需求/);
     assert.match(html, /未连接文件夹/);
@@ -246,6 +245,10 @@ test("paper reading conversations do not expose project-work deletion actions", 
       }],
       selectedConversationId: "paper-1",
       workspaceKind: "paper_reading",
+      activeRun: {
+        id: "journal-week",
+        statusLabel: "等待审阅",
+      },
       query: "",
       onQueryChange() {},
       onDeleteConversation() {},
@@ -254,7 +257,40 @@ test("paper reading conversations do not expose project-work deletion actions", 
     }));
 
     assert.match(html, /精读 · Agent 论文/);
+    assert.match(html, /每周追踪/);
+    assert.match(html, /论文研读/);
+    assert.ok(html.indexOf("每周追踪") < html.indexOf("精读 · Agent 论文"));
     assert.doesNotMatch(html, /更多操作|删除会话/);
+  });
+});
+
+test("paper reading rail keeps weekly tracking visible when no paper was selected to read", async () => {
+  await withViteModule("/src/components/ProjectRail.jsx", ({ ProjectRail }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectRail, {
+      projects: [{
+        id: "paper-project",
+        name: "长期研究项目",
+        state: "0 篇论文 · 1 个追踪",
+        updated: "本周",
+      }],
+      selectedId: "paper-project",
+      conversations: [],
+      selectedConversationId: null,
+      workspaceKind: "paper_reading",
+      activeRun: {
+        id: "journal-week",
+        statusLabel: "真实候选待审阅",
+      },
+      selectedRunId: "journal-week",
+      query: "",
+      onQueryChange() {},
+      onAddProject() {},
+    }));
+
+    assert.match(html, /每周追踪/);
+    assert.match(html, /真实候选待审阅/);
+    assert.match(html, /还没有选择研读的论文/);
+    assert.match(html, /aria-label="论文研读"/);
   });
 });
 

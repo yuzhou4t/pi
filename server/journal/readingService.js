@@ -806,6 +806,109 @@ export function createReadingService({
     return restarted;
   }
 
+  function assertPaperResettable(run, paperId) {
+    const externalState = [
+      run.zotero?.status,
+      run.obsidian?.status,
+      run.project_state?.status,
+    ].find((status) => status && status !== "not_started");
+    if (externalState) {
+      throw readingError(
+        "READING_RESET_EXTERNAL_STATE",
+        "归档预览或外部写入已经开始，不能再清空这篇论文的研读进度",
+      );
+    }
+    const paperState = normalizePaperState(normalizeReadings(run).papers[paperId]);
+    const committedAgentAction = paperState.agent_actions.proposals
+      .some((proposal) => proposal?.status === "committed");
+    if (committedAgentAction) {
+      throw readingError(
+        "READING_RESET_EXTERNAL_STATE",
+        "这篇论文的 Agent 笔记已经写入，不能再清空研读进度",
+      );
+    }
+  }
+
+  async function resetPaperReading(runId, paperId) {
+    const { run } = await getRunPaper(runId, paperId);
+    if (paperDecisions(run)[paperId] !== "read") {
+      throw readingError(
+        "READING_RESET_NOT_ALLOWED",
+        "这篇论文不在研读列表中",
+      );
+    }
+    assertPaperResettable(run, paperId);
+    const resetAt = now().toISOString();
+    const revision = sha256({
+      run_id: runId,
+      paper_id: paperId,
+      reset_at: resetAt,
+      nonce: idFactory(),
+    });
+    const snapshotPath = `restarts/paper-${revision.slice(7)}.json`;
+    await runStore.writeArtifact(runId, snapshotPath, {
+      schema_version: 1,
+      run_id: runId,
+      paper_id: paperId,
+      reading: normalizePaperState(normalizeReadings(run).papers[paperId]),
+      created_at: resetAt,
+    });
+    return update(runId, (current) => {
+      assertPaperResettable(current, paperId);
+      const readings = normalizeReadings(current);
+      delete readings.papers[paperId];
+      readings.paper_ids = readings.paper_ids.filter((id) => id !== paperId);
+      readings.last_error = null;
+      // Deleting the reading record also withdraws the read decision, so the
+      // paper returns to the weekly candidate list for a fresh choice and the
+      // run status is recomputed from the remaining decisions.
+      const decisions = paperDecisions(current);
+      delete decisions[paperId];
+      const requested = (current.guides?.requested_paper_ids ?? []).filter(
+        (id) => current.guides?.papers?.[id]?.status === "ready",
+      );
+      const allDecided = requested.length > 0
+        && requested.every((id) => ["collect", "read"].includes(decisions[id]));
+      const readPaperIds = requested.filter((id) => decisions[id] === "read");
+      readings.status = allDecided && readPaperIds.length > 0 ? "reading" : "not_started";
+      return {
+        status: !allDecided
+          ? "guide_ready"
+          : readPaperIds.length > 0
+            ? "reading"
+            : "draft_ready",
+        phase: !allDecided
+          ? "guide_review"
+          : readPaperIds.length > 0
+            ? "close_reading"
+            : "write_preview",
+        paused_reason: !allDecided
+          ? "已删除一篇论文的研读记录，可重新决定这篇论文的处理方式"
+          : readPaperIds.length > 0
+            ? "已删除一篇论文的研读记录"
+            : "导读决定已完成，等待生成写入预览",
+        paper_decisions: decisions,
+        ...(current.zotero?.decisions?.[paperId]
+          ? {
+              zotero: {
+                ...current.zotero,
+                decisions: Object.fromEntries(
+                  Object.entries(current.zotero.decisions)
+                    .filter(([id]) => id !== paperId),
+                ),
+              },
+            }
+          : {}),
+        readings,
+      };
+    }, {
+      type: "paper_reading_reset",
+      paper_id: paperId,
+      revision,
+      snapshot_artifact: snapshotPath,
+    });
+  }
+
   let conversationSeq = 0;
   function nextConversationId() {
     conversationSeq += 1;
@@ -2203,6 +2306,7 @@ export function createReadingService({
     generateStage,
     getReading,
     restartFromGuide,
+    resetPaperReading,
     createConversation,
     switchConversation,
     resume,

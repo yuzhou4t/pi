@@ -615,6 +615,7 @@ function CandidateReview({
   onStartJournalRun,
   onResumeJournalRun,
   readOnly = false,
+  readOnlyQuiet = false,
 }) {
   const selectedPaperIds = run?.selectedPaperIds ?? run?.selected_ids ?? [];
   const displayedPaperIds = new Set(papers.map((paper) => paper.id));
@@ -636,11 +637,6 @@ function CandidateReview({
   const sourceCount = liveRun?.scanSummary?.source_count ?? sourceProgress?.total_count ?? 11;
   const failedSourceIds = liveRun?.scanSummary?.failed_source_ids ?? sourceProgress?.failed_source_ids ?? [];
   const completedSourceCount = sourceProgress?.completed_source_ids?.length;
-  const journalPhaseLabel = journalRunState?.status === "starting"
-    ? "正在创建本轮运行"
-    : journalRunState?.status === "error"
-      ? "读取运行状态失败"
-    : JOURNAL_PHASE_LABELS[liveRun?.phase] ?? "尚未开始真实扫描";
   const canResumeMineru = hasLiveCandidates && [
     "not_configured",
     "quota_deferred",
@@ -697,7 +693,6 @@ function CandidateReview({
             ) : null}
             {liveScanStarted ? (
               <p className="workflow-live-scan-status" role={journalRunState?.error ? "alert" : "status"}>
-                <span>运行阶段 · {journalPhaseLabel}</span>
                 {successfulSourceCount !== undefined ? (
                   <>
                     {completedSourceCount !== undefined ? <span>已检查 {completedSourceCount}/{sourceCount}</span> : null}
@@ -842,24 +837,26 @@ function CandidateReview({
         </div>
       </div>
 
-      <footer className="workflow-stage-actions">
-        {readOnly ? (
-          <p>正在回看候选阶段。当时的选择已锁定；这里不会重新扫描、调用模型或改变当前进度。</p>
-        ) : (
-          <>
-            <p>
-              已选择 {selectedCount}/2 篇用于生成导读。浏览全文不会改变选择，也不会写入 Zotero。
-              {unavailableGuideCount > 0 ? ` 另有 ${unavailableGuideCount} 篇正文尚未准备完成。` : ""}
-            </p>
-            <div>
-              <button className="workflow-secondary-action" type="button" onClick={onSkipRun}>本周不处理</button>
-              <button className="workflow-primary-action" type="button" onClick={onPrepareGuides} disabled={selectedCount === 0}>
-                {guideFailure ? "重新生成五分钟导读" : "生成五分钟导读"} <ArrowRight size={15} weight="bold" aria-hidden="true" />
-              </button>
-            </div>
-          </>
-        )}
-      </footer>
+      {readOnly && readOnlyQuiet ? null : (
+        <footer className="workflow-stage-actions">
+          {readOnly ? (
+            <p>正在回看候选阶段。当时的选择已锁定；这里不会重新扫描、调用模型或改变当前进度。</p>
+          ) : (
+            <>
+              <p>
+                已选择 {selectedCount}/2 篇用于生成导读。浏览全文不会改变选择，也不会写入 Zotero。
+                {unavailableGuideCount > 0 ? ` 另有 ${unavailableGuideCount} 篇正文尚未准备完成。` : ""}
+              </p>
+              <div>
+                <button className="workflow-secondary-action" type="button" onClick={onSkipRun}>本周不处理</button>
+                <button className="workflow-primary-action" type="button" onClick={onPrepareGuides} disabled={selectedCount === 0}>
+                  {guideFailure ? "重新生成五分钟导读" : "生成五分钟导读"} <ArrowRight size={15} weight="bold" aria-hidden="true" />
+                </button>
+              </div>
+            </>
+          )}
+        </footer>
+      )}
     </section>
   );
 }
@@ -1970,14 +1967,19 @@ export function WorkflowWorkspace({
     projectStateUiState,
   });
   const requestedStepIndex = WORKFLOW_STEPS.findIndex((step) => step.id === viewStepId);
+  // 每周追踪的固定落点是候选审阅页：精读进行中的过程只从左栏「论文研读」
+  // 列表进入，不再作为工作流视图的默认画面；步骤条上的「精读」仍可显式查看。
+  const pinnedToReview = currentStep.id === "reading" && availableStepIds.has("review");
+  const defaultStep = pinnedToReview ? WORKFLOW_STEPS[0] : currentStep;
   const viewedStep = (
     requestedStepIndex >= 0
     && requestedStepIndex <= currentStepIndex
     && availableStepIds.has(viewStepId)
   )
     ? WORKFLOW_STEPS[requestedStepIndex]
-    : currentStep;
+    : defaultStep;
   const viewingHistory = viewedStep.id !== currentStep.id;
+  const pinnedLanding = pinnedToReview && viewStepId === null && viewedStep.id === "review";
   const viewStep = (stepId) => {
     const stepIndex = WORKFLOW_STEPS.findIndex((step) => step.id === stepId);
     if (
@@ -1986,7 +1988,7 @@ export function WorkflowWorkspace({
       || !availableStepIds.has(stepId)
     ) return;
     onCloseReader?.();
-    setViewStepId(stepId === currentStep.id ? null : stepId);
+    setViewStepId(stepId === defaultStep.id ? null : stepId);
   };
   const openRestartDialog = () => {
     setRestartDialog({ open: true, pending: false, error: null });
@@ -2075,7 +2077,7 @@ export function WorkflowWorkspace({
   if (status === "completed") content = <CompletedStage proposals={proposals} onReset={onReset} />;
   if (status === "completed_no_write") content = <CompletedNoWriteStage onReset={onReset} />;
   if (viewingHistory && viewedStep.id === "review") {
-    content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onTogglePaper={onTogglePaper} journalRunState={journalRunState} onOpenPaper={onOpenPaper} readOnly />;
+    content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onTogglePaper={onTogglePaper} journalRunState={journalRunState} onOpenPaper={onOpenPaper} readOnly readOnlyQuiet={pinnedLanding} />;
   }
   if (viewingHistory && viewedStep.id === "guide") {
     content = (
@@ -2149,9 +2151,11 @@ export function WorkflowWorkspace({
       <WorkflowHeader
         run={run}
         status={status}
-        statusLabel={viewingHistory
-          ? `回看${viewedStep.label} · 当前进度：${STATUS_LABELS[status] ?? liveHeaderStatus}`
-          : liveHeaderStatus}
+        statusLabel={pinnedLanding
+          ? liveHeaderStatus
+          : viewingHistory
+            ? `回看${viewedStep.label} · 当前进度：${STATUS_LABELS[status] ?? liveHeaderStatus}`
+            : liveHeaderStatus}
         sidebarOpen={sidebarOpen}
         onToggleSidebar={onToggleSidebar}
         contextRailOpen={contextRailOpen}
@@ -2173,12 +2177,18 @@ export function WorkflowWorkspace({
       />
       {viewingHistory ? (
         <div className="workflow-history-bar" role="status">
-          <span>正在查看已完成的「{viewedStep.label}」步骤，当前流程仍在「{currentStep.label}」。</span>
+          <span>
+            {pinnedLanding
+              ? `本周推荐的论文都在这里；精读从左侧「论文研读」列表继续，当前进度在「${currentStep.label}」。`
+              : `正在查看已完成的「${viewedStep.label}」步骤，当前流程仍在「${currentStep.label}」。`}
+          </span>
           <div>
             {viewedStep.id === "guide" && canRestartFromGuide ? (
               <button type="button" onClick={openRestartDialog}>从这里重新开始</button>
             ) : null}
-            <button type="button" onClick={() => viewStep(currentStep.id)}>返回当前步骤</button>
+            <button type="button" onClick={() => viewStep(currentStep.id)}>
+              {pinnedLanding ? "查看精读进度" : "返回当前步骤"}
+            </button>
           </div>
         </div>
       ) : null}

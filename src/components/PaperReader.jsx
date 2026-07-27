@@ -9,6 +9,7 @@ import {
   CircleNotch,
   FilePdf,
   ListBullets,
+  Pause,
   Quotes,
   Sparkle,
   Translate,
@@ -18,6 +19,7 @@ import {
   fetchJournalPaperReading,
   fetchJournalPaperTranslation,
   generateJournalReadingStage,
+  pauseJournalPaperTranslation,
   saveJournalReadingPosition,
   startJournalPaperTranslation,
 } from "../api/journalRuns.js";
@@ -48,6 +50,10 @@ export const READING_LENSES = [
   },
 ];
 
+const TRANSLATION_MODEL_LABEL = "GPT-5.3-Codex-Spark";
+const MATH_ONLY_BLOCK_PATTERN = /^\s*\$\$[\s\S]*\$\$\s*$/;
+const HAN_TEXT_PATTERN = /\p{Script=Han}/u;
+
 function errorMessage(error, fallback = "请求失败，请稍后重试") {
   if (typeof error === "string" && error.trim()) return error;
   if (typeof error?.message === "string" && error.message.trim()) return error.message;
@@ -67,6 +73,44 @@ function blockCopy(block) {
   return block.text?.trim() || block.markdown?.trim() || "";
 }
 
+function comparableBlockText(value) {
+  return String(value ?? "").trim().replaceAll(/\s+/g, " ");
+}
+
+export function documentTranslationView(document, translation) {
+  const blocks = {};
+  const resolvedBlockIds = new Set();
+  if (!document || translation?.documentRevision !== document.revision) {
+    return { blocks, resolvedBlockIds };
+  }
+  const translated = translation.blocks ?? {};
+  for (const block of document.blocks) {
+    const source = blockCopy(block);
+    if (
+      block.kind === "heading"
+      || block.kind === "image"
+      || !source
+      || MATH_ONLY_BLOCK_PATTERN.test(source)
+    ) {
+      resolvedBlockIds.add(block.id);
+      continue;
+    }
+    const zh = typeof translated[block.id] === "string"
+      ? translated[block.id].trim()
+      : "";
+    if (!zh) continue;
+    resolvedBlockIds.add(block.id);
+    if (
+      (!HAN_TEXT_PATTERN.test(source) && !HAN_TEXT_PATTERN.test(zh))
+      || comparableBlockText(source) === comparableBlockText(zh)
+    ) {
+      continue;
+    }
+    blocks[block.id] = zh;
+  }
+  return { blocks, resolvedBlockIds };
+}
+
 function locationLabel(block) {
   const path = block?.path?.filter(Boolean) ?? [];
   return path.slice(1).join(" › ") || "论文正文";
@@ -78,7 +122,7 @@ function activateOnKeyboard(event, action) {
   action();
 }
 
-function FullBlock({
+export function PaperReaderFullBlock({
   block,
   section,
   active,
@@ -86,8 +130,10 @@ function FullBlock({
   onActivate,
   zh = null,
   language = "original",
+  translationResolved = false,
 }) {
   const copy = blockCopy(block);
+  const translationPending = active && language !== "original" && !translationResolved;
   if (block.kind === "heading") {
     const Heading = section?.level >= 3 ? "h4" : "h3";
     return (
@@ -158,6 +204,11 @@ function FullBlock({
             <div className="paper-reader-zh" data-reader-zh="true">
               <PaperRichText content={zh} />
             </div>
+          ) : null}
+          {translationPending ? (
+            <p className="paper-reader-translation-fallback" role="status">
+              本段尚未翻译，暂时显示原文。
+            </p>
           ) : null}
         </>
       )}
@@ -286,6 +337,7 @@ function GuideOrientation({
 export function PaperReader({
   runId,
   paper,
+  initialConversationId = null,
   initialBlockId = null,
   purpose = "document",
   providerId = null,
@@ -320,6 +372,7 @@ export function PaperReader({
     status: "idle",
     translation: null,
     starting: false,
+    pausing: false,
     error: null,
   });
   const [translationRefreshKey, setTranslationRefreshKey] = useState(0);
@@ -403,10 +456,11 @@ export function PaperReader({
         setTranslationState((current) => ({
           status: "ready",
           translation,
-          starting: current.starting && translation.status === "running",
+          starting: false,
+          pausing: false,
           error: null,
         }));
-        if (translation.status === "running") {
+        if (["running", "pausing"].includes(translation.status)) {
           timer = window.setTimeout(load, 2500);
         }
       } catch (error) {
@@ -415,6 +469,7 @@ export function PaperReader({
           status: "error",
           translation: current.translation,
           starting: false,
+          pausing: false,
           error: errorMessage(error, "无法读取全文翻译"),
         }));
       }
@@ -423,6 +478,7 @@ export function PaperReader({
       status: "loading",
       translation: current.translation,
       starting: current.starting,
+      pausing: current.pausing,
       error: null,
     }));
     void load();
@@ -434,11 +490,33 @@ export function PaperReader({
   }, [paper.id, request.status, runId, translationRefreshKey]);
 
   const translation = translationState.translation;
-  const translationBlocks = useMemo(() => (
-    translation && translation.documentRevision === paperDocument?.revision
-      ? translation.blocks
-      : {}
-  ), [paperDocument?.revision, translation]);
+  const translationModelLabel = translation?.modelId
+    ? (
+        translation.modelId === "gpt-5.3-codex-spark"
+          ? "GPT-5.3-Codex-Spark"
+          : translation.modelId
+      )
+    : TRANSLATION_MODEL_LABEL;
+  // The reasoning effort stays available on hover instead of occupying the bar.
+  const translationEffortLabel = translation?.reasoningEffort
+    ? (translation.reasoningEffort === "low" ? "低思考强度" : translation.reasoningEffort)
+    : "低思考强度";
+  const translationUsesCurrentProfile = Boolean(
+    translation
+    && translation.providerId === "codex-subscription"
+    && translation.modelId === "gpt-5.3-codex-spark"
+    && translation.reasoningEffort === "low"
+  );
+  const translationNeedsProfileRestart = Boolean(
+    translation
+    && !["not_started", "stale"].includes(translation.status)
+    && !translationUsesCurrentProfile
+  );
+  const translationView = useMemo(
+    () => documentTranslationView(paperDocument, translation),
+    [paperDocument, translation],
+  );
+  const translationBlocks = translationView.blocks;
   const translationUsable = Object.keys(translationBlocks).length > 0;
   const effectiveLanguage = translationUsable ? language : "original";
   const readable = useMemo(
@@ -455,6 +533,20 @@ export function PaperReader({
   );
   const activeIndex = Math.max(readable.findIndex((block) => block.id === activeBlockId), 0);
   const activeBlock = readable[activeIndex] ?? null;
+  const activeTranslation = activeBlock ? translationBlocks[activeBlock.id] ?? null : null;
+  const activeTranslationPending = Boolean(
+    activeBlock
+    && effectiveLanguage !== "original"
+    && !translationView.resolvedBlockIds.has(activeBlock.id)
+  );
+  const focusedContentLabel = effectiveLanguage === "bilingual" && activeTranslation
+    ? "原文与中文对照"
+    : effectiveLanguage === "zh" && activeTranslation
+      ? "当前中文"
+      : "当前原文";
+  const persistentTranslationError = translation?.error
+    ? errorMessage(translation.error, "")
+    : "";
   const previousBlock = readable[activeIndex - 1] ?? null;
   const nextBlock = readable[activeIndex + 1] ?? null;
   const completedStageCount = READING_LENSES.filter(
@@ -492,9 +584,12 @@ export function PaperReader({
   useEffect(() => {
     if (!closeReading) return undefined;
     onReaderContextChange?.({
-      key: `${runId}:${paper.id}`,
+      key: `${runId}:${paper.id}:${reading?.activeConversationId ?? initialConversationId ?? "current"}`,
       runId,
       paperId: paper.id,
+      activeConversationId: reading?.activeConversationId
+        ?? initialConversationId
+        ?? "current",
       purpose,
       paper: {
         id: paper.id,
@@ -511,6 +606,7 @@ export function PaperReader({
   }, [
     activeBlockId,
     closeReading,
+    initialConversationId,
     onReaderContextChange,
     paper.id,
     paper.title,
@@ -672,19 +768,18 @@ export function PaperReader({
   };
 
   const startTranslation = async () => {
-    if (!modelAvailable || translationState.starting) return;
+    if (translationState.starting || translationState.pausing) return;
     setTranslationState((current) => ({ ...current, starting: true, error: null }));
     try {
       const nextTranslation = await startJournalPaperTranslation({
         runId,
         paperId: paper.id,
-        providerId,
-        modelId,
       });
       setTranslationState({
         status: "ready",
         translation: nextTranslation,
-        starting: nextTranslation.status === "running",
+        starting: false,
+        pausing: false,
         error: null,
       });
       setTranslationRefreshKey((current) => current + 1);
@@ -693,7 +788,35 @@ export function PaperReader({
         status: "error",
         translation: current.translation,
         starting: false,
+        pausing: false,
         error: errorMessage(error, "无法启动全文翻译"),
+      }));
+    }
+  };
+
+  const pauseTranslation = async () => {
+    if (translationState.pausing || translation?.status !== "running") return;
+    setTranslationState((current) => ({ ...current, pausing: true, error: null }));
+    try {
+      const nextTranslation = await pauseJournalPaperTranslation({
+        runId,
+        paperId: paper.id,
+      });
+      setTranslationState({
+        status: "ready",
+        translation: nextTranslation,
+        starting: false,
+        pausing: false,
+        error: null,
+      });
+      setTranslationRefreshKey((current) => current + 1);
+    } catch (error) {
+      setTranslationState((current) => ({
+        status: "error",
+        translation: current.translation,
+        starting: false,
+        pausing: false,
+        error: errorMessage(error, "无法暂停全文翻译"),
       }));
     }
   };
@@ -926,16 +1049,68 @@ export function PaperReader({
               </button>
             </div>
             <div className="paper-reader-language-status" aria-live="polite">
-              {translation?.status === "running" ? (
+              <span
+                className="paper-reader-translation-model"
+                title={`思考强度：${translationEffortLabel}`}
+              >
+                {translationNeedsProfileRestart ? "现有译文模型" : "翻译模型"}：
+                {translationModelLabel}
+              </span>
+              {translation && ["running", "pausing"].includes(translation.status) ? (
                 <span role="status">
                   <CircleNotch className="is-spinning" size={14} aria-hidden="true" />
-                  正在翻译 {translation.translatedBlocks}/{translation.totalBlocks} 段
+                  {translationState.pausing || translation.status === "pausing"
+                    ? "正在暂停"
+                    : "正在翻译"}{" "}
+                  {translation.translatedBlocks}/{translation.totalBlocks} 段
                 </span>
               ) : null}
-              {translation && ["not_started", "stale"].includes(translation.status) ? (
+              {translation?.status === "paused" ? (
+                <span role="status">
+                  已暂停 {translation.translatedBlocks}/{translation.totalBlocks} 段
+                </span>
+              ) : null}
+              {translation?.status === "partial" ? (
+                <span role="status">
+                  已翻译 {translation.translatedBlocks}/{translation.totalBlocks} 段；
+                  未完成段落继续显示原文
+                </span>
+              ) : null}
+              {translation?.passthroughBlocks > 0 && translation.status !== "ready" ? (
+                <span>
+                  另有 {translation.passthroughBlocks} 个纯公式无需翻译
+                </span>
+              ) : null}
+              {translation?.status === "running" ? (
                 <button
                   type="button"
-                  disabled={!modelAvailable || translationState.starting}
+                  disabled={translationState.pausing}
+                  onClick={pauseTranslation}
+                >
+                  {translationState.pausing
+                    ? <CircleNotch className="is-spinning" size={14} aria-hidden="true" />
+                    : <Pause size={14} weight="fill" aria-hidden="true" />}
+                  {translationState.pausing ? "正在暂停" : "暂停翻译"}
+                </button>
+              ) : null}
+              {translationNeedsProfileRestart ? (
+                <button
+                  type="button"
+                  disabled={translationState.starting}
+                  onClick={startTranslation}
+                >
+                  {translationState.starting
+                    ? <CircleNotch className="is-spinning" size={14} aria-hidden="true" />
+                    : <Translate size={14} aria-hidden="true" />}
+                  改用 GPT-5.3-Codex-Spark 重新翻译
+                </button>
+              ) : null}
+              {!translationNeedsProfileRestart
+                && translation
+                && ["not_started", "stale"].includes(translation.status) ? (
+                <button
+                  type="button"
+                  disabled={translationState.starting}
                   onClick={startTranslation}
                 >
                   {translationState.starting
@@ -944,20 +1119,30 @@ export function PaperReader({
                   {translation.status === "stale" ? "重新翻译全文" : "翻译全文"}
                 </button>
               ) : null}
-              {translation?.status === "partial" ? (
+              {!translationNeedsProfileRestart
+                && translation
+                && ["paused", "partial"].includes(translation.status) ? (
                 <button
                   type="button"
-                  disabled={!modelAvailable || translationState.starting}
+                  disabled={translationState.starting}
                   onClick={startTranslation}
                 >
                   {translationState.starting
                     ? <CircleNotch className="is-spinning" size={14} aria-hidden="true" />
                     : <Translate size={14} aria-hidden="true" />}
-                  继续翻译（已完成 {translation.translatedBlocks}/{translation.totalBlocks}）
+                  {translation.error ? "重试翻译" : "继续翻译"}
+                  （已完成 {translation.translatedBlocks}/{translation.totalBlocks}）
                 </button>
               ) : null}
               {translationState.error ? (
-                <span className="paper-reader-language-error">{translationState.error}</span>
+                <span className="paper-reader-language-error" role="alert">
+                  {translationState.error}
+                </span>
+              ) : null}
+              {persistentTranslationError ? (
+                <span className="paper-reader-language-error" role="alert">
+                  翻译未完成：{persistentTranslationError}
+                </span>
               ) : null}
             </div>
           </div>
@@ -980,12 +1165,24 @@ export function PaperReader({
                 onMouseUp={(event) => captureSelection(event.currentTarget)}
                 onKeyUp={(event) => captureSelection(event.currentTarget)}
               >
-                <h3 ref={contentTitleRef} tabIndex="-1">当前原文</h3>
-                <PaperRichText content={blockCopy(activeBlock)} />
-                {effectiveLanguage !== "original" && translationBlocks[activeBlock?.id] ? (
-                  <div className="paper-reader-zh" data-reader-zh="true">
-                    <PaperRichText content={translationBlocks[activeBlock.id]} />
+                <h3 ref={contentTitleRef} tabIndex="-1">{focusedContentLabel}</h3>
+                {effectiveLanguage !== "zh" || !activeTranslation ? (
+                  <PaperRichText content={blockCopy(activeBlock)} />
+                ) : null}
+                {effectiveLanguage === "zh" && activeTranslation ? (
+                  <div className="paper-reader-zh is-only" data-reader-zh="true">
+                    <PaperRichText content={activeTranslation} />
                   </div>
+                ) : null}
+                {effectiveLanguage === "bilingual" && activeTranslation ? (
+                  <div className="paper-reader-zh" data-reader-zh="true">
+                    <PaperRichText content={activeTranslation} />
+                  </div>
+                ) : null}
+                {activeTranslationPending ? (
+                  <p className="paper-reader-translation-fallback" role="status">
+                    本段尚未翻译，暂时显示原文。
+                  </p>
                 ) : null}
               </article>
 
@@ -1033,7 +1230,7 @@ export function PaperReader({
                 <p>点击段落可记录当前位置；选择同一段文字，可连同原文位置一起交给右侧论文 Agent。</p>
               </header>
               {(paperDocument.blocks ?? []).map((block) => (
-                <FullBlock
+                <PaperReaderFullBlock
                   block={block}
                   section={sectionsById.get(block.sectionId)}
                   active={block.id === activeBlockId}
@@ -1041,6 +1238,7 @@ export function PaperReader({
                   onActivate={(blockId) => activateBlock(blockId)}
                   zh={translationBlocks[block.id] ?? null}
                   language={effectiveLanguage}
+                  translationResolved={translationView.resolvedBlockIds.has(block.id)}
                   key={block.id}
                 />
               ))}

@@ -23,6 +23,7 @@ const NOOP = () => {};
 export function ReadingWorkbench({
   readerTarget,
   readerPaper,
+  activeReadingConversationId = null,
   readerGuide = null,
   readerPeerPapers = [],
   readerContext = null,
@@ -195,6 +196,7 @@ export function ReadingWorkbench({
                 <PaperReader
                   runId={readerTarget.runId}
                   paper={readerPaper}
+                  initialConversationId={activeReadingConversationId}
                   initialBlockId={readerTarget.blockId}
                   purpose={readerTarget.purpose}
                   providerId={readingProviderId}

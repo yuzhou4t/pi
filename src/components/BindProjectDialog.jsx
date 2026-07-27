@@ -154,7 +154,6 @@ export function BindProjectDialog({
 
         {step === "choose" ? (
           <div className="bind-project-step">
-            <p>选择已有文件夹，或从一个新的项目文件夹开始。</p>
             <div className="bind-project-choice-list">
               <button
                 className="bind-project-picker"
@@ -165,7 +164,6 @@ export function BindProjectDialog({
                 <FolderOpen size={22} weight="regular" aria-hidden="true" />
                 <span>
                   <strong>选择本地文件夹</strong>
-                  <small>把电脑中的现有项目加入当前工作类型</small>
                 </span>
                 <ArrowRight size={17} aria-hidden="true" />
               </button>
@@ -178,7 +176,6 @@ export function BindProjectDialog({
                 <FolderSimplePlus size={22} weight="regular" aria-hidden="true" />
                 <span>
                   <strong>新建项目文件夹</strong>
-                  <small>创建一个空项目，再让 Agent 从这里开始工作</small>
                 </span>
                 <ArrowRight size={17} aria-hidden="true" />
               </button>

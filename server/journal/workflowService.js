@@ -12,6 +12,8 @@ import { generateFiveMinuteGuide } from "./guideGenerator.js";
 import {
   isMathOnlyBlock,
   isTranslatableBlock,
+  TRANSLATION_MODEL_PROFILE,
+  TRANSLATION_PROMPT_ID,
   translatePaperBatch,
   translationBatches,
 } from "./translationGenerator.js";
@@ -204,6 +206,13 @@ export function createJournalWorkflowService({
   const activeGuidePrompt = guideGenerator === generateFiveMinuteGuide
     ? promptRegistry.loadPrompt("five-minute-guide")
     : null;
+  const activeTranslationPrompt = promptRegistry.loadPrompt(TRANSLATION_PROMPT_ID);
+  const translationProfile = Object.freeze({
+    ...TRANSLATION_MODEL_PROFILE,
+    promptId: activeTranslationPrompt.id,
+    promptVersion: activeTranslationPrompt.version,
+    promptHash: activeTranslationPrompt.prompt_hash,
+  });
   const projectContext = createProjectContextReader({
     projectRoot: path.resolve(env.PI_PROJECT_ROOT || "."),
     projectStatePath: env.PI_PROJECT_STATE_PATH || "project_state.md",
@@ -1333,33 +1342,83 @@ export function createJournalWorkflowService({
     }
   }
 
+  function translationArtifactMatchesProfile(artifact, documentRevision) {
+    return Boolean(
+      artifact
+      && artifact.document_revision === documentRevision
+      && artifact.provider_id === translationProfile.providerId
+      && artifact.model_id === translationProfile.modelId
+      && artifact.reasoning_effort === translationProfile.reasoningEffort
+      && artifact.prompt_id === translationProfile.promptId
+      && artifact.prompt_version === translationProfile.promptVersion
+      && artifact.prompt_hash === translationProfile.promptHash
+    );
+  }
+
+  function generatedTranslationMatchesProfile(generated) {
+    return Boolean(
+      generated
+      && generated.provider_id === translationProfile.providerId
+      && generated.model_id === translationProfile.modelId
+      && generated.reasoning_effort === translationProfile.reasoningEffort
+      && generated.prompt_id === translationProfile.promptId
+      && generated.prompt_version === translationProfile.promptVersion
+      && generated.prompt_hash === translationProfile.promptHash
+    );
+  }
+
+  function translationProgress(document, blocks = {}) {
+    let total = 0;
+    let translated = 0;
+    let passthrough = 0;
+    for (const block of document.blocks) {
+      if (!isTranslatableBlock(block)) continue;
+      if (isMathOnlyBlock(block)) {
+        passthrough += 1;
+        continue;
+      }
+      total += 1;
+      if (typeof blocks[block.block_id] === "string" && blocks[block.block_id]) {
+        translated += 1;
+      }
+    }
+    return { total, translated, passthrough };
+  }
+
   function publicTranslation(runId, paperId, document, artifact, job) {
-    const total = document.blocks.filter(isTranslatableBlock).length;
     const matching = artifact && artifact.document_revision === document.revision
       ? artifact
       : null;
     const blocks = matching ? { ...matching.blocks } : {};
-    const translated = Math.min(Object.keys(blocks).length, total);
+    const { total, translated, passthrough } = translationProgress(document, blocks);
     const running = Boolean(job && job.revision === document.revision);
     const status = running
-      ? "running"
+      ? job.pauseRequested ? "pausing" : "running"
       : !matching
         ? artifact ? "stale" : "not_started"
-        : total > 0 && translated >= total
+        : matching.status === "ready" && translated >= total
           ? "ready"
-          : translated > 0 || matching.last_error
-            ? "partial"
-            : "not_started";
+          : matching.status === "paused" || ["running", "pausing"].includes(matching.status)
+            ? "paused"
+            : translated > 0 || matching.last_error
+              ? "partial"
+              : "not_started";
     return {
       schema_version: 1,
       run_id: runId,
       paper_id: paperId,
       document_revision: document.revision,
       status,
-      provider_id: matching?.provider_id ?? job?.providerId ?? null,
-      model_id: matching?.model_id ?? job?.modelId ?? null,
+      provider_id: matching?.provider_id ?? job?.providerId ?? translationProfile.providerId,
+      model_id: matching?.model_id ?? job?.modelId ?? translationProfile.modelId,
+      reasoning_effort: matching?.reasoning_effort
+        ?? job?.reasoningEffort
+        ?? translationProfile.reasoningEffort,
+      prompt_id: matching?.prompt_id ?? translationProfile.promptId,
+      prompt_version: matching?.prompt_version ?? translationProfile.promptVersion,
       total_blocks: total,
       translated_blocks: translated,
+      passthrough_blocks: passthrough,
       blocks,
       error: matching?.last_error ?? null,
       updated_at: matching?.updated_at ?? null,
@@ -1368,25 +1427,38 @@ export function createJournalWorkflowService({
 
   async function getPaperTranslation(runId, paperId) {
     const document = await getPaperDocument(runId, paperId);
+    const key = translationKey(runId, paperId);
+    const job = translationInFlight.get(key);
+    let artifact = await readTranslationArtifact(runId, paperId);
+    if (
+      artifact?.document_revision === document.revision
+      && !job
+      && ["running", "pausing"].includes(artifact.status)
+    ) {
+      artifact = {
+        ...artifact,
+        status: "paused",
+        updated_at: new Date().toISOString(),
+      };
+      await runStore.writeArtifact(runId, translationArtifactName(paperId), artifact);
+    }
     return publicTranslation(
       runId,
       paperId,
       document,
-      await readTranslationArtifact(runId, paperId),
-      translationInFlight.get(translationKey(runId, paperId)),
+      artifact,
+      job,
     );
   }
 
-  async function generatePaperTranslation(runId, paperId, {
-    providerId = defaults.providerId,
-    modelId = defaults.modelId,
-  } = {}) {
+  async function generatePaperTranslation(runId, paperId) {
     const document = await getPaperDocument(runId, paperId);
     if (
-      !isNonEmptyString(providerId)
-      || !isNonEmptyString(modelId)
-      || typeof modelProviders?.supports !== "function"
-      || !modelProviders.supports(providerId, modelId)
+      typeof modelProviders?.supports !== "function"
+      || !modelProviders.supports(
+        translationProfile.providerId,
+        translationProfile.modelId,
+      )
     ) {
       throw artifactError("TRANSLATION_PROVIDER_UNSUPPORTED", "服务商或模型不支持全文翻译", 400);
     }
@@ -1404,14 +1476,22 @@ export function createJournalWorkflowService({
     let artifact = await readTranslationArtifact(runId, paperId);
     // A translation for an older body is discarded; the reader never mixes revisions.
     if (artifact && artifact.document_revision !== document.revision) artifact = null;
+    // This POST is the explicit user action that starts the current fixed
+    // translation profile. A legacy generated artifact remains readable until
+    // this point, then restarts cleanly instead of mixing model provenance.
+    if (artifact && !translationArtifactMatchesProfile(artifact, document.revision)) artifact = null;
     const startedAt = new Date().toISOString();
     const nextArtifact = artifact ?? {
       schema_version: 1,
       run_id: runId,
       paper_id: paperId,
       document_revision: document.revision,
-      provider_id: providerId,
-      model_id: modelId,
+      provider_id: translationProfile.providerId,
+      model_id: translationProfile.modelId,
+      reasoning_effort: translationProfile.reasoningEffort,
+      prompt_id: translationProfile.promptId,
+      prompt_version: translationProfile.promptVersion,
+      prompt_hash: translationProfile.promptHash,
       status: "running",
       blocks: {},
       last_error: null,
@@ -1428,42 +1508,84 @@ export function createJournalWorkflowService({
       document.blocks,
       new Set(Object.keys(nextArtifact.blocks)),
     );
-    const total = document.blocks.filter(isTranslatableBlock).length;
+    const total = translationProgress(document, nextArtifact.blocks).total;
     if (batches.length === 0) {
-      nextArtifact.status = Object.keys(nextArtifact.blocks).length >= total ? "ready" : "partial";
+      nextArtifact.status = translationProgress(document, nextArtifact.blocks).translated >= total
+        ? "ready"
+        : "partial";
       nextArtifact.last_error = null;
       nextArtifact.updated_at = new Date().toISOString();
       await runStore.writeArtifact(runId, translationArtifactName(paperId), nextArtifact);
       return publicTranslation(runId, paperId, document, nextArtifact, null);
     }
     nextArtifact.status = "running";
-    nextArtifact.provider_id = providerId;
-    nextArtifact.model_id = modelId;
+    nextArtifact.provider_id = translationProfile.providerId;
+    nextArtifact.model_id = translationProfile.modelId;
+    nextArtifact.reasoning_effort = translationProfile.reasoningEffort;
+    nextArtifact.prompt_id = translationProfile.promptId;
+    nextArtifact.prompt_version = translationProfile.promptVersion;
+    nextArtifact.prompt_hash = translationProfile.promptHash;
     nextArtifact.last_error = null;
     nextArtifact.updated_at = startedAt;
     await runStore.writeArtifact(runId, translationArtifactName(paperId), nextArtifact);
-    const job = { revision: document.revision, providerId, modelId, promise: null };
+    const job = {
+      revision: document.revision,
+      providerId: translationProfile.providerId,
+      modelId: translationProfile.modelId,
+      reasoningEffort: translationProfile.reasoningEffort,
+      pauseRequested: false,
+      artifact: nextArtifact,
+      promise: null,
+    };
     job.promise = (async () => {
       let lastError = null;
       for (const batch of batches) {
+        let stopAfterBatch = false;
+        if (job.pauseRequested) {
+          nextArtifact.status = "paused";
+          nextArtifact.updated_at = new Date().toISOString();
+          await runStore.writeArtifact(runId, translationArtifactName(paperId), nextArtifact);
+          return;
+        }
         try {
           const generated = await translationGenerator({
             paperId,
             batch,
-            providerId,
-            modelId,
+            providerId: translationProfile.providerId,
+            modelId: translationProfile.modelId,
+            reasoningEffort: translationProfile.reasoningEffort,
             modelProviders,
             modelMode,
           });
+          if (!generatedTranslationMatchesProfile(generated)) {
+            throw artifactError(
+              "TRANSLATION_PROFILE_MISMATCH",
+              "翻译批次返回的模型或提示来源与当前译文档案不一致",
+              502,
+            );
+          }
           Object.assign(nextArtifact.blocks, generated.translations);
         } catch (error) {
-          // A failed batch is recorded and skipped; finished batches stay durable.
+          // A failed batch is recorded; finished batches stay durable.
           lastError = publicError(error);
+          stopAfterBatch = !lastError.retryable;
         }
+        nextArtifact.last_error = lastError;
         nextArtifact.updated_at = new Date().toISOString();
+        const complete = translationProgress(document, nextArtifact.blocks).translated >= total;
+        nextArtifact.status = complete
+          ? "ready"
+          : job.pauseRequested
+            ? "paused"
+            : stopAfterBatch
+              ? "partial"
+              : "running";
         await runStore.writeArtifact(runId, translationArtifactName(paperId), nextArtifact);
+        if (job.pauseRequested || complete || stopAfterBatch) return;
       }
-      nextArtifact.status = Object.keys(nextArtifact.blocks).length >= total ? "ready" : "partial";
+      nextArtifact.status = translationProgress(document, nextArtifact.blocks).translated >= total
+        ? "ready"
+        : "partial";
       nextArtifact.last_error = lastError;
       nextArtifact.updated_at = new Date().toISOString();
       await runStore.writeArtifact(runId, translationArtifactName(paperId), nextArtifact);
@@ -1472,6 +1594,32 @@ export function createJournalWorkflowService({
     });
     translationInFlight.set(key, job);
     return publicTranslation(runId, paperId, document, nextArtifact, job);
+  }
+
+  async function pausePaperTranslation(runId, paperId) {
+    const document = await getPaperDocument(runId, paperId);
+    const key = translationKey(runId, paperId);
+    const job = translationInFlight.get(key);
+    let artifact = job?.artifact ?? await readTranslationArtifact(runId, paperId);
+    if (!artifact || artifact.document_revision !== document.revision) {
+      return publicTranslation(runId, paperId, document, artifact, null);
+    }
+    if (job && job.revision === document.revision) {
+      job.pauseRequested = true;
+      artifact.status = "pausing";
+      artifact.updated_at = new Date().toISOString();
+      await runStore.writeArtifact(runId, translationArtifactName(paperId), artifact);
+      return publicTranslation(runId, paperId, document, artifact, job);
+    }
+    if (["running", "pausing"].includes(artifact.status)) {
+      artifact = {
+        ...artifact,
+        status: "paused",
+        updated_at: new Date().toISOString(),
+      };
+      await runStore.writeArtifact(runId, translationArtifactName(paperId), artifact);
+    }
+    return publicTranslation(runId, paperId, document, artifact, null);
   }
 
   function waitForTranslation(runId, paperId) {
@@ -1619,6 +1767,7 @@ export function createJournalWorkflowService({
     getPaperReading: reading.getReading,
     getPaperTranslation,
     generatePaperTranslation,
+    pausePaperTranslation,
     waitForTranslation,
     getProjectContext: projectContext.read,
     getReadingNoteProposal,
@@ -1630,6 +1779,7 @@ export function createJournalWorkflowService({
     listRuns: runStore.listRuns,
     resumeRun,
     restartReadingFromGuide: reading.restartFromGuide,
+    resetPaperReading: reading.resetPaperReading,
     createReadingConversation: reading.createConversation,
     switchReadingConversation: reading.switchConversation,
     savePaperDecisions: reading.setDecisions,

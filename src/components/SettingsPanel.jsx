@@ -25,7 +25,7 @@ function QuickSetting({ icon: Icon, label, detail, onClick }) {
   return (
     <button className="quick-setting-row" type="button" onClick={onClick}>
       <span className="quick-setting-icon"><Icon size={17} weight="regular" aria-hidden="true" /></span>
-      <span><strong>{label}</strong><small>{detail}</small></span>
+      <span><strong>{label}</strong>{detail ? <small>{detail}</small> : null}</span>
       <CaretRight size={14} aria-hidden="true" />
     </button>
   );
@@ -42,7 +42,6 @@ export function SettingsQuickPanel({ providerName, model, onOpenFull, onOpenSkil
       >
         <header className="settings-quick-header">
           <div>
-            <span className="eyebrow">快速入口</span>
             <h2 id="quick-settings-title">设置</h2>
           </div>
           <button className="icon-button" type="button" aria-label="关闭设置" onClick={onClose} autoFocus>
@@ -52,7 +51,7 @@ export function SettingsQuickPanel({ providerName, model, onOpenFull, onOpenSkil
 
         <div className="quick-setting-list">
           <QuickSetting icon={Cpu} label="模型与服务商" detail={`${providerName} · ${model}`} onClick={() => onOpenFull("providers")} />
-          <QuickSetting icon={Package} label="技能中心" detail="管理 Agent 能力扩展包" onClick={onOpenSkills ?? (() => onOpenFull("skills"))} />
+          <QuickSetting icon={Package} label="技能中心" onClick={onOpenSkills ?? (() => onOpenFull("skills"))} />
           <QuickSetting icon={Palette} label="外观" detail="浅色 · 紧凑界面" onClick={() => onOpenFull("appearance")} />
           <QuickSetting icon={FolderSimple} label="项目与本地数据" detail="仅保存在本机" onClick={() => onOpenFull("data")} />
         </div>

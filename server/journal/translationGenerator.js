@@ -1,12 +1,20 @@
 import { promptRegistry as defaultPromptRegistry } from "../promptRegistry.js";
 
-const PROMPT_ID = "translation";
+export const TRANSLATION_PROMPT_ID = "translation";
+export const TRANSLATION_MODEL_PROFILE = Object.freeze({
+  providerId: "codex-subscription",
+  modelId: "gpt-5.3-codex-spark",
+  reasoningEffort: "low",
+});
 const BLOCK_ID_PATTERN = /^block-[a-f0-9]{20}$/;
 const MAX_BATCH_BLOCKS = 24;
 const MAX_BATCH_CHARS = 12_000;
 const MAX_BLOCK_CHARS = 6_000;
 const HAN_PATTERN = /\p{Script=Han}/u;
 const MATH_ONLY_PATTERN = /^\s*\$\$[\s\S]*\$\$\s*$/;
+const URL_PATTERN = /https?:\/\/\S+/gi;
+const EMAIL_PATTERN = /\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b/gi;
+const SUP_TAG_PATTERN = /<sup>[^<]*<\/sup>/gi;
 
 export class TranslationGeneratorError extends Error {
   constructor(code, message, status = 400, retryable = false) {
@@ -31,6 +39,26 @@ function blockSource(block) {
     return String(block.markdown ?? block.text ?? "").trim();
   }
   return String(block?.text ?? block?.markdown ?? "").trim();
+}
+
+function allowsNonChinesePassthrough(source) {
+  const supTags = source.match(SUP_TAG_PATTERN) ?? [];
+  const withoutMarkup = source.replaceAll(/<[^>]+>/g, " ");
+  const authorWords = withoutMarkup.match(/\b[A-Za-z][A-Za-z'-]*\b/g) ?? [];
+  const authorLine = supTags.length >= 2
+    && authorWords.length >= 2
+    && !/\b(?:school|university|institute|department|laboratory|college)\b/i.test(withoutMarkup);
+  if (authorLine) return true;
+
+  if (!URL_PATTERN.test(source) && !EMAIL_PATTERN.test(source)) return false;
+  URL_PATTERN.lastIndex = 0;
+  EMAIL_PATTERN.lastIndex = 0;
+  const labels = source
+    .replace(URL_PATTERN, " ")
+    .replace(EMAIL_PATTERN, " ")
+    .replaceAll(/<[^>]+>/g, " ")
+    .match(/\b[A-Za-z][A-Za-z'-]*\b/g) ?? [];
+  return labels.length <= 4;
 }
 
 export function isTranslatableBlock(block) {
@@ -108,9 +136,13 @@ function validateOutput(value, paperId, batch) {
     if (!zh || zh.length > 8_000) throw outputError("译文长度不符合翻译合同");
     if (!HAN_PATTERN.test(zh)) {
       // Allow pure symbol/formula passthrough only when the source itself has
-      // no prose to translate; otherwise require Simplified Chinese output.
-      const letters = expected.get(blockId).source.replaceAll(/[^a-zA-Z]/g, "");
-      if (letters.length > 12) throw outputError("译文必须使用简体中文");
+      // no prose to translate. Author lists and link-only metadata likewise
+      // stay faithful when the model preserves them verbatim.
+      const source = expected.get(blockId).source;
+      const letters = source.replaceAll(/[^a-zA-Z]/g, "");
+      if (letters.length > 12 && !allowsNonChinesePassthrough(source)) {
+        throw outputError("译文必须使用简体中文");
+      }
     }
     translations[blockId] = zh;
   }
@@ -129,23 +161,25 @@ export async function translatePaperBatch({
   batch,
   providerId,
   modelId,
+  reasoningEffort,
   modelProviders,
   modelMode = "live",
   promptRegistry = defaultPromptRegistry,
 } = {}) {
   if (typeof paperId !== "string" || !paperId) throw inputError("paper_id 必须是非空字符串");
   const normalizedBatch = normalizeBatch(batch);
-  const prompt = promptRegistry.loadPrompt(PROMPT_ID);
+  const prompt = promptRegistry.loadPrompt(TRANSLATION_PROMPT_ID);
   const input = {
     paper_id: paperId,
     blocks: normalizedBatch,
   };
   const inputHash = promptRegistry.createInputHash({
-    promptId: PROMPT_ID,
+    promptId: TRANSLATION_PROMPT_ID,
     input,
     modelSettings: {
       provider_id: providerId ?? null,
       model_id: modelId ?? null,
+      reasoning_effort: reasoningEffort ?? null,
     },
   });
   const audit = {
@@ -160,8 +194,9 @@ export async function translatePaperBatch({
       translations: fixtureTranslations(normalizedBatch),
       source: "fixture",
       ...audit,
-      provider_id: null,
-      model_id: null,
+      provider_id: providerId ?? null,
+      model_id: modelId ?? null,
+      reasoning_effort: reasoningEffort ?? null,
       usage: null,
     };
   }
@@ -175,6 +210,7 @@ export async function translatePaperBatch({
   const generated = await modelProviders.completeStructured({
     providerId,
     modelId,
+    reasoningEffort,
     system: prompt.system,
     prompt: prompt.body,
     input,
@@ -186,6 +222,7 @@ export async function translatePaperBatch({
     ...audit,
     provider_id: generated.provider_id ?? providerId,
     model_id: generated.model_id ?? modelId,
+    reasoning_effort: generated.reasoning_effort ?? reasoningEffort ?? null,
     usage: generated.usage ?? null,
   };
 }

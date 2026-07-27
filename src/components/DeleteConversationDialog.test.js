@@ -37,7 +37,7 @@ test("delete conversation dialog names the session and explains the irreversible
       assert.match(html, /不可恢复/);
       assert.match(html, /2 个尚未应用的修改文件/);
       assert.match(html, /不会删除项目文件夹/);
-      assert.match(html, /不会回滚已经确认写入的修改/);
+      assert.match(html, /不会回滚已确认写入的修改/);
       assert.match(html, />取消</);
       assert.match(html, /删除会话/);
       assert.doesNotMatch(html, /\/Users\/|rootLabel|绝对路径/);
@@ -74,9 +74,9 @@ test("standalone deletion names the private draft scope without implying a bound
         onConfirm() {},
       }));
 
-      assert.match(html, /私有草稿区/);
-      assert.match(html, /随这个对话一起删除/);
-      assert.doesNotMatch(html, /不会删除项目文件夹|不会回滚已经确认写入/);
+      assert.match(html, /不可恢复/);
+      assert.match(html, /不会影响任何已绑定项目/);
+      assert.doesNotMatch(html, /不会删除项目文件夹|不会回滚已确认写入/);
     },
   );
 });

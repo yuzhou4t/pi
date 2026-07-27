@@ -177,6 +177,8 @@ function mapAgentNoteAction(action) {
 
 function mapReadingChat(chat) {
   return {
+    id: chat?.id ?? "current",
+    title: chat?.title ?? null,
     status: chat?.status ?? "idle",
     turns: (chat?.turns ?? []).map((turn) => ({
       id: turn.id,
@@ -255,6 +257,16 @@ function mapReadingSummary(readings) {
           answeredAt: question.answered_at ?? null,
         })),
         chat: mapReadingChat(paper?.chat),
+        activeConversationId: paper?.active_conversation_id
+          ?? paper?.chat?.id
+          ?? "current",
+        conversations: (paper?.conversations ?? []).map((conversation) => ({
+          id: conversation?.id ?? null,
+          title: conversation?.title ?? null,
+          turnCount: conversation?.turn_count ?? 0,
+          updatedAt: conversation?.updated_at ?? null,
+          active: Boolean(conversation?.active),
+        })),
         agentActions: {
           status: paper?.agent_actions?.status ?? "idle",
           proposals: (paper?.agent_actions?.proposals ?? []).map(mapAgentNoteAction),
@@ -275,9 +287,11 @@ export function mapJournalRun(run) {
   const guidePapers = run.guides?.papers ?? {};
   return {
     id: run.run_id,
+    projectId: run.project_id ?? "pi-agent-product",
     status: run.status,
     phase: run.phase,
     pausedReason: run.paused_reason ?? null,
+    createdAt: run.created_at ?? null,
     updatedAt: run.updated_at,
     scanSummary: run.scan_summary,
     sourceProgress: run.source_progress,
@@ -638,6 +652,21 @@ export async function restartJournalReadingFromGuide({ runId, signal } = {}) {
   );
   const body = await jsonResponse(response, "本地精读服务返回了无法解析的重新研读状态");
   if (!response.ok) throw requestError(response, body, "无法从五分钟导读重新开始");
+  return mapJournalRun(body);
+}
+
+export async function resetJournalPaperReading({ runId, paperId, signal } = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/reading/reset`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ schema_version: 1 }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地精读服务返回了无法解析的清空结果");
+  if (!response.ok) throw requestError(response, body, "无法清空这篇论文的研读进度");
   return mapJournalRun(body);
 }
 
@@ -1274,6 +1303,8 @@ export async function fetchJournalPaperDocument(runId, paperId, { signal } = {})
 const TRANSLATION_STATUSES = new Set([
   "not_started",
   "running",
+  "pausing",
+  "paused",
   "partial",
   "ready",
   "stale",
@@ -1300,8 +1331,14 @@ export function mapJournalPaperTranslation(body) {
     status: body.status,
     providerId: body.provider_id ?? null,
     modelId: body.model_id ?? null,
+    reasoningEffort: body.reasoning_effort ?? null,
+    promptId: body.prompt_id ?? null,
+    promptVersion: body.prompt_version ?? null,
     totalBlocks: Number.isSafeInteger(body.total_blocks) ? body.total_blocks : 0,
     translatedBlocks: Number.isSafeInteger(body.translated_blocks) ? body.translated_blocks : 0,
+    passthroughBlocks: Number.isSafeInteger(body.passthrough_blocks)
+      ? body.passthrough_blocks
+      : 0,
     blocks: Object.fromEntries(
       Object.entries(body.blocks).filter(([, zh]) => typeof zh === "string" && zh),
     ),
@@ -1323,8 +1360,6 @@ export async function fetchJournalPaperTranslation(runId, paperId, { signal } = 
 export async function startJournalPaperTranslation({
   runId,
   paperId,
-  providerId,
-  modelId,
   signal,
 } = {}) {
   const response = await fetch(
@@ -1334,13 +1369,30 @@ export async function startJournalPaperTranslation({
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         schema_version: 1,
-        provider_id: providerId,
-        model_id: modelId,
       }),
       signal,
     },
   );
   const body = await jsonResponse(response, "本地翻译服务返回了无法解析的内容");
   if (!response.ok) throw requestError(response, body, "无法启动全文翻译");
+  return mapJournalPaperTranslation(body);
+}
+
+export async function pauseJournalPaperTranslation({
+  runId,
+  paperId,
+  signal,
+} = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/translation/pause`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ schema_version: 1 }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地翻译服务返回了无法解析的内容");
+  if (!response.ok) throw requestError(response, body, "无法暂停全文翻译");
   return mapJournalPaperTranslation(body);
 }

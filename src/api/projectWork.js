@@ -1,4 +1,10 @@
 const PROJECT_WORK_API_ROOT = "/api/v1/project-work";
+export const MAX_PROJECT_WORK_IMAGE_BYTES = 5 * 1024 * 1024;
+export const PROJECT_WORK_IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
 
 function pick(value, snakeKey, camelKey, fallback = null) {
   if (!value || typeof value !== "object") return fallback;
@@ -21,6 +27,49 @@ function requiredId(value, label) {
 function createRequestId(prefix) {
   const uuid = globalThis.crypto?.randomUUID?.();
   return `${prefix}:${uuid ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunkSize = 32 * 1024;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return globalThis.btoa(binary);
+}
+
+export function validateProjectWorkImageFile(file) {
+  if (
+    !file
+    || typeof file.name !== "string"
+    || typeof file.type !== "string"
+    || !PROJECT_WORK_IMAGE_TYPES.has(file.type)
+    || !Number.isSafeInteger(file.size)
+    || file.size < 1
+  ) {
+    throw new TypeError("请选择 PNG、JPEG 或 WebP 图片");
+  }
+  if (file.size > MAX_PROJECT_WORK_IMAGE_BYTES) {
+    throw new TypeError("图片不能超过 5 MB");
+  }
+  return file;
+}
+
+export async function serializeProjectWorkImage(file) {
+  validateProjectWorkImageFile(file);
+  if (typeof file.arrayBuffer !== "function") {
+    throw new TypeError("当前环境无法读取所选图片");
+  }
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.length !== file.size) {
+    throw new TypeError("图片读取不完整，请重新选择");
+  }
+  return {
+    file_name: file.name,
+    mime_type: file.type,
+    byte_length: file.size,
+    data: bytesToBase64(bytes),
+  };
 }
 
 function mapApiError(response, body, fallback) {
@@ -67,6 +116,35 @@ async function requestJson(path, {
   return payload;
 }
 
+async function requestPdfContent(path, file, {
+  signal,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  if (typeof fetchImpl !== "function") {
+    throw new Error("当前环境不支持 fetch");
+  }
+  const response = await fetchImpl(path, {
+    method: "PUT",
+    signal,
+    headers: { "content-type": "application/pdf" },
+    body: file,
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    if (!response.ok) throw mapApiError(response, null, "PDF 上传失败");
+    const error = new Error("项目工作服务返回了无效 JSON");
+    error.name = "ProjectWorkApiError";
+    error.code = "PROJECT_WORK_RESPONSE_INVALID";
+    error.retryable = true;
+    error.status = response.status;
+    throw error;
+  }
+  if (!response.ok) throw mapApiError(response, payload, "PDF 上传失败");
+  return payload;
+}
+
 function mapProject(raw) {
   if (!raw || typeof raw !== "object") return null;
   const id = pick(raw, "project_id", "projectId", raw.id);
@@ -98,6 +176,17 @@ function mapModel(raw) {
     supportsThinking: Boolean(
       pick(raw, "supports_thinking", "supportsThinking", false),
     ),
+    supportsImages: Boolean(
+      pick(raw, "supports_images", "supportsImages", false),
+    ),
+    thinkingLevels: asArray(
+      pick(raw, "thinking_levels", "thinkingLevels", []),
+    ).filter((level) => typeof level === "string" && level),
+    defaultThinkingLevel: pick(
+      raw,
+      "default_thinking_level",
+      "defaultThinkingLevel",
+    ),
   };
 }
 
@@ -125,8 +214,19 @@ function mapMessage(raw) {
     role: raw.role === "user" ? "user" : "assistant",
     kind: pick(raw, "kind", "kind", "message"),
     content: raw.content ?? raw.text ?? "",
+    images: asArray(raw.images).map((image) => ({
+      id: pick(image, "image_id", "imageId", image?.id),
+      fileName: pick(image, "file_name", "fileName", "图片"),
+      mimeType: pick(image, "mime_type", "mimeType"),
+      byteLength: Number(pick(image, "byte_length", "byteLength", 0)) || 0,
+    })),
+    workflowId: pick(raw, "workflow_id", "workflowId"),
+    capabilities: asArray(raw.capabilities).filter(
+      (capability) => typeof capability === "string" && capability,
+    ),
     providerId: pick(raw, "provider_id", "providerId"),
     modelId: pick(raw, "model_id", "modelId"),
+    thinkingLevel: pick(raw, "thinking_level", "thinkingLevel"),
     createdAt: pick(raw, "created_at", "createdAt"),
     status: pick(raw, "status", "status", "completed"),
   };
@@ -171,6 +271,33 @@ function mapEvent(raw) {
     ),
     artifactId: pick(raw, "artifact_id", "artifactId", data.artifactId ?? null),
     path: pick(raw, "path", "path", data.path ?? null),
+    providerId: pick(
+      raw,
+      "provider_id",
+      "providerId",
+      pick(data, "provider_id", "providerId"),
+    ),
+    modelId: pick(
+      raw,
+      "model_id",
+      "modelId",
+      pick(data, "model_id", "modelId"),
+    ),
+    thinkingLevel: pick(
+      raw,
+      "thinking_level",
+      "thinkingLevel",
+      pick(data, "thinking_level", "thinkingLevel"),
+    ),
+    workflowId: pick(
+      raw,
+      "workflow_id",
+      "workflowId",
+      pick(data, "workflow_id", "workflowId"),
+    ),
+    capabilities: asArray(
+      pick(raw, "capabilities", "capabilities", data.capabilities),
+    ).filter((capability) => typeof capability === "string" && capability),
     createdAt: pick(raw, "created_at", "createdAt", pick(raw, "at", "at")),
   };
 }
@@ -399,6 +526,39 @@ function mapTreeEntries(entries, parentPath = "", inferredDepth = 0) {
   });
 }
 
+function mapProjectWorkDocument(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const id = pick(raw, "document_id", "documentId", raw.id);
+  const fileName = pick(raw, "file_name", "fileName");
+  if (typeof id !== "string" || !id || typeof fileName !== "string" || !fileName) {
+    return null;
+  }
+  const byteLength = Number(pick(raw, "byte_length", "byteLength", 0));
+  const rawBlockCount = pick(raw, "block_count", "blockCount");
+  const rawImageCount = pick(raw, "image_count", "imageCount");
+  const blockCount = rawBlockCount === null ? null : Number(rawBlockCount);
+  const imageCount = rawImageCount === null ? null : Number(rawImageCount);
+  return {
+    id,
+    fileName,
+    byteLength: Number.isSafeInteger(byteLength) && byteLength >= 0
+      ? byteLength
+      : 0,
+    status: pick(raw, "status", "status", "awaiting_upload"),
+    parser: pick(raw, "parser", "parser", "MinerU Cloud v4"),
+    parserState: pick(raw, "parser_state", "parserState"),
+    sha256: pick(raw, "sha256", "sha256"),
+    revision: pick(raw, "revision", "revision"),
+    title: pick(raw, "title", "title"),
+    blockCount: Number.isSafeInteger(blockCount) ? blockCount : null,
+    imageCount: Number.isSafeInteger(imageCount) ? imageCount : null,
+    error: pick(raw, "error", "error"),
+    createdAt: pick(raw, "created_at", "createdAt"),
+    updatedAt: pick(raw, "updated_at", "updatedAt"),
+    readyAt: pick(raw, "ready_at", "readyAt"),
+  };
+}
+
 export function mapProjectWorkConversation(raw) {
   const source = raw?.conversation && typeof raw.conversation === "object"
     ? raw.conversation
@@ -513,6 +673,7 @@ export function mapProjectWorkConversation(raw) {
     ),
     preview: pick(source, "preview", "preview"),
     compaction: mapCompaction(pick(source, "compaction", "compaction")),
+    documents: asArray(source.documents).map(mapProjectWorkDocument).filter(Boolean),
     error: pick(source, "last_error", "lastError"),
     hasMoreEvents: Boolean(raw?.hasMoreEvents ?? raw?.has_more_events ?? source.hasMoreEvents),
     createdAt: pick(source, "created_at", "createdAt"),
@@ -531,6 +692,12 @@ export async function fetchProjectWorkModels({ signal, fetchImpl } = {}) {
     providers: asArray(payload?.providers).map(mapProvider).filter(Boolean),
     defaultProviderId: pick(payload, "default_provider_id", "defaultProviderId"),
     defaultModelId: pick(payload, "default_model_id", "defaultModelId"),
+    defaultThinkingLevel: pick(
+      payload,
+      "default_thinking_level",
+      "defaultThinkingLevel",
+    ),
+    capabilities: pick(payload, "capabilities", "capabilities", {}),
   };
 }
 
@@ -577,6 +744,7 @@ export async function createProjectWorkConversation({
   projectId,
   providerId,
   modelId,
+  thinkingLevel,
   signal,
   fetchImpl,
 } = {}) {
@@ -589,6 +757,7 @@ export async function createProjectWorkConversation({
         schema_version: 1,
         ...(providerId ? { provider_id: providerId } : {}),
         ...(modelId ? { model_id: modelId } : {}),
+        ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
       },
       signal,
       fetchImpl,
@@ -600,6 +769,7 @@ export async function createProjectWorkConversation({
 export async function createStandaloneProjectWorkConversation({
   providerId,
   modelId,
+  thinkingLevel,
   signal,
   fetchImpl,
 } = {}) {
@@ -609,6 +779,7 @@ export async function createStandaloneProjectWorkConversation({
       schema_version: 1,
       ...(providerId ? { provider_id: providerId } : {}),
       ...(modelId ? { model_id: modelId } : {}),
+      ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
     },
     signal,
     fetchImpl,
@@ -756,22 +927,36 @@ export async function sendProjectWorkMessage({
   conversationId,
   text,
   contexts = [],
+  images = [],
+  capabilities = [],
+  workflowId,
   providerId,
   modelId,
+  thinkingLevel,
   clientRequestId = createRequestId("project-message"),
   signal,
   fetchImpl,
 } = {}) {
   requiredId(conversationId, "conversationId");
+  const requestId = requiredId(clientRequestId, "clientRequestId").trim();
   if (typeof text !== "string" || !text.trim()) throw new TypeError("text 必须是非空字符串");
+  if (!Array.isArray(images) || images.length > 1) {
+    throw new TypeError("每条消息最多添加一张图片");
+  }
+  const serializedImages = await Promise.all(images.map(serializeProjectWorkImage));
   const payload = await requestJson(
     `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/messages`,
     {
       method: "POST",
       body: {
         schema_version: 1,
-        client_request_id: clientRequestId,
+        client_request_id: requestId,
         text: text.trim(),
+        images: serializedImages,
+        capabilities: asArray(capabilities).filter(
+          (capability) => typeof capability === "string" && capability,
+        ),
+        ...(workflowId ? { workflow_id: workflowId } : {}),
         contexts: asArray(contexts).map((context) => ({
           context_id: context.id,
           path: context.path,
@@ -781,6 +966,125 @@ export async function sendProjectWorkMessage({
         })),
         ...(providerId ? { provider_id: providerId } : {}),
         ...(modelId ? { model_id: modelId } : {}),
+        ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
+}
+
+export async function uploadProjectWorkPdf({
+  conversationId,
+  file,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  if (
+    !file
+    || typeof file.name !== "string"
+    || !file.name.toLowerCase().endsWith(".pdf")
+    || !Number.isSafeInteger(file.size)
+    || file.size < 5
+  ) {
+    throw new TypeError("请选择有效的 PDF 文件");
+  }
+  const created = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/documents`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        file_name: file.name,
+        byte_length: file.size,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  const document = mapProjectWorkDocument(created?.document);
+  if (!document) {
+    throw new Error("项目工作服务没有返回有效的 PDF 资料记录");
+  }
+  try {
+    const payload = await requestPdfContent(
+      `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/documents/${encodeURIComponent(document.id)}/content`,
+      file,
+      { signal, fetchImpl },
+    );
+    return mapProjectWorkConversation(payload);
+  } catch (error) {
+    await removeProjectWorkPdf({
+      conversationId,
+      documentId: document.id,
+      fetchImpl,
+    }).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function retryProjectWorkPdf({
+  conversationId,
+  documentId,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(documentId, "documentId");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/documents/${encodeURIComponent(documentId)}/retry`,
+    {
+      method: "POST",
+      body: { schema_version: 1 },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
+}
+
+export async function removeProjectWorkPdf({
+  conversationId,
+  documentId,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(documentId, "documentId");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/documents/${encodeURIComponent(documentId)}`,
+    {
+      method: "DELETE",
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
+}
+
+export async function configureProjectWorkConversation({
+  conversationId,
+  providerId,
+  modelId,
+  thinkingLevel,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  if (typeof thinkingLevel !== "string" || !thinkingLevel.trim()) {
+    throw new TypeError("thinkingLevel 必须是非空字符串");
+  }
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/configuration`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        ...(providerId ? { provider_id: providerId } : {}),
+        ...(modelId ? { model_id: modelId } : {}),
+        thinking_level: thinkingLevel.trim(),
       },
       signal,
       fetchImpl,
@@ -1010,12 +1314,16 @@ export const projectWorkApi = {
   listConversations: listProjectWorkConversations,
   listStandaloneConversations: listStandaloneProjectWorkConversations,
   fetchConversation: fetchProjectWorkConversation,
+  configureConversation: configureProjectWorkConversation,
   sendMessage: sendProjectWorkMessage,
   steerConversation: steerProjectWorkConversation,
   abortConversation: abortProjectWorkConversation,
   compactConversation: compactProjectWorkConversation,
   fetchTree: fetchProjectWorkTree,
   fetchFile: fetchProjectWorkFile,
+  uploadPdf: uploadProjectWorkPdf,
+  retryPdf: retryProjectWorkPdf,
+  removePdf: removeProjectWorkPdf,
   applyChangeSet: applyProjectWorkChangeSet,
   runVerification: runProjectWorkVerification,
 };

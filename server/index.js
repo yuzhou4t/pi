@@ -269,6 +269,8 @@ function publicReadingState(readings) {
             }))
           : [],
         chat: {
+          id: paper?.chat?.id ?? "current",
+          title: paper?.chat?.title ?? null,
           status: paper?.chat?.status ?? "idle",
           turns: Array.isArray(paper?.chat?.turns)
             ? paper.chat.turns.map((turn) => ({
@@ -307,6 +309,29 @@ function publicReadingState(readings) {
             : [],
           updated_at: paper?.chat?.updated_at ?? null,
         },
+        active_conversation_id: paper?.chat?.id ?? "current",
+        conversations: [
+          {
+            id: paper?.chat?.id ?? "current",
+            title: paper?.chat?.title ?? null,
+            turn_count: Array.isArray(paper?.chat?.turns) ? paper.chat.turns.length : 0,
+            updated_at: paper?.chat?.updated_at ?? null,
+            active: true,
+          },
+          ...(Array.isArray(paper?.archived_conversations)
+            ? paper.archived_conversations.map((conversation) => ({
+                id: conversation?.id ?? null,
+                title: conversation?.title ?? null,
+                turn_count: Array.isArray(conversation?.turns)
+                  ? conversation.turns.length
+                  : 0,
+                updated_at: conversation?.updated_at
+                  ?? conversation?.created_at
+                  ?? null,
+                active: false,
+              }))
+            : []),
+        ],
         agent_actions: {
           status: paper?.agent_actions?.status ?? "idle",
           proposals: Array.isArray(paper?.agent_actions?.proposals)
@@ -625,10 +650,10 @@ function requireJsonRequest(request) {
   }
 }
 
-async function readProjectWorkJson(request) {
+async function readProjectWorkJson(request, options) {
   requireJsonRequest(request);
   try {
-    return await readJson(request);
+    return await readJson(request, options);
   } catch (error) {
     if (error instanceof CandidateSummaryError) {
       throw projectWorkError(error.code, error.message, error.status, error.retryable);
@@ -673,7 +698,7 @@ function publicProjectWorkConversationSummary(value) {
     status: conversation?.status ?? "idle",
     providerId: conversation?.providerId ?? null,
     modelId: conversation?.modelId ?? null,
-    thinkingLevel: conversation?.thinkingLevel ?? "medium",
+    thinkingLevel: conversation?.thinkingLevel ?? null,
     pendingChangeFileCount: conversation?.pendingChangeFileCount ?? 0,
     lastEventSeq: conversation?.lastEventSeq ?? 0,
     createdAt: conversation?.createdAt ?? null,
@@ -730,13 +755,22 @@ async function sendPdf(request, response, pdf, origin) {
   }
 }
 
-async function readJson(request) {
+async function readJson(request, {
+  maxBytes = 256 * 1024,
+} = {}) {
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 256 * 1024) {
-      throw new CandidateSummaryError("REQUEST_TOO_LARGE", "请求正文不能超过 256 KB", 413);
+    if (size > maxBytes) {
+      const limitLabel = maxBytes === 256 * 1024
+        ? "256 KB"
+        : `${Math.floor(maxBytes / (1024 * 1024))} MiB`;
+      throw new CandidateSummaryError(
+        "REQUEST_TOO_LARGE",
+        `请求正文不能超过 ${limitLabel}`,
+        413,
+      );
     }
     chunks.push(chunk);
   }
@@ -1023,6 +1057,85 @@ export function createApiServer({
         return;
       }
 
+      const conversationDocumentsMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/documents$/,
+      );
+      if (conversationDocumentsMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          conversationDocumentsMatch[1],
+        );
+        const payload = await readProjectWorkJson(request);
+        const result = await projectWorkService.createConversationDocument(
+          conversationId,
+          {
+            fileName: payload.file_name,
+            byteLength: payload.byte_length,
+          },
+        );
+        sendJson(response, 201, {
+          schemaVersion: 1,
+          document: result.document,
+          snapshot: result.snapshot,
+        }, origin);
+        return;
+      }
+
+      const conversationDocumentMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/documents\/([^/]+)$/,
+      );
+      if (conversationDocumentMatch && request.method === "DELETE") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          conversationDocumentMatch[1],
+        );
+        const documentId = decodeProjectWorkSegment(
+          conversationDocumentMatch[2],
+        );
+        const result = await projectWorkService.removeConversationDocument(
+          conversationId,
+          documentId,
+        );
+        sendJson(response, 200, result, origin);
+        return;
+      }
+
+      const conversationDocumentActionMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/documents\/([^/]+)\/(content|retry)$/,
+      );
+      if (conversationDocumentActionMatch) {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          conversationDocumentActionMatch[1],
+        );
+        const documentId = decodeProjectWorkSegment(
+          conversationDocumentActionMatch[2],
+        );
+        const action = conversationDocumentActionMatch[3];
+        if (action === "content" && request.method === "PUT") {
+          const result = await projectWorkService.uploadConversationDocument(
+            conversationId,
+            documentId,
+            request,
+            {
+              contentType: request.headers["content-type"],
+              declaredLength: request.headers["content-length"],
+            },
+          );
+          sendJson(response, 202, result, origin);
+          return;
+        }
+        if (action === "retry" && request.method === "POST") {
+          await readProjectWorkJson(request);
+          const result = await projectWorkService.retryConversationDocument(
+            conversationId,
+            documentId,
+          );
+          sendJson(response, 202, result, origin);
+          return;
+        }
+      }
+
       const conversationMatch = url.pathname.match(
         /^\/api\/v1\/project-work\/conversations\/([^/]+)$/,
       );
@@ -1066,13 +1179,18 @@ export function createApiServer({
       }
 
       const conversationActionMatch = url.pathname.match(
-        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/(messages|steer|abort|compact)$/,
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/(messages|steer|abort|compact|configuration)$/,
       );
       if (conversationActionMatch && request.method === "POST") {
         requireProjectWorkMutationOrigin(origin);
         const conversationId = decodeProjectWorkSegment(conversationActionMatch[1]);
         const action = conversationActionMatch[2];
-        const payload = await readProjectWorkJson(request);
+        const payload = await readProjectWorkJson(
+          request,
+          action === "messages"
+            ? { maxBytes: 8 * 1024 * 1024 }
+            : undefined,
+        );
         let result;
         if (action === "messages") {
           result = await projectWorkService.sendMessage(conversationId, {
@@ -1087,6 +1205,11 @@ export function createApiServer({
               : [],
             providerId: payload.provider_id,
             modelId: payload.model_id,
+            thinkingLevel: payload.thinking_level,
+            workflowId: payload.workflow_id,
+            capabilities: payload.capabilities,
+            images: payload.images,
+            clientRequestId: payload.client_request_id,
           });
         } else if (action === "steer") {
           result = await projectWorkService.steerConversation(conversationId, {
@@ -1094,12 +1217,23 @@ export function createApiServer({
           });
         } else if (action === "abort") {
           result = await projectWorkService.abortConversation(conversationId);
+        } else if (action === "configuration") {
+          result = await projectWorkService.configureConversation(conversationId, {
+            providerId: payload.provider_id,
+            modelId: payload.model_id,
+            thinkingLevel: payload.thinking_level,
+          });
         } else {
           result = await projectWorkService.compactConversation(conversationId, {
             instructions: payload.instructions,
           });
         }
-        sendJson(response, action === "messages" || action === "steer" ? 202 : 200, result, origin);
+        sendJson(
+          response,
+          action === "messages" || action === "steer" ? 202 : 200,
+          result,
+          origin,
+        );
         return;
       }
 
@@ -1335,6 +1469,33 @@ export function createApiServer({
       );
     } catch (error) {
       sendWorkflowError(response, error, origin, "无法从五分钟导读重新开始");
+    }
+    return;
+  }
+
+  const journalReadingResetMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/papers\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,119})\/reading\/reset$/,
+  );
+  if (request.method === "POST" && journalReadingResetMatch) {
+    try {
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (body?.schema_version !== 1) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "清空研读进度请求无效", 400);
+      }
+      sendJson(
+        response,
+        200,
+        publicRun(await journalWorkflowService.resetPaperReading(
+          journalReadingResetMatch[1],
+          journalReadingResetMatch[2],
+        )),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法清空这篇论文的研读进度");
     }
     return;
   }
@@ -1956,6 +2117,32 @@ export function createApiServer({
     }
     return;
   }
+  const journalTranslationPauseMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/papers\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,119})\/translation\/pause$/,
+  );
+  if (request.method === "POST" && journalTranslationPauseMatch) {
+    try {
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (body?.schema_version !== 1) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "暂停全文翻译请求版本无效", 400);
+      }
+      sendJson(
+        response,
+        200,
+        await journalWorkflowService.pausePaperTranslation(
+          journalTranslationPauseMatch[1],
+          journalTranslationPauseMatch[2],
+        ),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法暂停全文翻译");
+    }
+    return;
+  }
   if (request.method === "POST" && journalTranslationMatch) {
     try {
       if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
@@ -1971,10 +2158,6 @@ export function createApiServer({
         await journalWorkflowService.generatePaperTranslation(
           journalTranslationMatch[1],
           journalTranslationMatch[2],
-          {
-            providerId: body.provider_id,
-            modelId: body.model_id,
-          },
         ),
         origin,
       );

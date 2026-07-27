@@ -5,8 +5,16 @@ import path from "node:path";
 
 export const CODEX_PROVIDER_ID = "codex-subscription";
 export const CODEX_ACCOUNT_MODEL_ID = "account-default";
+export const CODEX_SPARK_MODEL_ID = "gpt-5.3-codex-spark";
+
+const CODEX_MODEL_IDS = new Set([
+  CODEX_ACCOUNT_MODEL_ID,
+  CODEX_SPARK_MODEL_ID,
+]);
+const CODEX_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
 
 const CHATGPT_LOGIN_STATUS = "Logged in using ChatGPT";
+const CODEX_PATH_ALIAS_WARNING = "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)";
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_STDOUT_BYTES = 1024 * 1024;
 const MAX_STDERR_BYTES = 256 * 1024;
@@ -171,6 +179,14 @@ function unavailable(reasonCode) {
   return { available: false, status: "unavailable", reasonCode };
 }
 
+function stripKnownStatusWarnings(stderr) {
+  return stderr
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== CODEX_PATH_ALIAS_WARNING)
+    .join("\n")
+    .trim();
+}
+
 export async function probeCodexSubscription({
   env = process.env,
   spawnImpl = spawn,
@@ -184,7 +200,7 @@ export async function probeCodexSubscription({
       timeoutMs,
     });
     const stdoutStatus = stdout.trim();
-    const stderrStatus = stderr.trim();
+    const stderrStatus = stripKnownStatusWarnings(stderr);
     const exactChatGptStatus = (stdoutStatus === CHATGPT_LOGIN_STATUS && stderrStatus === "")
       || (stderrStatus === CHATGPT_LOGIN_STATUS && stdoutStatus === "");
     if (!exactChatGptStatus) {
@@ -281,6 +297,8 @@ function parseExecution(stdout) {
 export async function runCodexSubscription({
   prompt,
   schema,
+  modelId = CODEX_ACCOUNT_MODEL_ID,
+  reasoningEffort = null,
   env = process.env,
   spawnImpl = spawn,
   timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -290,6 +308,12 @@ export async function runCodexSubscription({
   }
   if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
     throw commandError("CODEX_INVALID_REQUEST", "schema 必须是 JSON Schema 对象", false);
+  }
+  if (!CODEX_MODEL_IDS.has(modelId)) {
+    throw commandError("CODEX_INVALID_REQUEST", "Codex 模型不在允许列表中", false);
+  }
+  if (reasoningEffort !== null && !CODEX_REASONING_EFFORTS.has(reasoningEffort)) {
+    throw commandError("CODEX_INVALID_REQUEST", "Codex 思考强度无效", false);
   }
 
   let serializedSchema;
@@ -333,6 +357,8 @@ export async function runCodexSubscription({
     const { stdout } = await runProcess({
       args: [
         "-a", "never",
+        ...(modelId === CODEX_ACCOUNT_MODEL_ID ? [] : ["-m", modelId]),
+        ...(reasoningEffort ? ["-c", `model_reasoning_effort="${reasoningEffort}"`] : []),
         "exec",
         "--ephemeral",
         "--sandbox", "read-only",

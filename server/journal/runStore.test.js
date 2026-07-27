@@ -15,6 +15,7 @@ test("run store creates, updates, lists, and restores a run", async () => {
 
   const created = await store.createRun({ sourceIds: ["jmlr", "acl"] });
   assert.equal(created.run_id, "journal-2026-07-23T08-00-00-000Z-12345678");
+  assert.equal(created.project_id, "pi-agent-product");
   assert.equal(created.status, "scanning");
   assert.deepEqual(created.guides, {
     status: "not_started",
@@ -44,6 +45,22 @@ test("run store creates, updates, lists, and restores a run", async () => {
 
   const events = await readFile(path.join(dataDir, "runs", created.run_id, "events.jsonl"), "utf8");
   assert.match(events, /run_created/);
+});
+
+test("run store keeps an explicit project owner on new runs", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-run-project-"));
+  const store = createRunStore({
+    dataDir,
+    now: () => new Date("2026-07-23T08:00:00.000Z"),
+    idFactory: () => "12345678-aaaa-bbbb-cccc-dddddddddddd",
+  });
+
+  const created = await store.createRun({ projectId: "research-project" });
+  assert.equal(created.project_id, "research-project");
+  await assert.rejects(
+    store.createRun({ projectId: "../outside" }),
+    /unsupported characters/,
+  );
 });
 
 test("concurrent run updates are serialized and preserve unrelated fields", async () => {

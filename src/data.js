@@ -1,3 +1,5 @@
+import { PROJECT_WORK_WORKFLOWS } from "../shared/projectWorkCapabilities.js";
+
 export const providers = [
   {
     id: "codex-subscription",
@@ -23,9 +25,16 @@ export function getModelDisplayName(modelId) {
   return modelId === "account-default" ? "账户默认模型" : modelId;
 }
 
-// 先保留 Skill 中心的结构，不预设任何能力。
-// 等主用途和高频动作确定后，再从真实需求中添加第一个 Skill。
-export const skillCatalog = [];
+export const skillCatalog = PROJECT_WORK_WORKFLOWS.map((workflow) => ({
+  id: workflow.id,
+  name: workflow.label,
+  description: workflow.description,
+  category: "代码工作",
+  source: "Pi Agent 内置",
+  kind: "workflow",
+  defaultInstalled: true,
+  defaultEnabled: true,
+}));
 
 export const projects = [
   {

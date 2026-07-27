@@ -9,6 +9,7 @@ import {
 } from "@phosphor-icons/react";
 import { BindProjectDialog } from "./components/BindProjectDialog.jsx";
 import { DeleteConversationDialog } from "./components/DeleteConversationDialog.jsx";
+import { ResetPaperReadingDialog } from "./components/ResetPaperReadingDialog.jsx";
 import { ProjectRail } from "./components/ProjectRail.jsx";
 import { RenameConversationDialog } from "./components/RenameConversationDialog.jsx";
 import { LiveProjectWorkbench } from "./components/LiveProjectWorkbench.jsx";
@@ -47,6 +48,7 @@ import {
   fetchZoteroProposal,
   fetchZoteroTargets,
   restartJournalReadingFromGuide,
+  resetJournalPaperReading,
   resumeJournalRun,
   saveJournalPaperDecisions,
   selectZoteroCommitOperations,
@@ -57,6 +59,7 @@ import { getModelDisplayName, providers, skillCatalog } from "./data.js";
 import { usePersistentReducer } from "./hooks/usePersistentReducer.js";
 import { usePersistentState } from "./hooks/usePersistentState.js";
 import { workflowFixture } from "./workflow/fixtures.js";
+import { buildPaperReadingLibrary } from "./workflow/paperLibrary.js";
 import {
   createInitialRunState,
   isPersistedRunStateValid,
@@ -472,6 +475,7 @@ export function App() {
   const [bindProjectOpen, setBindProjectOpen] = useState(false);
   const [conversationToDelete, setConversationToDelete] = useState(null);
   const [conversationToRename, setConversationToRename] = useState(null);
+  const [paperToReset, setPaperToReset] = useState(null);
   const [deletingConversationId, setDeletingConversationId] = useState(null);
   const [activeConversationId, setActiveConversationId] = usePersistentState(
     "pi-agent-active-conversation-v1",
@@ -508,6 +512,7 @@ export function App() {
   const [candidateSummaryState, setCandidateSummaryState] = useState(createIdleSummaryState);
   const candidateRequestController = useRef(null);
   const [journalRunState, setJournalRunState] = useState(createRestoringJournalRunState);
+  const [journalRunHistory, setJournalRunHistory] = useState([]);
   const journalStartController = useRef(null);
   const journalRestoreController = useRef(null);
   const journalGuideController = useRef(null);
@@ -517,6 +522,7 @@ export function App() {
   const zoteroActionController = useRef(null);
   const projectContextController = useRef(null);
   const [guideState, setGuideState] = useState(createIdleGuideState);
+  const [readerGuideCache, setReaderGuideCache] = useState({});
   const [zoteroUiState, setZoteroUiState] = useState(createIdleZoteroUiState);
   const [obsidianUiState, setObsidianUiState] = useState(createIdleObsidianUiState);
   const [projectStateUiState, setProjectStateUiState] = useState(
@@ -552,19 +558,27 @@ export function App() {
       ...registeredProjectItems,
     ];
   }, [registeredProjectItems]);
+  const paperLibrary = useMemo(
+    () => buildPaperReadingLibrary(journalRunHistory, {
+      projectId: workflowFixture.project.id,
+    }),
+    [journalRunHistory],
+  );
   const paperProjectItems = useMemo(() => allProjects
     .filter((item) => item.workspaceKinds.includes("paper_reading"))
     .map((item) => {
-    const baseConversationCount = item.id === workflowFixture.project.id ? 1 : 0;
+    const baseConversationCount = item.id === workflowFixture.project.id
+      ? paperLibrary.length
+      : 0;
     const trackingCopy = item.id === workflowFixture.project.id
       ? " · 1 个追踪"
       : "";
     return {
       ...item,
-      state: `${baseConversationCount} 个会话${trackingCopy}`,
+      state: `${baseConversationCount} 篇论文${trackingCopy}`,
       removable: !item.seeded,
     };
-  }), [allProjects]);
+  }), [allProjects, paperLibrary.length]);
   const liveProjectItems = useMemo(() => liveProjectWork.projects.map((item) => ({
     ...item,
     workspaceKinds: ["project_work"],
@@ -642,7 +656,9 @@ export function App() {
     .find((provider) => provider.id === selectedProjectWorkProvider?.id)
     ?.models.find((model) => model.id === selectedProjectWorkModel);
   const installedSkillCount = useMemo(
-    () => skillCatalog.filter((skill) => skillState[skill.id]?.installed).length,
+    () => skillCatalog.filter((skill) => (
+      skill.kind === "workflow" || skillState[skill.id]?.installed
+    )).length,
     [skillState],
   );
   const activeRun = useMemo(() => ({
@@ -668,22 +684,57 @@ export function App() {
   const selectedReaderPapers = workflowPapers.filter(
     (paper) => (run.selectedPaperIds ?? []).includes(paper.id),
   );
+  const readerRun = readerTarget
+    ? (
+        journalRunState.run?.id === readerTarget.runId
+          ? journalRunState.run
+          : journalRunHistory.find((candidateRun) => candidateRun.id === readerTarget.runId)
+      ) ?? null
+    : null;
   const readerPaper = readerTarget
-    ? workflowPapers.find(
+    ? readerRun?.candidates?.find(
         (paper) => paper.id === readerTarget.paperId
           && paper.isDemo === false
           && paper.mineruStatus === "ready",
       ) ?? null
     : null;
-  const paperConversationId = readerPaper ? `paper:${readerPaper.id}` : "paper-reading-entry";
+  const paperConversationId = readerTarget
+    ? `paper:${readerTarget.paperId}`
+    : "paper-reading-entry";
   const activeProjectWorkState = liveProjectWork.conversation;
   const projectWorkMode = workspaceKind === "project_work";
   const readingMode = Boolean(readerPaper) && activeConversationId === paperConversationId;
   const workflowMode = !projectWorkMode && !readingMode;
-  const readerGuide = readerPaper ? (guideState.byPaperId?.[readerPaper.id] ?? null) : null;
-  const readerPeerPapers = readerTarget?.purpose === "close-reading"
-    ? selectedReaderPapers.filter((paper) => run.guideChoices?.[paper.id] === "read")
-    : selectedReaderPapers;
+  const readerGuideArtifactState = readerTarget
+    ? readerRun?.guides?.papers?.[readerTarget.paperId] ?? null
+    : null;
+  const readerGuideCacheKey = readerTarget && readerGuideArtifactState?.status === "ready"
+    ? [
+        readerTarget.runId,
+        readerTarget.paperId,
+        readerGuideArtifactState.documentRevision,
+        readerGuideArtifactState.promptVersion,
+        readerGuideArtifactState.inputHash,
+      ].join(":")
+    : null;
+  const readerGuide = (
+    readerGuideCacheKey
+      ? readerGuideCache[readerGuideCacheKey]?.guide
+      : null
+  ) ?? (
+    readerPaper && guideState.runId === readerTarget?.runId
+      ? (guideState.byPaperId?.[readerPaper.id] ?? null)
+      : null
+  );
+  const readerPeerPapers = readerTarget?.runId === journalRunState.run?.id
+    ? (
+        readerTarget?.purpose === "close-reading"
+          ? selectedReaderPapers.filter((paper) => run.guideChoices?.[paper.id] === "read")
+          : selectedReaderPapers
+      )
+    : (readerRun?.candidates ?? []).filter(
+        (paper) => readerRun?.paperDecisions?.[paper.id] === "read",
+      );
   const liveZoteroDecisionsReady = run.source === "live"
     && [
       RUN_STATUS.DRAFT_READY,
@@ -692,18 +743,22 @@ export function App() {
     ].includes(run.status)
     && run.preparedGuideIds.length > 0
     && run.preparedGuideIds.every((paperId) => ["collect", "read"].includes(run.guideChoices[paperId]));
-  const paperConversations = useMemo(() => [
-    {
-      id: paperConversationId,
-      projectId: workflowFixture.project.id,
-      kind: "paper_reading",
-      title: readerPaper ? `精读 · ${readerPaper.shortTitle ?? readerPaper.title}` : "选择论文开始精读",
-      subtitle: readerPaper ? "论文精读 · 位置与对话已保存" : "从本周追踪创建精读会话",
-    },
-  ], [
-    paperConversationId,
-    readerPaper,
-  ]);
+  const paperConversations = useMemo(() => paperLibrary.map((entry) => ({
+    id: entry.id,
+    projectId: entry.projectId,
+    kind: "paper_reading",
+    title: entry.paper.shortTitle ?? entry.paper.title,
+    subtitle: [
+      entry.statusLabel,
+      entry.position?.blockId ? "位置已保存" : null,
+      entry.sourceRuns.length > 1 ? `${entry.sourceRuns.length} 次周度记录` : null,
+    ].filter(Boolean).join(" · "),
+    runId: entry.runId,
+    paperId: entry.paperId,
+    blockId: entry.position?.blockId ?? null,
+    activeReadingConversationId: entry.activeConversationId,
+    resetBlocked: entry.archived,
+  })), [paperLibrary]);
   const liveProjectWorkConversations = useMemo(
     () => liveProjectWork.conversations.map((conversation) => ({
       id: conversation.id,
@@ -732,6 +787,43 @@ export function App() {
     () => conversations.filter((conversation) => conversation.kind === workspaceKind),
     [conversations, workspaceKind],
   );
+
+  useEffect(() => {
+    if (
+      !readerGuideCacheKey
+      || !readerTarget?.runId
+      || !readerTarget?.paperId
+      || readerGuideCache[readerGuideCacheKey]?.guide
+    ) {
+      return undefined;
+    }
+    const controller = new AbortController();
+    fetchJournalPaperGuide(readerTarget.runId, readerTarget.paperId, {
+      signal: controller.signal,
+    }).then((guide) => {
+      setReaderGuideCache((current) => ({
+        ...current,
+        [readerGuideCacheKey]: {
+          guide,
+          error: null,
+        },
+      }));
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      setReaderGuideCache((current) => ({
+        ...current,
+        [readerGuideCacheKey]: {
+          guide: current[readerGuideCacheKey]?.guide ?? null,
+          error: error.message,
+        },
+      }));
+    });
+    return () => controller.abort();
+  }, [
+    readerGuideCacheKey,
+    readerTarget?.paperId,
+    readerTarget?.runId,
+  ]);
 
   const syncProjectWorkModel = useCallback((conversation) => {
     if (!conversation?.providerId || !conversation?.modelId) return;
@@ -1014,12 +1106,6 @@ export function App() {
     workspaceKind,
   ]);
 
-  useEffect(() => {
-    if (!String(activeConversationId).startsWith("paper:") || readerPaper) return;
-    setActiveConversationId("workflow-run");
-    setMobileView("run");
-  }, [activeConversationId, readerPaper, setActiveConversationId]);
-
   const showToast = useCallback((message, tone = "success") => {
     window.clearTimeout(toastTimer.current);
     setToast({ message, tone });
@@ -1057,6 +1143,14 @@ export function App() {
   }, []);
 
   const syncJournalRun = useCallback((nextRun) => {
+    setJournalRunHistory((current) => [
+      nextRun,
+      ...current.filter((runItem) => runItem.id !== nextRun.id),
+    ].sort((left, right) => (
+      String(right.createdAt ?? right.updatedAt ?? "").localeCompare(
+        String(left.createdAt ?? left.updatedAt ?? ""),
+      )
+    )));
     setJournalRunState(journalRunStateFromRun(nextRun));
     dispatch(liveRunBinding(nextRun));
     setObsidianUiState((current) => (
@@ -1090,6 +1184,7 @@ export function App() {
     }));
     try {
       const runs = await fetchJournalRuns({ signal: controller.signal });
+      setJournalRunHistory(runs);
       if (runs.length > 0) {
         syncJournalRun(runs[0]);
       } else {
@@ -1578,18 +1673,129 @@ export function App() {
     void resumeCurrentJournalRun();
   }, [journalRunState.run?.status, resumeCurrentJournalRun]);
 
-  const openJournalPaper = useCallback((paperId, blockId = null, purpose = "document") => {
-    const liveRun = journalRunState.run;
-    const paper = liveRun?.candidates?.find((candidate) => candidate.id === paperId);
-    if (!liveRun?.id || paper?.mineruStatus !== "ready") return;
+  const openJournalPaperFromRun = useCallback((
+    targetRun,
+    paperId,
+    blockId = null,
+    purpose = "document",
+    activeReadingConversationId = null,
+  ) => {
+    const paper = targetRun?.candidates?.find((candidate) => candidate.id === paperId);
+    if (!targetRun?.id || paper?.mineruStatus !== "ready") return;
     setReaderContext(null);
     setReaderSelectionState({ reference: null, error: null });
     setContextRailView(purpose === "close-reading" ? "agent" : "evidence");
     if (purpose === "close-reading") setContextRailOpen(true);
-    setReaderTarget({ runId: liveRun.id, paperId, blockId, purpose });
+    setReaderTarget({
+      runId: targetRun.id,
+      paperId,
+      blockId,
+      purpose,
+      activeReadingConversationId,
+    });
     setActiveConversationId(`paper:${paperId}`);
     setMobileView("run");
-  }, [journalRunState.run, setActiveConversationId]);
+  }, [setActiveConversationId]);
+
+  const openJournalPaper = useCallback((paperId, blockId = null, purpose = "document") => {
+    openJournalPaperFromRun(journalRunState.run, paperId, blockId, purpose);
+  }, [journalRunState.run, openJournalPaperFromRun]);
+
+  const openPaperLibraryConversation = useCallback((conversation) => {
+    const targetRun = journalRunHistory.find((runItem) => runItem.id === conversation?.runId);
+    if (!targetRun || !conversation?.paperId) {
+      showToast("这篇论文的历史研读暂时无法恢复", "warning");
+      return;
+    }
+    openJournalPaperFromRun(
+      targetRun,
+      conversation.paperId,
+      conversation.blockId,
+      "close-reading",
+      conversation.activeReadingConversationId,
+    );
+  }, [journalRunHistory, openJournalPaperFromRun, showToast]);
+
+  // Deleting one paper's reading record is a durable server-side action: it
+  // clears the conversation and progress, withdraws the read decision, and
+  // returns the paper to the weekly candidate list. Archived papers stay
+  // read-only. The library entry disappears because it is decision-driven.
+  const confirmResetPaperReading = useCallback(async (conversation) => {
+    const refreshed = await resetJournalPaperReading({
+      runId: conversation.runId,
+      paperId: conversation.paperId,
+    });
+    if (refreshed.id === journalRunState.run?.id) {
+      syncJournalRun(refreshed);
+    } else {
+      setJournalRunHistory((current) => [
+        refreshed,
+        ...current.filter((runItem) => runItem.id !== refreshed.id),
+      ]);
+    }
+    // Drop the client-side ten-round walk progress for this paper so a later
+    // fresh reading does not resurrect stale progress.
+    try {
+      const rawProgress = window.localStorage.getItem("pi-reading-round-progress");
+      if (rawProgress) {
+        const progress = JSON.parse(rawProgress);
+        const prefix = `${conversation.runId}:${conversation.paperId}:`;
+        const kept = Object.fromEntries(
+          Object.entries(progress).filter(([key]) => !key.startsWith(prefix)),
+        );
+        window.localStorage.setItem("pi-reading-round-progress", JSON.stringify(kept));
+      }
+    } catch {
+      // Local reading aids are best-effort; the durable reset already happened.
+    }
+    if (
+      (readerTarget?.runId === conversation.runId
+        && readerTarget?.paperId === conversation.paperId)
+      || activeConversationId === conversation.id
+    ) {
+      setReaderTarget(null);
+      setReaderContext(null);
+      setActiveConversationId("workflow-run");
+      setMobileView("run");
+    }
+    showToast("已删除研读记录，论文已回到本周候选");
+  }, [
+    activeConversationId,
+    journalRunState.run?.id,
+    readerTarget?.paperId,
+    readerTarget?.runId,
+    setActiveConversationId,
+    showToast,
+    syncJournalRun,
+  ]);
+
+  useEffect(() => {
+    if (
+      workspaceKind !== "paper_reading"
+      || readerTarget
+      || journalRunState.status === "restoring"
+      || !String(activeConversationId).startsWith("paper:")
+    ) {
+      return;
+    }
+    const savedConversation = paperConversations.find(
+      (conversation) => conversation.id === activeConversationId,
+    );
+    if (savedConversation) {
+      openPaperLibraryConversation(savedConversation);
+      return;
+    }
+    setActiveConversationId("workflow-run");
+    setMobileView("run");
+  }, [
+    activeConversationId,
+    journalRunState.status,
+    openPaperLibraryConversation,
+    paperConversations,
+    readerTarget,
+    setActiveConversationId,
+    workspaceKind,
+  ]);
 
   const closeJournalPaper = useCallback(() => {
     setReaderTarget(null);
@@ -1702,11 +1908,19 @@ export function App() {
     syncJournalRun,
   ]);
 
-  const refreshReadingRun = useCallback(async () => {
-    const runId = journalRunState.run?.id;
+  const refreshReadingRun = useCallback(async (requestedRunId = null) => {
+    const runId = requestedRunId ?? journalRunState.run?.id;
     if (!runId) return;
     try {
-      syncJournalRun(await fetchJournalRun(runId));
+      const refreshed = await fetchJournalRun(runId);
+      if (runId === journalRunState.run?.id) {
+        syncJournalRun(refreshed);
+      } else {
+        setJournalRunHistory((current) => [
+          refreshed,
+          ...current.filter((runItem) => runItem.id !== refreshed.id),
+        ]);
+      }
     } catch (error) {
       showToast(error.message, "warning");
     }
@@ -1735,7 +1949,7 @@ export function App() {
         ? { ...current, reading: nextReading }
         : current
     ));
-    void refreshReadingRun();
+    void refreshReadingRun(nextReading?.runId);
   }, [readerContext?.reading, refreshReadingRun]);
 
   const openReaderBlock = useCallback((blockId) => {
@@ -2467,11 +2681,12 @@ export function App() {
           && conversation.kind === "paper_reading"
           && conversation.projectId === nextProject?.id,
       );
-      setActiveConversationId(
-        savedPaperConversation && readerPaper
-          ? savedPaperConversation.id
-          : "workflow-run",
-      );
+      if (savedPaperConversation) {
+        openPaperLibraryConversation(savedPaperConversation);
+        return;
+      }
+      setReaderTarget(null);
+      setActiveConversationId("workflow-run");
       setMobileView("run");
       return;
     }
@@ -2604,11 +2819,8 @@ export function App() {
           onSelect={(projectId) => {
             if (workspaceKind === "paper_reading") {
               setSelectedProjectId(projectId);
-              setActiveConversationId(
-                readerPaper && projectId === workflowFixture.project.id
-                  ? paperConversationId
-                  : "workflow-run",
-              );
+              setReaderTarget(null);
+              setActiveConversationId("workflow-run");
               setMobileView("run");
               return;
             }
@@ -2635,14 +2847,16 @@ export function App() {
               }
               return;
             }
-            if (readerPaper && conversationId === paperConversationId) {
-              setActiveConversationId(conversationId);
-              setMobileView("run");
+            const paperConversation = paperConversations.find(
+              (conversation) => conversation.id === conversationId,
+            );
+            if (paperConversation) {
+              openPaperLibraryConversation(paperConversation);
               return;
             }
             setActiveConversationId("workflow-run");
             setMobileView("run");
-            showToast("请先从本周 Run 选择一篇已解析论文", "warning");
+            showToast("请先从每周追踪选择一篇论文开始研读", "warning");
           }}
           creatingConversationProjectIds={creatingConversationProjectIds}
           preparingConversationProjectId={preparingConversationSelection?.projectId ?? null}
@@ -2664,11 +2878,8 @@ export function App() {
               return;
             }
             setSelectedProjectId(projectId);
-            setActiveConversationId(
-              readerPaper && projectId === workflowFixture.project.id
-                ? paperConversationId
-                : "workflow-run",
-            );
+            setReaderTarget(null);
+            setActiveConversationId("workflow-run");
             setMobileView("run");
             showToast(
               projectId === workflowFixture.project.id
@@ -2682,6 +2893,9 @@ export function App() {
             : undefined}
           onDeleteConversation={workspaceKind === "project_work"
             ? requestDeleteWorkConversation
+            : undefined}
+          onResetPaperConversation={workspaceKind === "paper_reading"
+            ? setPaperToReset
             : undefined}
           workspaceKind={workspaceKind}
           onWorkspaceKindChange={selectWorkspaceKind}
@@ -2773,6 +2987,7 @@ export function App() {
           <ReadingWorkbench
             readerTarget={readerTarget}
             readerPaper={readerPaper}
+            activeReadingConversationId={readerTarget?.activeReadingConversationId ?? null}
             readerGuide={readerGuide}
             readerPeerPapers={readerPeerPapers}
             readerContext={readerContext}
@@ -2784,15 +2999,21 @@ export function App() {
             readingModelId={selectedModel}
             projectContextState={projectContextState}
             onReloadProjectContext={loadProjectContext}
-            onSwitchPaper={(paperId) => openJournalPaper(
+            onSwitchPaper={(paperId) => openJournalPaperFromRun(
+              readerRun,
               paperId,
               readerTarget?.purpose === "close-reading"
-                ? journalRunState.run?.readings?.papers?.[paperId]?.position?.blockId ?? null
+                ? readerRun?.readings?.papers?.[paperId]?.position?.blockId ?? null
                 : null,
               readerTarget?.purpose ?? "document",
+              readerRun?.readings?.papers?.[paperId]?.activeConversationId ?? null,
             )}
-            onGuideDecision={(choice) => chooseGuideAction(readerPaper.id, choice)}
-            guideDecision={run.guideChoices?.[readerPaper.id] ?? null}
+            onGuideDecision={readerTarget?.runId === journalRunState.run?.id
+              ? (choice) => chooseGuideAction(readerPaper.id, choice)
+              : undefined}
+            guideDecision={readerTarget?.runId === journalRunState.run?.id
+              ? run.guideChoices?.[readerPaper.id] ?? null
+              : "read"}
             onReaderSelectionChange={updateReaderSelection}
             onReaderContextChange={setReaderContext}
             onReaderReadingChange={publishReaderReading}
@@ -2817,7 +3038,12 @@ export function App() {
             }}
             onProviderChange={selectProvider}
             onModelChange={selectModel}
-            onRestartFromGuide={readerTarget?.purpose === "close-reading" ? restartCurrentReadingFromGuide : undefined}
+            onRestartFromGuide={
+              readerTarget?.purpose === "close-reading"
+              && readerTarget?.runId === journalRunState.run?.id
+                ? restartCurrentReadingFromGuide
+                : undefined
+            }
             mobileActive={mobileView === "run" || mobileView === "evidence"}
             mobileView={mobileView}
           />
@@ -2973,6 +3199,12 @@ export function App() {
         conversation={conversationToDelete}
         onClose={closeDeleteConversation}
         onConfirm={deleteWorkConversation}
+      />
+
+      <ResetPaperReadingDialog
+        paperConversation={paperToReset}
+        onClose={() => setPaperToReset(null)}
+        onConfirm={confirmResetPaperReading}
       />
 
       <RenameConversationDialog

@@ -3,6 +3,9 @@ import { appendFile, mkdir, readFile, readdir, rename, writeFile } from "node:fs
 import path from "node:path";
 
 const RUN_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,159}$/;
+const PROJECT_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,159}$/;
+
+export const DEFAULT_JOURNAL_PROJECT_ID = "pi-agent-product";
 
 function assertRunId(runId) {
   if (typeof runId !== "string" || !RUN_ID_PATTERN.test(runId)) {
@@ -57,12 +60,17 @@ export function createRunStore({ dataDir, now = () => new Date(), idFactory = ra
     workflowId = "journal-reading-v1",
     trigger = "manual",
     sourceIds = [],
+    projectId = DEFAULT_JOURNAL_PROJECT_ID,
   } = {}) {
+    if (typeof projectId !== "string" || !PROJECT_ID_PATTERN.test(projectId)) {
+      throw new Error("projectId contains unsupported characters");
+    }
     const createdAt = now().toISOString();
     const runId = `journal-${createdAt.replaceAll(/[:.]/g, "-")}-${idFactory().slice(0, 8)}`;
     const run = {
       schema_version: 1,
       run_id: runId,
+      project_id: projectId,
       workflow_id: workflowId,
       trigger,
       status: "scanning",

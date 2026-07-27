@@ -68,8 +68,36 @@ test("Pi-style provider registry keeps the existing Codex subscription adapter",
   });
   assert.equal(result.value.answer, "ok");
   assert.equal(received.timeoutMs, 2400);
+  assert.equal(received.modelId, "account-default");
+  assert.equal(received.reasoningEffort, null);
   assert.match(received.prompt, /One bounded task/);
   assert.deepEqual(received.schema, schema);
+});
+
+test("Pi-style provider registry forwards the fixed Spark reasoning profile", async () => {
+  let received;
+  const registry = createModelProviderRegistry({
+    codexRunner: async (request) => {
+      received = request;
+      return {
+        text: JSON.stringify({ answer: "ok" }),
+        operationId: "codex-spark-operation",
+        usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+      };
+    },
+  });
+  const result = await registry.completeStructured({
+    providerId: "codex-subscription",
+    modelId: "gpt-5.3-codex-spark",
+    reasoningEffort: "low",
+    system: "Short system.",
+    prompt: "Translate one batch.",
+    input: { paper_id: "paper-1" },
+    schema,
+  });
+  assert.equal(received.modelId, "gpt-5.3-codex-spark");
+  assert.equal(received.reasoningEffort, "low");
+  assert.equal(result.reasoning_effort, "low");
 });
 
 test("unknown providers and malformed JSON outputs are rejected", async () => {

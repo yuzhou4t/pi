@@ -1,0 +1,157 @@
+import {
+  PROJECT_WORK_CAPABILITIES,
+  projectWorkCapability,
+  projectWorkWorkflow,
+} from "../../shared/projectWorkCapabilities.js";
+import { projectWorkError } from "./errors.js";
+import { PROJECT_WORK_DEFAULT_TOOL_NAMES } from "./piSessionHost.js";
+
+const READ_ONLY_TOOL_NAMES = [
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "list_documents",
+  "search_documents",
+  "read_document",
+  "update_plan",
+  "request_verification",
+];
+
+const WORKFLOW_RULES = {
+  code_review: {
+    toolNames: READ_ONLY_TOOL_NAMES,
+    guidance: [
+      "Review only: do not edit or write files in this turn.",
+      "Lead with evidence-backed defects, regressions, and missing verification; cite exact project paths and lines.",
+      "If no concrete defect is supported by the inspected evidence, say so directly.",
+    ].join(" "),
+  },
+  bug_diagnosis: {
+    toolNames: READ_ONLY_TOOL_NAMES,
+    guidance: [
+      "Diagnose only: do not edit or write files in this turn.",
+      "Reproduce or trace the failure, identify the root cause, and separate confirmed evidence from uncertainty.",
+      "Propose the smallest repair and targeted verification without applying it.",
+    ].join(" "),
+  },
+  official_docs: {
+    toolNames: READ_ONLY_TOOL_NAMES,
+    capabilityIds: ["docs_search"],
+    guidance: [
+      "When library or API behavior matters, consult Context7 before answering.",
+      "Resolve an exact library ID, query only the needed current documentation, and cite the library ID or returned source.",
+      "Do not edit or write files in this turn.",
+    ].join(" "),
+  },
+  screenshot_review: {
+    toolNames: READ_ONLY_TOOL_NAMES,
+    requiresImages: true,
+    guidance: [
+      "Review the attached screenshot with project read tools only; do not edit or write files in this turn.",
+      "Separate directly visible observations from inferences, and report concrete UI defects or implementation mismatches.",
+    ].join(" "),
+  },
+};
+
+function normalizedCapabilityStatus(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
+}
+
+function requireCapabilityAvailable(capabilityId, capabilityStatus) {
+  const status = normalizedCapabilityStatus(capabilityStatus)[capabilityId];
+  if (status?.available === true) return;
+  const capability = projectWorkCapability(capabilityId);
+  throw projectWorkError(
+    "PROJECT_WORK_CAPABILITY_UNAVAILABLE",
+    status?.reason || `${capability?.label ?? capabilityId}尚未配置`,
+    409,
+  );
+}
+
+export function resolveProjectWorkTurn({
+  workflowId,
+  capabilityIds = [],
+  capabilityStatus,
+  hasImages = false,
+} = {}) {
+  const normalizedWorkflowId = typeof workflowId === "string"
+    ? workflowId.trim()
+    : "";
+  const workflow = normalizedWorkflowId
+    ? projectWorkWorkflow(normalizedWorkflowId)
+    : null;
+  const workflowRule = normalizedWorkflowId
+    ? WORKFLOW_RULES[normalizedWorkflowId]
+    : null;
+  if (normalizedWorkflowId && (!workflow || !workflowRule)) {
+    throw projectWorkError(
+      "PROJECT_WORK_WORKFLOW_INVALID",
+      "所选代码工作流无效，请重新选择",
+      400,
+    );
+  }
+
+  if (!Array.isArray(capabilityIds) || capabilityIds.length > PROJECT_WORK_CAPABILITIES.length) {
+    throw projectWorkError(
+      "PROJECT_WORK_CAPABILITIES_INVALID",
+      "当前消息的检索能力选择无效",
+      400,
+    );
+  }
+  const normalizedCapabilityIds = [...new Set(capabilityIds.map((value) => (
+    typeof value === "string" ? value.trim() : ""
+  )))].filter(Boolean);
+  if (
+    normalizedCapabilityIds.length !== capabilityIds.length
+    || normalizedCapabilityIds.some((id) => !projectWorkCapability(id))
+  ) {
+    throw projectWorkError(
+      "PROJECT_WORK_CAPABILITIES_INVALID",
+      "当前消息包含未知或重复的检索能力",
+      400,
+    );
+  }
+
+  const requiredCapabilityIds = [
+    ...(workflowRule?.capabilityIds ?? []),
+    ...normalizedCapabilityIds,
+  ];
+  for (const capabilityId of new Set(requiredCapabilityIds)) {
+    requireCapabilityAvailable(capabilityId, capabilityStatus);
+  }
+  if (workflowRule?.requiresImages && !hasImages) {
+    throw projectWorkError(
+      "PROJECT_WORK_WORKFLOW_IMAGE_REQUIRED",
+      "截图验收需要先为当前消息添加一张图片",
+      400,
+    );
+  }
+
+  const activeCapabilityIds = [...new Set(requiredCapabilityIds)];
+  const activeToolNames = new Set(
+    workflowRule?.toolNames ?? PROJECT_WORK_DEFAULT_TOOL_NAMES,
+  );
+  for (const capabilityId of activeCapabilityIds) {
+    const capability = projectWorkCapability(capabilityId);
+    for (const toolName of capability?.toolNames ?? []) {
+      activeToolNames.add(toolName);
+    }
+  }
+  const capabilityGuidance = activeCapabilityIds.map((capabilityId) => (
+    capabilityId === "web_search"
+      ? "Use Tavily only when current public web evidence is needed; keep queries short and cite returned URLs."
+      : "Use Context7 only for public package documentation; resolve the exact library ID before querying and cite the returned source."
+  ));
+
+  return {
+    workflowId: workflow?.id ?? null,
+    capabilityIds: activeCapabilityIds,
+    toolNames: [...activeToolNames],
+    guidance: [workflowRule?.guidance, ...capabilityGuidance]
+      .filter(Boolean)
+      .join("\n"),
+  };
+}

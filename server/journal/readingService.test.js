@@ -773,3 +773,63 @@ test("resume fails an interrupted chat without changing the reading workflow sta
   assert.equal(resumed.readings.status, before.readings.status);
   assert.equal(resumed.readings.last_error, before.readings.last_error);
 });
+
+test("deleting one paper's reading record withdraws the decision and returns it to the weekly pool", async () => {
+  const { service, runId } = await setup();
+  await service.setDecisions(runId, { [paper.paper_id]: "read" });
+  await service.generateStage(runId, paper.paper_id, "research-question");
+  await service.savePosition(runId, paper.paper_id, {
+    mode: "full",
+    blockId: paperDocument().blocks[5].block_id,
+  });
+
+  const reset = await service.resetPaperReading(runId, paper.paper_id);
+  assert.equal(reset.status, "guide_ready");
+  assert.equal(reset.phase, "guide_review");
+  assert.deepEqual(reset.paper_decisions, {});
+  assert.deepEqual(reset.readings.paper_ids, []);
+  assert.equal(reset.readings.status, "not_started");
+  assert.equal(reset.readings.papers[paper.paper_id], undefined);
+
+  // The paper can be chosen again and starts a completely fresh reading.
+  await service.setDecisions(runId, { [paper.paper_id]: "read" });
+  const fresh = await service.getReading(runId, paper.paper_id);
+  assert.equal(fresh.stages["research-question"].status, "not_started");
+  assert.equal(fresh.position.block_id, null);
+  assert.equal(fresh.chat.turns.length, 0);
+});
+
+test("deleting a fully read paper's record steps the run back from draft_ready", async () => {
+  const { store, service, runId } = await setup();
+  await service.setDecisions(runId, { [paper.paper_id]: "read" });
+  for (const stage of READING_STAGE_ORDER) {
+    await service.generateStage(runId, paper.paper_id, stage);
+  }
+  assert.equal((await store.getRun(runId)).status, "draft_ready");
+
+  const reset = await service.resetPaperReading(runId, paper.paper_id);
+  assert.equal(reset.status, "guide_ready");
+  assert.equal(reset.phase, "guide_review");
+  assert.equal(reset.readings.status, "not_started");
+  assert.deepEqual(reset.readings.paper_ids, []);
+});
+
+test("paper reading reset is blocked after external writes begin or without a read decision", async () => {
+  const { store, service, runId } = await setup();
+  await assert.rejects(
+    service.resetPaperReading(runId, paper.paper_id),
+    (error) => error.code === "READING_RESET_NOT_ALLOWED",
+  );
+
+  await service.setDecisions(runId, { [paper.paper_id]: "read" });
+  await store.updateRun(runId, {
+    zotero: {
+      ...(await store.getRun(runId)).zotero,
+      status: "preview_ready",
+    },
+  });
+  await assert.rejects(
+    service.resetPaperReading(runId, paper.paper_id),
+    (error) => error.code === "READING_RESET_EXTERNAL_STATE",
+  );
+});

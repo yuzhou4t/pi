@@ -16,24 +16,43 @@ import {
   CheckCircle,
   CircleNotch,
   Code,
+  ArrowClockwise,
+  Brain,
   FileCode,
+  FilePdf,
   Files,
   Folder,
   Gauge,
   GitDiff,
+  GlobeSimple,
+  ImageSquare,
   Package,
+  Paperclip,
   PaperPlaneTilt,
   Play,
   SidebarSimple,
   StopCircle,
   TestTube,
+  UploadSimple,
   WarningCircle,
   X,
 } from "@phosphor-icons/react";
-import { projectWorkApi } from "../api/projectWork.js";
+import {
+  projectWorkApi,
+  validateProjectWorkImageFile,
+} from "../api/projectWork.js";
 import { mergeFreshConversationSnapshot } from "../project-work/liveProjectWorkState.js";
+import {
+  PROJECT_WORK_CAPABILITIES,
+  PROJECT_WORK_WORKFLOWS,
+  projectWorkCapability,
+  projectWorkWorkflow,
+} from "../../shared/projectWorkCapabilities.js";
 import { AgentArtifactLayout } from "./AgentArtifactLayout.jsx";
-import { ProviderMenu } from "./ProviderMenu.jsx";
+import {
+  ProviderMenu,
+  THINKING_LEVEL_LABELS,
+} from "./ProviderMenu.jsx";
 
 const ARTIFACTS = [
   { id: "files", label: "文件" },
@@ -53,6 +72,32 @@ const RUNNING_STATUSES = new Set([
   "compacting",
   "verifying",
 ]);
+
+const PROCESSING_DOCUMENT_STATUSES = new Set([
+  "receiving",
+  "local_ready",
+  "submitting",
+  "parsing",
+  "preparing",
+  "indexing",
+]);
+
+const DOCUMENT_STATUS_LABELS = {
+  awaiting_upload: "等待上传",
+  receiving: "正在上传",
+  local_ready: "正在由 MinerU 解析",
+  submitting: "正在由 MinerU 解析",
+  parsing: "正在由 MinerU 解析",
+  preparing: "正在准备可读内容",
+  indexing: "正在准备可读内容",
+  ready: "已可供 AI 阅读",
+  not_configured: "MinerU 尚未配置",
+  quota_deferred: "MinerU 今日额度已用完",
+  upload_interrupted: "上传未完成",
+  failed: "解析失败",
+  indexing_failed: "可读内容准备失败",
+  removing: "正在移除",
+};
 
 const STATUS_LABELS = {
   idle: "等待任务",
@@ -84,6 +129,12 @@ const TOOL_LABELS = {
   grep: "搜索内容",
   find: "查找文件",
   ls: "查看目录",
+  list_documents: "查看 PDF 资料",
+  search_documents: "搜索 PDF 资料",
+  read_document: "读取 PDF 资料",
+  search_web: "搜索网页",
+  resolve_library_id: "查找技术文档库",
+  query_docs: "查询技术文档",
   update_plan: "更新计划",
   request_verification: "保存验证命令",
 };
@@ -110,10 +161,16 @@ const QUIET_EVENT_TYPES = new Set([
   "message.delta",
   "message.update",
   "assistant.delta",
+  "document.created",
+  "document.uploaded",
+  "document.parsing_started",
+  "document.parsing_progress",
+  "document.ready",
+  "document.failed",
+  "document.retry_requested",
 ]);
 
 const ARTIFACT_STORAGE_KEY = "pi-agent-project-work-artifacts-v1";
-
 const PROJECT_MARKDOWN_COMPONENTS = {
   a: ({ node: _node, href, children, ...props }) => {
     const opensNewTab = /^https?:\/\//i.test(href ?? "");
@@ -178,6 +235,24 @@ function activeStatus(conversation) {
 
 function isConversationRunning(conversation) {
   return RUNNING_STATUSES.has(activeStatus(conversation));
+}
+
+export function hasProcessingDocuments(conversation) {
+  return (conversation?.documents ?? []).some(
+    (document) => PROCESSING_DOCUMENT_STATUSES.has(document.status),
+  );
+}
+
+function documentStatusLabel(document) {
+  return DOCUMENT_STATUS_LABELS[document?.status] ?? document?.status ?? "等待处理";
+}
+
+function formatDocumentSize(byteLength) {
+  const bytes = Number(byteLength);
+  if (!Number.isFinite(bytes) || bytes < 0) return "大小未知";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function statusClass(conversation) {
@@ -536,17 +611,10 @@ function EmptyConversationPane({ project, preparing = false, standalone = false 
             <h2>
               {preparing
                 ? "正在准备新工作会话"
-                : "新建对话或绑定项目后开始"}
-            </h2>
-            <p>
-              {preparing
-                ? standalone
-                  ? "Pi Agent 正在创建独立对话，不需要选择文件夹。"
-                  : "Pi Agent 正在创建轻量会话，马上就可以输入任务。"
                 : project
-                ? `在“${project.name}”中新建一个会话，Pi Agent 才会读取项目并开始工作。`
-                : "可以直接新建独立对话，也可以先绑定本地项目再开始工作。"}
-            </p>
+                  ? `在“${project.name}”中新建会话后开始`
+                  : "新建对话后开始"}
+            </h2>
           </div>
         </section>
       </div>
@@ -725,25 +793,365 @@ export function ProjectContextUsageMenu({
   );
 }
 
-function ProjectAgentPane({
+export function ProjectThinkingLevelControl({
+  thinkingLevels = [],
+  thinkingLevel,
+  supportsThinking = false,
+  running = false,
+  saving = false,
+  onChange,
+}) {
+  const levels = thinkingLevels.filter(
+    (level) => typeof level === "string" && level,
+  );
+  const activeLevel = levels.includes(thinkingLevel)
+    ? thinkingLevel
+    : levels[0] ?? "off";
+  const disabled = !supportsThinking || levels.length === 0 || running || saving;
+  const hint = !supportsThinking
+    ? "当前模型不支持调节思考强度"
+    : running
+      ? "Agent 工作期间不能切换思考强度"
+      : saving
+        ? "正在保存思考强度"
+        : "选择下一轮使用的思考强度";
+
+  return (
+    <label
+      className={`project-composer-tool project-composer-thinking${disabled ? " is-disabled" : ""}`}
+      title={hint}
+    >
+      <Brain size={13} weight="regular" aria-hidden="true" />
+      <span className="sr-only">思考强度</span>
+      <select
+        aria-label="思考强度"
+        value={activeLevel}
+        disabled={disabled}
+        onChange={(event) => onChange?.(event.target.value)}
+      >
+        {!supportsThinking ? (
+          <option value="off">思考 · 不支持</option>
+        ) : levels.map((level) => (
+          <option value={level} key={level}>
+            {`思考 · ${THINKING_LEVEL_LABELS[level] ?? level}`}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function capabilityAvailability(capabilityStatus, capabilityId) {
+  const status = capabilityStatus?.[capabilityId];
+  return {
+    available: status?.available === true,
+    reason: typeof status?.reason === "string" && status.reason
+      ? status.reason
+      : "正在读取服务端配置",
+  };
+}
+
+export function ProjectCapabilityMenu({
+  open,
+  onOpenChange,
+  capabilityStatus = {},
+  selectedCapabilityIds = [],
+  onToggleCapability,
+  selectedWorkflowId = null,
+  onSelectWorkflow,
+  supportsImages = false,
+  running = false,
+  onOpenSkills,
+  installedSkillCount = 0,
+}) {
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") onOpenChange(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onOpenChange, open]);
+
+  const selectedCount = selectedCapabilityIds.length
+    + (selectedWorkflowId ? 1 : 0);
+
+  return (
+    <div className="project-capability-menu">
+      <button
+        className={`header-meta-pill header-skill-pill${open ? " is-open" : ""}`}
+        type="button"
+        disabled={running}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        onClick={() => onOpenChange(!open)}
+      >
+        <Package size={13} weight="regular" aria-hidden="true" />
+        <span>{selectedCount > 0 ? `能力 · ${selectedCount}` : "能力"}</span>
+        <CaretDown size={11} weight="bold" aria-hidden="true" />
+      </button>
+      {open ? (
+        <>
+          <button
+            className="popover-scrim"
+            type="button"
+            aria-label="关闭能力选择"
+            onClick={() => onOpenChange(false)}
+          />
+          <section
+            className="project-capability-popover"
+            role="dialog"
+            aria-label="选择当前消息的能力"
+          >
+            <header>
+              <div>
+                <strong>当前消息</strong>
+                <span>只在显式发送的这一轮生效</span>
+              </div>
+              {selectedCount > 0 ? <small>{selectedCount} 项</small> : null}
+            </header>
+
+            <div className="project-capability-section">
+              <span>检索</span>
+              {PROJECT_WORK_CAPABILITIES.map((capability) => {
+                const status = capabilityAvailability(
+                  capabilityStatus,
+                  capability.id,
+                );
+                const selected = selectedCapabilityIds.includes(capability.id);
+                return (
+                  <button
+                    className={`project-capability-option${selected ? " is-selected" : ""}`}
+                    type="button"
+                    key={capability.id}
+                    disabled={running || !status.available}
+                    aria-pressed={selected}
+                    onClick={() => onToggleCapability(capability.id)}
+                  >
+                    <span className="project-capability-option-icon">
+                      {capability.id === "web_search" ? (
+                        <GlobeSimple size={15} aria-hidden="true" />
+                      ) : (
+                        <Files size={15} aria-hidden="true" />
+                      )}
+                    </span>
+                    <span>
+                      <strong>{capability.label}</strong>
+                      <small>
+                        {status.available ? capability.description : status.reason}
+                      </small>
+                    </span>
+                    {selected ? (
+                      <Check size={14} weight="bold" aria-hidden="true" />
+                    ) : null}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="project-capability-section">
+              <span>代码流程</span>
+              {PROJECT_WORK_WORKFLOWS.map((workflow) => {
+                const missingCapability = workflow.requiredCapabilities?.find(
+                  (capabilityId) => (
+                    !capabilityAvailability(
+                      capabilityStatus,
+                      capabilityId,
+                    ).available
+                  ),
+                );
+                const unavailableReason = missingCapability
+                  ? capabilityAvailability(
+                      capabilityStatus,
+                      missingCapability,
+                    ).reason
+                  : workflow.requiresImages && !supportsImages
+                    ? "当前模型不支持识图"
+                    : "";
+                const selected = selectedWorkflowId === workflow.id;
+                return (
+                  <button
+                    className={`project-capability-option${selected ? " is-selected" : ""}`}
+                    type="button"
+                    key={workflow.id}
+                    disabled={running || Boolean(unavailableReason)}
+                    aria-pressed={selected}
+                    onClick={() => onSelectWorkflow(
+                      selected ? null : workflow.id,
+                    )}
+                  >
+                    <span className="project-capability-option-icon">
+                      {workflow.requiresImages ? (
+                        <ImageSquare size={15} aria-hidden="true" />
+                      ) : (
+                        <Code size={15} aria-hidden="true" />
+                      )}
+                    </span>
+                    <span>
+                      <strong>{workflow.label}</strong>
+                      <small>{unavailableReason || workflow.description}</small>
+                    </span>
+                    {selected ? (
+                      <Check size={14} weight="bold" aria-hidden="true" />
+                    ) : null}
+                  </button>
+                );
+              })}
+            </div>
+
+            <footer>
+              <span>
+                {running
+                  ? "Agent 工作期间不能更换本轮能力"
+                  : "未选择时不增加工具或提示词"}
+              </span>
+              {onOpenSkills ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onOpenChange(false);
+                    onOpenSkills();
+                  }}
+                >
+                  查看内置流程{installedSkillCount > 0
+                    ? ` · ${installedSkillCount}`
+                    : ""}
+                </button>
+              ) : null}
+            </footer>
+          </section>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function canRetryDocument(document) {
+  return document?.error?.retryable === true
+    && document.status !== "upload_interrupted";
+}
+
+function ConversationDocumentStrip({
+  documents,
+  uploadingPdf,
+  onOpenFiles,
+  onRetryDocument,
+  retryingDocumentId,
+}) {
+  const activeDocuments = documents.filter((document) => (
+    PROCESSING_DOCUMENT_STATUSES.has(document.status)
+    || document.error
+  ));
+  const visibleDocuments = (
+    activeDocuments.length > 0 ? activeDocuments : documents.slice(-1)
+  ).slice(-3);
+  if (!uploadingPdf && visibleDocuments.length === 0) return null;
+  return (
+    <div className="project-document-statuses" aria-label="会话 PDF 资料状态">
+      {uploadingPdf ? (
+        <button type="button" onClick={onOpenFiles}>
+          <CircleNotch className="spin" size={15} aria-hidden="true" />
+          <span>
+            <strong>{uploadingPdf.fileName}</strong>
+            <small>正在上传 · 将发送至 MinerU Cloud</small>
+          </span>
+        </button>
+      ) : null}
+      {visibleDocuments.map((document) => (
+        <div
+          className={`project-document-status is-${document.status}`}
+          key={document.id}
+        >
+          <button type="button" onClick={onOpenFiles}>
+            {PROCESSING_DOCUMENT_STATUSES.has(document.status) ? (
+              <CircleNotch className="spin" size={15} aria-hidden="true" />
+            ) : document.status === "ready" ? (
+              <CheckCircle size={15} weight="fill" aria-hidden="true" />
+            ) : (
+              <WarningCircle size={15} weight="fill" aria-hidden="true" />
+            )}
+            <span>
+              <strong>{document.fileName}</strong>
+              <small>
+                {document.error?.message ?? documentStatusLabel(document)}
+              </small>
+            </span>
+          </button>
+          {canRetryDocument(document) ? (
+            <button
+              className="project-document-retry"
+              type="button"
+              disabled={retryingDocumentId === document.id}
+              onClick={() => onRetryDocument(document.id)}
+              aria-label={`重试解析 ${document.fileName}`}
+              title="重试 MinerU 解析"
+            >
+              {retryingDocumentId === document.id ? (
+                <CircleNotch className="spin" size={13} aria-hidden="true" />
+              ) : (
+                <ArrowClockwise size={13} aria-hidden="true" />
+              )}
+            </button>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function ProjectAgentPane({
   conversation,
   draft,
   onDraftChange,
   contextChips,
   onRemoveContext,
+  selectedCapabilityIds,
+  onRemoveCapability,
+  selectedWorkflowId,
+  onRemoveWorkflow,
+  pendingImage,
+  onRemoveImage,
+  imageInputRef,
+  onSelectImage,
+  supportsImages,
   onSubmit,
   onAbort,
   onOpenArtifact,
   action,
   error,
   modelLabel,
+  thinkingLevelControl,
   contextUsageControl,
+  pdfInputRef,
+  uploadingPdf,
+  onUploadPdf,
+  onRetryDocument,
+  retryingDocumentId,
   standalone = false,
 }) {
   const running = isConversationRunning(conversation);
+  const turnPayloadLocked = action === "message";
   const status = activeStatus(conversation);
   const statusLabel = STATUS_LABELS[status] ?? status;
-  const canSubmit = draft.trim() && !action;
+  const selectedWorkflow = projectWorkWorkflow(selectedWorkflowId);
+  const selectedCapabilities = selectedCapabilityIds
+    .map(projectWorkCapability)
+    .filter(Boolean);
+  const imageUnsupported = Boolean(pendingImage) && !supportsImages;
+  const workflowImageMissing = selectedWorkflow?.requiresImages === true
+    && !pendingImage;
+  const turnSelectionDeferred = running && Boolean(
+    pendingImage
+    || selectedWorkflow
+    || selectedCapabilities.length > 0,
+  );
+  const canSubmit = Boolean(
+    draft.trim()
+    && !action
+    && !imageUnsupported
+    && !workflowImageMissing
+    && !turnSelectionDeferred,
+  );
   const limitedSnapshotEvent = conversation.events.find(
     (event) => event.type === "workspace.snapshot_limited",
   );
@@ -834,7 +1242,10 @@ function ProjectAgentPane({
         ) : (
           conversation.messages.map((message, index) => {
             const text = messageText(message.content);
-            if (!text) return null;
+            const messageImages = Array.isArray(message.images)
+              ? message.images
+              : [];
+            if (!text && messageImages.length === 0) return null;
             return (
               <Fragment key={message.id}>
                 {settledWithAnswer && index === lastAssistantMessageIndex
@@ -846,6 +1257,20 @@ function ProjectAgentPane({
                   <small>{message.role === "user" ? "你" : "Pi Agent"}</small>
                   {message.role === "assistant" ? (
                     <ProjectAgentMarkdown>{text}</ProjectAgentMarkdown>
+                  ) : messageImages.length > 0 ? (
+                    <div className="project-agent-user-message-content">
+                      {text ? (
+                        <div className="project-agent-plain-text">{text}</div>
+                      ) : null}
+                      <div className="project-agent-message-images">
+                        {messageImages.map((image, imageIndex) => (
+                          <span key={image.id ?? `${message.id}-image-${imageIndex}`}>
+                            <ImageSquare size={13} aria-hidden="true" />
+                            图片 · {image.fileName || "图片"}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
                   ) : (
                     <div className="project-agent-plain-text">{text}</div>
                   )}
@@ -888,6 +1313,13 @@ function ProjectAgentPane({
       </div>
 
       <form className="project-agent-composer" onSubmit={onSubmit}>
+        <ConversationDocumentStrip
+          documents={conversation.documents ?? []}
+          uploadingPdf={uploadingPdf}
+          onOpenFiles={() => onOpenArtifact("files")}
+          onRetryDocument={onRetryDocument}
+          retryingDocumentId={retryingDocumentId}
+        />
         {contextChips.length > 0 ? (
           <>
             <div className="project-context-chips" aria-label="本条消息的文件上下文">
@@ -897,6 +1329,7 @@ function ProjectAgentPane({
                   {context.label}
                   <button
                     type="button"
+                    disabled={turnPayloadLocked}
                     onClick={() => onRemoveContext(context.id)}
                     aria-label={`移除上下文：${context.label}`}
                   >
@@ -912,11 +1345,82 @@ function ProjectAgentPane({
             ) : null}
           </>
         ) : null}
+        {selectedWorkflow || selectedCapabilities.length > 0 ? (
+          <div className="project-turn-chips" aria-label="当前消息使用的能力">
+            {selectedWorkflow ? (
+              <span className="is-workflow">
+                <Code size={13} aria-hidden="true" />
+                流程 · {selectedWorkflow.label}
+                <button
+                  type="button"
+                  disabled={running || turnPayloadLocked}
+                  onClick={onRemoveWorkflow}
+                  aria-label={`移除流程：${selectedWorkflow.label}`}
+                >
+                  <X size={12} weight="bold" aria-hidden="true" />
+                </button>
+              </span>
+            ) : null}
+            {selectedCapabilities.map((capability) => (
+              <span key={capability.id}>
+                {capability.id === "web_search" ? (
+                  <GlobeSimple size={13} aria-hidden="true" />
+                ) : (
+                  <Files size={13} aria-hidden="true" />
+                )}
+                {capability.label}
+                <button
+                  type="button"
+                  disabled={running || turnPayloadLocked}
+                  onClick={() => onRemoveCapability(capability.id)}
+                  aria-label={`移除能力：${capability.label}`}
+                >
+                  <X size={12} weight="bold" aria-hidden="true" />
+                </button>
+              </span>
+            ))}
+          </div>
+        ) : null}
+        {pendingImage ? (
+          <div className="project-pending-image">
+            {pendingImage.previewUrl ? (
+              <img src={pendingImage.previewUrl} alt="" />
+            ) : (
+              <span><ImageSquare size={18} aria-hidden="true" /></span>
+            )}
+            <div>
+              <strong>{pendingImage.file.name}</strong>
+              <small>仅随当前消息发送</small>
+            </div>
+            <button
+              type="button"
+              disabled={running || turnPayloadLocked}
+              onClick={onRemoveImage}
+              aria-label={`移除图片：${pendingImage.file.name}`}
+            >
+              <X size={13} weight="bold" aria-hidden="true" />
+            </button>
+          </div>
+        ) : null}
+        {imageUnsupported || workflowImageMissing || turnSelectionDeferred ? (
+          <small className="project-composer-warning" role="status">
+            <WarningCircle size={13} weight="fill" aria-hidden="true" />
+            {imageUnsupported
+              ? "当前模型不能看图，请切换支持图片的模型"
+              : workflowImageMissing
+                ? "截图验收需要先添加一张图片"
+                : "当前 Agent 完成后再发送所选能力或图片"}
+          </small>
+        ) : null}
         <label>
           <span className="sr-only">给 Agent 的消息</span>
           <textarea
             value={draft}
-            disabled={action === "abort" || action === "compact"}
+            disabled={
+              turnPayloadLocked
+              || action === "abort"
+              || action === "compact"
+            }
             onChange={(event) => onDraftChange(event.target.value)}
             onKeyDown={handleProjectComposerKeyDown}
             aria-keyshortcuts="Enter"
@@ -930,9 +1434,67 @@ function ProjectAgentPane({
         <footer>
           <div className="project-composer-meta">
             <div className="project-composer-tools">
+              <button
+                className="project-composer-tool project-composer-attachment"
+                type="button"
+                onClick={() => onOpenArtifact("files")}
+              >
+                <Paperclip size={13} aria-hidden="true" />
+                添加文件
+              </button>
+              <button
+                className="project-composer-tool project-composer-attachment"
+                type="button"
+                disabled={Boolean(uploadingPdf)}
+                onClick={() => pdfInputRef.current?.click()}
+                title="选择 PDF 后将上传至 MinerU Cloud 解析"
+              >
+                {uploadingPdf ? (
+                  <CircleNotch className="spin" size={13} aria-hidden="true" />
+                ) : (
+                  <UploadSimple size={13} aria-hidden="true" />
+                )}
+                上传 PDF
+              </button>
+              <button
+                className="project-composer-tool project-composer-attachment"
+                type="button"
+                disabled={running || turnPayloadLocked}
+                onClick={() => imageInputRef.current?.click()}
+                title="为当前消息添加一张 PNG、JPEG 或 WebP 图片"
+              >
+                <ImageSquare size={13} aria-hidden="true" />
+                添加图片
+              </button>
+              <input
+                className="sr-only"
+                ref={pdfInputRef}
+                type="file"
+                accept=".pdf,application/pdf"
+                aria-label="选择要交给 MinerU Cloud 解析的 PDF"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (file) onUploadPdf(file);
+                }}
+              />
+              <input
+                className="sr-only"
+                ref={imageInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                disabled={running || turnPayloadLocked}
+                aria-label="为当前消息选择一张图片"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (file) onSelectImage(file);
+                }}
+              />
               <span className="project-composer-model">
                 {modelLabel || (standalone ? "跟随默认模型" : "跟随项目默认模型")}
               </span>
+              {thinkingLevelControl}
               {contextUsageControl}
             </div>
             <small>
@@ -961,16 +1523,22 @@ function ProjectAgentPane({
 function FileArtifact({
   conversationId,
   standalone = false,
+  documents = [],
   api,
   selectedPath,
   requestedPath,
   onRequestedPathHandled,
   onAddContext,
+  onRetryDocument,
+  retryingDocumentId,
+  onRemoveDocument,
+  removingDocumentId,
   onError,
 }) {
   const [entries, setEntries] = useState([]);
   const [expandedPaths, setExpandedPaths] = useState([]);
   const [activePath, setActivePath] = useState(selectedPath ?? "");
+  const [activeDocumentId, setActiveDocumentId] = useState("");
   const [fileCache, setFileCache] = useState({});
   const [loadingTree, setLoadingTree] = useState(false);
   const [loadingFile, setLoadingFile] = useState(false);
@@ -1009,6 +1577,7 @@ function FileArtifact({
 
   const loadFile = useCallback(async (path) => {
     if (!conversationId || !path) return;
+    setActiveDocumentId("");
     setActivePath(path);
     if (fileCache[path]) return;
     fileAbort.current?.abort();
@@ -1036,6 +1605,7 @@ function FileArtifact({
     setEntries([]);
     setExpandedPaths([]);
     setActivePath("");
+    setActiveDocumentId("");
     setFileCache({});
     setError(null);
     loadDirectory("");
@@ -1055,10 +1625,40 @@ function FileArtifact({
     return parents.every((parent) => expandedPaths.includes(parent));
   });
   const selectedFile = fileCache[activePath] ?? null;
+  const selectedDocument = documents.find(
+    (document) => document.id === activeDocumentId,
+  ) ?? null;
 
   return (
     <div className="project-file-artifact">
       <aside aria-label={standalone ? "私有草稿文件" : "项目文件"}>
+        {documents.length > 0 ? (
+          <>
+            <div className="project-file-section-heading">
+              <FilePdf size={15} aria-hidden="true" />
+              会话资料
+            </div>
+            {documents.map((document) => (
+              <button
+                className={`project-document-file${
+                  document.id === activeDocumentId ? " is-active" : ""
+                }`}
+                type="button"
+                key={document.id}
+                onClick={() => {
+                  setActivePath("");
+                  setActiveDocumentId(document.id);
+                }}
+              >
+                <FilePdf size={15} aria-hidden="true" />
+                <span>
+                  <strong>{document.fileName}</strong>
+                  <small>{documentStatusLabel(document)}</small>
+                </span>
+              </button>
+            ))}
+          </>
+        ) : null}
         <header>
           <Files size={15} aria-hidden="true" />
           {loadingTree
@@ -1104,16 +1704,32 @@ function FileArtifact({
       <section className="project-code-viewer">
         <header>
           <div>
-            <strong>{activePath || "选择一个文件"}</strong>
+            <strong>
+              {selectedDocument?.fileName || activePath || "选择一个文件"}
+            </strong>
             <small>
-              {selectedFile
+              {selectedDocument
+                ? `${documentStatusLabel(selectedDocument)} · ${
+                    formatDocumentSize(selectedDocument.byteLength)
+                  }`
+                : selectedFile
                 ? `${selectedFile.language.toUpperCase()} · 只读${selectedFile.truncated ? " · 已截断" : ""}`
                 : loadingFile
                   ? "正在读取文件"
                   : "文件内容按需读取"}
             </small>
           </div>
-          {selectedFile && !selectedFile.binary ? (
+          {selectedDocument && canRetryDocument(selectedDocument) ? (
+            <button
+              type="button"
+              disabled={retryingDocumentId === selectedDocument.id}
+              onClick={() => onRetryDocument(selectedDocument.id)}
+            >
+              {retryingDocumentId === selectedDocument.id
+                ? "正在重试"
+                : "重试解析"}
+            </button>
+          ) : selectedFile && !selectedFile.binary ? (
             <button
               type="button"
               onClick={() => onAddContext({
@@ -1130,7 +1746,65 @@ function FileArtifact({
             </button>
           ) : null}
         </header>
-        {error ? (
+        {selectedDocument ? (
+          <div className="project-document-detail">
+            <div className={`project-document-detail-icon is-${selectedDocument.status}`}>
+              {PROCESSING_DOCUMENT_STATUSES.has(selectedDocument.status) ? (
+                <CircleNotch className="spin" size={24} aria-hidden="true" />
+              ) : selectedDocument.status === "ready" ? (
+                <CheckCircle size={24} weight="fill" aria-hidden="true" />
+              ) : (
+                <FilePdf size={24} aria-hidden="true" />
+              )}
+            </div>
+            <div>
+              <span>MinerU Cloud v4</span>
+              <h3>{documentStatusLabel(selectedDocument)}</h3>
+              <p>
+                {selectedDocument.error?.message
+                  ?? (selectedDocument.status === "ready"
+                    ? Number(selectedDocument.imageCount) > 0
+                      ? `Pi 已可按需读取解析正文。PDF 中保留了 ${selectedDocument.imageCount} 张图像，但本版资料工具暂不解读这些图像。`
+                      : "解析正文保存在当前会话中。下一次明确发送任务时，Pi 可以通过只读资料工具按需检索和阅读。"
+                    : "PDF 已与项目文件和待应用修改隔离；解析过程不会自动调用模型。")}
+              </p>
+            </div>
+            <dl>
+              <div>
+                <dt>文件</dt>
+                <dd>{selectedDocument.fileName}</dd>
+              </div>
+              <div>
+                <dt>大小</dt>
+                <dd>{formatDocumentSize(selectedDocument.byteLength)}</dd>
+              </div>
+              {selectedDocument.title ? (
+                <div>
+                  <dt>解析标题</dt>
+                  <dd>{selectedDocument.title}</dd>
+                </div>
+              ) : null}
+              {Number.isSafeInteger(selectedDocument.blockCount) ? (
+                <div>
+                  <dt>可读内容块</dt>
+                  <dd>{selectedDocument.blockCount}</dd>
+                </div>
+              ) : null}
+            </dl>
+            {!PROCESSING_DOCUMENT_STATUSES.has(selectedDocument.status) ? (
+              <button
+                className="project-document-remove"
+                type="button"
+                disabled={removingDocumentId === selectedDocument.id}
+                onClick={() => onRemoveDocument(selectedDocument)}
+              >
+                {removingDocumentId === selectedDocument.id
+                  ? "正在移除"
+                  : "移除这份会话资料"}
+              </button>
+            ) : null}
+          </div>
+        ) : error ? (
           <div className="project-run-empty" role="alert">
             <WarningCircle size={24} aria-hidden="true" />
             <h3>{standalone ? "无法读取草稿文件" : "无法读取项目文件"}</h3>
@@ -1498,6 +2172,10 @@ function ArtifactPane({
   requestedFilePath,
   onRequestedFilePathHandled,
   onAddContext,
+  onRetryDocument,
+  retryingDocumentId,
+  onRemoveDocument,
+  removingDocumentId,
   onError,
 }) {
   const changeCount = conversation.pendingChangeSet?.files?.length ?? 0;
@@ -1528,10 +2206,15 @@ function ArtifactPane({
               key={`${conversation.id}:${conversation.pendingChangeSet?.id ?? "base"}:${conversation.pendingChangeSet?.status ?? "clean"}`}
               conversationId={conversation.id}
               standalone={standalone}
+              documents={conversation.documents ?? []}
               api={api}
               requestedPath={requestedFilePath}
               onRequestedPathHandled={onRequestedFilePathHandled}
               onAddContext={onAddContext}
+              onRetryDocument={onRetryDocument}
+              retryingDocumentId={retryingDocumentId}
+              onRemoveDocument={onRemoveDocument}
+              removingDocumentId={removingDocumentId}
               onError={onError}
             />
           ) : activeArtifactId === "changes" ? (
@@ -1585,6 +2268,15 @@ export function LiveProjectWorkbench({
   const [contextChips, setContextChips] = useState([]);
   const [artifactOpen, setArtifactOpen] = useState(false);
   const [contextUsageOpen, setContextUsageOpen] = useState(false);
+  const [capabilityOpen, setCapabilityOpen] = useState(false);
+  const [selectedCapabilityIds, setSelectedCapabilityIds] = useState([]);
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState(null);
+  const [pendingImage, setPendingImage] = useState(null);
+  const [modelCatalog, setModelCatalog] = useState({
+    providers: [],
+    defaultThinkingLevel: null,
+    capabilities: {},
+  });
   const [activeArtifactId, setActiveArtifactId] = useState(
     readLastArtifact(
       conversation?.id,
@@ -1597,22 +2289,68 @@ export function LiveProjectWorkbench({
   const [actionError, setActionError] = useState(null);
   const [applyError, setApplyError] = useState(null);
   const [verificationError, setVerificationError] = useState(null);
+  const [uploadingPdf, setUploadingPdf] = useState(null);
   const snapshotRef = useRef(conversation);
   const conversationChangeRef = useRef(onConversationChange);
   const errorRef = useRef(onError);
+  const pdfInputRef = useRef(null);
+  const imageInputRef = useRef(null);
+  const pdfUploadAbort = useRef(null);
+  const pendingImageRef = useRef(null);
+
+  const replacePendingImage = useCallback((nextImage) => {
+    const current = pendingImageRef.current;
+    if (
+      current?.previewUrl
+      && typeof globalThis.URL?.revokeObjectURL === "function"
+    ) {
+      globalThis.URL.revokeObjectURL(current.previewUrl);
+    }
+    pendingImageRef.current = nextImage;
+    setPendingImage(nextImage);
+  }, []);
 
   useEffect(() => {
     conversationChangeRef.current = onConversationChange;
     errorRef.current = onError;
   }, [onConversationChange, onError]);
 
+  useEffect(() => () => {
+    pdfUploadAbort.current?.abort();
+    const image = pendingImageRef.current;
+    if (
+      image?.previewUrl
+      && typeof globalThis.URL?.revokeObjectURL === "function"
+    ) {
+      globalThis.URL.revokeObjectURL(image.previewUrl);
+    }
+    pendingImageRef.current = null;
+  }, []);
+
   useEffect(() => {
+    if (typeof api.listModels !== "function") return undefined;
+    const controller = new AbortController();
+    api.listModels({ signal: controller.signal }).then((catalog) => {
+      setModelCatalog(catalog);
+    }).catch((error) => {
+      if (error?.name !== "AbortError") errorRef.current?.(error);
+    });
+    return () => controller.abort();
+  }, [api]);
+
+  useEffect(() => {
+    pdfUploadAbort.current?.abort();
+    pdfUploadAbort.current = null;
     snapshotRef.current = conversation;
     setSnapshot(conversation);
     setDraft("");
     setContextChips([]);
     setArtifactOpen(false);
     setContextUsageOpen(false);
+    setCapabilityOpen(false);
+    setSelectedCapabilityIds([]);
+    setSelectedWorkflowId(null);
+    replacePendingImage(null);
     setActiveArtifactId(readLastArtifact(
       conversation?.id,
       conversation?.activeArtifactId ?? "files",
@@ -1620,7 +2358,8 @@ export function LiveProjectWorkbench({
     setActionError(null);
     setApplyError(null);
     setVerificationError(null);
-  }, [conversation?.id]);
+    setUploadingPdf(null);
+  }, [conversation?.id, replacePendingImage]);
 
   useEffect(() => {
     setSnapshot((current) => {
@@ -1657,9 +2396,14 @@ export function LiveProjectWorkbench({
     return acceptedSnapshot;
   }, []);
 
+  const shouldPollConversation = Boolean(
+    snapshot?.id
+    && (isConversationRunning(snapshot) || hasProcessingDocuments(snapshot)),
+  );
+
   useEffect(() => {
     const conversationId = snapshot?.id;
-    if (!conversationId || !isConversationRunning(snapshot)) return undefined;
+    if (!conversationId || !shouldPollConversation) return undefined;
     let disposed = false;
     let timeoutId = null;
     let controller = null;
@@ -1673,7 +2417,10 @@ export function LiveProjectWorkbench({
         });
         if (disposed) return;
         const acceptedSnapshot = publishSnapshot(nextSnapshot);
-        if (isConversationRunning(acceptedSnapshot)) {
+        if (
+          isConversationRunning(acceptedSnapshot)
+          || hasProcessingDocuments(acceptedSnapshot)
+        ) {
           timeoutId = window.setTimeout(poll, pollIntervalMs);
         }
       } catch (error) {
@@ -1693,9 +2440,8 @@ export function LiveProjectWorkbench({
     api,
     pollIntervalMs,
     publishSnapshot,
+    shouldPollConversation,
     snapshot?.id,
-    snapshot?.status,
-    snapshot?.turnStatus,
   ]);
 
   useEffect(() => {
@@ -1723,11 +2469,54 @@ export function LiveProjectWorkbench({
     }
   }, [action, publishSnapshot, snapshot?.id]);
 
+  const activeProviderId = providerId || snapshot?.providerId;
+  const activeProvider = providers.find((provider) => provider.id === activeProviderId)
+    ?? providers.find((provider) => provider.available)
+    ?? providers[0];
+  const activeModelId = modelId || snapshot?.modelId || activeProvider?.models?.[0] || "";
+  const activeModelInfo = modelCatalog.providers
+    .find((provider) => provider.id === activeProviderId)
+    ?.models.find((model) => model.id === activeModelId);
+  const supportsImages = activeModelInfo?.supportsImages === true;
+  const availableThinkingLevels = activeModelInfo?.thinkingLevels ?? [];
+  const activeThinkingLevel = availableThinkingLevels.includes(
+    snapshot?.thinkingLevel,
+  )
+    ? snapshot.thinkingLevel
+    : availableThinkingLevels.includes(activeModelInfo?.defaultThinkingLevel)
+      ? activeModelInfo.defaultThinkingLevel
+      : availableThinkingLevels.includes(modelCatalog.defaultThinkingLevel)
+        ? modelCatalog.defaultThinkingLevel
+        : availableThinkingLevels[0] ?? snapshot?.thinkingLevel ?? null;
+
   const submitMessage = useCallback((event) => {
     event.preventDefault();
-    const text = draft.trim();
+    const submittedDraft = draft;
+    const text = submittedDraft.trim();
     if (!text || !snapshot?.id || action) return;
     const running = isConversationRunning(snapshot);
+    if (
+      running
+      && (
+        pendingImage
+        || selectedWorkflowId
+        || selectedCapabilityIds.length > 0
+      )
+    ) {
+      return;
+    }
+    if (
+      pendingImage
+      && !supportsImages
+    ) {
+      return;
+    }
+    if (
+      projectWorkWorkflow(selectedWorkflowId)?.requiresImages
+      && !pendingImage
+    ) {
+      return;
+    }
     executeAction("message", () => (
       running
         ? api.steerConversation({
@@ -1738,13 +2527,24 @@ export function LiveProjectWorkbench({
             conversationId: snapshot.id,
             text,
             contexts: contextChips,
+            images: pendingImage ? [pendingImage.file] : [],
+            capabilities: selectedCapabilityIds,
+            workflowId: selectedWorkflowId,
             providerId: providerId || snapshot.providerId,
             modelId: modelId || snapshot.modelId,
+            thinkingLevel: activeThinkingLevel,
           })
     )).then((nextSnapshot) => {
       if (!nextSnapshot) return;
-      setDraft("");
-      if (!running) setContextChips([]);
+      setDraft((current) => (
+        current === submittedDraft ? "" : current
+      ));
+      if (!running) {
+        setContextChips([]);
+        setSelectedCapabilityIds([]);
+        setSelectedWorkflowId(null);
+        replacePendingImage(null);
+      }
     });
   }, [
     action,
@@ -1753,9 +2553,30 @@ export function LiveProjectWorkbench({
     draft,
     executeAction,
     modelId,
+    pendingImage,
     providerId,
+    replacePendingImage,
+    selectedCapabilityIds,
+    selectedWorkflowId,
+    supportsImages,
+    activeThinkingLevel,
     snapshot,
   ]);
+
+  const selectImage = useCallback((file) => {
+    if (action === "message") return;
+    try {
+      validateProjectWorkImageFile(file);
+      const previewUrl = typeof globalThis.URL?.createObjectURL === "function"
+        ? globalThis.URL.createObjectURL(file)
+        : "";
+      replacePendingImage({ file, previewUrl });
+      setActionError(null);
+    } catch (error) {
+      setActionError(error);
+      errorRef.current?.(error);
+    }
+  }, [action, replacePendingImage]);
 
   const openArtifact = useCallback((artifactId, path = "") => {
     if (!ARTIFACTS.some((artifact) => artifact.id === artifactId)) return;
@@ -1764,11 +2585,82 @@ export function LiveProjectWorkbench({
     if (artifactId === "files" && path) setRequestedFilePath(path);
   }, []);
 
+  const uploadPdf = useCallback(async (file) => {
+    if (!snapshot?.id || uploadingPdf || typeof api.uploadPdf !== "function") return;
+    const controller = new AbortController();
+    pdfUploadAbort.current?.abort();
+    pdfUploadAbort.current = controller;
+    setUploadingPdf({
+      fileName: file.name,
+      byteLength: file.size,
+    });
+    setActionError(null);
+    try {
+      const nextSnapshot = await api.uploadPdf({
+        conversationId: snapshot.id,
+        file,
+        signal: controller.signal,
+      });
+      publishSnapshot(nextSnapshot);
+      openArtifact("files");
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      setActionError(error);
+      errorRef.current?.(error);
+      try {
+        const refreshed = await api.fetchConversation({
+          conversationId: snapshot.id,
+        });
+        publishSnapshot(refreshed);
+      } catch {
+        // The original upload error remains the useful user-facing result.
+      }
+    } finally {
+      if (pdfUploadAbort.current === controller) {
+        pdfUploadAbort.current = null;
+        setUploadingPdf(null);
+      }
+    }
+  }, [
+    api,
+    openArtifact,
+    publishSnapshot,
+    snapshot?.id,
+    uploadingPdf,
+  ]);
+
+  const retryDocument = useCallback((documentId) => {
+    if (!documentId || typeof api.retryPdf !== "function") return;
+    executeAction(
+      `document-retry:${documentId}`,
+      () => api.retryPdf({
+        conversationId: snapshot.id,
+        documentId,
+      }),
+    );
+  }, [api, executeAction, snapshot?.id]);
+
+  const removeDocument = useCallback((document) => {
+    if (!document?.id || typeof api.removePdf !== "function") return;
+    const confirmed = typeof window === "undefined" || window.confirm(
+      `移除“${document.fileName}”？\n\n这会删除 Pi Agent 当前会话中的本地 PDF 和解析结果，不代表删除 MinerU Cloud 上的副本。`,
+    );
+    if (!confirmed) return;
+    executeAction(
+      `document-remove:${document.id}`,
+      () => api.removePdf({
+        conversationId: snapshot.id,
+        documentId: document.id,
+      }),
+    );
+  }, [api, executeAction, snapshot?.id]);
+
   const addContext = useCallback((context) => {
+    if (action === "message") return;
     setContextChips((current) => (
       current.some((item) => item.id === context.id) ? current : [...current, context]
     ));
-  }, []);
+  }, [action]);
 
   const applySelectedChanges = useCallback((selectedFiles) => {
     const changeSet = snapshot?.pendingChangeSet;
@@ -1797,11 +2689,6 @@ export function LiveProjectWorkbench({
     }))
   ), [api, executeAction, snapshot?.id]);
 
-  const activeProviderId = providerId || snapshot?.providerId;
-  const activeProvider = providers.find((provider) => provider.id === activeProviderId)
-    ?? providers.find((provider) => provider.available)
-    ?? providers[0];
-  const activeModelId = modelId || snapshot?.modelId || activeProvider?.models?.[0] || "";
   const standalone = snapshot?.scope === "standalone"
     || snapshot?.workspaceKind === "scratch"
     || snapshot?.projectId === null;
@@ -1812,6 +2699,52 @@ export function LiveProjectWorkbench({
     (message) => message.role === "assistant" && Boolean(messageText(message.content)),
   ) === true;
   const conversationRunning = snapshot ? isConversationRunning(snapshot) : false;
+  const turnPayloadLocked = action === "message";
+  const retryingDocumentId = action?.startsWith("document-retry:")
+    ? action.slice("document-retry:".length)
+    : null;
+  const removingDocumentId = action?.startsWith("document-remove:")
+    ? action.slice("document-remove:".length)
+    : null;
+  const thinkingSaving = action === "thinking-level";
+  const thinkingBusy = conversationRunning || Boolean(action && !thinkingSaving);
+  const thinkingHint = activeModelInfo?.supportsThinking !== true
+    ? "当前模型不支持调节思考强度"
+    : conversationRunning
+      ? "Agent 工作期间不能切换思考强度"
+      : thinkingSaving
+        ? "正在保存思考强度"
+        : thinkingBusy
+          ? "当前操作完成后可切换思考强度"
+          : "选择下一轮使用的思考强度";
+  const showGptThinking = activeProviderId === "openai-codex"
+    && Boolean(activeModelId);
+  const changeThinkingLevel = useCallback((nextThinkingLevel) => {
+    if (
+      conversationRunning
+      || !snapshot?.id
+      || action
+      || !availableThinkingLevels.includes(nextThinkingLevel)
+      || typeof api.configureConversation !== "function"
+    ) {
+      return;
+    }
+    executeAction("thinking-level", () => api.configureConversation({
+      conversationId: snapshot.id,
+      providerId: activeProviderId,
+      modelId: activeModelId,
+      thinkingLevel: nextThinkingLevel,
+    }));
+  }, [
+    action,
+    activeModelId,
+    activeProviderId,
+    api,
+    availableThinkingLevels,
+    conversationRunning,
+    executeAction,
+    snapshot?.id,
+  ]);
   const headerTitle = (
     <div className="workflow-title-block">
       <button
@@ -1837,7 +2770,10 @@ export function LiveProjectWorkbench({
         <ProviderMenu
           open={providerOpen}
           onOpenChange={(open) => {
-            if (open) setContextUsageOpen(false);
+            if (open) {
+              setContextUsageOpen(false);
+              setCapabilityOpen(false);
+            }
             onProviderOpenChange?.(open);
           }}
           providers={providers}
@@ -1845,21 +2781,43 @@ export function LiveProjectWorkbench({
           model={activeModelId}
           onProviderChange={onProviderChange}
           onModelChange={onModelChange}
+          thinkingLevels={showGptThinking ? availableThinkingLevels : null}
+          thinkingLevel={activeThinkingLevel}
+          supportsThinking={activeModelInfo?.supportsThinking === true}
+          thinkingDisabled={thinkingBusy || thinkingSaving}
+          thinkingHint={thinkingHint}
+          onThinkingLevelChange={changeThinkingLevel}
         />
       ) : null}
-      {onOpenSkills ? (
-        <button
-          className="header-meta-pill header-skill-pill"
-          type="button"
-          onClick={() => {
+      <ProjectCapabilityMenu
+        open={capabilityOpen}
+        onOpenChange={(open) => {
+          if (turnPayloadLocked && open) return;
+          setCapabilityOpen(open);
+          if (open) {
             setContextUsageOpen(false);
-            onOpenSkills();
-          }}
-        >
-          <Package size={13} weight="regular" aria-hidden="true" />
-          <span>技能 · {installedSkillCount}</span>
-        </button>
-      ) : null}
+            onProviderOpenChange?.(false);
+          }
+        }}
+        capabilityStatus={modelCatalog.capabilities}
+        selectedCapabilityIds={selectedCapabilityIds}
+        onToggleCapability={(capabilityId) => {
+          if (turnPayloadLocked) return;
+          setSelectedCapabilityIds((current) => (
+            current.includes(capabilityId)
+              ? current.filter((id) => id !== capabilityId)
+              : [...current, capabilityId]
+          ));
+        }}
+        selectedWorkflowId={selectedWorkflowId}
+        onSelectWorkflow={(workflowId) => {
+          if (!turnPayloadLocked) setSelectedWorkflowId(workflowId);
+        }}
+        supportsImages={supportsImages}
+        running={conversationRunning || turnPayloadLocked}
+        onOpenSkills={onOpenSkills}
+        installedSkillCount={installedSkillCount}
+      />
     </>
   );
 
@@ -1901,11 +2859,34 @@ export function LiveProjectWorkbench({
         <ProjectAgentPane
           conversation={snapshot}
           draft={draft}
-          onDraftChange={setDraft}
+          onDraftChange={(nextDraft) => {
+            if (!turnPayloadLocked) setDraft(nextDraft);
+          }}
           contextChips={contextChips}
-          onRemoveContext={(contextId) => setContextChips(
-            (current) => current.filter((context) => context.id !== contextId),
-          )}
+          onRemoveContext={(contextId) => {
+            if (turnPayloadLocked) return;
+            setContextChips(
+              (current) => current.filter((context) => context.id !== contextId),
+            );
+          }}
+          selectedCapabilityIds={selectedCapabilityIds}
+          onRemoveCapability={(capabilityId) => {
+            if (turnPayloadLocked) return;
+            setSelectedCapabilityIds(
+              (current) => current.filter((id) => id !== capabilityId),
+            );
+          }}
+          selectedWorkflowId={selectedWorkflowId}
+          onRemoveWorkflow={() => {
+            if (!turnPayloadLocked) setSelectedWorkflowId(null);
+          }}
+          pendingImage={pendingImage}
+          onRemoveImage={() => {
+            if (!turnPayloadLocked) replacePendingImage(null);
+          }}
+          imageInputRef={imageInputRef}
+          onSelectImage={selectImage}
+          supportsImages={supportsImages}
           onSubmit={submitMessage}
           onAbort={() => executeAction("abort", () => api.abortConversation({
             conversationId: snapshot.id,
@@ -1914,12 +2895,25 @@ export function LiveProjectWorkbench({
           action={action}
           error={actionError}
           modelLabel={activeModelId}
+          thinkingLevelControl={(
+            <ProjectThinkingLevelControl
+              thinkingLevels={availableThinkingLevels}
+              thinkingLevel={activeThinkingLevel}
+              supportsThinking={activeModelInfo?.supportsThinking === true}
+              running={thinkingBusy}
+              saving={thinkingSaving}
+              onChange={changeThinkingLevel}
+            />
+          )}
           contextUsageControl={(
             <ProjectContextUsageMenu
               open={contextUsageOpen}
               onOpenChange={(open) => {
                 setContextUsageOpen(open);
-                if (open) onProviderOpenChange?.(false);
+                if (open) {
+                  setCapabilityOpen(false);
+                  onProviderOpenChange?.(false);
+                }
               }}
               contextUsage={snapshot.contextUsage}
               modelContextWindow={modelContextWindow}
@@ -1930,6 +2924,11 @@ export function LiveProjectWorkbench({
               onCompact={compactContext}
             />
           )}
+          pdfInputRef={pdfInputRef}
+          uploadingPdf={uploadingPdf}
+          onUploadPdf={uploadPdf}
+          onRetryDocument={retryDocument}
+          retryingDocumentId={retryingDocumentId}
           standalone={standalone}
         />
       )}
@@ -1951,6 +2950,10 @@ export function LiveProjectWorkbench({
           requestedFilePath={requestedFilePath}
           onRequestedFilePathHandled={() => setRequestedFilePath("")}
           onAddContext={addContext}
+          onRetryDocument={retryDocument}
+          retryingDocumentId={retryingDocumentId}
+          onRemoveDocument={removeDocument}
+          removingDocumentId={removingDocumentId}
           onError={(error) => errorRef.current?.(error)}
         />
       )}

@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   CODEX_ACCOUNT_MODEL_ID,
   CODEX_PROVIDER_ID,
+  CODEX_SPARK_MODEL_ID,
   probeCodexSubscription,
   runCodexSubscription,
 } from "./codexSubscription.js";
@@ -75,6 +76,7 @@ const completedJsonl = [
 test("exports stable provider and account model ids", () => {
   assert.equal(CODEX_PROVIDER_ID, "codex-subscription");
   assert.equal(CODEX_ACCOUNT_MODEL_ID, "account-default");
+  assert.equal(CODEX_SPARK_MODEL_ID, "gpt-5.3-codex-spark");
 });
 
 test("probe accepts only the exact ChatGPT login status", async () => {
@@ -107,6 +109,36 @@ test("probe accepts the exact ChatGPT status when the CLI writes it to stderr", 
   const status = await probeCodexSubscription({ env: {}, spawnImpl });
   assert.equal(status.available, true);
   assert.equal(status.reasonCode, "CHATGPT_SUBSCRIPTION");
+});
+
+test("probe ignores only the known PATH aliases warning", async () => {
+  const warning = "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)";
+  const readySpawn = createSpawnMock([{
+    stderr: `${warning}\nLogged in using ChatGPT\n`,
+  }]);
+  const ready = await probeCodexSubscription({ env: {}, spawnImpl: readySpawn });
+  assert.deepEqual(ready, {
+    available: true,
+    status: "ready",
+    reasonCode: "CHATGPT_SUBSCRIPTION",
+  });
+
+  const apiKeySpawn = createSpawnMock([{
+    stderr: `${warning}\nLogged in using an API key\n`,
+  }]);
+  const apiKey = await probeCodexSubscription({ env: {}, spawnImpl: apiKeySpawn });
+  assert.equal(apiKey.available, false);
+  assert.equal(apiKey.reasonCode, "CODEX_AUTH_NOT_CHATGPT");
+
+  const unknownOutputSpawn = createSpawnMock([{
+    stderr: `${warning}\nLogged in using ChatGPT\nunexpected output\n`,
+  }]);
+  const unknownOutput = await probeCodexSubscription({
+    env: {},
+    spawnImpl: unknownOutputSpawn,
+  });
+  assert.equal(unknownOutput.available, false);
+  assert.equal(unknownOutput.reasonCode, "CODEX_AUTH_NOT_CHATGPT");
 });
 
 test("probe never passes API keys into the Codex process", async () => {
@@ -216,6 +248,32 @@ test("run uses a shell-free ephemeral read-only Codex exec and parses JSONL", as
 
   await assert.rejects(stat(execCall.args[schemaIndex + 1]), { code: "ENOENT" });
   await assert.rejects(stat(execCall.args[cwdIndex + 1]), { code: "ENOENT" });
+});
+
+test("run pins an explicit Spark model and reasoning effort without user config", async () => {
+  const spawnImpl = createSpawnMock([
+    { stdout: "Logged in using ChatGPT" },
+    { stdout: completedJsonl },
+  ]);
+  await runCodexSubscription({
+    prompt: "Translate one batch.",
+    schema,
+    modelId: "gpt-5.3-codex-spark",
+    reasoningEffort: "low",
+    env: {},
+    spawnImpl,
+    timeoutMs: 1000,
+  });
+
+  const args = spawnImpl.calls[1].args;
+  const modelIndex = args.indexOf("-m");
+  const effortIndex = args.indexOf("model_reasoning_effort=\"low\"");
+  assert.ok(modelIndex > 0);
+  assert.equal(args[modelIndex + 1], "gpt-5.3-codex-spark");
+  assert.ok(effortIndex > 0);
+  assert.equal(args[effortIndex - 1], "-c");
+  assert.ok(modelIndex < args.indexOf("exec"));
+  assert.ok(effortIndex < args.indexOf("exec"));
 });
 
 test("run refuses non-ChatGPT login before executing a model turn", async () => {

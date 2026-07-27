@@ -267,6 +267,8 @@ function committingRun() {
             answered_at: "2026-07-23T12:00:01.000Z",
           }],
           chat: {
+            id: "reading-conversation-current",
+            title: "论文主研读",
             status: "ready",
             turns: [{
               id: "chat-turn-1",
@@ -302,6 +304,12 @@ function committingRun() {
             }],
             updated_at: "2026-07-23T12:00:01.000Z",
           },
+          archived_conversations: [{
+            id: "reading-conversation-branch",
+            title: "方法分支",
+            turns: [{ id: "branch-turn-1" }],
+            updated_at: "2026-07-23T11:00:00.000Z",
+          }],
           agent_actions: {
             schema_version: 1,
             status: "committed",
@@ -393,6 +401,157 @@ async function startTestServer(
     }),
   };
 }
+
+test("project-work PDF routes use raw bytes and conversation-owned retry/remove actions", async (t) => {
+  const calls = [];
+  const snapshot = (status, documents = [{
+    id: "document-route-1",
+    fileName: "开发手册.pdf",
+    byteLength: 18,
+    status,
+    parser: "MinerU Cloud v4",
+  }]) => ({
+    schemaVersion: 1,
+    conversation: {
+      id: "conversation-route-1",
+      projectId: "project-route-1",
+      workspaceKind: "bound_project",
+      scope: "project",
+      rootLabel: "项目",
+      title: "接口测试",
+      status: "idle",
+      messages: [],
+      documents,
+      lastEventSeq: 0,
+      createdAt: "2026-07-27T00:00:00.000Z",
+      updatedAt: "2026-07-27T00:00:00.000Z",
+    },
+    events: [],
+    hasMoreEvents: false,
+  });
+  const projectWorkService = {
+    async createConversationDocument(conversationId, options) {
+      calls.push({ action: "create", conversationId, options });
+      return {
+        document: snapshot("awaiting_upload").conversation.documents[0],
+        snapshot: snapshot("awaiting_upload"),
+      };
+    },
+    async uploadConversationDocument(
+      conversationId,
+      documentId,
+      request,
+      options,
+    ) {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      calls.push({
+        action: "upload",
+        conversationId,
+        documentId,
+        options,
+        body: Buffer.concat(chunks).toString("utf8"),
+      });
+      return snapshot("local_ready");
+    },
+    async retryConversationDocument(conversationId, documentId) {
+      calls.push({ action: "retry", conversationId, documentId });
+      return snapshot("local_ready");
+    },
+    async removeConversationDocument(conversationId, documentId) {
+      calls.push({ action: "remove", conversationId, documentId });
+      return snapshot("idle", []);
+    },
+  };
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(() => server.close());
+  const headers = {
+    origin: "http://127.0.0.1:4173",
+    "content-type": "application/json",
+  };
+
+  const createdResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-route-1/documents`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        schema_version: 1,
+        file_name: "开发手册.pdf",
+        byte_length: 18,
+      }),
+    },
+  );
+  assert.equal(createdResponse.status, 201);
+  assert.equal((await createdResponse.json()).document.status, "awaiting_upload");
+
+  const pdf = Buffer.from("%PDF-1.7\nroute\n", "utf8");
+  const uploadedResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-route-1/documents/document-route-1/content`,
+    {
+      method: "PUT",
+      headers: {
+        origin: "http://127.0.0.1:4173",
+        "content-type": "application/pdf",
+      },
+      body: pdf,
+    },
+  );
+  assert.equal(uploadedResponse.status, 202);
+  assert.equal(
+    (await uploadedResponse.json()).conversation.documents[0].status,
+    "local_ready",
+  );
+
+  const retriedResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-route-1/documents/document-route-1/retry`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ schema_version: 1 }),
+    },
+  );
+  assert.equal(retriedResponse.status, 202);
+
+  const removedResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-route-1/documents/document-route-1`,
+    {
+      method: "DELETE",
+      headers: { origin: "http://127.0.0.1:4173" },
+    },
+  );
+  assert.equal(removedResponse.status, 200);
+  assert.deepEqual((await removedResponse.json()).conversation.documents, []);
+  assert.deepEqual(calls, [{
+    action: "create",
+    conversationId: "conversation-route-1",
+    options: {
+      fileName: "开发手册.pdf",
+      byteLength: 18,
+    },
+  }, {
+    action: "upload",
+    conversationId: "conversation-route-1",
+    documentId: "document-route-1",
+    options: {
+      contentType: "application/pdf",
+      declaredLength: String(pdf.length),
+    },
+    body: pdf.toString("utf8"),
+  }, {
+    action: "retry",
+    conversationId: "conversation-route-1",
+    documentId: "document-route-1",
+  }, {
+    action: "remove",
+    conversationId: "conversation-route-1",
+    documentId: "document-route-1",
+  }]);
+});
 
 test("project-work conversation menu routes stay project-scoped and return safe data", async (t) => {
   const calls = [];
@@ -598,6 +757,130 @@ test("standalone project-work conversation routes use the global scope and retur
     },
     { action: "delete", conversationId: "conversation-standalone" },
   ]);
+});
+
+test("project-work message routes accept bounded images and forward one-turn settings", async (t) => {
+  const calls = [];
+  const projectWorkService = {
+    sendMessage: async (conversationId, options) => {
+      calls.push({ conversationId, options });
+      return {
+        conversation: {
+          id: conversationId,
+          projectId: "project-one",
+          status: "running",
+          messages: [],
+        },
+        events: [],
+      };
+    },
+    configureConversation: async () => {
+      throw new Error("oversized configuration must not reach the service");
+    },
+    steerConversation: async () => {
+      throw new Error("oversized steer must not reach the service");
+    },
+  };
+  const server = await startTestServer({}, candidateSummaryService, projectWorkService);
+  t.after(server.close);
+  const endpoint = `${server.baseUrl}/api/v1/project-work/conversations/conversation-image/messages`;
+  const largeBoundedData = "A".repeat(300_000);
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: "http://127.0.0.1:4173",
+    },
+    body: JSON.stringify({
+      schema_version: 1,
+      client_request_id: "project-message:image-route",
+      text: "检查截图",
+      workflow_id: "screenshot_review",
+      capabilities: ["web_search"],
+      images: [{
+        file_name: "设置页.png",
+        mime_type: "image/png",
+        byte_length: 225_000,
+        data: largeBoundedData,
+      }],
+      contexts: [{
+        path: "src/App.jsx",
+        content_hash: "sha256:source",
+        start_line: 10,
+        end_line: 20,
+      }],
+      provider_id: "test",
+      model_id: "vision",
+      thinking_level: "medium",
+    }),
+  });
+  assert.equal(response.status, 202);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], {
+    conversationId: "conversation-image",
+    options: {
+      text: "检查截图",
+      context: [{
+        path: "src/App.jsx",
+        contentHash: "sha256:source",
+        startLine: 10,
+        endLine: 20,
+      }],
+      providerId: "test",
+      modelId: "vision",
+      thinkingLevel: "medium",
+      workflowId: "screenshot_review",
+      capabilities: ["web_search"],
+      images: [{
+        file_name: "设置页.png",
+        mime_type: "image/png",
+        byte_length: 225_000,
+        data: largeBoundedData,
+      }],
+      clientRequestId: "project-message:image-route",
+    },
+  });
+
+  const oversizedConfiguration = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-image/configuration`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "http://127.0.0.1:4173",
+      },
+      body: JSON.stringify({
+        schema_version: 1,
+        thinking_level: "medium",
+        padding: "x".repeat(300_000),
+      }),
+    },
+  );
+  assert.equal(oversizedConfiguration.status, 413);
+  assert.match(
+    (await oversizedConfiguration.json()).error.message,
+    /256 KB/,
+  );
+
+  const oversizedSteer = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-image/steer`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "http://127.0.0.1:4173",
+      },
+      body: JSON.stringify({
+        schema_version: 1,
+        text: "x".repeat(300_000),
+      }),
+    },
+  );
+  assert.equal(oversizedSteer.status, 413);
+  assert.match(
+    (await oversizedSteer.json()).error.message,
+    /256 KB/,
+  );
 });
 
 test("candidate summaries use the server project-state source", async (t) => {
@@ -842,6 +1125,14 @@ test("publicRun excludes internal artifact paths and connector internals", () =>
   assert.deepEqual(result.paper_decisions, { "paper-1": "read" });
   assert.equal(result.readings.papers["paper-1"].stages["research-question"].status, "ready");
   assert.equal(result.readings.papers["paper-1"].chat.turns[0].question, "这段是什么意思？");
+  assert.equal(
+    result.readings.papers["paper-1"].active_conversation_id,
+    "reading-conversation-current",
+  );
+  assert.deepEqual(
+    result.readings.papers["paper-1"].conversations.map((conversation) => conversation.id),
+    ["reading-conversation-current", "reading-conversation-branch"],
+  );
   assert.equal(result.readings.papers["paper-1"].chat.turns[0].cache_write_failed, true);
   assert.deepEqual(
     result.readings.papers["paper-1"].agent_actions.proposals[0],
@@ -1407,4 +1698,72 @@ test("reading HTTP routes preserve request fields and return durable stage state
   );
   assert.equal(positionResponse.status, 200);
   assert.deepEqual(calls.position.options, { mode: "focused", blockId: "block-1" });
+});
+
+test("translation routes use the server-owned profile and expose an idempotent pause action", async (t) => {
+  const calls = [];
+  const translation = {
+    schema_version: 1,
+    run_id: "journal-test",
+    paper_id: "paper-1",
+    document_revision: "sha256:document",
+    status: "running",
+    provider_id: "codex-subscription",
+    model_id: "gpt-5.3-codex-spark",
+    reasoning_effort: "low",
+    prompt_id: "translation",
+    prompt_version: "translation.v1",
+    total_blocks: 10,
+    translated_blocks: 2,
+    blocks: {},
+    error: null,
+    updated_at: "2026-07-26T00:00:00.000Z",
+  };
+  const workflow = {
+    getPaperTranslation: async (runId, paperId) => {
+      calls.push({ action: "get", runId, paperId });
+      return translation;
+    },
+    generatePaperTranslation: async (runId, paperId) => {
+      calls.push({ action: "start", runId, paperId });
+      return translation;
+    },
+    pausePaperTranslation: async (runId, paperId) => {
+      calls.push({ action: "pause", runId, paperId });
+      return { ...translation, status: "pausing" };
+    },
+  };
+  const server = await startTestServer(workflow);
+  t.after(server.close);
+  const endpoint = `${server.baseUrl}/api/v1/journal-runs/journal-test/papers/paper-1/translation`;
+
+  const startResponse = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      schema_version: 1,
+      provider_id: "deepseek",
+      model_id: "deepseek-v4-pro",
+    }),
+  });
+  assert.equal(startResponse.status, 202);
+  assert.equal((await startResponse.json()).model_id, "gpt-5.3-codex-spark");
+  assert.deepEqual(calls[0], {
+    action: "start",
+    runId: "journal-test",
+    paperId: "paper-1",
+  });
+
+  const pauseResponse = await fetch(`${endpoint}/pause`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ schema_version: 1 }),
+  });
+  assert.equal(pauseResponse.status, 200);
+  assert.equal((await pauseResponse.json()).status, "pausing");
+  assert.deepEqual(calls[1], {
+    action: "pause",
+    runId: "journal-test",
+    paperId: "paper-1",
+  });
 });

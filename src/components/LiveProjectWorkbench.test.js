@@ -112,7 +112,7 @@ test("live project workbench renders the honest empty states without starting wo
       { project, conversation: null },
     ));
 
-    assert.match(noConversationHtml, /新建对话或绑定项目后开始/);
+    assert.match(noConversationHtml, /新建会话后开始/);
     assert.match(noConversationHtml, /等待会话/);
     assert.match(noConversationHtml, /新建会话后可打开项目工件/);
 
@@ -126,8 +126,52 @@ test("live project workbench renders the honest empty states without starting wo
     assert.match(emptyConversationHtml, /修改先审阅/);
     assert.match(emptyConversationHtml, /命令显式运行/);
     assert.match(emptyConversationHtml, /只有显式发送才开始工作/);
+    assert.match(emptyConversationHtml, /添加文件/);
+    assert.match(emptyConversationHtml, /上传 PDF/);
+    assert.match(emptyConversationHtml, /MinerU Cloud/);
     assert.doesNotMatch(emptyConversationHtml, /aria-label="项目工件"/);
-    assert.doesNotMatch(emptyConversationHtml, /MinerU|Zotero|Obsidian|阅读镜头/);
+    assert.doesNotMatch(emptyConversationHtml, /Zotero|Obsidian|阅读镜头/);
+  });
+});
+
+test("PDF state stays visible while MinerU parses without marking the Agent as running", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench, hasProcessingDocuments }) => {
+    const parsing = conversation({
+      documents: [{
+        id: "document-1",
+        fileName: "开发手册.pdf",
+        byteLength: 1024,
+        status: "parsing",
+        parser: "MinerU Cloud v4",
+        error: null,
+      }],
+    });
+    assert.equal(hasProcessingDocuments(parsing), true);
+    assert.equal(parsing.status, "idle");
+    const parsingHtml = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      { project, conversation: parsing },
+    ));
+    assert.match(parsingHtml, /开发手册\.pdf/);
+    assert.match(parsingHtml, /正在由 MinerU 解析/);
+    assert.match(parsingHtml, /等待任务/);
+    assert.doesNotMatch(parsingHtml, /Agent 正在工作/);
+
+    const ready = {
+      ...parsing,
+      documents: [{
+        ...parsing.documents[0],
+        status: "ready",
+        revision: "sha256:ready",
+      }],
+    };
+    assert.equal(hasProcessingDocuments(ready), false);
+    const readyHtml = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      { project, conversation: ready },
+    ));
+    assert.match(readyHtml, /已可供 AI 阅读/);
+    assert.match(readyHtml, /只有显式发送才开始工作/);
   });
 });
 
@@ -283,6 +327,195 @@ test("manual context compaction waits for the first assistant reply", async () =
   });
 });
 
+test("composer thinking control exposes only model-supported Chinese levels", async () => {
+  await withLiveWorkbench(({ ProjectThinkingLevelControl }) => {
+    const availableHtml = renderToStaticMarkup(React.createElement(
+      ProjectThinkingLevelControl,
+      {
+        thinkingLevels: ["low", "medium", "high"],
+        thinkingLevel: "medium",
+        supportsThinking: true,
+        running: false,
+        onChange: () => {},
+      },
+    ));
+    assert.match(availableHtml, /aria-label="思考强度"/);
+    assert.match(availableHtml, /思考 · 低/);
+    assert.match(availableHtml, /思考 · 中/);
+    assert.match(availableHtml, /思考 · 高/);
+    assert.doesNotMatch(availableHtml, /思考 · 最高/);
+
+    const runningHtml = renderToStaticMarkup(React.createElement(
+      ProjectThinkingLevelControl,
+      {
+        thinkingLevels: ["low", "medium", "high"],
+        thinkingLevel: "high",
+        supportsThinking: true,
+        running: true,
+        onChange: () => {},
+      },
+    ));
+    assert.match(runningHtml, /Agent 工作期间不能切换思考强度/);
+    assert.match(runningHtml, /disabled=""/);
+
+    const unsupportedHtml = renderToStaticMarkup(React.createElement(
+      ProjectThinkingLevelControl,
+      {
+        thinkingLevels: ["off"],
+        thinkingLevel: "off",
+        supportsThinking: false,
+        onChange: () => {},
+      },
+    ));
+    assert.match(unsupportedHtml, /思考 · 不支持/);
+    assert.match(unsupportedHtml, /disabled=""/);
+  });
+});
+
+test("current-message capability menu exposes only configured retrieval and one workflow", async () => {
+  await withLiveWorkbench(({ ProjectCapabilityMenu }) => {
+    const html = renderToStaticMarkup(React.createElement(
+      ProjectCapabilityMenu,
+      {
+        open: true,
+        onOpenChange: () => {},
+        capabilityStatus: {
+          web_search: { available: true, reason: "Tavily 已配置" },
+          docs_search: { available: false, reason: "Context7 尚未配置" },
+        },
+        selectedCapabilityIds: ["web_search"],
+        onToggleCapability: () => {},
+        selectedWorkflowId: "code_review",
+        onSelectWorkflow: () => {},
+        supportsImages: false,
+        running: false,
+        onOpenSkills: () => {},
+        installedSkillCount: 4,
+      },
+    ));
+
+    assert.match(html, /能力 · 2/);
+    assert.match(html, /只在显式发送的这一轮生效/);
+    assert.match(html, /联网搜索/);
+    assert.match(html, /aria-pressed="true"/);
+    assert.match(html, /Context7 尚未配置/);
+    assert.match(html, /当前模型不支持识图/);
+    assert.match(html, /查看内置流程 · 4/);
+    assert.match(html, /未选择时不增加工具或提示词/);
+
+    const lockedHtml = renderToStaticMarkup(React.createElement(
+      ProjectCapabilityMenu,
+      {
+        open: true,
+        onOpenChange: () => {},
+        capabilityStatus: {
+          web_search: { available: true, reason: "Tavily 已配置" },
+        },
+        selectedCapabilityIds: ["web_search"],
+        onToggleCapability: () => {},
+        selectedWorkflowId: "code_review",
+        onSelectWorkflow: () => {},
+        running: true,
+      },
+    ));
+    assert.match(
+      lockedHtml,
+      /header-skill-pill[^>]*type="button" disabled=""/,
+    );
+    assert.match(lockedHtml, /Agent 工作期间不能更换本轮能力/);
+  });
+});
+
+test("message payload controls stay frozen until image serialization and HTTP finish", async () => {
+  await withLiveWorkbench(({ ProjectAgentPane }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectAgentPane, {
+      conversation: conversation({ documents: [] }),
+      draft: "检查这张截图",
+      onDraftChange: () => {},
+      contextChips: [{ id: "context-1", label: "src/App.jsx" }],
+      onRemoveContext: () => {},
+      selectedCapabilityIds: ["web_search"],
+      onRemoveCapability: () => {},
+      selectedWorkflowId: "code_review",
+      onRemoveWorkflow: () => {},
+      pendingImage: {
+        file: { name: "设置页.png" },
+        previewUrl: "",
+      },
+      onRemoveImage: () => {},
+      imageInputRef: { current: null },
+      onSelectImage: () => {},
+      supportsImages: true,
+      onSubmit: () => {},
+      onAbort: () => {},
+      onOpenArtifact: () => {},
+      action: "message",
+      error: null,
+      modelLabel: "vision-model",
+      thinkingLevelControl: null,
+      contextUsageControl: null,
+      pdfInputRef: { current: null },
+      uploadingPdf: null,
+      onUploadPdf: () => {},
+      onRetryDocument: () => {},
+      retryingDocumentId: null,
+    }));
+
+    assert.match(html, /<textarea[^>]*disabled=""/);
+    assert.match(
+      html,
+      /<button type="button" disabled="" aria-label="移除上下文：src\/App\.jsx"/,
+    );
+    assert.match(
+      html,
+      /<button type="button" disabled="" aria-label="移除流程：代码审查"/,
+    );
+    assert.match(
+      html,
+      /<button type="button" disabled="" aria-label="移除能力：联网搜索"/,
+    );
+    assert.match(
+      html,
+      /<button type="button" disabled="" aria-label="移除图片：设置页\.png"/,
+    );
+    assert.match(
+      html,
+      /project-composer-attachment" type="button" disabled="" title="为当前消息添加一张/,
+    );
+    assert.match(
+      html,
+      /type="file" accept="image\/png,image\/jpeg,image\/webp" disabled=""/,
+    );
+  });
+});
+
+test("safe image metadata is visible without returning image data to the browser", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      {
+        project,
+        conversation: conversation({
+          messages: [{
+            id: "message-image",
+            role: "user",
+            content: "检查这张界面截图",
+            images: [{
+              fileName: "设置页.png",
+              mimeType: "image/png",
+              byteLength: 2048,
+            }],
+          }],
+        }),
+      },
+    ));
+
+    assert.match(html, /检查这张界面截图/);
+    assert.match(html, /图片 · 设置页\.png/);
+    assert.doesNotMatch(html, /data:image|base64/);
+  });
+});
+
 test("normal-work keeps context usage beside the composer model and out of the header", async () => {
   const source = await readFile(COMPONENT_URL, "utf8");
   const headerStart = source.indexOf("const headerActions");
@@ -293,12 +526,14 @@ test("normal-work keeps context usage beside the composer model and out of the h
   const composerImplementation = source.slice(composerStart, composerEnd);
 
   const providerIndex = headerImplementation.indexOf("<ProviderMenu");
-  const skillsIndex = headerImplementation.indexOf("header-skill-pill");
+  const capabilitiesIndex = headerImplementation.indexOf("<ProjectCapabilityMenu");
   const modelIndex = composerImplementation.indexOf("project-composer-model");
+  const thinkingIndex = composerImplementation.indexOf("{thinkingLevelControl}");
   const contextIndex = composerImplementation.indexOf("{contextUsageControl}");
-  assert.ok(providerIndex >= 0 && providerIndex < skillsIndex);
+  assert.ok(providerIndex >= 0 && providerIndex < capabilitiesIndex);
   assert.doesNotMatch(headerImplementation, /ProjectContextUsageMenu/);
-  assert.ok(modelIndex >= 0 && modelIndex < contextIndex);
+  assert.ok(modelIndex >= 0 && modelIndex < thinkingIndex);
+  assert.ok(thinkingIndex < contextIndex);
   assert.doesNotMatch(source, />\s*整理上下文\s*</);
 });
 
@@ -374,7 +609,6 @@ test("live project workbench renders an immediate preparation state for a new co
 
     assert.match(html, /正在准备新工作会话/);
     assert.match(html, /创建会话/);
-    assert.match(html, /马上就可以输入任务/);
     assert.doesNotMatch(html, /还没有会话/);
   });
 });
@@ -748,5 +982,14 @@ test("adding file context only updates removable composer context until submit",
   assert.match(source, /<form className="project-agent-composer" onSubmit=\{onSubmit\}>/);
   assert.match(submitImplementation, /api\.sendMessage/);
   assert.match(submitImplementation, /contexts: contextChips/);
+  assert.match(submitImplementation, /images: pendingImage/);
+  assert.match(submitImplementation, /capabilities: selectedCapabilityIds/);
+  assert.match(submitImplementation, /workflowId: selectedWorkflowId/);
+  assert.match(submitImplementation, /const submittedDraft = draft/);
+  assert.match(
+    submitImplementation,
+    /setDraft\(\(current\) => \(\s*current === submittedDraft \? "" : current\s*\)\)/,
+  );
+  assert.match(submitImplementation, /replacePendingImage\(null\)/);
   assert.match(source, /useState\(\s*readLastArtifact\(/);
 });

@@ -23,6 +23,7 @@ function ConversationList({
   onSelectConversation,
   onRenameConversation,
   onDeleteConversation,
+  onResetPaperConversation,
   openConversationMenuId,
   setOpenConversationMenuId,
 }) {
@@ -35,8 +36,12 @@ function ConversationList({
       : conversation.kind === "paper_reading"
         ? BookOpenText
         : Code;
-    const hasConversationActions = conversation.kind === "project_work"
-      && (onRenameConversation || onDeleteConversation);
+    const resetBlocked = conversation.resetBlocked === true;
+    const hasPaperActions = conversation.kind === "paper_reading" && Boolean(onResetPaperConversation);
+    const hasConversationActions = (
+      conversation.kind === "project_work"
+      && (onRenameConversation || onDeleteConversation)
+    ) || hasPaperActions;
     return (
       <div
         key={conversation.id}
@@ -90,7 +95,7 @@ function ConversationList({
                 aria-label={`“${conversation.title}”会话操作`}
                 onPointerDown={(event) => event.stopPropagation()}
               >
-                {onRenameConversation ? (
+                {conversation.kind === "project_work" && onRenameConversation ? (
                   <button
                     type="button"
                     role="menuitem"
@@ -104,7 +109,7 @@ function ConversationList({
                     重命名
                   </button>
                 ) : null}
-                {onDeleteConversation ? (
+                {conversation.kind === "project_work" && onDeleteConversation ? (
                   <button
                     className="is-danger"
                     type="button"
@@ -121,6 +126,25 @@ function ConversationList({
                   >
                     <Trash size={15} weight="regular" aria-hidden="true" />
                     删除会话
+                  </button>
+                ) : null}
+                {hasPaperActions ? (
+                  <button
+                    className="is-danger"
+                    type="button"
+                    role="menuitem"
+                    disabled={resetBlocked}
+                    title={resetBlocked
+                      ? "这篇论文已完成归档，研读记录保持只读"
+                      : undefined}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setOpenConversationMenuId(null);
+                      onResetPaperConversation(conversation);
+                    }}
+                  >
+                    <Trash size={15} weight="regular" aria-hidden="true" />
+                    删除研读记录
                   </button>
                 ) : null}
               </div>
@@ -143,6 +167,7 @@ export function ProjectRail({
   onNewStandaloneConversation,
   onDeleteConversation,
   onRenameConversation,
+  onResetPaperConversation,
   deletingConversationId = null,
   creatingConversationProjectIds = [],
   preparingConversationProjectId = null,
@@ -259,45 +284,41 @@ export function ProjectRail({
               )}
               <span>
                 <strong>新建对话</strong>
-                <small>无需选择文件夹</small>
               </span>
             </button>
-            <section className="standalone-conversations" aria-label="独立对话">
-              <div className="project-list-heading">
-                <span className="eyebrow">独立对话</span>
-              </div>
-              <div className="project-conversation-list">
-                {creatingStandaloneConversation ? (
-                  <button
-                    className={`project-conversation-row${preparingStandaloneConversation ? " is-active" : ""}`}
-                    type="button"
-                    disabled
-                    aria-live="polite"
-                  >
-                    <CircleNotch className="spin" size={16} weight="bold" aria-hidden="true" />
-                    <span>
-                      <strong>新工作会话</strong>
-                      <small>正在创建会话…</small>
-                    </span>
-                  </button>
-                ) : null}
-                <ConversationList
-                  conversations={standaloneConversations}
-                  selectedConversationId={selectedConversationId}
-                  deletingConversationId={deletingConversationId}
-                  onSelectConversation={onSelectConversation}
-                  onRenameConversation={onRenameConversation}
-                  onDeleteConversation={onDeleteConversation}
-                  openConversationMenuId={openConversationMenuId}
-                  setOpenConversationMenuId={setOpenConversationMenuId}
-                />
-                {!creatingStandaloneConversation && standaloneConversations.length === 0 ? (
-                  <p className="project-child-empty">
-                    {normalizedQuery ? "没有匹配的独立对话" : "还没有独立对话"}
-                  </p>
-                ) : null}
-              </div>
-            </section>
+            {creatingStandaloneConversation || standaloneConversations.length > 0 ? (
+              <section className="standalone-conversations" aria-label="独立对话">
+                <div className="project-list-heading">
+                  <span className="eyebrow">独立对话</span>
+                </div>
+                <div className="project-conversation-list">
+                  {creatingStandaloneConversation ? (
+                    <button
+                      className={`project-conversation-row${preparingStandaloneConversation ? " is-active" : ""}`}
+                      type="button"
+                      disabled
+                      aria-live="polite"
+                    >
+                      <CircleNotch className="spin" size={16} weight="bold" aria-hidden="true" />
+                      <span>
+                        <strong>新工作会话</strong>
+                        <small>正在创建会话…</small>
+                      </span>
+                    </button>
+                  ) : null}
+                  <ConversationList
+                    conversations={standaloneConversations}
+                    selectedConversationId={selectedConversationId}
+                    deletingConversationId={deletingConversationId}
+                    onSelectConversation={onSelectConversation}
+                    onRenameConversation={onRenameConversation}
+                    onDeleteConversation={onDeleteConversation}
+                    openConversationMenuId={openConversationMenuId}
+                    setOpenConversationMenuId={setOpenConversationMenuId}
+                  />
+                </div>
+              </section>
+            ) : null}
           </>
         ) : null}
         <div className="project-list-heading">
@@ -367,37 +388,70 @@ export function ProjectRail({
               </div>
               {selected ? (
                 <div className="project-children">
-                  <div className="project-conversation-list">
-                    {creatingConversation ? (
-                      <button
-                        className={`project-conversation-row${preparingConversationProjectId === project.id ? " is-active" : ""}`}
-                        type="button"
-                        disabled
-                        aria-live="polite"
-                      >
-                        <CircleNotch className="spin" size={16} weight="bold" aria-hidden="true" />
-                        <span>
-                          <strong>新工作会话</strong>
-                          <small>正在创建会话…</small>
-                        </span>
-                      </button>
-                    ) : null}
-                    <ConversationList
-                      conversations={projectConversations}
-                      selectedConversationId={selectedConversationId}
-                      deletingConversationId={deletingConversationId}
-                      onSelectConversation={onSelectConversation}
-                      onRenameConversation={onRenameConversation}
-                      onDeleteConversation={onDeleteConversation}
-                      openConversationMenuId={openConversationMenuId}
-                      setOpenConversationMenuId={setOpenConversationMenuId}
-                    />
-                    {projectConversations.length === 0 && !creatingConversation ? (
-                      <p className="project-child-empty">还没有会话</p>
-                    ) : null}
-                  </div>
+                  {workspaceKind === "paper_reading" && activeRun ? (
+                    <button
+                      className={`capability-row project-run-row${selectedRunId === activeRun.id ? " is-active" : ""}`}
+                      type="button"
+                      aria-label={`打开本周追踪：${activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}`}
+                      onClick={() => onSelectRun?.(activeRun.id)}
+                    >
+                      <PlayCircle size={17} weight="regular" aria-hidden="true" />
+                      <span>
+                        <strong>每周追踪</strong>
+                        <small>{activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}</small>
+                      </span>
+                    </button>
+                  ) : null}
 
-                  {activeRun ? (
+                  <section
+                    className={workspaceKind === "paper_reading"
+                      ? "project-paper-conversations"
+                      : undefined}
+                    aria-label={workspaceKind === "paper_reading" ? "论文研读" : "项目会话"}
+                  >
+                    {workspaceKind === "paper_reading" ? (
+                      <div className="project-child-heading">
+                        <span>论文研读</span>
+                        <small>{projectConversations.length}</small>
+                      </div>
+                    ) : null}
+                    <div className="project-conversation-list">
+                      {creatingConversation ? (
+                        <button
+                          className={`project-conversation-row${preparingConversationProjectId === project.id ? " is-active" : ""}`}
+                          type="button"
+                          disabled
+                          aria-live="polite"
+                        >
+                          <CircleNotch className="spin" size={16} weight="bold" aria-hidden="true" />
+                          <span>
+                            <strong>新工作会话</strong>
+                            <small>正在创建会话…</small>
+                          </span>
+                        </button>
+                      ) : null}
+                      <ConversationList
+                        conversations={projectConversations}
+                        selectedConversationId={selectedConversationId}
+                        deletingConversationId={deletingConversationId}
+                        onSelectConversation={onSelectConversation}
+                        onRenameConversation={onRenameConversation}
+                        onDeleteConversation={onDeleteConversation}
+                        onResetPaperConversation={onResetPaperConversation}
+                        openConversationMenuId={openConversationMenuId}
+                        setOpenConversationMenuId={setOpenConversationMenuId}
+                      />
+                      {projectConversations.length === 0 && !creatingConversation ? (
+                        <p className="project-child-empty">
+                          {workspaceKind === "paper_reading"
+                            ? "还没有选择研读的论文"
+                            : "还没有会话"}
+                        </p>
+                      ) : null}
+                    </div>
+                  </section>
+
+                  {workspaceKind !== "paper_reading" && activeRun ? (
                     <button
                       className={`capability-row project-run-row${selectedRunId === activeRun.id ? " is-active" : ""}`}
                       type="button"

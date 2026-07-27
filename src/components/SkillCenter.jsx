@@ -18,13 +18,16 @@ export function SkillCenter({ catalog, skillState, installingId, onInstall, onTo
     const normalized = query.trim().toLowerCase();
     return catalog.filter((skill) => {
       const state = skillState[skill.id];
+      const installed = skill.kind === "workflow" || state?.installed;
       const matchesSearch = `${skill.name} ${skill.description} ${skill.category}`.toLowerCase().includes(normalized);
-      const matchesView = view === "all" || (view === "installed" ? state?.installed : !state?.installed);
+      const matchesView = view === "all" || (view === "installed" ? installed : !installed);
       return matchesSearch && matchesView;
     });
   }, [catalog, query, skillState, view]);
 
-  const installedCount = catalog.filter((skill) => skillState[skill.id]?.installed).length;
+  const installedCount = catalog.filter((skill) => (
+    skill.kind === "workflow" || skillState[skill.id]?.installed
+  )).length;
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
@@ -62,7 +65,10 @@ export function SkillCenter({ catalog, skillState, installingId, onInstall, onTo
             const state = skillState[skill.id];
             const installing = installingId === skill.id;
             return (
-              <article className={`skill-row${state?.enabled ? " is-enabled" : ""}`} key={skill.id}>
+              <article
+                className={`skill-row${skill.kind === "workflow" || state?.enabled ? " is-enabled" : ""}`}
+                key={skill.id}
+              >
                 <span className="skill-row-icon"><Package size={19} weight="regular" aria-hidden="true" /></span>
                 <div className="skill-row-copy">
                   <div className="skill-row-title">
@@ -72,12 +78,22 @@ export function SkillCenter({ catalog, skillState, installingId, onInstall, onTo
                   </div>
                   <p>{skill.description}</p>
                   <div className="skill-state-line">
-                    {state?.installed ? <CheckCircle size={14} weight="fill" aria-hidden="true" /> : <DownloadSimple size={14} aria-hidden="true" />}
-                    <span>{state?.installed ? (state.enabled ? "已安装并启用" : "已安装，当前停用") : "尚未下载到本机"}</span>
+                    {skill.kind === "workflow" || state?.installed
+                      ? <CheckCircle size={14} weight="fill" aria-hidden="true" />
+                      : <DownloadSimple size={14} aria-hidden="true" />}
+                    <span>
+                      {skill.kind === "workflow"
+                        ? "内置流程，仅在当前一轮选择后使用"
+                        : state?.installed
+                          ? (state.enabled ? "已安装并启用" : "已安装，当前停用")
+                          : "尚未下载到本机"}
+                    </span>
                   </div>
                 </div>
                 <div className="skill-row-action">
-                  {state?.installed ? (
+                  {skill.kind === "workflow" ? (
+                    <span className="skill-builtin-label">按需</span>
+                  ) : state?.installed ? (
                     <button
                       className={`switch-control${state.enabled ? " is-on" : ""}`}
                       type="button"
@@ -112,7 +128,10 @@ export function SkillCenter({ catalog, skillState, installingId, onInstall, onTo
         <footer className="skill-dialog-footer">
           <div>
             <ShieldCheck size={17} weight="regular" aria-hidden="true" />
-            <p><strong>毛坯状态</strong><span>当前只保留入口和结构；不会执行真实包安装，也不收集密钥。</span></p>
+            <p>
+              <strong>保持上下文清爽</strong>
+              <span>内置流程不会常驻提示词；只有在当前消息选择后才注入一次。</span>
+            </p>
           </div>
           <button className="primary-action" type="button" onClick={onClose}>完成</button>
         </footer>

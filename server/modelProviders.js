@@ -1,6 +1,7 @@
 import {
   CODEX_ACCOUNT_MODEL_ID,
   CODEX_PROVIDER_ID,
+  CODEX_SPARK_MODEL_ID,
   runCodexSubscription,
 } from "./providers/codexSubscription.js";
 import {
@@ -76,7 +77,10 @@ export function createModelProviderRegistry({
 
   function supports(providerId, modelId) {
     return (
-      (providerId === CODEX_PROVIDER_ID && modelId === CODEX_ACCOUNT_MODEL_ID)
+      (
+        providerId === CODEX_PROVIDER_ID
+        && [CODEX_ACCOUNT_MODEL_ID, CODEX_SPARK_MODEL_ID].includes(modelId)
+      )
       || (providerId === DEEPSEEK_PROVIDER_ID && DEEPSEEK_MODELS.includes(modelId))
     );
   }
@@ -97,6 +101,8 @@ export function createModelProviderRegistry({
       result = await enqueueCodex(() => codexRunner({
         prompt: `${combinedSystem}\n\n输入 JSON：\n${input}\n\n只返回符合 schema 的 JSON。`,
         schema: request.schema,
+        modelId: request.modelId,
+        reasoningEffort: request.reasoningEffort ?? null,
         env,
         timeoutMs: Number.parseInt(env.PI_CODEX_TIMEOUT_MS || "90000", 10),
       }));
@@ -119,6 +125,7 @@ export function createModelProviderRegistry({
       value: parseStructuredText(result.text),
       provider_id: request.providerId,
       model_id: request.modelId,
+      reasoning_effort: request.reasoningEffort ?? null,
       operation_id: result.operationId,
       upstream_request_id: result.upstreamRequestId ?? null,
       usage: result.usage,

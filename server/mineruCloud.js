@@ -479,7 +479,16 @@ export function createMineruCloudAdapter({
     }
   }
 
-  async function submitBatch(files) {
+  async function submitBatch(files, {
+    onBatchAllocated,
+    onUploadCompleted,
+  } = {}) {
+    if (onBatchAllocated !== undefined && typeof onBatchAllocated !== "function") {
+      throw invalidRequest("onBatchAllocated 必须是函数");
+    }
+    if (onUploadCompleted !== undefined && typeof onUploadCompleted !== "function") {
+      throw invalidRequest("onUploadCompleted 必须是函数");
+    }
     const validatedFiles = await validateBatchFiles(files);
     const body = await requestApi("/file-urls/batch", {
       method: "POST",
@@ -512,6 +521,15 @@ export function createMineruCloudAdapter({
     if (new Set(uploadUrls).size !== uploadUrls.length) {
       throw invalidResponse("MinerU 返回了重复的上传 URL", traceId);
     }
+    await onBatchAllocated?.({
+      batchId,
+      traceId,
+      files: validatedFiles.map((file) => ({
+        fileName: file.fileName,
+        dataId: file.dataId,
+        size: file.size,
+      })),
+    });
 
     const uploads = await Promise.all(validatedFiles.map(async (file, index) => {
       try {
@@ -538,6 +556,13 @@ export function createMineruCloudAdapter({
         if (!response.ok) {
           throw classifyUpstreamError({ status: response.status });
         }
+        await onUploadCompleted?.({
+          batchId,
+          traceId,
+          fileName: file.fileName,
+          dataId: file.dataId,
+          size: file.size,
+        });
         return {
           fileName: file.fileName,
           dataId: file.dataId,

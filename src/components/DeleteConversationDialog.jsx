@@ -84,8 +84,8 @@ export function DeleteConversationDialog({
             </>
           ) : null}
           {standalone
-            ? "此操作不可恢复。这个对话的私有草稿区会随这个对话一起删除，不会影响任何已绑定项目。"
-            : "此操作不可恢复，但不会删除项目文件夹，也不会回滚已经确认写入的修改。"}
+            ? "此操作不可恢复，不会影响任何已绑定项目。"
+            : "此操作不可恢复，不会删除项目文件夹，也不会回滚已确认写入的修改。"}
         </p>
         {conversation.checking ? (
           <p className="conversation-delete-checking" role="status">

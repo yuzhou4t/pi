@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import {
   lstat,
@@ -9,6 +9,12 @@ import {
   rmdir,
 } from "node:fs/promises";
 import path from "node:path";
+import { createMineruCloudAdapter } from "../mineruCloud.js";
+import {
+  createConversationDocumentService,
+  hasActiveConversationDocuments,
+  publicConversationDocument,
+} from "./conversationDocuments.js";
 import { createConversationStore } from "./conversationStore.js";
 import {
   ProjectWorkError,
@@ -17,9 +23,12 @@ import {
 } from "./errors.js";
 import {
   createPiSessionFactory,
+  PROJECT_WORK_DEFAULT_TOOL_NAMES,
   readProjectWorkOverlayTextFile,
 } from "./piSessionHost.js";
+import { resolveProjectWorkTurn } from "./projectWorkWorkflows.js";
 import { createMacOSProjectPicker } from "./macosProjectPicker.js";
+import { normalizeProjectWorkImages } from "./projectWorkImages.js";
 import { createProjectRegistry, publicProject } from "./projectRegistry.js";
 import { createVerificationRunner } from "./verificationRunner.js";
 import {
@@ -32,15 +41,13 @@ import {
 } from "./workspace.js";
 
 const SELECTION_TTL_MS = 10 * 60 * 1_000;
-const THINKING_LEVELS = new Set([
+const LEGACY_THINKING_LEVELS = [
   "off",
   "minimal",
   "low",
   "medium",
   "high",
-  "xhigh",
-  "max",
-]);
+];
 const SAFE_VERIFICATION_FILES = new Set(["npm", "pnpm", "yarn", "bun", "node"]);
 const PACKAGE_COMMANDS = new Set(["test", "run", "lint", "check", "typecheck"]);
 const DEFAULT_CONVERSATION_TITLE = "新工作会话";
@@ -62,6 +69,7 @@ const COMPACTION_REASONS = new Set([
   "threshold",
   "overflow",
 ]);
+const CLIENT_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 
 function nullableNonNegativeNumber(value) {
   if (value === null || value === undefined) return null;
@@ -138,6 +146,58 @@ function compactText(value, maxLength, fallback = "") {
     .trim()
     .replaceAll(/\s+/g, " ");
   return normalized.slice(0, maxLength) || fallback;
+}
+
+function normalizeClientRequestId(value, idFactory) {
+  const requestId = value === undefined || value === null
+    ? `project-message:${idFactory()}`
+    : String(value).trim();
+  if (!CLIENT_REQUEST_ID_PATTERN.test(requestId)) {
+    throw projectWorkError(
+      "PROJECT_WORK_CLIENT_REQUEST_ID_INVALID",
+      "客户端请求标识无效",
+      400,
+    );
+  }
+  return requestId;
+}
+
+function messageRequestFingerprint({
+  text,
+  context,
+  images,
+  capabilities,
+  workflowId,
+  providerId,
+  modelId,
+  thinkingLevel,
+}) {
+  const imageSignatures = images.map((image) => ({
+    fileName: image?.fileName ?? image?.file_name ?? null,
+    mimeType: image?.mimeType ?? image?.mime_type ?? null,
+    byteLength: image?.byteLength ?? image?.byte_length ?? null,
+    sha256: createHash("sha256")
+      .update(String(image?.data ?? ""))
+      .digest("hex"),
+  }));
+  const payload = {
+    text,
+    context: context.map((item) => ({
+      path: item?.path ?? null,
+      contentHash: item?.contentHash ?? null,
+      startLine: item?.startLine ?? null,
+      endLine: item?.endLine ?? null,
+    })),
+    images: imageSignatures,
+    capabilities: [...capabilities],
+    workflowId: workflowId ?? null,
+    providerId: providerId ?? null,
+    modelId: modelId ?? null,
+    thinkingLevel: thinkingLevel ?? null,
+  };
+  return createHash("sha256")
+    .update(JSON.stringify(payload))
+    .digest("hex");
 }
 
 function conversationTitle(value) {
@@ -221,7 +281,23 @@ function publicConversationState(conversation, lastEventSeq) {
       id: message.id,
       role: message.role,
       text: message.text,
+      images: Array.isArray(message.images)
+        ? message.images.map((image) => ({
+            fileName: compactText(image?.fileName, 160, "图片"),
+            mimeType: compactText(image?.mimeType, 80),
+            byteLength: Number.isSafeInteger(image?.byteLength)
+              ? image.byteLength
+              : 0,
+          }))
+        : [],
       status: message.status,
+      providerId: message.providerId ?? null,
+      modelId: message.modelId ?? null,
+      thinkingLevel: message.thinkingLevel ?? null,
+      workflowId: message.workflowId ?? null,
+      capabilities: Array.isArray(message.capabilities)
+        ? [...message.capabilities]
+        : [],
       createdAt: message.createdAt,
     })),
     plan: conversation.plan ? structuredClone(conversation.plan) : null,
@@ -236,6 +312,9 @@ function publicConversationState(conversation, lastEventSeq) {
       : null,
     contextUsage: normalizedContextUsage(conversation.contextUsage),
     compaction: normalizedCompactionState(conversation.compaction),
+    documents: (conversation.documents ?? [])
+      .map(publicConversationDocument)
+      .filter(Boolean),
     lastError: conversation.lastError ? structuredClone(conversation.lastError) : null,
   };
 }
@@ -260,10 +339,59 @@ function selectModel(catalog, { providerId, modelId } = {}) {
       true,
     );
   }
+  const thinkingLevels = Array.isArray(model.thinkingLevels)
+    && model.thinkingLevels.length > 0
+    ? [...new Set(model.thinkingLevels.filter(
+        (level) => typeof level === "string" && level,
+      ))]
+    : model.supportsThinking === false
+      ? ["off"]
+      : [...LEGACY_THINKING_LEVELS];
+  const defaultThinkingLevel = thinkingLevels.includes(model.defaultThinkingLevel)
+    ? model.defaultThinkingLevel
+    : thinkingLevels.includes(catalog.defaultThinkingLevel)
+      ? catalog.defaultThinkingLevel
+      : [
+          "medium",
+          "low",
+          "high",
+          "minimal",
+          "off",
+          ...thinkingLevels,
+        ].find((level) => thinkingLevels.includes(level)) ?? "off";
   return {
     providerId: provider.id,
     modelId: model.id,
     modelRef: `${provider.id}/${model.id}`,
+    supportsImages: model.supportsImages === true,
+    thinkingLevels,
+    defaultThinkingLevel,
+  };
+}
+
+function selectThinkingLevel(selectedModel, requestedLevel, {
+  strict = false,
+} = {}) {
+  const requested = compactText(requestedLevel, 40);
+  if (requested && selectedModel.thinkingLevels.includes(requested)) {
+    return requested;
+  }
+  if (requested && strict) {
+    throw projectWorkError(
+      "PROJECT_WORK_THINKING_LEVEL_UNSUPPORTED",
+      "所选模型不支持该思考强度",
+      400,
+    );
+  }
+  return selectedModel.defaultThinkingLevel;
+}
+
+function publicModelSelection(selectedModel, thinkingLevel) {
+  return {
+    providerId: selectedModel.providerId,
+    modelId: selectedModel.modelId,
+    modelRef: selectedModel.modelRef,
+    thinkingLevel,
   };
 }
 
@@ -496,9 +624,44 @@ function defaultStorageRoot() {
     : path.join(homedir(), ".local", "share", "pi-agent", "project-work");
 }
 
+function defaultDocumentParser() {
+  const token = String(process.env.PI_MINERU_API_TOKEN ?? "").trim();
+  return token
+    ? createMineruCloudAdapter({
+        apiToken: token,
+        baseUrl: process.env.PI_MINERU_BASE_URL || undefined,
+      })
+    : null;
+}
+
+function positiveEnvironmentInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function defaultDocumentPollInterval() {
+  return positiveEnvironmentInteger(
+    process.env.PI_MINERU_POLL_INTERVAL_MS,
+    10_000,
+  );
+}
+
+function defaultDocumentMaxPollAttempts(pollIntervalMs) {
+  const timeoutMs = positiveEnvironmentInteger(
+    process.env.PI_MINERU_TIMEOUT_MS,
+    30 * 60 * 1_000,
+  );
+  return Math.max(1, Math.ceil(timeoutMs / Math.max(pollIntervalMs, 1)));
+}
+
 export function createProjectWorkService({
   storageRoot = defaultStorageRoot(),
   sessionFactory,
+  documentParser = defaultDocumentParser(),
+  documentPollIntervalMs = defaultDocumentPollInterval(),
+  documentMaxPollAttempts = defaultDocumentMaxPollAttempts(
+    documentPollIntervalMs,
+  ),
   snapshotter = createFilteredProjectSnapshot,
   picker = createMacOSProjectPicker(),
   runner = createVerificationRunner(),
@@ -518,9 +681,31 @@ export function createProjectWorkService({
   });
   const selections = new Map();
   const runtimes = new Map();
+  const activeMessageClaims = new Map();
   const verificationControllers = new Map();
   const applyQueues = new Map();
   const deletingConversations = new Set();
+  const deletingProjects = new Set();
+  const documentOperationCounts = new Map();
+  const conversationCreationCounts = new Map();
+  const documentService = createConversationDocumentService({
+    getConversation: (conversationId) => conversationStore.get(conversationId),
+    updateConversation: (conversationId, patch) => (
+      updateConversation(conversationId, patch)
+    ),
+    appendEvent: (conversationId, type, data) => (
+      appendEvent(conversationId, type, data)
+    ),
+    directoryForConversation: (conversationId) => (
+      conversationStore.directory(conversationId)
+    ),
+    parser: documentParser,
+    pollIntervalMs: documentPollIntervalMs,
+    maxPollAttempts: documentMaxPollAttempts,
+    now,
+    idFactory,
+  });
+  let modelCatalogCache = null;
   let disposed = false;
 
   function timestamp() {
@@ -539,6 +724,45 @@ export function createProjectWorkService({
         409,
         true,
       );
+    }
+  }
+
+  async function withDocumentOperation(conversationId, operation) {
+    assertConversationNotDeleting(conversationId);
+    const conversation = await conversationStore.get(conversationId);
+    if (
+      conversation.projectId
+      && deletingProjects.has(conversation.projectId)
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_PROJECT_DELETE_IN_PROGRESS",
+        "项目正在删除，暂时不能修改会话资料",
+        409,
+        true,
+      );
+    }
+    documentOperationCounts.set(
+      conversationId,
+      (documentOperationCounts.get(conversationId) ?? 0) + 1,
+    );
+    try {
+      assertConversationNotDeleting(conversationId);
+      if (
+        conversation.projectId
+        && deletingProjects.has(conversation.projectId)
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_PROJECT_DELETE_IN_PROGRESS",
+          "项目正在删除，暂时不能修改会话资料",
+          409,
+          true,
+        );
+      }
+      return await operation(conversation);
+    } finally {
+      const remaining = (documentOperationCounts.get(conversationId) ?? 1) - 1;
+      if (remaining > 0) documentOperationCounts.set(conversationId, remaining);
+      else documentOperationCounts.delete(conversationId);
     }
   }
 
@@ -571,13 +795,15 @@ export function createProjectWorkService({
       BUSY_CONVERSATION_STATUSES.has(conversation.status)
       || verificationControllers.has(conversation.id)
       || Boolean(runtime?.completion)
+      || (documentOperationCounts.get(conversation.id) ?? 0) > 0
+      || hasActiveConversationDocuments(conversation)
       || (conversation.verifications ?? []).some(
         (verification) => verification.status === "running",
       )
     ) {
       throw projectWorkError(
         "PROJECT_WORK_CONVERSATION_DELETE_BUSY",
-        "工作会话仍有正在运行的 Agent、验证或修改应用操作",
+        "工作会话仍有正在运行的 Agent、验证、PDF 解析或修改应用操作",
         409,
         true,
       );
@@ -958,6 +1184,11 @@ export function createProjectWorkService({
 
   async function handleRuntimeEvent(runtime, event) {
     const conversationId = runtime.conversationId;
+    const turnSettings = runtime.activeTurnSettings ?? {
+      providerId: runtime.providerId,
+      modelId: runtime.modelId,
+      thinkingLevel: runtime.thinkingLevel,
+    };
     switch (event?.type) {
       case "agent_start":
         await finishRuntimeThinking(runtime);
@@ -1002,11 +1233,13 @@ export function createProjectWorkService({
         runtime.turnIndex += 1;
         await appendEvent(conversationId, "turn.started", {
           turnIndex: runtime.turnIndex,
+          ...turnSettings,
         });
         break;
       case "turn_end":
         await appendEvent(conversationId, "turn.completed", {
           turnIndex: runtime.turnIndex,
+          ...turnSettings,
         });
         break;
       case "message_start":
@@ -1016,6 +1249,7 @@ export function createProjectWorkService({
           await appendEvent(conversationId, "message.started", {
             id: runtime.activeAssistantId,
             role: "assistant",
+            ...turnSettings,
           });
         }
         break;
@@ -1049,6 +1283,7 @@ export function createProjectWorkService({
             role: "assistant",
             text: fullText,
             status,
+            ...turnSettings,
             createdAt: timestamp(),
           };
           await updateConversation(conversationId, (current) => ({
@@ -1141,6 +1376,11 @@ export function createProjectWorkService({
       thinkingObserved: false,
       thinkingActive: false,
       completion: null,
+      providerId: conversation.providerId,
+      modelId: conversation.modelId,
+      modelRef: conversation.modelRef,
+      thinkingLevel: conversation.thinkingLevel,
+      activeTurnSettings: null,
       host: null,
       unsubscribe: null,
     };
@@ -1154,6 +1394,17 @@ export function createProjectWorkService({
       thinkingLevel: conversation.thinkingLevel,
       workspaceSnapshot,
       workspaceKind: workspace.workspaceKind,
+      documentAccess: {
+        list: () => documentService.listForAgent(conversationId),
+        search: (request) => documentService.searchForAgent(
+          conversationId,
+          request,
+        ),
+        read: (request) => documentService.readForAgent(
+          conversationId,
+          request,
+        ),
+      },
       onPlan: (plan) => recordPlan(conversationId, plan),
       onVerificationRequest: (request) => recordVerificationRequest(
         conversationId,
@@ -1176,6 +1427,7 @@ export function createProjectWorkService({
   }
 
   async function snapshot(conversationId, options = {}) {
+    await documentService.resumeConversation(conversationId);
     let conversation = await conversationStore.get(conversationId);
     if (
       conversation.status === "verifying"
@@ -1205,6 +1457,7 @@ export function createProjectWorkService({
     if (
       (conversation.status === "running" || staleCompaction)
       && !runtimes.has(conversationId)
+      && !activeMessageClaims.has(conversationId)
     ) {
       const interruptedAt = timestamp();
       conversation = await updateConversation(conversationId, (current) => ({
@@ -1239,8 +1492,9 @@ export function createProjectWorkService({
     };
   }
 
-  async function listModels() {
+  async function loadModelCatalog({ refresh = false } = {}) {
     assertActive();
+    if (!refresh && modelCatalogCache) return structuredClone(modelCatalogCache);
     if (typeof effectiveSessionFactory.listModels !== "function") {
       throw projectWorkError(
         "PROJECT_WORK_MODELS_UNAVAILABLE",
@@ -1249,7 +1503,12 @@ export function createProjectWorkService({
         true,
       );
     }
-    return effectiveSessionFactory.listModels();
+    modelCatalogCache = await effectiveSessionFactory.listModels();
+    return structuredClone(modelCatalogCache);
+  }
+
+  async function listModels() {
+    return loadModelCatalog({ refresh: true });
   }
 
   async function pickProjectRoot({ mode = "existing", name } = {}) {
@@ -1429,20 +1688,13 @@ export function createProjectWorkService({
     title,
     providerId,
     modelId,
-    thinkingLevel = "medium",
+    thinkingLevel,
   } = {}) {
     assertActive();
-    if (!THINKING_LEVELS.has(thinkingLevel)) {
-      throw projectWorkError(
-        "PROJECT_WORK_THINKING_LEVEL_INVALID",
-        "思考强度无效",
-        400,
-      );
-    }
     const requestedProviderId = compactText(providerId, 120) || null;
     const requestedModelId = compactText(modelId, 200) || null;
     const catalog = validateModel && typeof effectiveSessionFactory.listModels === "function"
-      ? await effectiveSessionFactory.listModels()
+      ? await loadModelCatalog()
       : null;
     const selectedModel = catalog
       ? selectModel(catalog, {
@@ -1455,7 +1707,14 @@ export function createProjectWorkService({
           modelRef: requestedProviderId && requestedModelId
             ? `${requestedProviderId}/${requestedModelId}`
             : requestedModelId,
+          thinkingLevels: [...LEGACY_THINKING_LEVELS],
+          defaultThinkingLevel: "medium",
         };
+    const selectedThinkingLevel = selectThinkingLevel(
+      selectedModel,
+      thinkingLevel,
+      { strict: thinkingLevel !== undefined && thinkingLevel !== null },
+    );
     const conversationId = `conversation-${idFactory()}`;
     const paths = conversationPaths(conversationId);
     try {
@@ -1481,11 +1740,12 @@ export function createProjectWorkService({
         providerId: selectedModel.providerId,
         modelId: selectedModel.modelId,
         modelRef: selectedModel.modelRef,
-        thinkingLevel,
+        thinkingLevel: selectedThinkingLevel,
         messages: [],
         plan: null,
         activeChangeSet: null,
         verifications: [],
+        documents: [],
         workspaceSnapshot: {
           schemaVersion: 1,
           rulesVersion: 2,
@@ -1517,12 +1777,46 @@ export function createProjectWorkService({
 
   async function createConversation(projectId, options = {}) {
     assertActive();
+    if (deletingProjects.has(projectId)) {
+      throw projectWorkError(
+        "PROJECT_WORK_PROJECT_DELETE_IN_PROGRESS",
+        "项目正在删除，暂时不能新建会话",
+        409,
+        true,
+      );
+    }
     const project = await registry.get(projectId);
-    return createConversationRecord({
-      projectId: project.id,
-      workspaceKind: "bound_project",
-      rootLabel: project.rootLabel,
-    }, options);
+    if (deletingProjects.has(project.id)) {
+      throw projectWorkError(
+        "PROJECT_WORK_PROJECT_DELETE_IN_PROGRESS",
+        "项目正在删除，暂时不能新建会话",
+        409,
+        true,
+      );
+    }
+    conversationCreationCounts.set(
+      project.id,
+      (conversationCreationCounts.get(project.id) ?? 0) + 1,
+    );
+    try {
+      if (deletingProjects.has(project.id)) {
+        throw projectWorkError(
+          "PROJECT_WORK_PROJECT_DELETE_IN_PROGRESS",
+          "项目正在删除，暂时不能新建会话",
+          409,
+          true,
+        );
+      }
+      return await createConversationRecord({
+        projectId: project.id,
+        workspaceKind: "bound_project",
+        rootLabel: project.rootLabel,
+      }, options);
+    } finally {
+      const remaining = (conversationCreationCounts.get(project.id) ?? 1) - 1;
+      if (remaining > 0) conversationCreationCounts.set(project.id, remaining);
+      else conversationCreationCounts.delete(project.id);
+    }
   }
 
   async function createStandaloneConversation(options = {}) {
@@ -1549,6 +1843,55 @@ export function createProjectWorkService({
   async function getConversation(conversationId, options = {}) {
     assertActive();
     return snapshot(conversationId, options);
+  }
+
+  async function createConversationDocument(conversationId, options = {}) {
+    assertActive();
+    return withDocumentOperation(conversationId, async () => {
+      await conversationStore.get(conversationId);
+      const document = await documentService.createDocument(
+        conversationId,
+        options,
+      );
+      return {
+        document,
+        snapshot: await snapshot(conversationId),
+      };
+    });
+  }
+
+  async function uploadConversationDocument(
+    conversationId,
+    documentId,
+    stream,
+    options = {},
+  ) {
+    assertActive();
+    return withDocumentOperation(conversationId, async () => {
+      await documentService.uploadContent(
+        conversationId,
+        documentId,
+        stream,
+        options,
+      );
+      return snapshot(conversationId);
+    });
+  }
+
+  async function retryConversationDocument(conversationId, documentId) {
+    assertActive();
+    return withDocumentOperation(conversationId, async () => {
+      await documentService.retryDocument(conversationId, documentId);
+      return snapshot(conversationId);
+    });
+  }
+
+  async function removeConversationDocument(conversationId, documentId) {
+    assertActive();
+    return withDocumentOperation(conversationId, async () => {
+      await documentService.removeDocument(conversationId, documentId);
+      return snapshot(conversationId);
+    });
   }
 
   async function buildPromptContext(conversationId, context) {
@@ -1615,11 +1958,58 @@ export function createProjectWorkService({
     return `\n\nThe user explicitly attached these project excerpts as JSON:\n${JSON.stringify(sections)}`;
   }
 
+  async function configureConversation(conversationId, {
+    providerId,
+    modelId,
+    thinkingLevel,
+  } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const conversation = await conversationStore.get(conversationId);
+    if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
+      throw projectWorkError(
+        "PROJECT_WORK_CONVERSATION_BUSY",
+        "Agent 工作期间不能切换模型或思考强度",
+        409,
+      );
+    }
+    const catalog = await listModels();
+    const selectedModel = selectModel(catalog, {
+      providerId: providerId || conversation.providerId,
+      modelId: modelId || conversation.modelId,
+    });
+    const selectedThinkingLevel = selectThinkingLevel(
+      selectedModel,
+      thinkingLevel ?? conversation.thinkingLevel,
+      { strict: thinkingLevel !== undefined && thinkingLevel !== null },
+    );
+    const selection = publicModelSelection(
+      selectedModel,
+      selectedThinkingLevel,
+    );
+    const changed = selection.modelRef !== conversation.modelRef
+      || selection.thinkingLevel !== conversation.thinkingLevel;
+    if (changed) {
+      await updateConversation(conversationId, selection);
+      await appendEvent(conversationId, "model.configuration_changed", {
+        providerId: selection.providerId,
+        modelId: selection.modelId,
+        thinkingLevel: selection.thinkingLevel,
+      });
+    }
+    return snapshot(conversationId);
+  }
+
   async function sendMessage(conversationId, {
     text,
     context = [],
+    images = [],
+    capabilities = [],
+    workflowId,
     providerId,
     modelId,
+    thinkingLevel,
+    clientRequestId,
   } = {}) {
     assertActive();
     assertConversationNotDeleting(conversationId);
@@ -1631,22 +2021,163 @@ export function createProjectWorkService({
         400,
       );
     }
-    const conversation = await conversationStore.get(conversationId);
-    if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
-      throw projectWorkError(
-        "PROJECT_WORK_CONVERSATION_BUSY",
-        "Agent 正在工作，请使用调整任务或等待当前操作完成",
-        409,
-      );
+    const requestId = normalizeClientRequestId(clientRequestId, idFactory);
+    const messageContext = Array.isArray(context) ? context : [];
+    const requestedCapabilities = Array.isArray(capabilities) ? capabilities : [];
+    const requestedImages = Array.isArray(images) ? images : [];
+    const requestFingerprint = messageRequestFingerprint({
+      text: messageText,
+      context: messageContext,
+      images: requestedImages,
+      capabilities: requestedCapabilities,
+      workflowId,
+      providerId,
+      modelId,
+      thinkingLevel,
+    });
+    const existingConversation = await conversationStore.get(conversationId);
+    const existingMessage = (existingConversation.messages ?? []).find(
+      (message) => message.clientRequestId === requestId,
+    );
+    if (existingMessage) {
+      if (existingMessage.requestFingerprint !== requestFingerprint) {
+        throw projectWorkError(
+          "PROJECT_WORK_CLIENT_REQUEST_CONFLICT",
+          "同一客户端请求标识不能用于不同消息",
+          409,
+        );
+      }
+      return snapshot(conversationId);
     }
-    const runtime = await getRuntime(conversationId);
-    if (providerId || modelId) {
-      const catalog = await listModels();
-      const selectedModel = selectModel(catalog, {
-        providerId: providerId || conversation.providerId,
-        modelId: modelId || conversation.modelId,
+    const catalog = await listModels();
+    const turn = resolveProjectWorkTurn({
+      workflowId,
+      capabilityIds: requestedCapabilities,
+      capabilityStatus: catalog.capabilities,
+      hasImages: Array.isArray(images) && images.length > 0,
+    });
+    const normalizedImages = await normalizeProjectWorkImages(images);
+    const promptContext = await buildPromptContext(
+      conversationId,
+      messageContext,
+    );
+    const createdAt = timestamp();
+    const proposedMessageId = `message-${idFactory()}`;
+    let claimKind = "new";
+    let claimInstalled = false;
+    let selectedModel;
+    let selectedThinkingLevel;
+    let selection;
+    let selectionChanged = false;
+    let turnSettings;
+    let userMessage;
+    try {
+      await updateConversation(conversationId, (current) => {
+        const existingMessage = (current.messages ?? []).find(
+          (message) => message.clientRequestId === requestId,
+        );
+        if (existingMessage) {
+          if (existingMessage.requestFingerprint !== requestFingerprint) {
+            throw projectWorkError(
+              "PROJECT_WORK_CLIENT_REQUEST_CONFLICT",
+              "同一客户端请求标识不能用于不同消息",
+              409,
+            );
+          }
+          claimKind = "duplicate";
+          userMessage = existingMessage;
+          return {};
+        }
+        if (
+          activeMessageClaims.has(conversationId)
+          || BUSY_CONVERSATION_STATUSES.has(current.status)
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_CONVERSATION_BUSY",
+            "Agent 正在工作，请使用调整任务或等待当前操作完成",
+            409,
+          );
+        }
+        selectedModel = selectModel(catalog, {
+          providerId: providerId || current.providerId,
+          modelId: modelId || current.modelId,
+        });
+        if (
+          normalizedImages.length > 0
+          && selectedModel.supportsImages !== true
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_MODEL_VISION_UNSUPPORTED",
+            "当前模型不能读取图片，请切换支持图片的模型",
+            400,
+          );
+        }
+        selectedThinkingLevel = selectThinkingLevel(
+          selectedModel,
+          thinkingLevel ?? current.thinkingLevel,
+          { strict: thinkingLevel !== undefined && thinkingLevel !== null },
+        );
+        selection = publicModelSelection(
+          selectedModel,
+          selectedThinkingLevel,
+        );
+        selectionChanged = selection.modelRef !== current.modelRef
+          || selection.thinkingLevel !== current.thinkingLevel;
+        turnSettings = {
+          providerId: selection.providerId,
+          modelId: selection.modelId,
+          thinkingLevel: selection.thinkingLevel,
+          workflowId: turn.workflowId,
+          capabilities: turn.capabilityIds,
+        };
+        userMessage = {
+          id: proposedMessageId,
+          role: "user",
+          text: messageText,
+          images: normalizedImages.map(({ metadata }) => metadata),
+          status: "accepted",
+          ...turnSettings,
+          clientRequestId: requestId,
+          requestFingerprint,
+          createdAt,
+        };
+        activeMessageClaims.set(conversationId, {
+          requestId,
+          requestFingerprint,
+          messageId: userMessage.id,
+        });
+        claimInstalled = true;
+        return {
+          ...selection,
+          title: (
+            current.title === DEFAULT_CONVERSATION_TITLE
+            && (current.messages ?? []).length === 0
+          )
+            ? conversationTitleFromMessage(messageText)
+            : current.title,
+          status: "running",
+          messages: [...(current.messages ?? []), userMessage],
+          lastError: null,
+        };
       });
-      if (selectedModel.modelRef !== conversation.modelRef) {
+    } catch (error) {
+      if (
+        claimInstalled
+        && activeMessageClaims.get(conversationId)?.messageId
+          === proposedMessageId
+      ) {
+        activeMessageClaims.delete(conversationId);
+      }
+      throw error;
+    }
+    if (claimKind === "duplicate") {
+      return snapshot(conversationId);
+    }
+
+    let runtime = null;
+    try {
+      runtime = await getRuntime(conversationId);
+      if (selectedModel.modelRef !== runtime.modelRef) {
         if (typeof runtime.host.setModel !== "function") {
           throw projectWorkError(
             "PROJECT_WORK_MODEL_SWITCH_UNAVAILABLE",
@@ -1655,37 +2186,95 @@ export function createProjectWorkService({
           );
         }
         await runtime.host.setModel(selectedModel.modelRef);
-        await updateConversation(conversationId, selectedModel);
+        runtime.providerId = selectedModel.providerId;
+        runtime.modelId = selectedModel.modelId;
+        runtime.modelRef = selectedModel.modelRef;
         await appendEvent(conversationId, "model.changed", {
           providerId: selectedModel.providerId,
           modelId: selectedModel.modelId,
         });
         await refreshRuntimeContext(runtime);
       }
+      if (typeof runtime.host.setActiveToolsByName !== "function") {
+        if (turn.workflowId || turn.capabilityIds.length > 0) {
+          throw projectWorkError(
+            "PROJECT_WORK_TOOL_SELECTION_UNAVAILABLE",
+            "当前 Pi 会话不能按本轮切换工具",
+            409,
+          );
+        }
+      } else {
+        runtime.host.setActiveToolsByName(turn.toolNames);
+      }
+      if (typeof runtime.host.setThinkingLevel !== "function") {
+        if (runtime.thinkingLevel !== selectedThinkingLevel) {
+          throw projectWorkError(
+            "PROJECT_WORK_THINKING_LEVEL_SWITCH_UNAVAILABLE",
+            "当前 Pi 会话不能切换思考强度",
+            409,
+          );
+        }
+      } else {
+        const effectiveThinkingLevel = runtime.host.setThinkingLevel(
+          selectedThinkingLevel,
+        );
+        if (effectiveThinkingLevel !== selectedThinkingLevel) {
+          throw projectWorkError(
+            "PROJECT_WORK_THINKING_LEVEL_UNSUPPORTED",
+            "所选模型不支持该思考强度",
+            400,
+          );
+        }
+        runtime.thinkingLevel = effectiveThinkingLevel;
+      }
+      if (selectionChanged) {
+        await appendEvent(conversationId, "model.configuration_applied", {
+          providerId: selection.providerId,
+          modelId: selection.modelId,
+          thinkingLevel: selection.thinkingLevel,
+        });
+      }
+      runtime.activeTurnSettings = turnSettings;
+      const {
+        clientRequestId: _clientRequestId,
+        requestFingerprint: _requestFingerprint,
+        ...publicUserMessage
+      } = userMessage;
+      await appendEvent(conversationId, "message.created", publicUserMessage);
+    } catch (error) {
+      const safeError = safeProjectWorkError(error);
+      await updateConversation(conversationId, {
+        status: "error",
+        lastError: safeError,
+      }).catch(() => undefined);
+      await appendEvent(conversationId, "error", safeError).catch(() => undefined);
+      try {
+        runtime?.host.setActiveToolsByName?.(PROJECT_WORK_DEFAULT_TOOL_NAMES);
+      } catch {
+        // The next accepted turn reapplies the default list.
+      }
+      if (runtime) {
+        runtime.completion = null;
+        runtime.activeTurnSettings = null;
+      }
+      if (
+        activeMessageClaims.get(conversationId)?.messageId
+        === proposedMessageId
+      ) {
+        activeMessageClaims.delete(conversationId);
+      }
+      throw error;
     }
-    const promptContext = await buildPromptContext(conversationId, context);
-    const createdAt = timestamp();
-    const userMessage = {
-      id: `message-${idFactory()}`,
-      role: "user",
-      text: messageText,
-      status: "accepted",
-      createdAt,
-    };
-    await updateConversation(conversationId, (current) => ({
-      title: (
-        current.title === DEFAULT_CONVERSATION_TITLE
-        && (current.messages ?? []).length === 0
-      )
-        ? conversationTitleFromMessage(messageText)
-        : current.title,
-      status: "running",
-      messages: [...(current.messages ?? []), userMessage],
-      lastError: null,
-    }));
-    await appendEvent(conversationId, "message.created", userMessage);
     const completion = Promise.resolve()
-      .then(() => runtime.host.prompt(`${messageText}${promptContext}`))
+      .then(() => runtime.host.prompt(
+        `${messageText}${promptContext}`,
+        {
+          turnGuidance: turn.guidance,
+          ...(normalizedImages.length > 0 ? {
+            images: normalizedImages.map(({ image }) => image),
+          } : {}),
+        },
+      ))
       .then(() => runtime.eventQueue)
       .catch(async (error) => {
         const safeError = safeProjectWorkError(error);
@@ -1696,12 +2285,27 @@ export function createProjectWorkService({
         await appendEvent(conversationId, "error", safeError);
       })
       .finally(async () => {
-        const latest = await conversationStore.get(conversationId);
-        if (latest.status === "running") {
-          await updateConversation(conversationId, { status: "idle" });
-          await appendEvent(conversationId, "agent.status", { status: "idle" });
+        try {
+          const latest = await conversationStore.get(conversationId);
+          if (latest.status === "running") {
+            await updateConversation(conversationId, { status: "idle" });
+            await appendEvent(conversationId, "agent.status", { status: "idle" });
+          }
+        } finally {
+          try {
+            runtime.host.setActiveToolsByName?.(PROJECT_WORK_DEFAULT_TOOL_NAMES);
+          } catch {
+            // A future normal turn sets the default list again before prompting.
+          }
+          runtime.completion = null;
+          runtime.activeTurnSettings = null;
+          if (
+            activeMessageClaims.get(conversationId)?.messageId
+            === proposedMessageId
+          ) {
+            activeMessageClaims.delete(conversationId);
+          }
         }
-        runtime.completion = null;
       });
     runtime.completion = completion;
     return snapshot(conversationId);
@@ -1733,6 +2337,16 @@ export function createProjectWorkService({
       role: "user",
       text: messageText,
       status: "queued",
+      providerId: runtime.activeTurnSettings?.providerId
+        ?? conversation.providerId,
+      modelId: runtime.activeTurnSettings?.modelId
+        ?? conversation.modelId,
+      thinkingLevel: runtime.activeTurnSettings?.thinkingLevel
+        ?? conversation.thinkingLevel,
+      workflowId: runtime.activeTurnSettings?.workflowId ?? null,
+      capabilities: Array.isArray(runtime.activeTurnSettings?.capabilities)
+        ? [...runtime.activeTurnSettings.capabilities]
+        : [],
       createdAt: timestamp(),
     };
     await updateConversation(conversationId, (current) => ({
@@ -2274,37 +2888,80 @@ export function createProjectWorkService({
 
   async function removeProject(projectId) {
     assertActive();
+    if (deletingProjects.has(projectId)) {
+      throw projectWorkError(
+        "PROJECT_WORK_PROJECT_DELETE_IN_PROGRESS",
+        "项目正在删除",
+        409,
+        true,
+      );
+    }
     const project = await registry.get(projectId);
-    const conversations = await conversationStore.list(projectId);
-    if (conversations.some((conversation) => (
+    deletingProjects.add(project.id);
+    let guardedConversationIds = [];
+    const hasBusyConversation = (items) => items.some((conversation) => (
       BUSY_CONVERSATION_STATUSES.has(conversation.status)
+      || (documentOperationCounts.get(conversation.id) ?? 0) > 0
+      || hasActiveConversationDocuments(conversation)
       || (conversation.verifications ?? []).some(
         (verification) => verification.status === "running",
       )
-    ))) {
-      throw projectWorkError(
-        "PROJECT_WORK_PROJECT_BUSY",
-        "项目仍有正在运行的 Agent 或验证任务",
-        409,
+    ));
+    try {
+      if ((conversationCreationCounts.get(project.id) ?? 0) > 0) {
+        throw projectWorkError(
+          "PROJECT_WORK_PROJECT_BUSY",
+          "项目仍有正在创建的工作会话",
+          409,
+          true,
+        );
+      }
+      const conversations = await conversationStore.list(project.id);
+      if (hasBusyConversation(conversations)) {
+        throw projectWorkError(
+          "PROJECT_WORK_PROJECT_BUSY",
+          "项目仍有正在运行的 Agent、验证或 PDF 解析任务",
+          409,
+        );
+      }
+      guardedConversationIds = conversations.map(
+        (conversation) => conversation.id,
       );
+      for (const conversationId of guardedConversationIds) {
+        deletingConversations.add(conversationId);
+      }
+      const latestConversations = await conversationStore.list(project.id);
+      if (hasBusyConversation(latestConversations)) {
+        throw projectWorkError(
+          "PROJECT_WORK_PROJECT_BUSY",
+          "项目仍有正在运行的 Agent、验证或 PDF 解析任务",
+          409,
+        );
+      }
+      for (const conversation of latestConversations) {
+        const runtime = runtimes.get(conversation.id);
+        runtime?.unsubscribe?.();
+        runtime?.host?.dispose?.();
+        runtimes.delete(conversation.id);
+        await conversationStore.remove(conversation.id);
+      }
+      await registry.remove(projectId);
+      return {
+        id: project.id,
+        removed: true,
+      };
+    } finally {
+      deletingProjects.delete(project.id);
+      for (const conversationId of guardedConversationIds) {
+        deletingConversations.delete(conversationId);
+      }
     }
-    for (const conversation of conversations) {
-      const runtime = runtimes.get(conversation.id);
-      runtime?.unsubscribe?.();
-      runtime?.host?.dispose?.();
-      runtimes.delete(conversation.id);
-      await conversationStore.remove(conversation.id);
-    }
-    await registry.remove(projectId);
-    return {
-      id: project.id,
-      removed: true,
-    };
   }
 
   async function dispose() {
     if (disposed) return;
     disposed = true;
+    await documentService.dispose();
     for (const controller of verificationControllers.values()) controller.abort();
     verificationControllers.clear();
     const closing = [];
@@ -2315,6 +2972,7 @@ export function createProjectWorkService({
       runtime.host?.dispose?.();
     }
     runtimes.clear();
+    activeMessageClaims.clear();
     await Promise.allSettled(closing);
     await effectiveSessionFactory.dispose?.();
   }
@@ -2323,7 +2981,9 @@ export function createProjectWorkService({
     abortConversation,
     applyChangeSet,
     compactConversation,
+    configureConversation,
     createConversation,
+    createConversationDocument,
     createStandaloneConversation,
     dispose,
     getChangeSet,
@@ -2340,13 +3000,16 @@ export function createProjectWorkService({
     readProjectFile,
     registerProject,
     removeConversation,
+    removeConversationDocument,
     removeProject,
     removeStandaloneConversation,
     renameConversation,
     renameStandaloneConversation,
+    retryConversationDocument,
     runVerification,
     sendMessage,
     steerConversation,
+    uploadConversationDocument,
   });
 }
 
