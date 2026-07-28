@@ -41,7 +41,6 @@ import {
 } from "@phosphor-icons/react";
 import {
   MAX_PROJECT_WORK_TEXT_ATTACHMENTS,
-  MAX_PROJECT_WORK_TEXT_ATTACHMENT_TOTAL_BYTES,
   projectWorkDroppedFileKind,
   projectWorkApi,
   validateProjectWorkImageFile,
@@ -164,6 +163,9 @@ const TOOL_LABELS = {
   list_documents: "查看会话资料",
   search_documents: "搜索会话资料",
   read_document: "读取会话资料",
+  list_attachments: "查看普通附件",
+  search_attachments: "搜索普通附件",
+  read_attachment: "读取普通附件",
   search_web: "搜索网页",
   resolve_library_id: "查找技术文档库",
   query_docs: "查询技术文档",
@@ -186,6 +188,9 @@ const RESEARCH_TOOL_GROUPS = {
   list_documents: "document",
   search_documents: "document",
   read_document: "document",
+  list_attachments: "document",
+  search_attachments: "document",
+  read_attachment: "document",
   search_web: "retrieval",
   resolve_library_id: "retrieval",
   query_docs: "retrieval",
@@ -2064,6 +2069,7 @@ export function ProjectAgentPane({
   pendingImage,
   onRemoveImage,
   pendingAttachments = [],
+  uploadingAttachments = [],
   onRemoveAttachment,
   onDropFiles,
   imageInputRef,
@@ -2132,6 +2138,7 @@ export function ProjectAgentPane({
   const canSubmit = Boolean(
     draft.trim()
     && !action
+    && uploadingAttachments.length === 0
     && !imageUnsupported
     && !workflowImageMissing
     && !turnSelectionDeferred
@@ -2473,23 +2480,32 @@ export function ProjectAgentPane({
             ) : null}
           </>
         ) : null}
-        {pendingAttachments.length > 0 ? (
-          <div className="project-pending-attachments" aria-label="当前消息的临时文件">
+        {pendingAttachments.length > 0 || uploadingAttachments.length > 0 ? (
+          <div className="project-pending-attachments" aria-label="当前消息的普通附件">
             {pendingAttachments.map((attachment) => (
               <span key={attachment.id}>
                 <FileCode size={13} aria-hidden="true" />
                 <span>
-                  <strong>{attachment.file.name}</strong>
-                  <small>仅随当前消息发送</small>
+                  <strong>{attachment.fileName}</strong>
+                  <small>AI 按需读取 · 不预载全文</small>
                 </span>
                 <button
                   type="button"
                   disabled={turnPayloadLocked}
                   onClick={() => onRemoveAttachment?.(attachment.id)}
-                  aria-label={`移除文件：${attachment.file.name}`}
+                  aria-label={`移除文件：${attachment.fileName}`}
                 >
                   <X size={12} weight="bold" aria-hidden="true" />
                 </button>
+              </span>
+            ))}
+            {uploadingAttachments.map((fileName, index) => (
+              <span key={`uploading:${fileName}:${index}`} className="is-uploading">
+                <CircleNotch className="spin" size={13} aria-hidden="true" />
+                <span>
+                  <strong>{fileName}</strong>
+                  <small>正在保存到当前会话</small>
+                </span>
               </span>
             ))}
           </div>
@@ -2683,7 +2699,7 @@ export function ProjectAgentPane({
                   ? "发送会加入持久后续队列"
                   : running
                     ? "发送会立即调整当前 Agent 的方向"
-                    : "只有显式发送才开始工作 · 可拖入 PDF、图片或文本文件"}
+                    : "只有显式发送才开始工作 · 普通文件由 AI 按需读取"}
               {" · Enter 发送 · Shift+Enter 换行"}
             </small>
           </div>
@@ -4222,6 +4238,7 @@ export function LiveProjectWorkbench({
   const [runningMessageMode, setRunningMessageMode] = useState("steer");
   const [pendingImage, setPendingImage] = useState(null);
   const [pendingAttachments, setPendingAttachments] = useState([]);
+  const [uploadingAttachments, setUploadingAttachments] = useState([]);
   const [modelCatalog, setModelCatalog] = useState({
     providers: [],
     defaultThinkingLevel: null,
@@ -4258,6 +4275,7 @@ export function LiveProjectWorkbench({
   const imageInputRef = useRef(null);
   const pdfUploadAbort = useRef(null);
   const pendingImageRef = useRef(null);
+  const pendingAttachmentsRef = useRef([]);
 
   const replacePendingImage = useCallback((nextImage) => {
     const current = pendingImageRef.current;
@@ -4269,6 +4287,11 @@ export function LiveProjectWorkbench({
     }
     pendingImageRef.current = nextImage;
     setPendingImage(nextImage);
+  }, []);
+
+  const replacePendingAttachments = useCallback((nextAttachments) => {
+    pendingAttachmentsRef.current = nextAttachments;
+    setPendingAttachments(nextAttachments);
   }, []);
 
   useEffect(() => {
@@ -4286,7 +4309,18 @@ export function LiveProjectWorkbench({
       globalThis.URL.revokeObjectURL(image.previewUrl);
     }
     pendingImageRef.current = null;
-  }, []);
+    const conversationId = snapshotRef.current?.id;
+    const attachments = pendingAttachmentsRef.current;
+    pendingAttachmentsRef.current = [];
+    if (conversationId && typeof api.removeAttachment === "function") {
+      for (const attachment of attachments) {
+        api.removeAttachment({
+          conversationId,
+          attachmentId: attachment.id,
+        }).catch(() => undefined);
+      }
+    }
+  }, [api]);
 
   useEffect(() => {
     if (typeof api.listModels !== "function") return undefined;
@@ -4300,6 +4334,20 @@ export function LiveProjectWorkbench({
   }, [api]);
 
   useEffect(() => {
+    const previousConversationId = snapshotRef.current?.id;
+    const previousAttachments = pendingAttachmentsRef.current;
+    if (
+      previousConversationId
+      && previousConversationId !== conversation?.id
+      && typeof api.removeAttachment === "function"
+    ) {
+      for (const attachment of previousAttachments) {
+        api.removeAttachment({
+          conversationId: previousConversationId,
+          attachmentId: attachment.id,
+        }).catch(() => undefined);
+      }
+    }
     pdfUploadAbort.current?.abort();
     pdfUploadAbort.current = null;
     snapshotRef.current = conversation;
@@ -4314,7 +4362,8 @@ export function LiveProjectWorkbench({
     setSelectedWorkflowId(null);
     setRunningMessageMode("steer");
     replacePendingImage(null);
-    setPendingAttachments([]);
+    replacePendingAttachments([]);
+    setUploadingAttachments([]);
     setActiveArtifactId(readLastArtifact(
       conversation?.id,
       conversation?.activeArtifactId ?? "files",
@@ -4334,7 +4383,12 @@ export function LiveProjectWorkbench({
     const firstTurnSeq = firstVisibleTurnSeq(conversation);
     setHistoryCursor(firstTurnSeq > 1 ? firstTurnSeq : null);
     setLoadingEarlier(false);
-  }, [conversation?.id, replacePendingImage]);
+  }, [
+    api,
+    conversation?.id,
+    replacePendingAttachments,
+    replacePendingImage,
+  ]);
 
   useEffect(() => {
     setSnapshot((current) => {
@@ -4601,7 +4655,12 @@ export function LiveProjectWorkbench({
     event.preventDefault();
     const submittedDraft = draft;
     const text = submittedDraft.trim();
-    if (!text || !snapshot?.id || action) return;
+    if (
+      !text
+      || !snapshot?.id
+      || action
+      || uploadingAttachments.length > 0
+    ) return;
     if ((snapshot.askUserRequests ?? []).some(
       (request) => request.status === "pending",
     )) {
@@ -4648,7 +4707,7 @@ export function LiveProjectWorkbench({
             text,
             contexts: contextChips,
             images: pendingImage ? [pendingImage.file] : [],
-            attachments: pendingAttachments.map((attachment) => attachment.file),
+            attachments: pendingAttachments,
             capabilities: selectedCapabilityIds,
             workflowId: selectedWorkflowId,
             providerId: providerId || snapshot.providerId,
@@ -4665,7 +4724,7 @@ export function LiveProjectWorkbench({
         setSelectedCapabilityIds([]);
         setSelectedWorkflowId(null);
         replacePendingImage(null);
-        setPendingAttachments([]);
+        replacePendingAttachments([]);
       }
     });
   }, [
@@ -4678,6 +4737,7 @@ export function LiveProjectWorkbench({
     pendingAttachments,
     pendingImage,
     providerId,
+    replacePendingAttachments,
     replacePendingImage,
     runningMessageMode,
     selectedCapabilityIds,
@@ -4685,6 +4745,7 @@ export function LiveProjectWorkbench({
     supportsImages,
     activeThinkingLevel,
     snapshot,
+    uploadingAttachments,
   ]);
 
   const selectImage = useCallback((file) => {
@@ -4702,37 +4763,97 @@ export function LiveProjectWorkbench({
     }
   }, [action, replacePendingImage]);
 
-  const addPendingAttachments = useCallback((files) => {
-    if (action || isConversationRunning(snapshot)) {
+  const addPendingAttachments = useCallback(async (files) => {
+    if (
+      action
+      || uploadingAttachments.length > 0
+      || isConversationRunning(snapshot)
+    ) {
       throw new TypeError("请等待当前 Agent 完成后再添加消息文件");
     }
-    const additions = files.map((file) => {
-      validateProjectWorkTextAttachmentFile(file);
-      return {
-        id: `${file.name}:${file.size}:${file.lastModified ?? 0}`,
-        file,
-      };
-    });
-    const next = [...pendingAttachments];
-    for (const attachment of additions) {
-      if (!next.some((item) => item.id === attachment.id)) {
-        next.push(attachment);
-      }
+    if (!snapshot?.id || typeof api.uploadAttachment !== "function") {
+      throw new TypeError("当前会话暂时不能保存普通附件");
     }
-    if (next.length > MAX_PROJECT_WORK_TEXT_ATTACHMENTS) {
+    const current = pendingAttachmentsRef.current;
+    const additions = files
+      .map(validateProjectWorkTextAttachmentFile)
+      .filter((file) => !current.some((attachment) => (
+        attachment.fileName === file.name
+        && attachment.byteLength === file.size
+      )));
+    if (current.length + additions.length > MAX_PROJECT_WORK_TEXT_ATTACHMENTS) {
       throw new TypeError(
         `每条消息最多添加 ${MAX_PROJECT_WORK_TEXT_ATTACHMENTS} 个文本或代码文件`,
       );
     }
-    if (
-      next.reduce((total, attachment) => total + attachment.file.size, 0)
-      > MAX_PROJECT_WORK_TEXT_ATTACHMENT_TOTAL_BYTES
-    ) {
-      throw new TypeError("当前消息的文本附件总大小不能超过 120 KB");
+    if (additions.length === 0) {
+      setActionError(null);
+      return;
     }
-    setPendingAttachments(next);
-    setActionError(null);
-  }, [action, pendingAttachments, snapshot]);
+    const conversationId = snapshot.id;
+    setUploadingAttachments(additions.map((file) => file.name));
+    try {
+      for (const file of additions) {
+        const attachment = await api.uploadAttachment({
+          conversationId,
+          file,
+        });
+        if (snapshotRef.current?.id !== conversationId) {
+          await api.removeAttachment?.({
+            conversationId,
+            attachmentId: attachment.id,
+          }).catch(() => undefined);
+          continue;
+        }
+        replacePendingAttachments([
+          ...pendingAttachmentsRef.current,
+          attachment,
+        ]);
+      }
+      setActionError(null);
+    } finally {
+      setUploadingAttachments([]);
+    }
+  }, [
+    action,
+    api,
+    replacePendingAttachments,
+    snapshot,
+    uploadingAttachments.length,
+  ]);
+
+  const removePendingAttachment = useCallback((attachmentId) => {
+    if (!attachmentId || action === "message") return;
+    const conversationId = snapshot?.id;
+    const attachment = pendingAttachmentsRef.current.find(
+      (item) => item.id === attachmentId,
+    );
+    if (!conversationId || !attachment) return;
+    replacePendingAttachments(
+      pendingAttachmentsRef.current.filter(
+        (item) => item.id !== attachmentId,
+      ),
+    );
+    if (typeof api.removeAttachment !== "function") return;
+    api.removeAttachment({
+      conversationId,
+      attachmentId,
+    }).catch((error) => {
+      if (
+        snapshotRef.current?.id === conversationId
+        && !pendingAttachmentsRef.current.some(
+          (item) => item.id === attachmentId,
+        )
+      ) {
+        replacePendingAttachments([
+          ...pendingAttachmentsRef.current,
+          attachment,
+        ]);
+      }
+      setActionError(error);
+      errorRef.current?.(error);
+    });
+  }, [action, api, replacePendingAttachments, snapshot?.id]);
 
   const openArtifact = useCallback((artifactId, path = "") => {
     if (!ARTIFACTS.some((artifact) => artifact.id === artifactId)) return;
@@ -4818,7 +4939,7 @@ export function LiveProjectWorkbench({
     }
     if (grouped.text.length > 0) {
       try {
-        addPendingAttachments(grouped.text);
+        await addPendingAttachments(grouped.text);
       } catch (error) {
         errors.push(error);
       }
@@ -5364,14 +5485,8 @@ export function LiveProjectWorkbench({
             if (!turnPayloadLocked) replacePendingImage(null);
           }}
           pendingAttachments={pendingAttachments}
-          onRemoveAttachment={(attachmentId) => {
-            if (turnPayloadLocked) return;
-            setPendingAttachments(
-              (current) => current.filter(
-                (attachment) => attachment.id !== attachmentId,
-              ),
-            );
-          }}
+          uploadingAttachments={uploadingAttachments}
+          onRemoveAttachment={removePendingAttachment}
           onDropFiles={dropFiles}
           imageInputRef={imageInputRef}
           onSelectImage={selectImage}

@@ -8,8 +8,7 @@ export const PROJECT_WORK_IMAGE_TYPES = new Set([
   "image/webp",
 ]);
 export const MAX_PROJECT_WORK_TEXT_ATTACHMENTS = 5;
-export const MAX_PROJECT_WORK_TEXT_ATTACHMENT_BYTES = 120 * 1024;
-export const MAX_PROJECT_WORK_TEXT_ATTACHMENT_TOTAL_BYTES = 120 * 1024;
+export const MAX_PROJECT_WORK_TEXT_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 const PROJECT_WORK_TEXT_ATTACHMENT_PATTERN = /\.(?:bash|c|cfg|cjs|conf|cpp|cs|css|csv|fish|go|gql|graphql|h|hpp|htm|html|ini|java|js|json|jsonl|jsx|kt|kts|less|log|md|mdx|mjs|php|py|rb|rs|scss|sh|sql|swift|toml|ts|tsv|tsx|txt|xml|ya?ml|zsh)$/i;
 const PROJECT_WORK_SENSITIVE_ATTACHMENT_PATTERN = /^(?:\.env(?:\..+)?|credentials?(?:\.[^.]+)?|secrets?(?:\.[^.]+)?|id_(?:dsa|ecdsa|ed25519|rsa)|.+\.(?:key|p12|pem|pfx))$/i;
 
@@ -102,25 +101,23 @@ export function validateProjectWorkTextAttachmentFile(file) {
     throw new TypeError("请选择文本、代码、Markdown、JSON 或表格文件");
   }
   if (file.size > MAX_PROJECT_WORK_TEXT_ATTACHMENT_BYTES) {
-    throw new TypeError(`文件 ${file.name} 不能超过 120 KB`);
+    throw new TypeError(`文件 ${file.name} 不能超过 5 MB`);
   }
   return file;
 }
 
-export async function serializeProjectWorkTextAttachment(file) {
-  validateProjectWorkTextAttachmentFile(file);
-  if (typeof file.text !== "function") {
-    throw new TypeError("当前环境无法读取所选文件");
-  }
-  const text = await file.text();
-  if (!text || text.includes("\0")) {
-    throw new TypeError(`文件 ${file.name} 不是可读取的文本文件`);
+export function serializeProjectWorkAttachmentReference(attachment) {
+  const id = requiredId(attachment?.id, "attachment.id");
+  const revision = requiredId(
+    attachment?.revision ?? attachment?.contentHash,
+    "attachment.revision",
+  );
+  if (!SHA256_PATTERN.test(revision)) {
+    throw new TypeError("附件版本无效，请重新添加文件");
   }
   return {
-    file_name: file.name,
-    mime_type: file.type || "text/plain",
-    byte_length: file.size,
-    text,
+    attachment_id: id,
+    attachment_revision: revision,
   };
 }
 
@@ -211,6 +208,37 @@ async function requestPdfContent(path, file, {
     throw error;
   }
   if (!response.ok) throw mapApiError(response, payload, "论文资料上传失败");
+  return payload;
+}
+
+async function requestAttachmentContent(path, file, {
+  signal,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  if (typeof fetchImpl !== "function") {
+    throw new Error("当前环境不支持 fetch");
+  }
+  const response = await fetchImpl(path, {
+    method: "PUT",
+    signal,
+    headers: {
+      "content-type": file.type || "application/octet-stream",
+    },
+    body: file,
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    if (!response.ok) throw mapApiError(response, null, "普通附件上传失败");
+    const error = new Error("项目工作服务返回了无效 JSON");
+    error.name = "ProjectWorkApiError";
+    error.code = "PROJECT_WORK_RESPONSE_INVALID";
+    error.retryable = true;
+    error.status = response.status;
+    throw error;
+  }
+  if (!response.ok) throw mapApiError(response, payload, "普通附件上传失败");
   return payload;
 }
 
@@ -432,12 +460,19 @@ function mapMessage(raw) {
       byteLength: Number(pick(image, "byte_length", "byteLength", 0)) || 0,
     })),
     attachments: asArray(raw.attachments).map((attachment) => ({
+      id: pick(attachment, "attachment_id", "attachmentId", attachment.id),
       fileName: pick(attachment, "file_name", "fileName", "文件"),
       mimeType: pick(attachment, "mime_type", "mimeType"),
       byteLength: Number(
         pick(attachment, "byte_length", "byteLength", 0),
       ) || 0,
       contentHash: pick(attachment, "content_hash", "contentHash"),
+      revision: pick(
+        attachment,
+        "attachment_revision",
+        "attachmentRevision",
+        attachment.revision ?? attachment.contentHash,
+      ),
     })),
     workflowId: pick(raw, "workflow_id", "workflowId"),
     capabilities: asArray(raw.capabilities).filter(
@@ -1083,6 +1118,39 @@ function mapProjectWorkDocument(raw) {
     blockCount: Number.isSafeInteger(blockCount) ? blockCount : null,
     imageCount: Number.isSafeInteger(imageCount) ? imageCount : null,
     error: mapProjectWorkDocumentError(pick(raw, "error", "error")),
+    createdAt: pick(raw, "created_at", "createdAt"),
+    updatedAt: pick(raw, "updated_at", "updatedAt"),
+    readyAt: pick(raw, "ready_at", "readyAt"),
+  };
+}
+
+function mapProjectWorkAttachment(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const id = pick(raw, "attachment_id", "attachmentId", raw.id);
+  const fileName = pick(raw, "file_name", "fileName");
+  const revision = pick(
+    raw,
+    "attachment_revision",
+    "attachmentRevision",
+    raw.revision ?? raw.contentHash,
+  );
+  if (
+    typeof id !== "string"
+    || !id
+    || typeof fileName !== "string"
+    || !fileName
+  ) {
+    return null;
+  }
+  return {
+    id,
+    fileName,
+    mimeType: pick(raw, "mime_type", "mimeType", "text/plain"),
+    byteLength: Number(pick(raw, "byte_length", "byteLength", 0)) || 0,
+    status: pick(raw, "status", "status", "awaiting_upload"),
+    contentHash: pick(raw, "content_hash", "contentHash", revision),
+    revision,
+    lineCount: nullableNumber(raw, "line_count", "lineCount"),
     createdAt: pick(raw, "created_at", "createdAt"),
     updatedAt: pick(raw, "updated_at", "updatedAt"),
     readyAt: pick(raw, "ready_at", "readyAt"),
@@ -2094,17 +2162,9 @@ export async function sendProjectWorkMessage({
     );
   }
   const serializedImages = await Promise.all(images.map(serializeProjectWorkImage));
-  const serializedAttachments = await Promise.all(
-    attachments.map(serializeProjectWorkTextAttachment),
+  const serializedAttachments = attachments.map(
+    serializeProjectWorkAttachmentReference,
   );
-  if (
-    serializedAttachments.reduce(
-      (total, attachment) => total + attachment.byte_length,
-      0,
-    ) > MAX_PROJECT_WORK_TEXT_ATTACHMENT_TOTAL_BYTES
-  ) {
-    throw new TypeError("当前消息的文本附件总大小不能超过 120 KB");
-  }
   const payload = await requestJson(
     `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/messages`,
     {
@@ -2135,6 +2195,71 @@ export async function sendProjectWorkMessage({
     },
   );
   return mapProjectWorkConversation(payload);
+}
+
+export async function uploadProjectWorkAttachment({
+  conversationId,
+  file,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  validateProjectWorkTextAttachmentFile(file);
+  const created = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/attachments`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        file_name: file.name,
+        mime_type: file.type || "text/plain",
+        byte_length: file.size,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  const attachment = mapProjectWorkAttachment(created?.attachment);
+  if (!attachment) {
+    throw new Error("项目工作服务没有返回有效的普通附件记录");
+  }
+  try {
+    const uploaded = await requestAttachmentContent(
+      `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachment.id)}/content`,
+      file,
+      { signal, fetchImpl },
+    );
+    const ready = mapProjectWorkAttachment(uploaded?.attachment);
+    if (!ready || ready.status !== "ready" || !ready.revision) {
+      throw new Error("普通附件上传完成后缺少可读取版本");
+    }
+    return ready;
+  } catch (error) {
+    await removeProjectWorkAttachment({
+      conversationId,
+      attachmentId: attachment.id,
+      fetchImpl,
+    }).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function removeProjectWorkAttachment({
+  conversationId,
+  attachmentId,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(attachmentId, "attachmentId");
+  return requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachmentId)}`,
+    {
+      method: "DELETE",
+      signal,
+      fetchImpl,
+    },
+  );
 }
 
 export async function uploadProjectWorkPdf({
@@ -2975,6 +3100,8 @@ export const projectWorkApi = {
   fetchTree: fetchProjectWorkTree,
   fetchFile: fetchProjectWorkFile,
   imageUrl: projectWorkImageUrl,
+  uploadAttachment: uploadProjectWorkAttachment,
+  removeAttachment: removeProjectWorkAttachment,
   uploadPdf: uploadProjectWorkPdf,
   retryPdf: retryProjectWorkPdf,
   removePdf: removeProjectWorkPdf,

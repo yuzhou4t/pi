@@ -37,13 +37,14 @@ import {
   sendProjectWorkMessage,
   saveProjectWorkProviderApiKey,
   projectWorkDroppedFileKind,
+  serializeProjectWorkAttachmentReference,
   serializeProjectWorkImage,
-  serializeProjectWorkTextAttachment,
   setProjectWorkSkillEnabled,
   startProjectWorkPreview,
   subscribeProjectWorkConversation,
   undoProjectWorkApply,
   uploadProjectWorkPdf,
+  uploadProjectWorkAttachment,
   fetchInstalledProjectWorkSkills,
   inspectProjectWorkSkillPackage,
   installProjectWorkSkillPackage,
@@ -1482,11 +1483,10 @@ test("thinking level maps in conversation messages and uses snake-case mutation 
       "界面.png",
       { type: "image/png" },
     )],
-    attachments: [new File(
-      ["# Review\nCheck the current route."],
-      "review.md",
-      { type: "text/markdown" },
-    )],
+    attachments: [{
+      id: "attachment-review",
+      revision: `sha256:${"a".repeat(64)}`,
+    }],
     providerId: "openai-codex",
     modelId: "gpt-5.3-codex",
     thinkingLevel: "high",
@@ -1517,10 +1517,8 @@ test("thinking level maps in conversation messages and uses snake-case mutation 
     data: "iVBORw==",
   }]);
   assert.deepEqual(messagePayload.attachments, [{
-    file_name: "review.md",
-    mime_type: "text/markdown",
-    byte_length: 33,
-    text: "# Review\nCheck the current route.",
+    attachment_id: "attachment-review",
+    attachment_revision: `sha256:${"a".repeat(64)}`,
   }]);
 });
 
@@ -1544,7 +1542,7 @@ test("project-work image serialization keeps only bounded image data", async () 
   );
 });
 
-test("project-work dropped files route PDF, image, and temporary text safely", async () => {
+test("project-work dropped files route PDF, image, and private text safely", async () => {
   const markdown = new File(["# Notes"], "notes.md", { type: "text/markdown" });
   assert.equal(projectWorkDroppedFileKind(markdown), "text");
   assert.equal(
@@ -1571,12 +1569,65 @@ test("project-work dropped files route PDF, image, and temporary text safely", a
     })),
     "unsupported",
   );
-  assert.deepEqual(await serializeProjectWorkTextAttachment(markdown), {
+  assert.deepEqual(serializeProjectWorkAttachmentReference({
+    id: "attachment-notes",
+    revision: `sha256:${"b".repeat(64)}`,
+  }), {
+    attachment_id: "attachment-notes",
+    attachment_revision: `sha256:${"b".repeat(64)}`,
+  });
+});
+
+test("ordinary attachment upload keeps bytes out of JSON and returns a safe reference", async () => {
+  const calls = [];
+  const revision = `sha256:${"c".repeat(64)}`;
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, options });
+    if (options.method === "POST") {
+      return jsonResponse({
+        attachment: {
+          id: "attachment-upload",
+          file_name: "notes.md",
+          mime_type: "text/markdown",
+          byte_length: 7,
+          status: "awaiting_upload",
+        },
+      }, 201);
+    }
+    assert.equal(options.method, "PUT");
+    assert.equal(options.body instanceof File, true);
+    return jsonResponse({
+      attachment: {
+        id: "attachment-upload",
+        file_name: "notes.md",
+        mime_type: "text/markdown",
+        byte_length: 7,
+        status: "ready",
+        revision,
+      },
+    }, 201);
+  };
+
+  const attachment = await uploadProjectWorkAttachment({
+    conversationId: "conversation-upload",
+    file: new File(["# Notes"], "notes.md", { type: "text/markdown" }),
+    fetchImpl,
+  });
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
     file_name: "notes.md",
     mime_type: "text/markdown",
     byte_length: 7,
-    text: "# Notes",
   });
+  assert.doesNotMatch(calls[0].options.body, /# Notes/);
+  assert.equal(
+    calls[1].url,
+    "/api/v1/project-work/conversations/conversation-upload/attachments/attachment-upload/content",
+  );
+  assert.equal(attachment.id, "attachment-upload");
+  assert.equal(attachment.revision, revision);
 });
 
 test("standalone conversations use global list and create routes", async () => {

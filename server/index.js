@@ -1697,6 +1697,76 @@ export function createApiServer({
         return;
       }
 
+      const conversationAttachmentsMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/attachments$/,
+      );
+      if (conversationAttachmentsMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          conversationAttachmentsMatch[1],
+        );
+        const payload = await readProjectWorkJson(request);
+        const attachment = await projectWorkService.createConversationAttachment(
+          conversationId,
+          {
+            fileName: payload.file_name,
+            mimeType: payload.mime_type,
+            byteLength: payload.byte_length,
+          },
+        );
+        sendJson(response, 201, {
+          schemaVersion: 1,
+          attachment,
+        }, origin);
+        return;
+      }
+
+      const conversationAttachmentMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/attachments\/([^/]+)$/,
+      );
+      if (conversationAttachmentMatch && request.method === "DELETE") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          conversationAttachmentMatch[1],
+        );
+        const attachmentId = decodeProjectWorkSegment(
+          conversationAttachmentMatch[2],
+        );
+        const result = await projectWorkService.removeConversationAttachment(
+          conversationId,
+          attachmentId,
+        );
+        sendJson(response, 200, result, origin);
+        return;
+      }
+
+      const conversationAttachmentContentMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/attachments\/([^/]+)\/content$/,
+      );
+      if (conversationAttachmentContentMatch && request.method === "PUT") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          conversationAttachmentContentMatch[1],
+        );
+        const attachmentId = decodeProjectWorkSegment(
+          conversationAttachmentContentMatch[2],
+        );
+        const attachment = await projectWorkService.uploadConversationAttachment(
+          conversationId,
+          attachmentId,
+          request,
+          {
+            contentType: request.headers["content-type"],
+            declaredLength: request.headers["content-length"],
+          },
+        );
+        sendJson(response, 201, {
+          schemaVersion: 1,
+          attachment,
+        }, origin);
+        return;
+      }
+
       const conversationDocumentMatch = url.pathname.match(
         /^\/api\/v1\/project-work\/conversations\/([^/]+)\/documents\/([^/]+)$/,
       );

@@ -384,6 +384,7 @@ test("public harness snapshots expose structure without paths or private reasoni
     snapshot: "bounded",
     projectRules: 1,
     conversationDocuments: "on_demand",
+    conversationAttachments: "on_demand",
   });
   assert.equal(snapshot.disclosure.privateReasoning, false);
   assert.match(snapshot.prompt.policyHash, /^sha256:[a-f0-9]{64}$/);
@@ -828,6 +829,104 @@ test("contained PDF tools expose only bounded conversation document access", asy
       documentId: "document-1",
       revision: "sha256:current",
       blockIds: ["block-auth"],
+    },
+  }]);
+});
+
+test("ordinary attachment tools list, search, and read only bounded private content", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-attachment-tools-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const baseRoot = path.join(temporaryRoot, "base");
+  const workspaceRoot = path.join(temporaryRoot, "workspace");
+  await Promise.all([
+    mkdir(projectRoot),
+    mkdir(baseRoot),
+    mkdir(workspaceRoot),
+  ]);
+  const calls = [];
+  const revision = `sha256:${"a".repeat(64)}`;
+  const tools = await createProjectWorkTools({
+    projectRoot,
+    baseRoot,
+    workspaceRoot,
+    attachmentAccess: {
+      async list() {
+        calls.push({ type: "list" });
+        return [{
+          attachment_id: "attachment-1",
+          attachment_revision: revision,
+          file_name: "review.md",
+          byte_length: 72,
+        }];
+      },
+      async search(request) {
+        calls.push({ type: "search", request });
+        return [{
+          attachment_id: "attachment-1",
+          line: 2,
+          excerpt: "primary button",
+        }];
+      },
+      async read(request) {
+        calls.push({ type: "read", request });
+        return {
+          attachment_id: "attachment-1",
+          attachment_revision: revision,
+          offset: 0,
+          end_offset: 16,
+          content: "# Review\nprimary",
+          has_more: true,
+          next_offset: 16,
+          trust: "untrusted_reference",
+        };
+      },
+    },
+    onPlan: async () => {},
+    onVerificationRequest: async () => ({ id: "verification-1" }),
+  });
+
+  const listed = await toolByName(tools, "list_attachments").execute(
+    "list-attachments",
+    {},
+  );
+  assert.match(listed.content[0].text, /review\.md/);
+  const searched = await toolByName(tools, "search_attachments").execute(
+    "search-attachments",
+    {
+      query: "primary",
+      attachment_ids: ["attachment-1"],
+      limit: 4,
+    },
+  );
+  assert.match(searched.content[0].text, /primary button/);
+  const read = await toolByName(tools, "read_attachment").execute(
+    "read-attachment",
+    {
+      attachment_id: "attachment-1",
+      attachment_revision: revision,
+      offset: 0,
+      limit: 16,
+    },
+  );
+  assert.match(read.content[0].text, /untrusted_reference/);
+  assert.match(read.content[0].text, /"next_offset":\s*16/);
+  assert.deepEqual(calls, [{
+    type: "list",
+  }, {
+    type: "search",
+    request: {
+      query: "primary",
+      attachmentIds: ["attachment-1"],
+      limit: 4,
+    },
+  }, {
+    type: "read",
+    request: {
+      attachmentId: "attachment-1",
+      revision,
+      offset: 0,
+      limit: 16,
     },
   }]);
 });

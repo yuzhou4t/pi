@@ -44,8 +44,9 @@ import { resolveProjectWorkTurn } from "./projectWorkWorkflows.js";
 import { createMacOSProjectPicker } from "./macosProjectPicker.js";
 import { normalizeProjectWorkImages } from "./projectWorkImages.js";
 import {
-  normalizeProjectWorkTextAttachments,
-  projectWorkTextAttachmentPrompt,
+  bindProjectWorkMessageAttachments,
+  createConversationAttachmentService,
+  projectWorkAttachmentManifestPrompt,
 } from "./projectWorkAttachments.js";
 import { createProjectRegistry, publicProject } from "./projectRegistry.js";
 import { createSkillPackageService } from "./skillPackageService.js";
@@ -394,12 +395,17 @@ function publicConversationMessage(message) {
       : [],
     attachments: Array.isArray(message.attachments)
       ? message.attachments.map((attachment) => ({
+          id: compactText(attachment?.id, 180),
           fileName: compactText(attachment?.fileName, 180, "文件"),
           mimeType: compactText(attachment?.mimeType, 120),
           byteLength: Number.isSafeInteger(attachment?.byteLength)
             ? attachment.byteLength
             : 0,
           contentHash: compactText(attachment?.contentHash, 80),
+          revision: compactText(
+            attachment?.revision ?? attachment?.contentHash,
+            80,
+          ),
         }))
       : [],
     status: message.status,
@@ -816,12 +822,14 @@ function messageRequestFingerprint({
       .digest("hex"),
   }));
   const attachmentSignatures = attachments.map((attachment) => ({
-    fileName: attachment?.fileName ?? attachment?.file_name ?? null,
-    mimeType: attachment?.mimeType ?? attachment?.mime_type ?? null,
-    byteLength: attachment?.byteLength ?? attachment?.byte_length ?? null,
-    sha256: createHash("sha256")
-      .update(String(attachment?.text ?? ""))
-      .digest("hex"),
+    attachmentId: attachment?.attachmentId
+      ?? attachment?.attachment_id
+      ?? attachment?.id
+      ?? null,
+    attachmentRevision: attachment?.attachmentRevision
+      ?? attachment?.attachment_revision
+      ?? attachment?.revision
+      ?? null,
   }));
   const payload = {
     text,
@@ -1969,6 +1977,20 @@ export function createProjectWorkService({
     parser: documentParser,
     pollIntervalMs: documentPollIntervalMs,
     maxPollAttempts: documentMaxPollAttempts,
+    now,
+    idFactory,
+  });
+  const attachmentService = createConversationAttachmentService({
+    getConversation: (conversationId) => conversationStore.get(conversationId),
+    updateConversation: (conversationId, patch) => (
+      updateConversation(conversationId, patch)
+    ),
+    appendEvent: (conversationId, type, data) => (
+      appendEvent(conversationId, type, data)
+    ),
+    directoryForConversation: (conversationId) => (
+      conversationStore.directory(conversationId)
+    ),
     now,
     idFactory,
   });
@@ -3311,9 +3333,27 @@ export function createProjectWorkService({
       }
     }
     if (event.type === "tool_execution_end") {
-      const summary = extractMessageText({
-        content: event.result?.content,
-      });
+      const attachmentTool = [
+        "list_attachments",
+        "search_attachments",
+        "read_attachment",
+      ].includes(data.name);
+      const attachmentDetails = event.result?.details;
+      const summary = attachmentTool
+        ? data.name === "list_attachments"
+          ? `附件清单 ${Array.isArray(attachmentDetails?.attachments)
+            ? attachmentDetails.attachments.length
+            : 0} 项`
+          : data.name === "search_attachments"
+            ? `附件检索 ${Array.isArray(attachmentDetails?.matches)
+              ? attachmentDetails.matches.length
+              : 0} 项`
+            : `已按需读取附件${attachmentDetails?.hasMore === true
+              ? "，仍有后续内容"
+              : "，已到文件末尾"}`
+        : extractMessageText({
+            content: event.result?.content,
+          });
       if (summary) {
         data.summary = await sanitizeForConversation(
           runtime.conversationId,
@@ -3676,6 +3716,17 @@ export function createProjectWorkService({
           request,
         ),
         read: (request) => documentService.readForAgent(
+          conversationId,
+          request,
+        ),
+      },
+      attachmentAccess: {
+        list: () => attachmentService.listForAgent(conversationId),
+        search: (request) => attachmentService.searchForAgent(
+          conversationId,
+          request,
+        ),
+        read: (request) => attachmentService.readForAgent(
           conversationId,
           request,
         ),
@@ -4316,6 +4367,7 @@ export function createProjectWorkService({
         askUserRequests: [],
         operations: [],
         documents: [],
+        attachments: [],
         applyJournal: [],
         workspaceSnapshot: {
           schemaVersion: 1,
@@ -4598,6 +4650,38 @@ export function createProjectWorkService({
     });
   }
 
+  async function createConversationAttachment(conversationId, options = {}) {
+    assertActive();
+    return withDocumentOperation(conversationId, async () => {
+      await conversationStore.get(conversationId);
+      return attachmentService.createAttachment(conversationId, options);
+    });
+  }
+
+  async function uploadConversationAttachment(
+    conversationId,
+    attachmentId,
+    stream,
+    options = {},
+  ) {
+    assertActive();
+    return withDocumentOperation(conversationId, () => (
+      attachmentService.uploadContent(
+        conversationId,
+        attachmentId,
+        stream,
+        options,
+      )
+    ));
+  }
+
+  async function removeConversationAttachment(conversationId, attachmentId) {
+    assertActive();
+    return withDocumentOperation(conversationId, () => (
+      attachmentService.removeAttachment(conversationId, attachmentId)
+    ));
+  }
+
   async function buildPromptContext(conversationId, context) {
     if (!Array.isArray(context) || context.length === 0) return "";
     if (context.length > 8) {
@@ -4871,15 +4955,9 @@ export function createProjectWorkService({
       hasImages: Array.isArray(images) && images.length > 0,
     });
     const normalizedImages = await normalizeProjectWorkImages(images);
-    const normalizedAttachments = normalizeProjectWorkTextAttachments(
-      requestedAttachments,
-    );
     const promptContext = await buildPromptContext(
       conversationId,
       messageContext,
-    );
-    const attachmentContext = projectWorkTextAttachmentPrompt(
-      normalizedAttachments,
     );
     const createdAt = timestamp();
     const proposedMessageId = `message-${idFactory()}`;
@@ -4893,6 +4971,8 @@ export function createProjectWorkService({
     let previewToolActive = false;
     let turnSettings;
     let userMessage;
+    let messageAttachments = [];
+    let attachmentContext = "";
     try {
       await updateConversation(conversationId, (current) => {
         const existingMessage = (current.messages ?? []).find(
@@ -4988,13 +5068,25 @@ export function createProjectWorkService({
           executionPolicyRevision: executionPolicy.revision,
           executionPolicyVersion: executionPolicy.policyVersion,
         };
+        const boundAttachments = bindProjectWorkMessageAttachments(
+          current,
+          requestedAttachments,
+          {
+            messageId: proposedMessageId,
+            boundAt: createdAt,
+          },
+        );
+        messageAttachments = boundAttachments.messageAttachments;
+        attachmentContext = projectWorkAttachmentManifestPrompt(
+          messageAttachments,
+        );
         userMessage = {
           id: proposedMessageId,
           messageSeq: nextMessageSequence(current),
           role: "user",
           text: messageText,
           images: normalizedImages.map(({ metadata }) => metadata),
-          attachments: normalizedAttachments.map(({ metadata }) => metadata),
+          attachments: messageAttachments,
           status: "accepted",
           ...turnSettings,
           clientRequestId: requestId,
@@ -5018,6 +5110,7 @@ export function createProjectWorkService({
           status: "running",
           plan: null,
           messages: [...(current.messages ?? []), userMessage],
+          attachments: boundAttachments.attachments,
           lastError: null,
         };
       });
@@ -5133,6 +5226,7 @@ export function createProjectWorkService({
             : "current",
           projectRules: 0,
           conversationDocuments: "on_demand",
+          conversationAttachments: "on_demand",
         },
         prompt: hostHarnessSnapshot?.prompt ?? {
           layers: [],
@@ -8099,6 +8193,7 @@ export function createProjectWorkService({
     configureConversation,
     configureExecutionPolicy,
     createAskUserRequest,
+    createConversationAttachment,
     createConversation,
     createConversationDocument,
     createStandaloneConversation,
@@ -8133,6 +8228,7 @@ export function createProjectWorkService({
     inspectSkillPackage,
     installSkillPackage,
     removeConversation,
+    removeConversationAttachment,
     removeConversationDocument,
     removeFollowUp,
     removeProject,
@@ -8152,6 +8248,7 @@ export function createProjectWorkService({
     subscribeEvents: conversationStore.subscribe,
     subscribeConversationEvents,
     undoApply,
+    uploadConversationAttachment,
     uploadConversationDocument,
   });
 }

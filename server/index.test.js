@@ -1285,10 +1285,8 @@ test("project-work message routes accept bounded images and forward one-turn set
         data: largeBoundedData,
       }],
       attachments: [{
-        file_name: "检查说明.md",
-        mime_type: "text/markdown",
-        byte_length: 18,
-        text: "# 检查\n按钮。",
+        attachment_id: "attachment-check",
+        attachment_revision: `sha256:${"a".repeat(64)}`,
       }],
       contexts: [{
         path: "src/App.jsx",
@@ -1325,10 +1323,8 @@ test("project-work message routes accept bounded images and forward one-turn set
         data: largeBoundedData,
       }],
       attachments: [{
-        file_name: "检查说明.md",
-        mime_type: "text/markdown",
-        byte_length: 18,
-        text: "# 检查\n按钮。",
+        attachment_id: "attachment-check",
+        attachment_revision: `sha256:${"a".repeat(64)}`,
       }],
       clientRequestId: "project-message:image-route",
     },
@@ -1374,6 +1370,110 @@ test("project-work message routes accept bounded images and forward one-turn set
     (await oversizedSteer.json()).error.message,
     /256 KB/,
   );
+});
+
+test("ordinary attachment routes create, stream, and remove private conversation files", async (t) => {
+  const calls = [];
+  const revision = `sha256:${"b".repeat(64)}`;
+  const projectWorkService = {
+    async createConversationAttachment(conversationId, options) {
+      calls.push({ action: "create", conversationId, options });
+      return {
+        id: "attachment-route",
+        fileName: options.fileName,
+        mimeType: options.mimeType,
+        byteLength: options.byteLength,
+        status: "awaiting_upload",
+      };
+    },
+    async uploadConversationAttachment(
+      conversationId,
+      attachmentId,
+      stream,
+      options,
+    ) {
+      let content = "";
+      for await (const chunk of stream) content += chunk.toString("utf8");
+      calls.push({
+        action: "upload",
+        conversationId,
+        attachmentId,
+        content,
+        options,
+      });
+      return {
+        id: attachmentId,
+        fileName: "review.md",
+        mimeType: "text/markdown",
+        byteLength: Buffer.byteLength(content),
+        status: "ready",
+        revision,
+      };
+    },
+    async removeConversationAttachment(conversationId, attachmentId) {
+      calls.push({ action: "remove", conversationId, attachmentId });
+      return { attachmentId, removed: true };
+    },
+  };
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+  const root = `${server.baseUrl}/api/v1/project-work/conversations/conversation-attachments/attachments`;
+  const headers = {
+    "content-type": "application/json",
+    origin: "http://127.0.0.1:4173",
+  };
+  const created = await fetch(root, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      schema_version: 1,
+      file_name: "review.md",
+      mime_type: "text/markdown",
+      byte_length: 8,
+    }),
+  });
+  assert.equal(created.status, 201);
+  const uploaded = await fetch(`${root}/attachment-route/content`, {
+    method: "PUT",
+    headers: {
+      "content-type": "text/markdown",
+      origin: "http://127.0.0.1:4173",
+    },
+    body: "# Review",
+  });
+  assert.equal(uploaded.status, 201);
+  assert.equal((await uploaded.json()).attachment.revision, revision);
+  const removed = await fetch(`${root}/attachment-route`, {
+    method: "DELETE",
+    headers: { origin: "http://127.0.0.1:4173" },
+  });
+  assert.equal(removed.status, 200);
+  assert.deepEqual(calls, [{
+    action: "create",
+    conversationId: "conversation-attachments",
+    options: {
+      fileName: "review.md",
+      mimeType: "text/markdown",
+      byteLength: 8,
+    },
+  }, {
+    action: "upload",
+    conversationId: "conversation-attachments",
+    attachmentId: "attachment-route",
+    content: "# Review",
+    options: {
+      contentType: "text/markdown",
+      declaredLength: "8",
+    },
+  }, {
+    action: "remove",
+    conversationId: "conversation-attachments",
+    attachmentId: "attachment-route",
+  }]);
 });
 
 test("project-work execution policy route forwards the CAS revision", async (t) => {

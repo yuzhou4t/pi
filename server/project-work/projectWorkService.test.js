@@ -3531,10 +3531,15 @@ test("apply journal exposes one hash-bound undo and blocks stale external change
   const conversation = await service.createConversation(project.id);
 
   async function prepareAndApply(message) {
-    await service.sendMessage(conversation.id, { text: message });
+    const started = await service.sendMessage(conversation.id, { text: message });
+    const turnId = started.conversation.messages.at(-1)?.turnId;
     const settled = await eventually(
       () => service.getConversation(conversation.id),
-      (snapshot) => snapshot.conversation.activeChangeSet?.status === "ready",
+      (snapshot) => (
+        snapshot.conversation.status === "awaiting_confirmation"
+        && snapshot.conversation.activeChangeSet?.status === "ready"
+        && snapshot.conversation.activeChangeSet?.turnId === turnId
+      ),
       "change set did not become reviewable",
     );
     const changeSet = settled.conversation.activeChangeSet;
@@ -5215,6 +5220,24 @@ test("one-turn screenshot review passes a bounded image to Pi without persisting
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
     "base64",
   );
+  const attachmentBytes = Buffer.from("# 重点\n检查按钮遮挡。");
+  const createdAttachment = await service.createConversationAttachment(
+    conversation.id,
+    {
+      fileName: "验收说明.md",
+      mimeType: "text/markdown",
+      byteLength: attachmentBytes.length,
+    },
+  );
+  const readyAttachment = await service.uploadConversationAttachment(
+    conversation.id,
+    createdAttachment.id,
+    Readable.from([attachmentBytes]),
+    {
+      contentType: "text/markdown",
+      declaredLength: String(attachmentBytes.length),
+    },
+  );
 
   await service.sendMessage(conversation.id, {
     text: "检查这张设置页截图",
@@ -5226,9 +5249,8 @@ test("one-turn screenshot review passes a bounded image to Pi without persisting
       data: bytes.toString("base64"),
     }],
     attachments: [{
-      fileName: "验收说明.md",
-      mimeType: "text/markdown",
-      text: "# 重点\n检查按钮遮挡。",
+      attachmentId: readyAttachment.id,
+      attachmentRevision: readyAttachment.revision,
     }],
   });
   const settled = await eventually(
@@ -5244,9 +5266,12 @@ test("one-turn screenshot review passes a bounded image to Pi without persisting
   );
 
   assert.equal(sessions.length, 1);
-  assert.match(
+  assert.match(sessions[0].prompts[0].prompt, /^检查这张设置页截图/);
+  assert.match(sessions[0].prompts[0].prompt, /验收说明\.md/);
+  assert.match(sessions[0].prompts[0].prompt, /read_attachment/);
+  assert.doesNotMatch(
     sessions[0].prompts[0].prompt,
-    /^检查这张设置页截图[\s\S]*验收说明\.md[\s\S]*检查按钮遮挡/,
+    /检查按钮遮挡/,
   );
   assert.match(
     sessions[0].prompts[0].promptOptions.turnGuidance,
@@ -5271,6 +5296,8 @@ test("one-turn screenshot review passes a bounded image to Pi without persisting
     byteLength: bytes.length,
   }]);
   assert.equal(userMessage.attachments.length, 1);
+  assert.equal(userMessage.attachments[0].id, readyAttachment.id);
+  assert.equal(userMessage.attachments[0].revision, readyAttachment.revision);
   assert.equal(userMessage.attachments[0].fileName, "验收说明.md");
   assert.equal(userMessage.attachments[0].mimeType, "text/markdown");
   assert.match(userMessage.attachments[0].contentHash, /^sha256:[a-f0-9]{64}$/);
