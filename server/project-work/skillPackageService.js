@@ -6,6 +6,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import {
   DefaultPackageManager,
@@ -32,6 +33,23 @@ const BLOCKED_INSTALL_SCRIPTS = new Set([
   "postinstall",
   "prepare",
 ]);
+const DEFAULT_BUNDLED_SKILL_ROOT = fileURLToPath(
+  new URL("./bundled-skills/", import.meta.url),
+);
+const BUNDLED_SKILL_PACKAGES = Object.freeze({
+  "@pi-agent/project-orientation": Object.freeze({
+    version: "1.0.0",
+    directory: "project-orientation",
+    skillName: "project-orientation",
+    description: "先核对项目规则、入口、技术栈和运行边界，再安全开始当前工作。",
+  }),
+  "@pi-agent/git-closeout": Object.freeze({
+    version: "1.0.0",
+    directory: "git-closeout",
+    skillName: "git-closeout",
+    description: "审查任务变更、验证证据和暂存范围，经明确确认后完成本地 Git 提交。",
+  }),
+});
 
 function decodeHtml(value = "") {
   return value
@@ -66,6 +84,7 @@ function publicInstalledPackage(value) {
     name: value.name,
     version: value.version,
     source: value.source,
+    description: typeof value.description === "string" ? value.description : "",
     enabled: value.enabled === true,
     installedAt: value.installedAt,
     skillCount: Array.isArray(value.skillFiles) ? value.skillFiles.length : 0,
@@ -391,6 +410,7 @@ export function createSkillPackageService({
   storageRoot,
   fetchImpl = globalThis.fetch,
   packageManager,
+  bundledSkillRoot = DEFAULT_BUNDLED_SKILL_ROOT,
   now = () => new Date(),
   idFactory = randomUUID,
 } = {}) {
@@ -469,6 +489,39 @@ export function createSkillPackageService({
   }
 
   async function listCatalog({ query = "", sort = "downloads" } = {}) {
+    const normalizedQuery = typeof query === "string" ? query.trim().slice(0, 80) : "";
+    const normalizedSort = SORTS.has(sort) ? sort : "downloads";
+    const bundled = BUNDLED_SKILL_PACKAGES[normalizedQuery];
+    if (bundled) {
+      const installed = await readState();
+      const current = installed.packages.find((item) => item.name === normalizedQuery);
+      return {
+        schemaVersion: 1,
+        source: "pi-agent",
+        query: normalizedQuery,
+        sort: normalizedSort,
+        packages: [{
+          id: normalizedQuery,
+          name: normalizedQuery,
+          description: bundled.description,
+          author: "Pi Agent",
+          version: bundled.version,
+          types: ["skill"],
+          downloads: 0,
+          publishedAt: null,
+          source: `bundled:${normalizedQuery}@${bundled.version}`,
+          catalogUrl: null,
+          npmUrl: null,
+          repoUrl: null,
+          installSupported: true,
+          unsupportedReason: null,
+          bundled: true,
+          installed: Boolean(current),
+          enabled: current?.enabled === true,
+          installedVersion: current?.version ?? null,
+        }],
+      };
+    }
     if (typeof fetchImpl !== "function") {
       throw projectWorkError(
         "PROJECT_WORK_SKILL_CATALOG_UNAVAILABLE",
@@ -477,8 +530,6 @@ export function createSkillPackageService({
         true,
       );
     }
-    const normalizedQuery = typeof query === "string" ? query.trim().slice(0, 80) : "";
-    const normalizedSort = SORTS.has(sort) ? sort : "downloads";
     const cacheKey = `${normalizedQuery}\n${normalizedSort}`;
     const cached = catalogCache.get(cacheKey);
     if (cached && cached.expiresAt > now().getTime()) {
@@ -524,6 +575,70 @@ export function createSkillPackageService({
         "Skill 包名称无效",
         400,
       );
+    }
+    const bundled = BUNDLED_SKILL_PACKAGES[name];
+    if (bundled) {
+      if (version && version !== bundled.version) {
+        throw projectWorkError(
+          "PROJECT_WORK_SKILL_VERSION_NOT_FOUND",
+          "Skill 包版本不存在或来源不受支持",
+          404,
+        );
+      }
+      const sourcePath = path.join(
+        bundledSkillRoot,
+        bundled.directory,
+        "SKILL.md",
+      );
+      let content;
+      try {
+        content = await readFile(sourcePath);
+      } catch {
+        throw projectWorkError(
+          "PROJECT_WORK_SKILL_SOURCE_FAILED",
+          "Pi Agent 内置 Skill 暂时无法读取",
+          500,
+          true,
+        );
+      }
+      if (content.length > MAX_SKILL_FILE_BYTES) {
+        throw projectWorkError(
+          "PROJECT_WORK_SKILL_FILE_TOO_LARGE",
+          "内置 Skill 文件超过当前安全限制",
+          413,
+        );
+      }
+      const skillFile = `skills/${bundled.skillName}/SKILL.md`;
+      const digest = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+      const source = `bundled:${name}@${bundled.version}`;
+      const integrity = `sha256-${createHash("sha256").update(content).digest("base64")}`;
+      const previewHash = `sha256:${createHash("sha256").update(JSON.stringify({
+        source,
+        integrity,
+        skillFiles: [skillFile],
+        skillFileDigests: { [skillFile]: digest },
+      })).digest("hex")}`;
+      const previewId = `skill-preview-${idFactory()}`;
+      const preview = {
+        schemaVersion: 1,
+        previewId,
+        previewHash,
+        name,
+        version: bundled.version,
+        source,
+        description: bundled.description,
+        integrity,
+        skillFiles: [skillFile],
+        skillFileDigests: { [skillFile]: digest },
+        skillCount: 1,
+        archiveFileCount: 1,
+        archiveBytes: content.length,
+        defaultEnabled: false,
+        bundled: true,
+        expiresAt: new Date(now().getTime() + PREVIEW_TTL_MS).toISOString(),
+      };
+      previews.set(previewId, preview);
+      return structuredClone(preview);
     }
     const registryUrl = `${NPM_REGISTRY_BASE_URL}/${encodeURIComponent(name)}`;
     const metadata = JSON.parse((
@@ -601,11 +716,61 @@ export function createSkillPackageService({
       const existing = state.packages.find((item) => item.name === preview.name);
       if (existing?.version === preview.version) {
         previews.delete(previewId);
+        if (
+          !existing.description
+          && typeof preview.description === "string"
+          && preview.description
+        ) {
+          const updated = {
+            ...existing,
+            description: preview.description,
+          };
+          await writeState({
+            schemaVersion: 1,
+            revision: state.revision + 1,
+            packages: state.packages.map((item) => (
+              item.name === preview.name ? updated : item
+            )),
+          });
+          catalogCache.clear();
+          return publicInstalledPackage(updated);
+        }
         return publicInstalledPackage(existing);
       }
-      const manager = await getPackageManager();
-      await manager.install(preview.source, { local: false });
-      const installedPath = manager.getInstalledPath(preview.source, "user");
+      let installedPath;
+      if (preview.bundled === true) {
+        const definition = BUNDLED_SKILL_PACKAGES[preview.name];
+        const sourcePath = path.join(
+          bundledSkillRoot,
+          definition.directory,
+          "SKILL.md",
+        );
+        const content = await readFile(sourcePath);
+        const skillFile = preview.skillFiles[0];
+        const digest = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+        if (digest !== preview.skillFileDigests?.[skillFile]) {
+          throw projectWorkError(
+            "PROJECT_WORK_SKILL_INSTALL_INTEGRITY_MISMATCH",
+            "内置 Skill 内容在确认后发生了变化，请重新检查",
+            409,
+            true,
+          );
+        }
+        installedPath = path.join(
+          agentDir,
+          "bundled",
+          definition.directory,
+        );
+        const targetPath = path.join(installedPath, skillFile);
+        await mkdir(path.dirname(targetPath), { recursive: true, mode: 0o700 });
+        const temporaryPath = `${targetPath}.${idFactory()}.tmp`;
+        await writeFile(temporaryPath, content, { mode: 0o600 });
+        await rename(temporaryPath, targetPath);
+      } else {
+        const manager = await getPackageManager();
+        await manager.install(preview.source, { local: false });
+        installedPath = manager.getInstalledPath(preview.source, "user");
+      }
       if (!installedPath) {
         throw projectWorkError(
           "PROJECT_WORK_SKILL_INSTALL_FAILED",
@@ -641,6 +806,7 @@ export function createSkillPackageService({
         name: preview.name,
         version: preview.version,
         source: preview.source,
+        description: preview.description,
         integrity: preview.integrity,
         installedPath,
         skillFiles: [...preview.skillFiles],

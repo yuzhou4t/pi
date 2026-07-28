@@ -224,6 +224,91 @@ test("reviewed Skill installs disabled and only becomes loadable after explicit 
       "utf8",
     );
     assert.doesNotMatch(stateText, /postinstall|extensions\/index/);
+
+    const legacyState = JSON.parse(stateText);
+    delete legacyState.packages[0].description;
+    await writeFile(
+      path.join(storageRoot, "skill-packages.json"),
+      `${JSON.stringify(legacyState, null, 2)}\n`,
+    );
+    const refreshPreview = await service.inspectPackage({
+      name: "demo-skill",
+      version: "1.2.3",
+    });
+    const refreshed = await service.installPackage({
+      previewId: refreshPreview.previewId,
+      previewHash: refreshPreview.previewHash,
+    });
+    assert.equal(refreshed.description, "Demo package");
+    assert.equal(refreshed.enabled, true);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("bundled Pi Agent Skills use the same reviewed install and enable boundary", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-bundled-skill-"));
+  const storageRoot = path.join(temporaryRoot, "state");
+  const bundledSkillRoot = path.join(temporaryRoot, "bundled");
+  const skillText = [
+    "---",
+    "name: project-orientation",
+    "description: Safely map a project before work.",
+    "---",
+    "",
+    "# Project orientation",
+    "",
+  ].join("\n");
+  await mkdir(path.join(bundledSkillRoot, "project-orientation"), {
+    recursive: true,
+  });
+  await writeFile(
+    path.join(bundledSkillRoot, "project-orientation", "SKILL.md"),
+    skillText,
+  );
+  const service = createSkillPackageService({
+    storageRoot,
+    bundledSkillRoot,
+    fetchImpl: null,
+    now: () => new Date("2026-07-28T09:00:00.000Z"),
+    idFactory: () => "bundled-id",
+  });
+
+  try {
+    const catalog = await service.listCatalog({
+      query: "@pi-agent/project-orientation",
+    });
+    assert.equal(catalog.source, "pi-agent");
+    assert.equal(catalog.packages[0].bundled, true);
+    assert.equal(catalog.packages[0].installed, false);
+
+    const preview = await service.inspectPackage({
+      name: "@pi-agent/project-orientation",
+      version: "1.0.0",
+    });
+    assert.equal(preview.source, "bundled:@pi-agent/project-orientation@1.0.0");
+    assert.deepEqual(
+      preview.skillFiles,
+      ["skills/project-orientation/SKILL.md"],
+    );
+
+    const installed = await service.installPackage({
+      previewId: preview.previewId,
+      previewHash: preview.previewHash,
+    });
+    assert.equal(installed.enabled, false);
+    assert.equal(installed.description.includes("项目规则"), true);
+
+    const enabled = await service.setEnabled(
+      "@pi-agent/project-orientation",
+      true,
+    );
+    assert.equal(enabled.enabled, true);
+    const [enabledPath] = await service.getEnabledSkillPaths();
+    assert.equal(
+      await readFile(enabledPath, "utf8"),
+      skillText,
+    );
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }

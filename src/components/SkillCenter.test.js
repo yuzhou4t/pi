@@ -28,7 +28,7 @@ test("Skill center defaults to installed items and keeps the broad catalog exter
     assert.match(html, /href="https:\/\/pi\.dev\/packages\?type=skill"/);
     assert.match(html, /只显示本机安装项和已经确认的候选/);
     assert.match(html, /已安装 0/);
-    assert.match(html, /已确认候选 2/);
+    assert.match(html, /已确认候选 4/);
     assert.match(html, /没有安装任何 Skill/);
     assert.doesNotMatch(html, /正在同步 Pi Skill 目录|Superpowers|论文每周追踪/);
     assert.match(html, /安装不会自动启用/);

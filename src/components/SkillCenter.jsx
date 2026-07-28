@@ -18,6 +18,8 @@ const PI_SKILL_CATALOG_URL = "https://pi.dev/packages?type=skill";
 const REVIEWED_SKILL_CANDIDATES = [
   "@counterposition/skill-pi",
   "@firstpick/pi-skill-html-report",
+  "@pi-agent/project-orientation",
+  "@pi-agent/git-closeout",
 ];
 
 export function installedSkillRow(skill) {
@@ -39,7 +41,11 @@ function formatDownloads(value) {
 function packageStateLine(skill) {
   if (skill.kind === "workflow") return "内置流程，仅在当前一轮选择后使用";
   if (!skill.installSupported) return skill.unsupportedReason;
-  if (!skill.installed) return "来自 Pi 官方目录，安装前会先检查包内容";
+  if (!skill.installed) {
+    return skill.bundled
+      ? "Pi Agent 内置受审 Skill，安装前会核对精确内容"
+      : "来自 Pi 官方目录，安装前会先检查包内容";
+  }
   return skill.enabled
     ? "已安装并启用；下一次 Agent 运行会加载"
     : "已安装，当前停用";
@@ -356,7 +362,9 @@ export function SkillCenter({
                     <small>
                       {skill.kind === "workflow"
                         ? skill.source
-                        : `${skill.version || "最新"} · ${formatDownloads(skill.downloads)}`}
+                        : skill.bundled || skill.source?.startsWith("bundled:")
+                          ? `${skill.version || "最新"} · Pi Agent 内置`
+                          : `${skill.version || "最新"} · ${formatDownloads(skill.downloads)}`}
                     </small>
                   </div>
                   <p>{skill.description || "这个包没有提供说明。"}</p>
