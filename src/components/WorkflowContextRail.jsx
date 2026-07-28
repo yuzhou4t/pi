@@ -8,6 +8,7 @@ import {
   FileText,
   Flag,
   PaperPlaneTilt,
+  PushPin,
   Quotes,
   ShieldCheck,
   WarningCircle,
@@ -18,13 +19,17 @@ import {
   commitJournalAgentNoteProposal,
   createJournalAgentNoteProposal,
   createJournalReadingConversation,
+  pinJournalReadingConclusion,
+  promoteJournalReadingConversation,
   sendJournalReadingChatMessage,
   switchJournalReadingConversation,
+  unpinJournalReadingConclusion,
 } from "../api/journalRuns.js";
 import { getModelDisplayName } from "../data.js";
 import { usePersistentState } from "../hooks/usePersistentState.js";
 import { workflowFixture } from "../workflow/fixtures.js";
 import { PaperRichText } from "./PaperRichText.jsx";
+import { handleProjectComposerKeyDown } from "./projectComposerKeyboard.js";
 
 const MAX_SELECTION_LENGTH = 4_000;
 const NOOP_SELECTION_CHANGE = () => {};
@@ -264,13 +269,15 @@ function ChatObsidianProposalCard({
   action,
   busy,
   error,
+  writeBlocked = false,
   onCommit,
   onAbandon,
   onRegenerate,
 }) {
   const state = agentActionStatus(action);
   const diff = agentActionDiff(action);
-  const canCommit = ["draft", "proposal_ready", "failed"].includes(action.status);
+  const canCommit = !writeBlocked
+    && ["draft", "proposal_ready", "failed"].includes(action.status);
   const canAbandon = !["verified", "committed", "abandoned"].includes(action.status);
 
   return (
@@ -291,7 +298,9 @@ function ChatObsidianProposalCard({
       </p>
       <code className="reader-agent-note-path">{action.targetPath}</code>
       <p className="reader-agent-note-boundary">
-        只修改这篇论文的 Agent 补充区；不会推进精读阶段。
+        {writeBlocked
+          ? "当前是草稿分支，这份预览不能写入；提升为主研读后再确认。"
+          : "只修改这篇论文的 Agent 补充区；不会推进精读阶段。"}
       </p>
       {action.preview?.length ? (
         <ul>
@@ -309,7 +318,7 @@ function ChatObsidianProposalCard({
           {chatErrorMessage(error || action.error, "这次修改没有完成")}
         </p>
       ) : null}
-      {action.status === "abandoned" ? (
+      {action.status === "abandoned" && !writeBlocked ? (
         <button
           className="reader-agent-note-secondary"
           type="button"
@@ -543,22 +552,65 @@ export function selectionReferenceFromDom(
   });
 }
 
-function EvidenceSection({ paper, stage }) {
-  const evidence = (workflowFixture.evidence ?? [])
-    .filter((item) => item.paperId === paper?.id)
-    .slice(0, 3);
+function EvidenceSection({ paper, stage, run, liveRun }) {
+  const live = run?.source === "live";
+  const evidence = live || paper?.isDemo === false
+    ? []
+    : (workflowFixture.evidence ?? [])
+        .filter((item) => item.paperId === paper?.id)
+        .slice(0, 3);
+  const sourceProgress = liveRun?.sourceProgress;
+  const scanSummary = liveRun?.scanSummary;
+  const sourceCount = scanSummary?.source_count
+    ?? sourceProgress?.total_count
+    ?? 11;
+  const completedSourceCount = sourceProgress?.completed_source_ids?.length
+    ?? scanSummary?.source_count;
+  const successfulSourceCount = scanSummary?.successful_source_count
+    ?? sourceProgress?.successful_source_ids?.length;
+  const failedSourceCount = (
+    scanSummary?.failed_source_ids
+    ?? sourceProgress?.failed_source_ids
+    ?? []
+  ).length;
 
   return (
     <section className="workflow-context-section" aria-labelledby="workflow-current-paper-title">
       <header>
-        <div><FileText size={17} aria-hidden="true" /><h3 id="workflow-current-paper-title">当前论文</h3></div>
-        <span>{stage ? stage.label : "候选判断"}</span>
+        <div>
+          <FileText size={17} aria-hidden="true" />
+          <h3 id="workflow-current-paper-title">
+            {paper ? "当前论文" : live ? "当前扫描" : "当前论文"}
+          </h3>
+        </div>
+        <span>{paper && stage ? stage.label : paper ? "候选判断" : "来源进度"}</span>
       </header>
 
-      <article className="workflow-context-paper">
-        <span className="workflow-context-paper-icon"><FileText size={17} aria-hidden="true" /></span>
-        <div><strong>{paper?.shortTitle ?? paper?.title}</strong><p>{paper?.venue} · {paper?.publishedAt ?? paper?.published_at}</p></div>
-      </article>
+      {paper ? (
+        <article className="workflow-context-paper">
+          <span className="workflow-context-paper-icon"><FileText size={17} aria-hidden="true" /></span>
+          <div>
+            <strong>{paper.shortTitle ?? paper.title}</strong>
+            <p>{paper.venue} · {paper.publishedAt ?? paper.published_at}</p>
+          </div>
+        </article>
+      ) : live ? (
+        <div className="workflow-evidence-scope" role="status">
+          <ShieldCheck size={16} aria-hidden="true" />
+          <p>
+            <strong>
+              {completedSourceCount === undefined
+                ? "正在恢复来源进度"
+                : `已检查 ${completedSourceCount}/${sourceCount} 个来源`}
+            </strong>
+            <span>
+              {successfulSourceCount === undefined
+                ? "真实候选仍在准备"
+                : `成功 ${successfulSourceCount} · 失败 ${failedSourceCount}`}
+            </span>
+          </p>
+        </div>
+      ) : null}
 
       {paper?.evidenceScope ?? paper?.evidence_scope ? (
         <div className="workflow-evidence-scope">
@@ -622,7 +674,7 @@ export function ProjectStateSection({ projectContextState, onReload }) {
     );
   }
 
-  const projectState = projectContextState?.data ?? workflowFixture.projectState ?? {};
+  const projectState = projectContextState?.data ?? {};
   const decisions = projectState.decisions ?? [];
   const openQuestions = projectState.openQuestions ?? projectState.open_questions ?? [];
   const nextActions = projectState.nextActions
@@ -692,11 +744,47 @@ export function ProjectStateSection({ projectContextState, onReload }) {
   );
 }
 
-export function ReadingNotesPanel({ readerContext, onOpenBlock }) {
+export function ReadingNotesPanel({ readerContext, onOpenBlock, onReadingChange }) {
   const reading = readerContext?.reading;
-  const completedCount = READING_NOTE_LENSES.filter(
+  const [mutationState, setMutationState] = useState({
+    busyConclusionId: null,
+    error: null,
+  });
+  const requestIds = useRef(new Map());
+  const confirmedNotes = READING_NOTE_LENSES.filter(
     (lens) => reading?.stages?.[lens.id]?.status === "ready",
-  ).length;
+  );
+  const pinnedConclusions = (reading?.pinnedConclusions ?? []).filter(
+    (conclusion) => conclusion.status === "pinned",
+  );
+  const totalNotes = pinnedConclusions.length + confirmedNotes.length;
+
+  useEffect(() => {
+    setMutationState({ busyConclusionId: null, error: null });
+    requestIds.current.clear();
+  }, [readerContext?.key]);
+
+  const handleUnpin = async (conclusion) => {
+    if (!conclusion?.conclusionId || mutationState.busyConclusionId) return;
+    const requestKey = conclusion.conclusionId;
+    if (!requestIds.current.has(requestKey)) {
+      requestIds.current.set(requestKey, createAgentActionRequestId("unpin"));
+    }
+    setMutationState({ busyConclusionId: conclusion.conclusionId, error: null });
+    try {
+      const nextReading = await unpinJournalReadingConclusion({
+        runId: readerContext.runId,
+        paperId: readerContext.paperId,
+        conclusionId: conclusion.conclusionId,
+        clientRequestId: requestIds.current.get(requestKey),
+        confirmedBy: "local-user",
+      });
+      setMutationState({ busyConclusionId: null, error: null });
+      onReadingChange?.(nextReading);
+    } catch (error) {
+      setMutationState({ busyConclusionId: null, error });
+    }
+  };
 
   if (!reading) {
     return (
@@ -714,62 +802,98 @@ export function ReadingNotesPanel({ readerContext, onOpenBlock }) {
     <section className="reader-notes" aria-labelledby="reader-notes-title">
       <header>
         <div>
-          <span>本篇覆盖</span>
-          <h3 id="reader-notes-title">{completedCount}/4 项研读结论</h3>
+          <span>本篇研读</span>
+          <h3 id="reader-notes-title">已确认的研读结论</h3>
         </div>
-        <small>结论与原文引用分开保存</small>
+        <small>{totalNotes > 0 ? `${totalNotes} 条 · 均保留原文引用` : "可在对话中逐步固定"}</small>
       </header>
 
       <div className="reader-notes-list">
-        {READING_NOTE_LENSES.map((lens) => {
+        {totalNotes === 0 ? (
+          <p className="reader-notes-placeholder">
+            尚未固定研读结论。阅读时确认的重要判断会逐步出现在这里。
+          </p>
+        ) : null}
+        {pinnedConclusions.map((conclusion) => (
+          <article className="is-ready is-pinned" key={conclusion.conclusionId}>
+            <header>
+              <div>
+                <PushPin size={15} weight="fill" aria-hidden="true" />
+                <strong>对话结论</strong>
+              </div>
+              <div className="reader-notes-item-actions">
+                <span>已固定</span>
+                <button
+                  type="button"
+                  disabled={Boolean(mutationState.busyConclusionId)}
+                  onClick={() => handleUnpin(conclusion)}
+                >
+                  {mutationState.busyConclusionId === conclusion.conclusionId
+                    ? "正在取消…"
+                    : "取消固定"}
+                </button>
+              </div>
+            </header>
+            <div className="reader-notes-content">
+              <PaperRichText content={conclusion.content} />
+            </div>
+            {conclusion.citations?.length ? (
+              <div className="reader-notes-citations" aria-label="对话结论原文引用">
+                {conclusion.citations.map((reference, index) => (
+                  <button
+                    type="button"
+                    onClick={() => onOpenBlock(reference.blockId)}
+                    key={`${conclusion.conclusionId}-${reference.blockId}-${index}`}
+                  >
+                    <Quotes size={13} aria-hidden="true" />
+                    {citationLabel(reference)}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </article>
+        ))}
+        {mutationState.error ? (
+          <p className="reader-notes-mutation-error" role="status">
+            {chatErrorMessage(mutationState.error, "暂时无法取消固定")}
+          </p>
+        ) : null}
+        {confirmedNotes.map((lens) => {
           const stage = reading.stages?.[lens.id] ?? {};
-          const ready = stage.status === "ready" && Boolean(stage.result);
           return (
-            <article className={`is-${stage.status ?? "not_started"}`} key={lens.id}>
+            <article className="is-ready" key={lens.id}>
               <header>
                 <div>
-                  {ready
-                    ? <CheckCircle size={15} weight="fill" aria-hidden="true" />
-                    : stage.status === "running"
-                      ? <CircleNotch className="is-spinning" size={15} aria-hidden="true" />
-                      : <Circle size={15} aria-hidden="true" />}
+                  <CheckCircle size={15} weight="fill" aria-hidden="true" />
                   <strong>{lens.label}</strong>
                 </div>
-                <span>{ready ? "已整理" : stage.status === "running" ? "整理中" : "尚未整理"}</span>
+                <span>已确认</span>
               </header>
-              {ready ? (
-                <>
-                  <p>{stage.result.answer}</p>
-                  {stage.result.evidence?.length ? (
-                    <div className="reader-notes-citations" aria-label={`${lens.label}原文引用`}>
-                      {stage.result.evidence.map((reference, index) => (
-                        <button
-                          type="button"
-                          onClick={() => onOpenBlock(reference.blockId)}
-                          key={`${lens.id}-${reference.blockId}-${index}`}
-                        >
-                          <Quotes size={13} aria-hidden="true" />
-                          {citationLabel(reference)}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-                  {stage.result.openQuestions?.length ? (
-                    <details>
-                      <summary>仍需留意 {stage.result.openQuestions.length} 项</summary>
-                      <ul>
-                        {stage.result.openQuestions.map((question) => (
-                          <li key={question}>{question}</li>
-                        ))}
-                      </ul>
-                    </details>
-                  ) : null}
-                </>
-              ) : (
-                <p className="reader-notes-placeholder">
-                  整理研读结论后，这一项会出现在这里。
-                </p>
-              )}
+              <p>{stage.result.answer}</p>
+              {stage.result.evidence?.length ? (
+                <div className="reader-notes-citations" aria-label={`${lens.label}原文引用`}>
+                  {stage.result.evidence.map((reference, index) => (
+                    <button
+                      type="button"
+                      onClick={() => onOpenBlock(reference.blockId)}
+                      key={`${lens.id}-${reference.blockId}-${index}`}
+                    >
+                      <Quotes size={13} aria-hidden="true" />
+                      {citationLabel(reference)}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              {stage.result.openQuestions?.length ? (
+                <details>
+                  <summary>仍需留意 {stage.result.openQuestions.length} 项</summary>
+                  <ul>
+                    {stage.result.openQuestions.map((question) => (
+                      <li key={question}>{question}</li>
+                    ))}
+                  </ul>
+                </details>
+              ) : null}
             </article>
           );
         })}
@@ -800,6 +924,16 @@ function turnContextLabel(turn) {
   return "仅论文上下文";
 }
 
+function readingConversationLabel(conversation) {
+  const kind = conversation?.canonical
+    ? "主研读"
+    : conversation?.promotionStatus === "superseded"
+      ? "原主研读 · 草稿"
+      : "草稿分支";
+  const title = String(conversation?.title ?? "").trim();
+  return title && title !== kind ? `${kind} · ${title}` : kind;
+}
+
 export function ReaderAgentComposer({
   readerContext,
   providers,
@@ -822,8 +956,26 @@ export function ReaderAgentComposer({
     busyKey: null,
     errors: {},
   });
+  const [conversationBusy, setConversationBusy] = useState(false);
+  const [conversationError, setConversationError] = useState(null);
   const noteActionRequestIds = useRef(new Map());
   const sessionKey = readerContext?.key ?? null;
+  const reading = readerContext?.reading;
+  const conversations = reading?.conversations ?? [];
+  const activeConversationId = reading?.activeConversationId ?? "current";
+  const canonicalConversationId = reading?.canonicalConversationId
+    ?? activeConversationId;
+  const activeConversation = conversations.find(
+    (conversation) => conversation.id === activeConversationId,
+  );
+  const isScratchBranch = (
+    reading?.chat?.branchType === "scratch"
+    || activeConversation?.branchType === "scratch"
+    || activeConversationId !== canonicalConversationId
+  );
+  const pinnedConclusions = (reading?.pinnedConclusions ?? []).filter(
+    (conclusion) => conclusion.status === "pinned",
+  );
   const incomingTurns = readerContext?.reading?.chat?.turns ?? [];
   const incomingRevision = incomingTurns
     .map((turn) => [
@@ -851,6 +1003,8 @@ export function ReaderAgentComposer({
       error: null,
     });
     setNoteActionState({ busyKey: null, errors: {} });
+    setConversationBusy(false);
+    setConversationError(null);
     noteActionRequestIds.current.clear();
     onReferenceChange({ reference: null, error: null });
   }, [sessionKey]);
@@ -900,7 +1054,7 @@ export function ReaderAgentComposer({
 
   const createNoteProposal = async (turn) => {
     const key = `${turn.id}:preview`;
-    if (noteActionState.busyKey) return;
+    if (noteActionState.busyKey || isScratchBranch) return;
     setNoteActionState((current) => ({
       busyKey: key,
       errors: { ...current.errors, [key]: null },
@@ -986,6 +1140,33 @@ export function ReaderAgentComposer({
     }
   };
 
+  const pinConclusion = async (turn) => {
+    const key = `${turn.id}:pin`;
+    if (
+      noteActionState.busyKey
+      || turn.status !== "answered"
+      || !turn.citations?.length
+    ) {
+      return;
+    }
+    setNoteActionState((current) => ({
+      busyKey: key,
+      errors: { ...current.errors, [key]: null },
+    }));
+    try {
+      publishReading(await pinJournalReadingConclusion({
+        runId: readerContext.runId,
+        paperId: readerContext.paperId,
+        turnId: turn.id,
+        clientRequestId: requestIdFor(key, "pin"),
+        confirmedBy: "local-user",
+      }));
+      setNoteActionState({ busyKey: null, errors: {} });
+    } catch (error) {
+      updateNoteActionError(key, error);
+    }
+  };
+
   const submit = async (attempt = null) => {
     if (!modelAvailable || chatState.status === "running") return;
     const text = attempt?.text ?? draft.trim();
@@ -1002,6 +1183,7 @@ export function ReaderAgentComposer({
       question: nextAttempt.text,
       status: "running",
       reference: nextAttempt.reference,
+      roundId: nextAttempt.roundId ?? null,
       answer: null,
       citations: [],
       providerId,
@@ -1035,6 +1217,7 @@ export function ReaderAgentComposer({
                   endOffset: nextAttempt.reference.endOffset,
                 })
           : null,
+        roundId: nextAttempt.roundId ?? null,
         includeProjectContext: nextAttempt.includeProjectContext,
         clientRequestId: nextAttempt.clientRequestId,
         providerId,
@@ -1062,10 +1245,8 @@ export function ReaderAgentComposer({
   const [walkMode, setWalkMode] = usePersistentState("pi-reading-walk-mode", "rounds");
   const [roundProgress, setRoundProgress] = usePersistentState("pi-reading-round-progress", {});
   const [roundSelection, setRoundSelection] = useState(null);
-  const [conversationBusy, setConversationBusy] = useState(false);
-  const conversations = readerContext?.reading?.conversations ?? [];
-  const activeConversationId = readerContext?.reading?.activeConversationId ?? "current";
   const roundKey = `${sessionKey ?? "unknown"}:${activeConversationId}`;
+  const visibleChatTurns = chatState.turns.filter((turn) => !turn.auditOnly);
 
   useEffect(() => {
     setRoundSelection(null);
@@ -1074,6 +1255,7 @@ export function ReaderAgentComposer({
   const handleNewConversation = async () => {
     if (conversationBusy) return;
     setConversationBusy(true);
+    setConversationError(null);
     try {
       publishReading(await createJournalReadingConversation({
         runId: readerContext.runId,
@@ -1081,7 +1263,7 @@ export function ReaderAgentComposer({
       }));
       onReferenceChange({ reference: null, error: null });
     } catch (error) {
-      setChatState((current) => ({ ...current, error }));
+      setConversationError(error);
     } finally {
       setConversationBusy(false);
     }
@@ -1090,6 +1272,7 @@ export function ReaderAgentComposer({
   const handleSwitchConversation = async (conversationId) => {
     if (conversationBusy || conversationId === activeConversationId) return;
     setConversationBusy(true);
+    setConversationError(null);
     try {
       publishReading(await switchJournalReadingConversation({
         runId: readerContext.runId,
@@ -1098,7 +1281,36 @@ export function ReaderAgentComposer({
       }));
       onReferenceChange({ reference: null, error: null });
     } catch (error) {
-      setChatState((current) => ({ ...current, error }));
+      setConversationError(error);
+    } finally {
+      setConversationBusy(false);
+    }
+  };
+
+  const handlePromoteConversation = async () => {
+    if (!isScratchBranch || conversationBusy) return;
+    const confirmed = globalThis.confirm?.(
+      [
+        "将这个草稿分支提升为主研读吗？",
+        "",
+        "提升后，这个分支将成为唯一可以进入归档的主研读；原主研读会保留为草稿，不会被删除。",
+        "本操作不会写入 Zotero、Obsidian 或项目状态。",
+      ].join("\n"),
+    );
+    if (!confirmed) return;
+    const key = `${activeConversationId}:promote`;
+    setConversationBusy(true);
+    setConversationError(null);
+    try {
+      publishReading(await promoteJournalReadingConversation({
+        runId: readerContext.runId,
+        paperId: readerContext.paperId,
+        conversationId: activeConversationId,
+        clientRequestId: requestIdFor(key, "promote"),
+        confirmedBy: "local-user",
+      }));
+    } catch (error) {
+      setConversationError(error);
     } finally {
       setConversationBusy(false);
     }
@@ -1166,8 +1378,17 @@ export function ReaderAgentComposer({
 
   // Ten-round guided reading: progress is a client-side reading aid keyed by
   // paper conversation; it never advances the durable Run or reading stages.
+  const durableRoundsTaught = chatState.turns.reduce((highest, turn) => {
+    if (turn.status !== "answered" || turn.auditOnly || !turn.roundId) return highest;
+    const roundId = turn.roundId === "orientation" ? "field" : turn.roundId;
+    const index = READING_ROUNDS.findIndex((round) => round.id === roundId);
+    return index < 0 ? highest : Math.max(highest, index + 1);
+  }, 0);
+  const legacyRoundsTaught = Number.isSafeInteger(roundProgress[roundKey])
+    ? roundProgress[roundKey]
+    : 0;
   const roundsTaught = Math.min(
-    Number.isSafeInteger(roundProgress[roundKey]) ? roundProgress[roundKey] : 0,
+    durableRoundsTaught > 0 ? durableRoundsTaught : legacyRoundsTaught,
     READING_ROUNDS.length,
   );
   const activeRoundIndex = Math.min(
@@ -1198,21 +1419,13 @@ export function ReaderAgentComposer({
     void submit({
       clientRequestId: createChatRequestId(),
       text,
+      roundId: round.id,
       reference: reference
         ? { documentRevision: walkDocument.revision, blockIds: reference.blockIds }
         : null,
       includeProjectContext,
     });
-    if (intent === "read") {
-      setRoundSelection(index);
-      setRoundProgress((current) => ({
-        ...current,
-        [roundKey]: Math.max(
-          Number.isSafeInteger(current[roundKey]) ? current[roundKey] : 0,
-          index + 1,
-        ),
-      }));
-    }
+    if (intent === "read") setRoundSelection(index);
   };
 
   const readCurrentRound = () => teachRound(activeRoundIndex, "read");
@@ -1229,7 +1442,8 @@ export function ReaderAgentComposer({
         >
           {conversations.map((conversation) => (
             <option value={conversation.id} key={conversation.id}>
-              {conversation.title}{conversation.turnCount ? `（${conversation.turnCount}）` : ""}
+              {readingConversationLabel(conversation)}
+              {conversation.turnCount ? `（${conversation.turnCount}）` : ""}
             </option>
           ))}
         </select>
@@ -1242,7 +1456,31 @@ export function ReaderAgentComposer({
           ＋ 新建对话
         </button>
       </div>
-      {!chatState.turns.length ? (
+      <div className={`reader-agent-branch-state${isScratchBranch ? " is-scratch" : " is-canonical"}`}>
+        <div>
+          <span>{isScratchBranch ? "草稿分支" : "主研读"}</span>
+          <p>
+            {isScratchBranch
+              ? "用于探索不同思路；提升为主研读后才能生成或确认归档写入。"
+              : "这是当前唯一可以进入归档的研读会话。"}
+          </p>
+        </div>
+        {isScratchBranch ? (
+          <button
+            type="button"
+            disabled={conversationBusy || chatState.status === "running"}
+            onClick={handlePromoteConversation}
+          >
+            {conversationBusy ? "正在提升…" : "提升为主研读"}
+          </button>
+        ) : null}
+      </div>
+      {conversationError ? (
+        <p className="reader-agent-conversation-error" role="status">
+          {chatErrorMessage(conversationError, "暂时无法更新研读会话")}
+        </p>
+      ) : null}
+      {!visibleChatTurns.length ? (
         <div className="reader-agent-empty">
           <BookOpenText size={20} aria-hidden="true" />
           <div>
@@ -1273,10 +1511,18 @@ export function ReaderAgentComposer({
         </div>
       ) : null}
 
-      {chatState.turns.length ? (
+      {visibleChatTurns.length ? (
         <div className="reader-agent-history" aria-label="Agent 对话历史" aria-live="polite">
-          {chatState.turns.map((turn) => (
-            <article className={`is-${turn.status}`} key={turn.id}>
+          {visibleChatTurns.map((turn) => {
+            const pinnedConclusion = pinnedConclusions.find(
+              (conclusion) => (
+                conclusion.sourceConversationId === activeConversationId
+                && conclusion.sourceTurnId === turn.id
+              ),
+            );
+            const pinKey = `${turn.id}:pin`;
+            return (
+              <article className={`is-${turn.status}`} key={turn.id}>
               <div className="reader-agent-question">
                 {turn.reference?.quote ? (
                   <blockquote><PaperRichText content={turn.reference.quote} inline /></blockquote>
@@ -1305,6 +1551,7 @@ export function ReaderAgentComposer({
                     onClick={() => submit({
                       clientRequestId: createChatRequestId(),
                       text: turn.question,
+                      roundId: turn.roundId ?? null,
                       reference: turn.reference ? {
                         ...turn.reference,
                         documentRevision: readerContext.document?.revision,
@@ -1330,18 +1577,50 @@ export function ReaderAgentComposer({
                   ))}
                 </div>
               ) : null}
-              {turn.status === "answered" && !turn.noteAction ? (
+              {turn.status === "answered" ? (
                 <div className="reader-agent-note-entry">
                   <button
                     type="button"
-                    disabled={Boolean(noteActionState.busyKey)}
-                    onClick={() => createNoteProposal(turn)}
+                    disabled={
+                      Boolean(noteActionState.busyKey)
+                      || Boolean(pinnedConclusion)
+                      || !turn.citations?.length
+                    }
+                    title={
+                      turn.citations?.length
+                        ? "固定到阅读笔记，不会批准或执行任何归档写入"
+                        : "需要至少一条已验证的原文引用才能固定"
+                    }
+                    onClick={() => pinConclusion(turn)}
                   >
-                    {noteActionState.busyKey === `${turn.id}:preview`
+                    {noteActionState.busyKey === pinKey
                       ? <CircleNotch className="is-spinning" size={14} aria-hidden="true" />
-                      : <FileText size={14} aria-hidden="true" />}
-                    整理到 Obsidian 笔记
+                      : <PushPin size={14} weight={pinnedConclusion ? "fill" : "regular"} aria-hidden="true" />}
+                    {pinnedConclusion ? "已固定到阅读笔记" : "固定结论"}
                   </button>
+                  {!isScratchBranch && !turn.noteAction ? (
+                    <button
+                      type="button"
+                      disabled={Boolean(noteActionState.busyKey)}
+                      onClick={() => createNoteProposal(turn)}
+                    >
+                      {noteActionState.busyKey === `${turn.id}:preview`
+                        ? <CircleNotch className="is-spinning" size={14} aria-hidden="true" />
+                        : <FileText size={14} aria-hidden="true" />}
+                      整理到 Obsidian 笔记
+                    </button>
+                  ) : null}
+                  {isScratchBranch ? (
+                    <span>草稿分支只保存阅读探索，不生成归档写入。</span>
+                  ) : null}
+                  {noteActionState.errors[pinKey] ? (
+                    <p className="reader-agent-note-error" role="status">
+                      {chatErrorMessage(
+                        noteActionState.errors[pinKey],
+                        "暂时无法固定这条结论",
+                      )}
+                    </p>
+                  ) : null}
                   {noteActionState.errors[`${turn.id}:preview`] ? (
                     <p className="reader-agent-note-error" role="status">
                       {chatErrorMessage(noteActionState.errors[`${turn.id}:preview`])}
@@ -1352,6 +1631,7 @@ export function ReaderAgentComposer({
               {turn.noteAction ? (
                 <ChatObsidianProposalCard
                   action={turn.noteAction}
+                  writeBlocked={isScratchBranch}
                   busy={noteActionState.busyKey?.startsWith(turn.noteAction.proposalId)}
                   error={
                     noteActionState.errors[`${turn.noteAction.proposalId}:commit`]
@@ -1367,8 +1647,9 @@ export function ReaderAgentComposer({
                 {" · "}
                 {turnContextLabel(turn)}
               </small>
-            </article>
-          ))}
+              </article>
+            );
+          })}
         </div>
       ) : null}
 
@@ -1489,7 +1770,9 @@ export function ReaderAgentComposer({
               </div>
               {roundsCompleted ? (
                 <p className="reader-agent-walk-complete" role="status">
-                  十步已完成 · 可把关键回答逐条「整理到 Obsidian 笔记」，或进入归档整理。
+                  {isScratchBranch
+                    ? "十步已完成 · 可继续固定关键结论；草稿分支不会进入归档。"
+                    : "十步已完成 · 可固定关键结论，或进入归档整理。"}
                 </p>
               ) : null}
             </>
@@ -1569,6 +1852,8 @@ export function ReaderAgentComposer({
           value={draft}
           placeholder="解释、翻译、比较，或让 Agent 整理一份草稿…"
           onChange={(event) => updateDraft(event.target.value)}
+          onKeyDown={handleProjectComposerKeyDown}
+          aria-keyshortcuts="Enter"
         />
         <div>
           <label className={includeProjectContext ? "is-active" : ""}>
@@ -1601,7 +1886,8 @@ export function ReaderAgentComposer({
 
 export function WorkflowContextRail({
   run,
-  papers = workflowFixture.papers ?? [],
+  liveRun = null,
+  papers = [],
   preferredPaperId,
   mobileActive,
   readerContext = null,
@@ -1716,7 +2002,14 @@ export function WorkflowContextRail({
           aria-labelledby={`workflow-context-tab-${safeView}`}
           tabIndex={0}
         >
-          {safeView === "evidence" ? <EvidenceSection paper={paper} stage={stage} /> : null}
+          {safeView === "evidence" ? (
+            <EvidenceSection
+              paper={paper}
+              stage={stage}
+              run={run}
+              liveRun={liveRun}
+            />
+          ) : null}
           {safeView === "agent" ? (
             <ReaderAgentComposer
               key={readerContext.key}
@@ -1735,6 +2028,7 @@ export function WorkflowContextRail({
             <ReadingNotesPanel
               readerContext={readerContext}
               onOpenBlock={openCitation}
+              onReadingChange={onReaderReadingChange}
             />
           ) : null}
           {safeView === "state" ? (

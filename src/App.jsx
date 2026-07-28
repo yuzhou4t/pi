@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ChatText,
   Files,
@@ -12,12 +20,8 @@ import { DeleteConversationDialog } from "./components/DeleteConversationDialog.
 import { ResetPaperReadingDialog } from "./components/ResetPaperReadingDialog.jsx";
 import { ProjectRail } from "./components/ProjectRail.jsx";
 import { RenameConversationDialog } from "./components/RenameConversationDialog.jsx";
-import { LiveProjectWorkbench } from "./components/LiveProjectWorkbench.jsx";
 import { SettingsDialog, SettingsQuickPanel } from "./components/SettingsPanel.jsx";
 import { SkillCenter } from "./components/SkillCenter.jsx";
-import { WorkflowContextRail } from "./components/WorkflowContextRail.jsx";
-import { WorkflowWorkspace } from "./components/WorkflowWorkspace.jsx";
-import { ReadingWorkbench } from "./components/ReadingWorkbench.jsx";
 import { fetchCandidateSummaries, fetchModelProviders, mergeCandidateSummaries } from "./api/candidateSummaries.js";
 import { projectWorkApi } from "./api/projectWork.js";
 import {
@@ -34,7 +38,7 @@ import {
   upsertLiveProject,
 } from "./project-work/liveProjectWorkState.js";
 import {
-  commitZoteroProposal,
+  commitArchiveBatch,
   createObsidianPreview,
   createProjectStatePreview,
   createZoteroProposal,
@@ -49,11 +53,13 @@ import {
   fetchZoteroTargets,
   restartJournalReadingFromGuide,
   resetJournalPaperReading,
+  retryJournalPaperDocument,
   resumeJournalRun,
   saveJournalPaperDecisions,
   selectZoteroCommitOperations,
   startJournalGuides,
   startJournalRun,
+  subscribeJournalRun,
 } from "./api/journalRuns.js";
 import { getModelDisplayName, providers, skillCatalog } from "./data.js";
 import { usePersistentReducer } from "./hooks/usePersistentReducer.js";
@@ -67,6 +73,20 @@ import {
   RUN_STATUS,
   runReducer,
 } from "./workflow/runReducer.js";
+
+const LiveProjectWorkbench = lazy(() => import(
+  "./components/LiveProjectWorkbench.jsx"
+).then((module) => ({ default: module.LiveProjectWorkbench })));
+const ReadingWorkbench = lazy(() => import(
+  "./components/ReadingWorkbench.jsx"
+).then((module) => ({ default: module.ReadingWorkbench })));
+const WorkflowWorkspace = lazy(() => import(
+  "./components/WorkflowWorkspace.jsx"
+).then((module) => ({ default: module.WorkflowWorkspace })));
+const WorkflowContextRail = lazy(() => import(
+  "./components/WorkflowContextRail.jsx"
+).then((module) => ({ default: module.WorkflowContextRail })));
+const WORKFLOW_FIXTURES_ENABLED = import.meta.env.VITE_ENABLE_WORKFLOW_FIXTURES === "true";
 
 const runStatusLabels = {
   [RUN_STATUS.REVIEW_READY]: "本周待审阅",
@@ -90,7 +110,7 @@ const journalRunStatusLabels = {
   review_ready: "真实候选待审阅",
   preparing_guides: "正在生成导读",
   guide_ready: "真实导读待决定",
-  reading: "正在分阶段精读",
+  reading: "正在论文研读",
   draft_ready: "阅读成果待归档",
   awaiting_approval: "归档精确预览待核对",
   committing: "正在写入 Zotero",
@@ -187,7 +207,7 @@ function normalizeProviderConfig(config, catalogProviders, defaultProviderId) {
 function createLoadingSummaryState() {
   return {
     status: "loading",
-    source: "fixture",
+    source: null,
     providerId: null,
     modelId: null,
     items: [],
@@ -538,7 +558,6 @@ export function App() {
     error: null,
   });
   const [contextRailView, setContextRailView] = useState("evidence");
-  const autoOpenedReaderKeyRef = useRef(null);
 
   const registeredProjectItems = useMemo(() => (
     Array.isArray(registeredProjects)
@@ -662,7 +681,8 @@ export function App() {
     [skillState],
   );
   const activeRun = useMemo(() => ({
-    id: journalRunState.run?.id ?? run.runId,
+    id: journalRunState.run?.id
+      ?? (WORKFLOW_FIXTURES_ENABLED ? run.runId : "weekly-journal-tracking"),
     name: workflowFixture.workflowName,
     statusLabel: journalRunState.status === "restoring"
       ? "正在恢复上次 Run"
@@ -670,17 +690,20 @@ export function App() {
       ? "正在启动扫描"
       : journalRunState.status === "error"
         ? "扫描状态读取失败"
+        : journalRunState.status === "idle" && !journalRunState.run
+          ? "等待开始本周扫描"
         : journalRunStatusLabels[journalRunState.run?.status]
-          ?? runStatusLabels[run.status]
-          ?? run.status,
+          ?? (WORKFLOW_FIXTURES_ENABLED
+            ? runStatusLabels[run.status] ?? run.status
+            : "等待开始本周扫描"),
   }), [journalRunState.run?.id, journalRunState.run?.status, journalRunState.status, run.runId, run.status]);
   const liveJournalPapers = journalRunState.run?.candidates;
   const obsidianAgentActionRevision = runAgentActionRevision(journalRunState.run);
   const workflowPapers = useMemo(() => (
-    liveJournalPapers?.length > 0
-      ? liveJournalPapers
+    run.source === "live" || !WORKFLOW_FIXTURES_ENABLED
+      ? liveJournalPapers ?? []
       : mergeCandidateSummaries(workflowFixture.papers, candidateSummaryState.items)
-  ), [candidateSummaryState.items, liveJournalPapers]);
+  ), [candidateSummaryState.items, liveJournalPapers, run.source]);
   const selectedReaderPapers = workflowPapers.filter(
     (paper) => (run.selectedPaperIds ?? []).includes(paper.id),
   );
@@ -769,6 +792,7 @@ export function App() {
       subtitle: conversation.projectId === null
         ? `未连接文件夹 · ${projectWorkConversationLabel(conversation.status)}`
         : `正常工作 · ${projectWorkConversationLabel(conversation.status)}`,
+      unreadCount: conversation.unreadCount ?? 0,
       pendingChangeFileCount: conversation.pendingChangeFileCount ?? 0,
       deleteBlocked: isProjectWorkConversationDeleteBlocked(
         conversation.id,
@@ -985,6 +1009,9 @@ export function App() {
                 status: conversation.status,
                 providerId: conversation.providerId,
                 modelId: conversation.modelId,
+                unreadCount: conversation.unreadCount,
+                latestMessageSeq: conversation.latestMessageSeq,
+                lastReadMessageSeq: conversation.lastReadMessageSeq,
                 pendingChangeFileCount: conversation.pendingChangeFileCount,
                 updatedAt: conversation.updatedAt,
               }
@@ -1042,6 +1069,9 @@ export function App() {
         modelId: conversation.modelId,
         thinkingLevel: conversation.thinkingLevel,
         lastEventSeq: conversation.lastEventSeq,
+        unreadCount: conversation.unreadCount,
+        latestMessageSeq: conversation.latestMessageSeq,
+        lastReadMessageSeq: conversation.lastReadMessageSeq,
         pendingChangeFileCount: conversation.pendingChangeFileCount,
         updatedAt: conversation.updatedAt,
       };
@@ -1436,6 +1466,16 @@ export function App() {
     ) return undefined;
 
     const controller = new AbortController();
+    const unsubscribe = subscribeJournalRun({
+      runId,
+      afterSeq: journalRunState.run?.lastEventSeq ?? 0,
+      onRun: syncJournalRun,
+      onError: () => {
+        // EventSource reconnects automatically. The bounded poll below remains
+        // the fallback only when this runtime does not provide EventSource.
+      },
+    });
+    if (unsubscribe) return unsubscribe;
     let requestActive = false;
     const poll = async () => {
       if (requestActive) return;
@@ -1594,7 +1634,7 @@ export function App() {
       if (controller.signal.aborted) return;
       setCandidateSummaryState({
         status: "fallback",
-        source: "fixture",
+        source: null,
         providerId: selectedProvider.id,
         modelId: null,
         items: [],
@@ -1666,6 +1706,22 @@ export function App() {
         journalStartController.current = null;
       }
     }
+  }, [journalRunState.run?.id, syncJournalRun]);
+
+  const retryPaperDocument = useCallback(async (paperId) => {
+    const runId = journalRunState.run?.id;
+    if (!runId || !paperId) {
+      throw new Error("当前没有可重试的论文");
+    }
+    const suffix = globalThis.crypto?.randomUUID?.()
+      ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const nextRun = await retryJournalPaperDocument({
+      runId,
+      paperId,
+      clientRequestId: `document-retry-${suffix}`,
+    });
+    syncJournalRun(nextRun);
+    return nextRun;
   }, [journalRunState.run?.id, syncJournalRun]);
 
   useEffect(() => {
@@ -1869,9 +1925,9 @@ export function App() {
     syncJournalRun,
   ]);
 
-  const restartCurrentReadingFromGuide = useCallback(async () => {
-    const runId = journalRunState.run?.id;
-    if (!runId || run.source !== "live") return null;
+  const restartCurrentReadingFromGuide = useCallback(async (requestedRunId = null) => {
+    const runId = requestedRunId ?? journalRunState.run?.id;
+    if (!runId) return null;
     journalRestartController.current?.abort();
     const controller = new AbortController();
     journalRestartController.current = controller;
@@ -1885,12 +1941,32 @@ export function App() {
       setReaderSelectionState({ reference: null, error: null });
       setContextRailView("evidence");
       setActiveConversationId("workflow-run");
-      autoOpenedReaderKeyRef.current = null;
-      setZoteroUiState(createIdleZoteroUiState());
-      setObsidianUiState(createIdleObsidianUiState(runId));
-      setProjectStateUiState(createIdleProjectStateUiState(runId));
-      syncJournalRun(nextRun);
-      showToast("已返回本周推荐文章，可以重新选择要研读的论文");
+      try {
+        const rawProgress = window.localStorage.getItem("pi-reading-round-progress");
+        if (rawProgress) {
+          const progress = JSON.parse(rawProgress);
+          const prefix = `${runId}:`;
+          const kept = Object.fromEntries(
+            Object.entries(progress).filter(([key]) => !key.startsWith(prefix)),
+          );
+          window.localStorage.setItem("pi-reading-round-progress", JSON.stringify(kept));
+        }
+      } catch {
+        // Local reading aids are best-effort; the durable restart already happened.
+      }
+      if (runId === journalRunState.run?.id) {
+        setZoteroUiState(createIdleZoteroUiState());
+        setObsidianUiState(createIdleObsidianUiState(runId));
+        setProjectStateUiState(createIdleProjectStateUiState(runId));
+        syncJournalRun(nextRun);
+        showToast("已从导读重新开始，可以重新选择要研读的论文");
+      } else {
+        setJournalRunHistory((current) => [
+          nextRun,
+          ...current.filter((runItem) => runItem.id !== nextRun.id),
+        ]);
+        showToast("该次研读已从导读重新开始；当前每周追踪保持不变");
+      }
       return nextRun;
     } catch (error) {
       if (controller.signal.aborted) return null;
@@ -1902,7 +1978,6 @@ export function App() {
     }
   }, [
     journalRunState.run?.id,
-    run.source,
     setActiveConversationId,
     showToast,
     syncJournalRun,
@@ -1980,33 +2055,6 @@ export function App() {
       ["agent", "notes"].includes(current) ? "evidence" : current
     ));
   }, [readerTarget]);
-
-  useEffect(() => {
-    const liveRun = journalRunState.run;
-    if (projectWorkMode || !liveRun?.id || readerTarget || run.source !== "live") return;
-    if (!["guide_ready", "reading"].includes(liveRun.status)) return;
-    const openKey = `${liveRun.id}:${liveRun.status}`;
-    if (autoOpenedReaderKeyRef.current === openKey) return;
-
-    let paperId = null;
-    let blockId = null;
-    let purpose = "orientation";
-    if (liveRun.status === "guide_ready") {
-      paperId = (liveRun.guides?.requestedPaperIds ?? []).find((candidateId) => (
-        liveRun.guides?.papers?.[candidateId]?.status === "ready"
-      ));
-    } else {
-      purpose = "close-reading";
-      paperId = (liveRun.readings?.paperIds ?? []).find((candidateId) => (
-        liveRun.paperDecisions?.[candidateId] === "read"
-      )) ?? Object.entries(liveRun.paperDecisions ?? {})
-        .find(([, decision]) => decision === "read")?.[0];
-      blockId = liveRun.readings?.papers?.[paperId]?.position?.blockId ?? null;
-    }
-    if (!paperId) return;
-    autoOpenedReaderKeyRef.current = openKey;
-    openJournalPaper(paperId, blockId, purpose);
-  }, [journalRunState.run, openJournalPaper, projectWorkMode, readerTarget, run.source]);
 
   const prepareGuides = useCallback(async () => {
     if (run.source !== "live") {
@@ -2211,19 +2259,36 @@ export function App() {
       });
       return;
     }
-    if (Object.values(run.guideChoices).includes("read")) {
-      setZoteroUiState((current) => ({
-        ...current,
-        error: "本轮包含精读论文；Obsidian 与项目状态目前只完成了精确预览，联合写入尚未启用。",
-      }));
-      return;
-    }
     const runId = journalRunState.run?.id;
-    const operations = selectZoteroCommitOperations(run.proposals, { retry });
-    if (!runId || !run.zoteroProposalHash || operations.length === 0) {
+    const zoteroOperations = selectZoteroCommitOperations(run.proposals, { retry });
+    const obsidianPreview = obsidianUiState.preview;
+    const obsidianOperations = (obsidianPreview?.proposals ?? [])
+      .filter((proposal) => (
+        proposal.actionable !== false
+        && proposal.selected !== false
+      ))
+      .map((proposal) => ({
+        proposalId: proposal.proposalId ?? proposal.id,
+        contentHash: proposal.contentHash,
+        targetVersionOrHash: proposal.targetVersionOrHash,
+      }));
+    const projectStatePreview = projectStateUiState.preview;
+    const projectStateProposal = projectStatePreview?.proposal
+      ?? projectStatePreview?.proposals?.[0]
+      ?? null;
+    const includesReading = Object.values(run.guideChoices).includes("read");
+    const hasAnyOperation = (
+      zoteroOperations.length > 0
+      || obsidianOperations.length > 0
+      || (
+        projectStateProposal
+        && projectStateProposal.actionable !== false
+      )
+    );
+    if (!runId || !hasAnyOperation) {
       setZoteroUiState((current) => ({
         ...current,
-        error: "当前没有可确认的 Zotero 写入项",
+        error: "当前没有可确认的归档写入项",
       }));
       return;
     }
@@ -2236,10 +2301,37 @@ export function App() {
       error: null,
     }));
     try {
-      const nextRun = await commitZoteroProposal({
+      const nextRun = await commitArchiveBatch({
         runId,
-        proposalHash: run.zoteroProposalHash,
-        operations,
+        clientRequestId: `archive-${globalThis.crypto?.randomUUID?.() ?? Date.now()}`,
+        obsidian: includesReading && obsidianPreview
+          ? {
+              proposalHash: obsidianPreview.proposalHash,
+              operations: obsidianOperations,
+            }
+          : null,
+        zotero: run.zoteroProposalHash && zoteroOperations.length > 0
+          ? {
+              proposalHash: run.zoteroProposalHash,
+              operations: zoteroOperations,
+            }
+          : null,
+        projectState: includesReading
+          && projectStatePreview
+          && projectStateProposal?.actionable !== false
+          && projectStateProposal?.selected !== false
+          ? {
+              proposalHash: projectStatePreview.proposalHash,
+              operation: {
+                proposalId: projectStateProposal.proposalId
+                  ?? projectStateProposal.id,
+                contentHash: projectStateProposal.contentHash,
+                targetVersionOrHash:
+                  projectStateProposal.targetVersionOrHash,
+              },
+            }
+          : null,
+        simulateObsidianFailure,
         signal: controller.signal,
       });
       syncJournalRun(nextRun);
@@ -2260,6 +2352,8 @@ export function App() {
     }
   }, [
     journalRunState.run?.id,
+    obsidianUiState.preview,
+    projectStateUiState.preview,
     run.guideChoices,
     run.proposals,
     run.source,
@@ -2388,7 +2482,7 @@ export function App() {
     anchor.click();
     anchor.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    showToast("本轮运行记录已导出为 Markdown");
+    showToast("本轮运行记录已导出");
   };
 
   const dispatchAction = (type, payload = {}) => dispatch({ type, ...payload });
@@ -2916,8 +3010,9 @@ export function App() {
             ? activeRun.id
             : null}
           onSelectRun={() => {
-            setActiveConversationId("workflow-run");
-            setMobileView("run");
+            // 每周追踪固定落在候选页：清掉残留的论文阅读目标，避免旧工作流
+            // 布局把论文渲染到中栏、把论文 Agent 挤到右栏（位置调换 bug）。
+            closeJournalPaper();
           }}
           providers={catalogProviders}
           providerId={selectedProvider.id}
@@ -2943,6 +3038,11 @@ export function App() {
           isResizing={resizingSide === "left"}
         />
 
+        <Suspense fallback={(
+          <main className="workspace-module-loading" role="status">
+            正在打开工作台…
+          </main>
+        )}>
         {projectWorkMode ? (
           <LiveProjectWorkbench
             key={activeProjectWorkState?.id || project.id || "standalone-empty-workbench"}
@@ -3040,8 +3140,8 @@ export function App() {
             onModelChange={selectModel}
             onRestartFromGuide={
               readerTarget?.purpose === "close-reading"
-              && readerTarget?.runId === journalRunState.run?.id
-                ? restartCurrentReadingFromGuide
+              && readerRun
+                ? () => restartCurrentReadingFromGuide(readerTarget.runId)
                 : undefined
             }
             mobileActive={mobileView === "run" || mobileView === "evidence"}
@@ -3069,6 +3169,7 @@ export function App() {
           onStartJournalRun={startWeeklyJournalScan}
           onRestoreJournalRuns={restoreJournalRuns}
           onResumeJournalRun={resumeCurrentJournalRun}
+          onRetryPaperDocument={retryPaperDocument}
           onRestartFromGuide={restartCurrentReadingFromGuide}
           guideState={guideState}
           onTogglePaper={(paperId) => dispatchAction(RUN_ACTIONS.TOGGLE_PAPER, { paperId })}
@@ -3082,6 +3183,42 @@ export function App() {
           zoteroUiState={zoteroUiState}
           obsidianUiState={obsidianUiState}
           projectStateUiState={projectStateUiState}
+          onToggleObsidianProposal={(proposalId) => {
+            setObsidianUiState((current) => ({
+              ...current,
+              preview: current.preview
+                ? {
+                    ...current.preview,
+                    proposals: current.preview.proposals.map((proposal) => (
+                      (proposal.proposalId ?? proposal.id) === proposalId
+                        ? { ...proposal, selected: !proposal.selected }
+                        : proposal
+                    )),
+                  }
+                : current.preview,
+            }));
+          }}
+          onToggleProjectStateProposal={() => {
+            setProjectStateUiState((current) => {
+              if (!current.preview) return current;
+              const proposal = current.preview.proposal
+                ?? current.preview.proposals?.[0]
+                ?? null;
+              if (!proposal) return current;
+              const nextProposal = {
+                ...proposal,
+                selected: !proposal.selected,
+              };
+              return {
+                ...current,
+                preview: {
+                  ...current.preview,
+                  proposal: nextProposal,
+                  proposals: [nextProposal],
+                },
+              };
+            });
+          }}
           onSelectZoteroTarget={(targetId) => setZoteroUiState((current) => ({
             ...current,
             selectedTargetId: targetId,
@@ -3126,6 +3263,7 @@ export function App() {
 
         <WorkflowContextRail
           run={run}
+          liveRun={journalRunState.run}
           papers={workflowPapers}
           preferredPaperId={readerTarget?.paperId}
           mobileActive={mobileView === "evidence"}
@@ -3148,6 +3286,7 @@ export function App() {
         />
           </>
         )}
+        </Suspense>
       </div>
 
       <nav className="mobile-nav" aria-label="移动端主导航">

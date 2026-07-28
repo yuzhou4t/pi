@@ -14,6 +14,73 @@ function requestError(response, body, fallback) {
   return error;
 }
 
+const pendingJournalMutationIds = new Map();
+
+function journalMutationStorageKey(scope) {
+  return `pi-journal-mutation:${scope}`;
+}
+
+function journalMutationStorage() {
+  try {
+    const storage = globalThis.localStorage;
+    if (
+      storage
+      && typeof storage.getItem === "function"
+      && typeof storage.setItem === "function"
+      && typeof storage.removeItem === "function"
+    ) {
+      return storage;
+    }
+  } catch {
+    // The in-memory fallback still keeps a retry stable for this page lifetime.
+  }
+  return null;
+}
+
+function generatedJournalMutationId(operation) {
+  const suffix = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `journal-${operation}-${suffix}`;
+}
+
+function acquireJournalMutationId(scope, operation, supplied) {
+  if (typeof supplied === "string" && supplied.trim()) {
+    return { id: supplied, generated: false };
+  }
+  const storage = journalMutationStorage();
+  const storageKey = journalMutationStorageKey(scope);
+  const persisted = storage?.getItem(storageKey);
+  const existing = pendingJournalMutationIds.get(scope) ?? persisted;
+  if (existing) {
+    pendingJournalMutationIds.set(scope, existing);
+    return { id: existing, generated: true };
+  }
+  const id = generatedJournalMutationId(operation);
+  pendingJournalMutationIds.set(scope, id);
+  try {
+    storage?.setItem(storageKey, id);
+  } catch {
+    // Best-effort persistence; the in-memory identifier remains stable.
+  }
+  return { id, generated: true };
+}
+
+function releaseJournalMutationId(scope, token) {
+  if (!token.generated) return;
+  if (pendingJournalMutationIds.get(scope) === token.id) {
+    pendingJournalMutationIds.delete(scope);
+  }
+  const storage = journalMutationStorage();
+  const storageKey = journalMutationStorageKey(scope);
+  try {
+    if (storage?.getItem(storageKey) === token.id) {
+      storage.removeItem(storageKey);
+    }
+  } catch {
+    // A completed HTTP response is already authoritative.
+  }
+}
+
 function displayEvidenceScope(scope, documentStatus) {
   const rawScope = String(scope || "题录与摘要");
   if (documentStatus !== "ready") {
@@ -155,6 +222,66 @@ function mapReadingChatReference(reference) {
   };
 }
 
+function mapReadingParentCheckpoint(checkpoint) {
+  if (!checkpoint || typeof checkpoint !== "object") return null;
+  return {
+    conversationId: checkpoint.conversation_id ?? null,
+    turnId: checkpoint.turn_id ?? null,
+    turnCount: checkpoint.turn_count ?? 0,
+    checkpointHash: checkpoint.checkpoint_hash ?? null,
+    createdAt: checkpoint.created_at ?? null,
+  };
+}
+
+function mapReadingConversation(conversation, canonicalConversationId) {
+  const canonical = Boolean(
+    conversation?.canonical
+    || (
+      conversation?.id
+      && conversation.id === canonicalConversationId
+    ),
+  );
+  const branchType = conversation?.branch_type
+    ?? (canonical ? "canonical" : "scratch");
+  return {
+    id: conversation?.id ?? null,
+    title: conversation?.title ?? "新对话",
+    turnCount: conversation?.turn_count ?? 0,
+    branchType,
+    parentCheckpoint: mapReadingParentCheckpoint(conversation?.parent_checkpoint),
+    promotionStatus: conversation?.promotion_status
+      ?? (branchType === "canonical" ? "canonical" : "not_promoted"),
+    promotedAt: conversation?.promoted_at ?? null,
+    canonical,
+    updatedAt: conversation?.updated_at ?? null,
+    active: Boolean(conversation?.active),
+  };
+}
+
+function mapPinnedConclusion(conclusion) {
+  if (!conclusion || typeof conclusion !== "object") return null;
+  return {
+    schemaVersion: conclusion.schema_version ?? 1,
+    conclusionId: conclusion.conclusion_id ?? null,
+    sourceConversationId: conclusion.source_conversation_id ?? null,
+    sourceTurnId: conclusion.source_turn_id ?? null,
+    sourceInputHash: conclusion.source_input_hash ?? null,
+    content: conclusion.content ?? "",
+    contentHash: conclusion.content_hash ?? null,
+    coverageStages: Array.isArray(conclusion.coverage_stages)
+      ? [...conclusion.coverage_stages]
+      : [],
+    citations: (conclusion.citations ?? [])
+      .map(mapReadingChatReference)
+      .filter(Boolean),
+    confirmedBy: conclusion.confirmed_by ?? null,
+    status: conclusion.status ?? "unpinned",
+    pinnedAt: conclusion.pinned_at ?? null,
+    unpinnedAt: conclusion.unpinned_at ?? null,
+    updatedAt: conclusion.updated_at ?? null,
+  };
+}
+
 function mapAgentNoteAction(action) {
   if (!action || typeof action !== "object") return null;
   return {
@@ -175,18 +302,28 @@ function mapAgentNoteAction(action) {
   };
 }
 
-function mapReadingChat(chat) {
+function mapReadingChat(chat, canonicalConversationId = null) {
+  const chatId = chat?.id ?? "current";
+  const branchType = chat?.branch_type
+    ?? (chatId === canonicalConversationId ? "canonical" : "scratch");
   return {
-    id: chat?.id ?? "current",
+    id: chatId,
     title: chat?.title ?? null,
     status: chat?.status ?? "idle",
+    branchType,
+    parentCheckpoint: mapReadingParentCheckpoint(chat?.parent_checkpoint),
+    promotionStatus: chat?.promotion_status
+      ?? (branchType === "canonical" ? "canonical" : "not_promoted"),
+    promotedAt: chat?.promoted_at ?? null,
     turns: (chat?.turns ?? []).map((turn) => ({
       id: turn.id,
       clientRequestId: turn.client_request_id ?? null,
       question: turn.question ?? "",
+      roundId: turn.round_id ?? null,
       status: turn.status ?? "failed",
       reference: mapReadingChatReference(turn.reference),
       answer: turn.answer ?? null,
+      auditOnly: Boolean(turn.audit_only),
       citations: (turn.citations ?? []).map(mapReadingChatReference),
       providerId: turn.provider_id ?? null,
       modelId: turn.model_id ?? null,
@@ -256,17 +393,25 @@ function mapReadingSummary(readings) {
           createdAt: question.created_at ?? null,
           answeredAt: question.answered_at ?? null,
         })),
-        chat: mapReadingChat(paper?.chat),
+        chat: mapReadingChat(
+          paper?.chat,
+          paper?.canonical_conversation_id ?? paper?.chat?.id ?? "current",
+        ),
         activeConversationId: paper?.active_conversation_id
           ?? paper?.chat?.id
           ?? "current",
-        conversations: (paper?.conversations ?? []).map((conversation) => ({
-          id: conversation?.id ?? null,
-          title: conversation?.title ?? null,
-          turnCount: conversation?.turn_count ?? 0,
-          updatedAt: conversation?.updated_at ?? null,
-          active: Boolean(conversation?.active),
-        })),
+        canonicalConversationId: paper?.canonical_conversation_id
+          ?? paper?.chat?.id
+          ?? "current",
+        conversations: (paper?.conversations ?? []).map((conversation) => (
+          mapReadingConversation(
+            conversation,
+            paper?.canonical_conversation_id ?? paper?.chat?.id ?? "current",
+          )
+        )),
+        pinnedConclusions: (paper?.pinned_conclusions ?? [])
+          .map(mapPinnedConclusion)
+          .filter(Boolean),
         agentActions: {
           status: paper?.agent_actions?.status ?? "idle",
           proposals: (paper?.agent_actions?.proposals ?? []).map(mapAgentNoteAction),
@@ -288,6 +433,20 @@ export function mapJournalRun(run) {
   return {
     id: run.run_id,
     projectId: run.project_id ?? "pi-agent-product",
+    runtimeSchemaVersion: Number.isSafeInteger(run.runtime_schema_version)
+      ? run.runtime_schema_version
+      : 1,
+    lifecycle: [
+      "idle",
+      "running",
+      "awaiting_user",
+      "awaiting_review",
+      "verifying",
+      "recovering",
+      "stopped",
+    ].includes(run.lifecycle)
+      ? run.lifecycle
+      : "idle",
     status: run.status,
     phase: run.phase,
     pausedReason: run.paused_reason ?? null,
@@ -326,6 +485,28 @@ export function mapJournalRun(run) {
     obsidian: mapObsidianState(run.obsidian),
     projectState: mapProjectStateState(run.project_state),
     zotero: mapZoteroState(run.zotero),
+    archiveBatch: run.archive_batch && typeof run.archive_batch === "object"
+      ? {
+          id: run.archive_batch.batch_id ?? null,
+          clientRequestId: run.archive_batch.client_request_id ?? null,
+          status: run.archive_batch.status ?? null,
+          selectedTargets: run.archive_batch.selected_targets ?? [],
+          error: run.archive_batch.last_error?.message
+            ?? run.archive_batch.last_error
+            ?? null,
+          approvedAt: run.archive_batch.approved_at ?? null,
+          completedAt: run.archive_batch.completed_at ?? null,
+          updatedAt: run.archive_batch.updated_at ?? null,
+        }
+      : null,
+    snapshotWatermark: Number.isSafeInteger(run.snapshot_watermark)
+      ? run.snapshot_watermark
+      : 0,
+    lastEventSeq: Number.isSafeInteger(run.last_event_seq)
+      ? run.last_event_seq
+      : Number.isSafeInteger(run.snapshot_watermark)
+        ? run.snapshot_watermark
+        : 0,
     ranking: run.ranking,
     candidates: (run.candidates ?? []).map((paper) => {
       const documentState = mineruPapers[paper.paper_id] ?? {};
@@ -372,7 +553,7 @@ export function mapJournalPaperReading(body) {
     || typeof body.stages !== "object"
     || !Array.isArray(body.questions)
   ) {
-    throw new Error("分阶段精读格式无效");
+    throw new Error("论文研读格式无效");
   }
   return {
     runId: body.run_id,
@@ -430,15 +611,23 @@ export function mapJournalPaperReading(body) {
       evidence: mapReadingEvidence(question.evidence),
       openQuestions: question.open_questions ?? [],
     })),
-    chat: mapReadingChat(body.chat),
+    chat: mapReadingChat(
+      body.chat,
+      body.canonical_conversation_id ?? body.chat?.id ?? "current",
+    ),
     activeConversationId: body.active_conversation_id ?? body.chat?.id ?? "current",
-    conversations: (body.conversations ?? []).map((entry) => ({
-      id: entry.id,
-      title: entry.title ?? "新对话",
-      turnCount: entry.turn_count ?? 0,
-      updatedAt: entry.updated_at ?? null,
-      active: Boolean(entry.active),
-    })),
+    canonicalConversationId: body.canonical_conversation_id
+      ?? body.chat?.id
+      ?? "current",
+    conversations: (body.conversations ?? []).map((entry) => (
+      mapReadingConversation(
+        entry,
+        body.canonical_conversation_id ?? body.chat?.id ?? "current",
+      )
+    )),
+    pinnedConclusions: (body.pinned_conclusions ?? [])
+      .map(mapPinnedConclusion)
+      .filter(Boolean),
     agentActions: {
       status: body.agent_actions?.status ?? "idle",
       proposals: (body.agent_actions?.proposals ?? []).map(mapAgentNoteAction),
@@ -577,6 +766,7 @@ export async function startJournalRun({ providerId, modelId, signal } = {}) {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
+      schema_version: 1,
       provider_id: providerId,
       model_id: modelId,
     }),
@@ -594,6 +784,52 @@ export async function fetchJournalRun(runId, { signal } = {}) {
   return mapJournalRun(body);
 }
 
+export function subscribeJournalRun({
+  runId,
+  afterSeq = 0,
+  onRun,
+  onError,
+  eventSourceFactory,
+} = {}) {
+  if (typeof runId !== "string" || !runId) {
+    throw new TypeError("runId 必须是非空字符串");
+  }
+  const EventSourceFactory = eventSourceFactory ?? globalThis.EventSource;
+  if (typeof EventSourceFactory !== "function") return null;
+  const normalizedAfter = Number.isSafeInteger(afterSeq) && afterSeq >= 0
+    ? afterSeq
+    : 0;
+  const source = new EventSourceFactory(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/events`
+      + `?after_seq=${encodeURIComponent(normalizedAfter)}`,
+  );
+  const handleSnapshot = (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      if (!payload?.run) throw new Error("论文运行事件缺少状态快照");
+      onRun?.(mapJournalRun(payload.run), {
+        events: Array.isArray(payload.events) ? payload.events : [],
+        snapshotWatermark: payload.snapshot_watermark ?? 0,
+        lastSeq: payload.last_seq ?? 0,
+      });
+    } catch (error) {
+      onError?.(error);
+    }
+  };
+  const handleError = (event) => {
+    onError?.(event instanceof Error
+      ? event
+      : new Error("论文运行事件流正在重新连接"));
+  };
+  source.addEventListener("snapshot", handleSnapshot);
+  source.addEventListener("error", handleError);
+  return () => {
+    source.removeEventListener?.("snapshot", handleSnapshot);
+    source.removeEventListener?.("error", handleError);
+    source.close();
+  };
+}
+
 export async function fetchJournalRuns({ signal } = {}) {
   const response = await fetch("/api/v1/journal-runs", { signal });
   const body = await jsonResponse(response, "本地期刊服务返回了无法解析的运行列表");
@@ -605,6 +841,8 @@ export async function fetchJournalRuns({ signal } = {}) {
 export async function resumeJournalRun(runId, { signal } = {}) {
   const response = await fetch(`/api/v1/journal-runs/${encodeURIComponent(runId)}/resume`, {
     method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ schema_version: 1 }),
     signal,
   });
   const body = await jsonResponse(response, "本地期刊服务返回了无法解析的恢复状态");
@@ -637,7 +875,17 @@ export async function saveJournalPaperDecisions({
   return mapJournalRun(body);
 }
 
-export async function restartJournalReadingFromGuide({ runId, signal } = {}) {
+export async function restartJournalReadingFromGuide({
+  runId,
+  clientRequestId,
+  signal,
+} = {}) {
+  const scope = `restart-reading:${runId}`;
+  const requestId = acquireJournalMutationId(
+    scope,
+    "restart-reading",
+    clientRequestId,
+  );
   const response = await fetch(
     `/api/v1/journal-runs/${encodeURIComponent(runId)}/reading/restart`,
     {
@@ -646,26 +894,43 @@ export async function restartJournalReadingFromGuide({ runId, signal } = {}) {
       body: JSON.stringify({
         schema_version: 1,
         from_step: "guide",
+        client_request_id: requestId.id,
       }),
       signal,
     },
   );
   const body = await jsonResponse(response, "本地精读服务返回了无法解析的重新研读状态");
+  releaseJournalMutationId(scope, requestId);
   if (!response.ok) throw requestError(response, body, "无法从五分钟导读重新开始");
   return mapJournalRun(body);
 }
 
-export async function resetJournalPaperReading({ runId, paperId, signal } = {}) {
+export async function resetJournalPaperReading({
+  runId,
+  paperId,
+  clientRequestId,
+  signal,
+} = {}) {
+  const scope = `reset-reading:${runId}:${paperId}`;
+  const requestId = acquireJournalMutationId(
+    scope,
+    "reset-reading",
+    clientRequestId,
+  );
   const response = await fetch(
     `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/reading/reset`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ schema_version: 1 }),
+      body: JSON.stringify({
+        schema_version: 1,
+        client_request_id: requestId.id,
+      }),
       signal,
     },
   );
   const body = await jsonResponse(response, "本地精读服务返回了无法解析的清空结果");
+  releaseJournalMutationId(scope, requestId);
   if (!response.ok) throw requestError(response, body, "无法清空这篇论文的研读进度");
   return mapJournalRun(body);
 }
@@ -676,7 +941,7 @@ export async function fetchJournalPaperReading(runId, paperId, { signal } = {}) 
     { signal },
   );
   const body = await jsonResponse(response, "本地精读服务返回了无法解析的精读内容");
-  if (!response.ok) throw requestError(response, body, "无法读取分阶段精读");
+  if (!response.ok) throw requestError(response, body, "无法读取论文研读");
   return mapJournalPaperReading(body);
 }
 
@@ -717,6 +982,12 @@ export async function askJournalReadingQuestion({
   modelId,
   signal,
 } = {}) {
+  const scope = `reading-question:${runId}:${paperId}`;
+  const requestId = acquireJournalMutationId(
+    scope,
+    "reading-question",
+    clientRequestId,
+  );
   const response = await fetch(
     `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/reading/questions`,
     {
@@ -727,7 +998,7 @@ export async function askJournalReadingQuestion({
         stage,
         text,
         block_id: blockId,
-        client_request_id: clientRequestId,
+        client_request_id: requestId.id,
         provider_id: providerId,
         model_id: modelId,
       }),
@@ -735,6 +1006,7 @@ export async function askJournalReadingQuestion({
     },
   );
   const body = await jsonResponse(response, "本地精读服务返回了无法解析的追问结果");
+  releaseJournalMutationId(scope, requestId);
   if (!response.ok) throw requestError(response, body, "无法回答当前精读追问");
   return mapJournalPaperReading(body);
 }
@@ -744,6 +1016,7 @@ export async function sendJournalReadingChatMessage({
   paperId,
   text,
   reference = null,
+  roundId = null,
   clientRequestId = null,
   includeProjectContext = false,
   providerId,
@@ -766,6 +1039,7 @@ export async function sendJournalReadingChatMessage({
         schema_version: 1,
         client_request_id: clientRequestId,
         text,
+        ...(roundId ? { round_id: roundId } : {}),
         reference: reference
           ? (Array.isArray(reference.blockIds)
               ? {
@@ -791,12 +1065,32 @@ export async function sendJournalReadingChatMessage({
   return mapJournalPaperReading(body);
 }
 
-export async function createJournalReadingConversation({ runId, paperId, signal } = {}) {
+export async function createJournalReadingConversation({
+  runId,
+  paperId,
+  clientRequestId,
+  signal,
+} = {}) {
+  const scope = `create-reading-conversation:${runId}:${paperId}`;
+  const requestId = acquireJournalMutationId(
+    scope,
+    "create-reading-conversation",
+    clientRequestId,
+  );
   const response = await fetch(
     `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/reading/conversations`,
-    { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal },
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: 1,
+        client_request_id: requestId.id,
+      }),
+      signal,
+    },
   );
   const body = await jsonResponse(response, "本地论文服务返回了无法解析的会话结果");
+  releaseJournalMutationId(scope, requestId);
   if (!response.ok) throw requestError(response, body, "无法新建研读会话");
   return mapJournalPaperReading(body);
 }
@@ -813,6 +1107,84 @@ export async function switchJournalReadingConversation({ runId, paperId, convers
   );
   const body = await jsonResponse(response, "本地论文服务返回了无法解析的会话结果");
   if (!response.ok) throw requestError(response, body, "无法切换研读会话");
+  return mapJournalPaperReading(body);
+}
+
+export async function promoteJournalReadingConversation({
+  runId,
+  paperId,
+  conversationId,
+  clientRequestId,
+  confirmedBy,
+  signal,
+} = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/reading/conversations/${encodeURIComponent(conversationId)}/promote`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: 1,
+        client_request_id: clientRequestId,
+        confirmed_by: confirmedBy,
+      }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地论文服务返回了无法解析的分支提升结果");
+  if (!response.ok) throw requestError(response, body, "无法提升研读分支");
+  return mapJournalPaperReading(body);
+}
+
+export async function pinJournalReadingConclusion({
+  runId,
+  paperId,
+  turnId,
+  clientRequestId,
+  confirmedBy,
+  signal,
+} = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/reading/chat/turns/${encodeURIComponent(turnId)}/pin`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: 1,
+        client_request_id: clientRequestId,
+        confirmed_by: confirmedBy,
+      }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地论文服务返回了无法解析的固定结论结果");
+  if (!response.ok) throw requestError(response, body, "无法固定论文结论");
+  return mapJournalPaperReading(body);
+}
+
+export async function unpinJournalReadingConclusion({
+  runId,
+  paperId,
+  conclusionId,
+  clientRequestId,
+  confirmedBy,
+  signal,
+} = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/reading/pinned-conclusions/${encodeURIComponent(conclusionId)}/unpin`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: 1,
+        client_request_id: clientRequestId,
+        confirmed_by: confirmedBy,
+      }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地论文服务返回了无法解析的取消固定结果");
+  if (!response.ok) throw requestError(response, body, "无法取消固定论文结论");
   return mapJournalPaperReading(body);
 }
 
@@ -980,14 +1352,20 @@ function mapObsidianState(obsidian) {
       status: "not_started",
       proposalHash: null,
       proposals: [],
+      approval: null,
       error: null,
+      committedAt: null,
+      verifiedAt: null,
     };
   }
   return {
     status: obsidian.status ?? "not_started",
     proposalHash: obsidian.proposal_hash ?? null,
     proposals: (obsidian.proposals ?? []).map(mapObsidianOperation),
+    approval: obsidian.approval ?? null,
     error: obsidian.last_error?.message ?? obsidian.last_error ?? null,
+    committedAt: obsidian.committed_at ?? null,
+    verifiedAt: obsidian.verified_at ?? null,
   };
 }
 
@@ -1082,6 +1460,8 @@ function mapProjectStateState(projectState) {
       actionable: false,
       approval: null,
       error: null,
+      committedAt: null,
+      verifiedAt: null,
       updatedAt: null,
     };
   }
@@ -1095,6 +1475,8 @@ function mapProjectStateState(projectState) {
     actionable: Boolean(projectState.actionable),
     approval: projectState.approval ?? null,
     error: projectState.last_error?.message ?? projectState.last_error ?? null,
+    committedAt: projectState.committed_at ?? null,
+    verifiedAt: projectState.verified_at ?? null,
     updatedAt: projectState.updated_at ?? null,
   };
 }
@@ -1148,6 +1530,64 @@ export async function createProjectStatePreview({ runId, signal } = {}) {
   const body = await jsonResponse(response, "本地项目状态服务返回了无法解析的精确预览");
   if (!response.ok) throw requestError(response, body, "无法生成项目状态精确预览");
   return mapProjectStatePreview(body);
+}
+
+export async function commitArchiveBatch({
+  runId,
+  clientRequestId,
+  obsidian,
+  zotero,
+  projectState,
+  simulateObsidianFailure = false,
+  signal,
+} = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/archive/commit`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: 1,
+        client_request_id: clientRequestId,
+        obsidian: obsidian
+          ? {
+              proposal_hash: obsidian.proposalHash,
+              operations: (obsidian.operations ?? []).map((operation) => ({
+                proposal_id: operation.proposalId,
+                content_hash: operation.contentHash,
+                target_version_or_hash: operation.targetVersionOrHash,
+              })),
+            }
+          : null,
+        zotero: zotero
+          ? {
+              proposal_hash: zotero.proposalHash,
+              operations: (zotero.operations ?? []).map((operation) => ({
+                proposal_id: operation.proposalId,
+                content_hash: operation.contentHash,
+                target_version_or_hash: operation.targetVersionOrHash,
+              })),
+            }
+          : null,
+        project_state: projectState
+          ? {
+              proposal_hash: projectState.proposalHash,
+              operation: {
+                proposal_id: projectState.operation.proposalId,
+                content_hash: projectState.operation.contentHash,
+                target_version_or_hash:
+                  projectState.operation.targetVersionOrHash,
+              },
+            }
+          : null,
+        simulate_obsidian_failure: simulateObsidianFailure,
+      }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地论文服务返回了无法解析的归档状态");
+  if (!response.ok) throw requestError(response, body, "无法确认联合归档写入");
+  return mapJournalRun(body);
 }
 
 export async function startJournalGuides({
@@ -1298,6 +1738,29 @@ export async function fetchJournalPaperDocument(runId, paperId, { signal } = {})
   const body = await jsonResponse(response, "本地论文服务返回了无法解析的正文");
   if (!response.ok) throw requestError(response, body, "无法读取论文正文");
   return mapJournalPaperDocument(body);
+}
+
+export async function retryJournalPaperDocument({
+  runId,
+  paperId,
+  clientRequestId,
+  signal,
+} = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/document/retry`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: 1,
+        client_request_id: clientRequestId,
+      }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地论文服务返回了无法解析的全文准备状态");
+  if (!response.ok) throw requestError(response, body, "无法重试这篇论文的全文准备");
+  return mapJournalRun(body);
 }
 
 const TRANSLATION_STATUSES = new Set([

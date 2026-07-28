@@ -39,6 +39,13 @@ function headingText(section) {
   return section.split("\n", 1)[0].replace(/^#{1,6}\s+/, "").trim();
 }
 
+function canonicalLevelTwoSection(sections, heading) {
+  return sections.find((section) => {
+    const firstLine = section.split("\n", 1)[0];
+    return /^##\s+\S/.test(firstLine) && headingText(section) === heading;
+  });
+}
+
 function cleanListItem(value) {
   return String(value ?? "")
     .replace(/^\[[ xX]\]\s*/, "")
@@ -68,11 +75,10 @@ function firstSectionParagraph(section) {
 export function summarizeProjectState(markdown) {
   const sections = markdownSections(markdown);
   const title = headingText(sections[0] ?? "") || "项目状态";
-  const byHeading = new Map(sections.map((section) => [headingText(section), section]));
-  const goalSection = byHeading.get("当前目标");
-  const decisionsSection = byHeading.get("已确认决定");
-  const questionsSection = byHeading.get("开放问题");
-  const nextSection = byHeading.get("下一步");
+  const goalSection = canonicalLevelTwoSection(sections, "当前目标");
+  const decisionsSection = canonicalLevelTwoSection(sections, "已确认决定");
+  const questionsSection = canonicalLevelTwoSection(sections, "开放问题");
+  const nextSection = canonicalLevelTwoSection(sections, "下一步");
   const goal = goalSection ? firstSectionParagraph(goalSection) : "";
   const decisions = decisionsSection ? sectionListItems(decisionsSection).slice(0, 8) : [];
   const openQuestions = questionsSection ? sectionListItems(questionsSection).slice(0, 8) : [];

@@ -1,5 +1,13 @@
-import { createHash } from "node:crypto";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  chmod,
+  lstat,
+  readFile,
+  realpath,
+  rename,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { READING_STAGE_ORDER } from "./readingGenerator.js";
 
@@ -131,7 +139,7 @@ function assertCompleteReading(run, paperId, reading) {
   ) {
     throw previewError(
       "PROJECT_STATE_READING_NOT_READY",
-      "至少需要一篇完成四阶段精读的论文才能生成项目状态预览",
+      "至少需要一篇归档证据齐全的论文才能生成项目状态预览",
     );
   }
   for (const stageId of READING_STAGE_ORDER) {
@@ -145,7 +153,7 @@ function assertCompleteReading(run, paperId, reading) {
     ) {
       throw previewError(
         "PROJECT_STATE_READING_NOT_READY",
-        "至少需要一篇完成四阶段精读的论文才能生成项目状态预览",
+        "至少需要一篇归档证据齐全的论文才能生成项目状态预览",
       );
     }
   }
@@ -333,6 +341,64 @@ function proposalCore(proposal) {
   };
 }
 
+function proposalIntegrityCore(proposal) {
+  return {
+    ...proposalCore(proposal),
+    target_details: proposal.target_details,
+    target_version_or_hash: proposal.target_version_or_hash,
+    marker: proposal.marker,
+    markdown: proposal.markdown,
+    diff: proposal.diff,
+    paper_references: proposal.paper_references,
+  };
+}
+
+function assertProposalIntegrity(proposal) {
+  const expectedId = `project-state-preview-${sha256({
+    run_id: proposal.run_id,
+    target_locator: proposal.target_locator,
+    content_hash: proposal.content_hash,
+    target_hash: proposal.target_hash,
+  }).slice(7, 23)}`;
+  const basicValid = (
+    proposal.proposal_id === expectedId
+    && proposal.content_hash === sha256(proposal.markdown)
+    && proposal.target_hash === proposal.target_version_or_hash
+    && typeof proposal.marker === "string"
+    && proposal.markdown.includes(proposal.marker)
+  );
+  const diffValid = proposal.write_mode === "append_after_approval"
+    ? (
+        proposal.diff?.mode === "append"
+        && proposal.diff.before_hash
+          === proposal.target_details?.current_content_hash
+        && proposal.diff.append_text?.endsWith(proposal.markdown)
+      )
+    : proposal.write_mode === "blocked_existing_run"
+      && proposal.diff?.mode === "blocked_existing_run_marker"
+      && proposal.diff.before_hash
+        === proposal.target_details?.current_content_hash
+      && proposal.diff.after_hash
+        === proposal.target_details?.current_content_hash
+      && proposal.diff.append_text === null;
+  if (!basicValid || !diffValid) {
+    throw previewError(
+      "PROJECT_STATE_PREVIEW_CORRUPT",
+      "项目状态精确预览缺失或损坏，请重新生成",
+      409,
+      true,
+    );
+  }
+}
+
+function safeCommitError(error) {
+  return {
+    code: compactLine(error?.code, 120) || "PROJECT_STATE_WRITE_FAILED",
+    message: compactLine(error?.message, 500) || "项目状态写入失败",
+    retryable: error?.retryable !== false,
+  };
+}
+
 export function createProjectStatePreviewService({
   runStore,
   getPaperReading,
@@ -351,6 +417,13 @@ export function createProjectStatePreviewService({
   }
   const configuredRoot = path.resolve(projectRoot);
   const configuredTarget = path.resolve(configuredRoot, projectStatePath);
+  let commitQueue = Promise.resolve();
+
+  function withCommitLock(operation) {
+    const current = commitQueue.catch(() => undefined).then(operation);
+    commitQueue = current;
+    return current;
+  }
 
   async function readTarget() {
     const configuredRelative = path.relative(configuredRoot, configuredTarget);
@@ -414,10 +487,12 @@ export function createProjectStatePreviewService({
       content,
       content_hash: contentHash,
       byte_length: Buffer.byteLength(content, "utf8"),
+      mode: targetStat.mode & 0o777,
       target_hash: sha256({
         source_path: sourcePath,
         content_hash: contentHash,
         byte_length: Buffer.byteLength(content, "utf8"),
+        mode: targetStat.mode & 0o777,
       }),
     };
   }
@@ -428,7 +503,7 @@ export function createProjectStatePreviewService({
     if (run.status !== "draft_ready") {
       throw previewError(
         "PROJECT_STATE_PREVIEW_NOT_ALLOWED",
-        "只有四阶段精读完成后才能生成项目状态预览",
+        "只有归档所需证据齐全后才能生成项目状态预览",
       );
     }
     const decisions = run.paper_decisions;
@@ -544,7 +619,7 @@ export function createProjectStatePreviewService({
         obsidian_note: item.note.file_name,
       })),
     };
-    const proposalHash = sha256(proposalCore(proposal));
+    const proposalHash = sha256(proposalIntegrityCore(proposal));
     const generatedAt = now().toISOString();
     const status = alreadyPresent ? "blocked" : "preview_ready";
     const markdownArtifactPath = [
@@ -556,7 +631,7 @@ export function createProjectStatePreviewService({
       schema_version: 1,
       run_id: runId,
       target_type: "project_state",
-      write_capability: "preview_only",
+      write_capability: "hash_bound_commit",
       external_write_performed: false,
       status,
       source_hash: sourceHash,
@@ -619,10 +694,27 @@ export function createProjectStatePreviewService({
       );
     }
     const artifact = await runStore.readArtifact(runId, artifactPath);
+    let artifactIntegrityValid = false;
+    try {
+      assertProposalIntegrity(artifact?.proposal);
+      artifactIntegrityValid = (
+        sha256(proposalIntegrityCore(artifact.proposal)) === proposalHash
+      );
+    } catch {
+      artifactIntegrityValid = false;
+    }
     if (
       !artifact
       || artifact.run_id !== runId
       || artifact.proposal_hash !== proposalHash
+      || artifact.source_hash !== relevantRunHash(
+        run,
+        (artifact.proposal?.paper_references ?? [])
+          .map((reference) => reference.paper_id)
+          .filter(Boolean)
+          .sort(),
+      )
+      || !artifactIntegrityValid
     ) {
       throw previewError(
         "PROJECT_STATE_PREVIEW_STALE",
@@ -632,9 +724,216 @@ export function createProjectStatePreviewService({
     return artifact;
   }
 
+  async function validateCommit(runId, {
+    proposalHash,
+    operation,
+  } = {}) {
+    const artifact = await getPreview(runId);
+    const proposal = artifact.proposal;
+    if (
+      artifact.proposal_hash !== proposalHash
+      || !operation
+      || operation.proposal_id !== proposal.proposal_id
+      || operation.content_hash !== proposal.content_hash
+      || operation.target_version_or_hash !== proposal.target_version_or_hash
+      || proposal.actionable !== true
+      || proposal.write_mode !== "append_after_approval"
+    ) {
+      throw previewError(
+        "PROJECT_STATE_APPROVAL_INVALID",
+        "项目状态确认内容与当前预览不一致",
+        409,
+        true,
+      );
+    }
+    const target = await readTarget();
+    const alreadyCommitted = (
+      target.content_hash === proposal.diff.after_hash
+      && target.content.includes(proposal.marker)
+    );
+    if (!alreadyCommitted && target.target_hash !== proposal.target_version_or_hash) {
+      throw previewError(
+        "PROJECT_STATE_PREVIEW_STALE",
+        "项目状态文件在预览后发生变化，请重新生成预览",
+        409,
+        true,
+      );
+    }
+    const beforeContent = alreadyCommitted
+      ? target.content.slice(0, -proposal.diff.append_text.length)
+      : target.content;
+    const expectedDiff = exactAppend(beforeContent, proposal.markdown);
+    if (sha256(expectedDiff) !== sha256(proposal.diff)) {
+      throw previewError(
+        "PROJECT_STATE_PREVIEW_CORRUPT",
+        "项目状态精确预览的追加内容校验失败，请重新生成",
+        409,
+        true,
+      );
+    }
+    return { artifact, proposal, target, alreadyCommitted };
+  }
+
+  async function commit(runId, {
+    clientRequestId,
+    proposalHash,
+    operation,
+  } = {}) {
+    if (typeof clientRequestId !== "string" || !clientRequestId.trim()) {
+      throw previewError(
+        "PROJECT_STATE_APPROVAL_REQUEST_INVALID",
+        "项目状态确认请求标识无效",
+        400,
+      );
+    }
+    return withCommitLock(async () => {
+      const {
+        artifact,
+        proposal,
+        target,
+        alreadyCommitted,
+      } = await validateCommit(runId, { proposalHash, operation });
+      const approvedAt = now().toISOString();
+      const approval = {
+        schema_version: 1,
+        run_id: runId,
+        client_request_id: clientRequestId.trim(),
+        proposal_hash: proposalHash,
+        operation: {
+          proposal_id: proposal.proposal_id,
+          content_hash: proposal.content_hash,
+          target_version_or_hash: proposal.target_version_or_hash,
+        },
+        approved_at: approvedAt,
+      };
+      approval.approval_hash = sha256(approval);
+      const approvalPath =
+        `project-state/approvals/${approval.approval_hash.slice(7)}.json`;
+      await runStore.writeArtifact(runId, approvalPath, approval);
+      await runStore.updateRun(runId, (current) => ({
+        project_state: {
+          ...current.project_state,
+          status: "committing",
+          approval: {
+            ...approval,
+            artifact_path: approvalPath,
+          },
+          last_error: null,
+          updated_at: approvedAt,
+        },
+      }));
+      const ledgerPath = `writes/project-state/${proposal.proposal_id}.json`;
+      const startedAt = now().toISOString();
+      try {
+        await runStore.writeArtifact(runId, ledgerPath, {
+          schema_version: 1,
+          run_id: runId,
+          proposal_id: proposal.proposal_id,
+          approval_hash: approval.approval_hash,
+          status: "committing",
+          started_at: startedAt,
+        });
+        if (!alreadyCommitted) {
+          const temporaryPath = `${target.target}.${randomUUID()}.tmp`;
+          const afterContent = `${target.content}${proposal.diff.append_text}`;
+          await writeFile(temporaryPath, afterContent, {
+            encoding: "utf8",
+            flag: "wx",
+            mode: 0o600,
+          });
+          try {
+            const immediatelyBeforeWrite = await readTarget();
+            if (
+              immediatelyBeforeWrite.target_hash
+              !== proposal.target_version_or_hash
+            ) {
+              throw previewError(
+                "PROJECT_STATE_PREVIEW_STALE",
+                "项目状态文件在确认前发生变化，未执行写入",
+                409,
+                true,
+              );
+            }
+            await chmod(temporaryPath, immediatelyBeforeWrite.mode);
+            await rename(temporaryPath, target.target);
+          } catch (error) {
+            await unlink(temporaryPath).catch(() => undefined);
+            throw error;
+          }
+        }
+        const verified = await readTarget();
+        if (
+          verified.content_hash !== proposal.diff.after_hash
+          || !verified.content.includes(proposal.marker)
+        ) {
+          throw previewError(
+            "PROJECT_STATE_WRITE_VERIFICATION_FAILED",
+            "项目状态写入后的读回核验失败",
+            500,
+            true,
+          );
+        }
+        const completedAt = now().toISOString();
+        await runStore.writeArtifact(runId, ledgerPath, {
+          schema_version: 1,
+          run_id: runId,
+          proposal_id: proposal.proposal_id,
+          approval_hash: approval.approval_hash,
+          status: "committed",
+          started_at: startedAt,
+          completed_at: completedAt,
+          verified: true,
+          after_hash: verified.content_hash,
+        });
+        const updated = await runStore.updateRun(runId, (current) => ({
+          project_state: {
+            ...current.project_state,
+            status: "completed",
+            committed_at: completedAt,
+            verified_at: completedAt,
+            last_error: null,
+            updated_at: completedAt,
+          },
+        }));
+        await runStore.appendEvent(runId, {
+          type: "project_state_commit_completed",
+          proposal_id: proposal.proposal_id,
+          proposal_hash: artifact.proposal_hash,
+          at: completedAt,
+        });
+        return updated;
+      } catch (error) {
+        const failedAt = now().toISOString();
+        const lastError = safeCommitError(error);
+        await runStore.writeArtifact(runId, ledgerPath, {
+          schema_version: 1,
+          run_id: runId,
+          proposal_id: proposal.proposal_id,
+          approval_hash: approval.approval_hash,
+          status: "failed",
+          started_at: startedAt,
+          completed_at: failedAt,
+          verified: false,
+          error: lastError,
+        }).catch(() => undefined);
+        await runStore.updateRun(runId, (current) => ({
+          project_state: {
+            ...current.project_state,
+            status: "failed",
+            last_error: lastError,
+            updated_at: failedAt,
+          },
+        }));
+        throw error;
+      }
+    });
+  }
+
   return Object.freeze({
+    commit,
     createPreview,
     getPreview,
+    validateCommit,
   });
 }
 

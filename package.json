@@ -9,7 +9,10 @@
     "local": "node scripts/pi-agent-local.mjs",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test"
+    "test:contracts": "node --test server/runtimeSchema.test.js server/modelMode.test.js server/project-work/piSdkCompatibility.test.js server/promptRegistry.test.js",
+    "test": "node --test --test-concurrency=1",
+    "schema:check": "node scripts/check-runtime-schemas.mjs",
+    "verify": "npm run test:contracts && npm test && npm run build && npm run schema:check"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.82.0",

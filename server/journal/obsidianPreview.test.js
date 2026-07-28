@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
   realpath,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -160,7 +162,7 @@ test("creates an exact deterministic preview artifact without writing the Obsidi
 
   const first = await service.createPreview(runId);
   const proposal = first.proposals[0];
-  assert.equal(first.write_capability, "preview_only");
+  assert.equal(first.write_capability, "hash_bound_commit");
   assert.equal(first.external_write_performed, false);
   assert.equal(first.status, "preview_ready");
   assert.equal(calls.length, 1);
@@ -218,6 +220,166 @@ test("creates an exact deterministic preview artifact without writing the Obsidi
   assert.equal(second.proposals[0].content_hash, proposal.content_hash);
   assert.equal(second.proposals[0].target_hash, proposal.target_hash);
   await assert.rejects(readFile(proposal.target_locator, "utf8"), { code: "ENOENT" });
+});
+
+test("canonical pinned conclusions lead the workflow region and stage output only fills uncovered lenses", async () => {
+  const pinnedContent = "用户确认：该方法通过持久化检查点降低长流程中的状态漂移。";
+  const pinnedCitation = {
+    ...citation(9),
+    excerpt: undefined,
+    quote: "Canonical source quote for the pinned conclusion.",
+  };
+  const context = await setup({
+    readingFactory: (runId) => reading(runId, {
+      active_conversation_id: "conversation-canonical",
+      canonical_conversation_id: "conversation-canonical",
+      chat: {
+        id: "conversation-canonical",
+        branch_type: "canonical",
+      },
+      pinned_conclusions: [
+        {
+          schema_version: 1,
+          conclusion_id: "pinned-conclusion-1",
+          source_conversation_id: "conversation-canonical",
+          source_turn_id: "chat-turn-1",
+          source_input_hash: `sha256:${"a".repeat(64)}`,
+          content: pinnedContent,
+          content_hash: __test.sha256(pinnedContent),
+          citations: [pinnedCitation],
+          coverage_stages: ["research-question"],
+          confirmed_by: "local-user",
+          status: "pinned",
+          pinned_at: "2026-07-23T08:45:00.000Z",
+          updated_at: "2026-07-23T08:45:00.000Z",
+        },
+        {
+          schema_version: 1,
+          conclusion_id: "pinned-conclusion-withdrawn",
+          source_conversation_id: "conversation-canonical",
+          source_turn_id: "chat-turn-withdrawn",
+          content: "这条结论已经取消固定，不应进入归档。",
+          content_hash: __test.sha256("这条结论已经取消固定，不应进入归档。"),
+          citations: [citation(10)],
+          coverage_stages: [],
+          confirmed_by: "local-user",
+          status: "unpinned",
+          pinned_at: "2026-07-23T08:40:00.000Z",
+          unpinned_at: "2026-07-23T08:44:00.000Z",
+          updated_at: "2026-07-23T08:44:00.000Z",
+        },
+      ],
+    }),
+  });
+
+  const preview = await context.service.createPreview(context.runId);
+  const markdown = preview.proposals[0].markdown;
+  assert.match(markdown, /## 已确认结论/);
+  assert.match(markdown, new RegExp(pinnedContent));
+  assert.match(markdown, /来源 Turn：`chat-turn-1`/);
+  assert.match(markdown, /原文摘录：Canonical source quote for the pinned conclusion\./);
+  assert.match(markdown, /固定操作本身不构成任何外部写入批准/);
+  assert.doesNotMatch(markdown, /这条结论已经取消固定/);
+  assert.match(markdown, /## 四镜头覆盖补充/);
+  assert.equal(
+    markdown.indexOf("## 已确认结论")
+      < markdown.indexOf("## 四镜头覆盖补充"),
+    true,
+  );
+  assert.doesNotMatch(markdown, /research-question answer grounded in the paper/);
+  assert.match(markdown, /method answer grounded in the paper/);
+  assert.match(markdown, /evidence answer grounded in the paper/);
+  assert.match(markdown, /project-relation answer grounded in the paper/);
+});
+
+test("commits only hash-bound selected notes and verifies the managed note on read-back", async () => {
+  const context = await setup();
+  const preview = await context.service.createPreview(context.runId);
+  const proposal = preview.proposals[0];
+  const approval = {
+    clientRequestId: "obsidian-approval-1",
+    proposalHash: preview.proposal_hash,
+    operations: [{
+      proposal_id: proposal.proposal_id,
+      content_hash: proposal.content_hash,
+      target_version_or_hash: proposal.target_version_or_hash,
+    }],
+  };
+
+  const committed = await context.service.commit(context.runId, approval);
+  assert.equal(
+    await readFile(proposal.target_locator, "utf8"),
+    proposal.markdown,
+  );
+  assert.equal(committed.obsidian.status, "completed");
+  assert.equal(committed.obsidian.proposals[0].status, "committed");
+  assert.ok(committed.obsidian.proposals[0].verified_at);
+
+  const idempotent = await context.service.commit(context.runId, {
+    ...approval,
+    clientRequestId: "obsidian-approval-2",
+  });
+  assert.equal(idempotent.obsidian.status, "completed");
+  assert.equal(await readFile(proposal.target_locator, "utf8"), proposal.markdown);
+});
+
+test("refuses an Obsidian commit when the preview target changed", async () => {
+  const context = await setup();
+  const preview = await context.service.createPreview(context.runId);
+  const proposal = preview.proposals[0];
+  await writeFile(proposal.target_locator, "# User created this note\n", "utf8");
+
+  await assert.rejects(
+    context.service.commit(context.runId, {
+      clientRequestId: "obsidian-stale-1",
+      proposalHash: preview.proposal_hash,
+      operations: [{
+        proposal_id: proposal.proposal_id,
+        content_hash: proposal.content_hash,
+        target_version_or_hash: proposal.target_version_or_hash,
+      }],
+    }),
+    (error) => error.code === "OBSIDIAN_PREVIEW_STALE",
+  );
+  assert.equal(
+    await readFile(proposal.target_locator, "utf8"),
+    "# User created this note\n",
+  );
+});
+
+test("refuses a tampered Obsidian preview artifact before writing", async () => {
+  const context = await setup();
+  const preview = await context.service.createPreview(context.runId);
+  const proposal = preview.proposals[0];
+  const tamperedMarkdown = `${proposal.markdown}\n篡改内容\n`;
+  await context.runStore.writeArtifact(context.runId, preview.artifact_path, {
+    ...preview,
+    proposals: [{
+      ...proposal,
+      markdown: tamperedMarkdown,
+      content_hash: __test.sha256(tamperedMarkdown),
+      diff: {
+        ...proposal.diff,
+        after: tamperedMarkdown,
+      },
+    }],
+  });
+
+  await assert.rejects(
+    context.service.commit(context.runId, {
+      clientRequestId: "obsidian-tampered-artifact",
+      proposalHash: preview.proposal_hash,
+      operations: [{
+        proposal_id: proposal.proposal_id,
+        content_hash: proposal.content_hash,
+        target_version_or_hash: proposal.target_version_or_hash,
+      }],
+    }),
+    (error) => error.code === "OBSIDIAN_PREVIEW_STALE",
+  );
+  await assert.rejects(readFile(proposal.target_locator, "utf8"), {
+    code: "ENOENT",
+  });
 });
 
 test("an Agent note action invalidates an older whole-note preview", async () => {
@@ -355,6 +517,7 @@ test("a managed note update preserves confirmed Agent notes exactly", async () =
     agentRegion,
   );
   await writeFile(targetPath, managed, "utf8");
+  await chmod(targetPath, 0o640);
 
   const result = await context.service.createPreview(context.runId);
   const proposal = result.proposals[0];
@@ -367,6 +530,18 @@ test("a managed note update preserves confirmed Agent notes exactly", async () =
   assert.match(proposal.markdown, /agent-action:agent-note-1:start/);
   assert.match(proposal.markdown, /它把项目状态和单次执行显式连接起来/);
   assert.equal(await readFile(targetPath, "utf8"), managed);
+
+  await context.service.commit(context.runId, {
+    clientRequestId: "obsidian-managed-mode",
+    proposalHash: result.proposal_hash,
+    operations: [{
+      proposal_id: proposal.proposal_id,
+      content_hash: proposal.content_hash,
+      target_version_or_hash: proposal.target_version_or_hash,
+    }],
+  });
+  assert.equal((await stat(targetPath)).mode & 0o777, 0o640);
+  assert.match(await readFile(targetPath, "utf8"), /agent-action:agent-note-1:start/);
 });
 
 test("missing citation fields and unfinished questions block a durable preview", async () => {

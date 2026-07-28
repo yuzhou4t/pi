@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { access, lstat, mkdir, open, realpath } from "node:fs/promises";
+import { resolveModelMode } from "../modelMode.js";
 import path from "node:path";
 import { createMineruCloudAdapter, MineruCloudError } from "../mineruCloud.js";
 import { createModelProviderRegistry } from "../modelProviders.js";
@@ -23,7 +24,10 @@ import { createProjectStatePreviewService } from "./projectStatePreview.js";
 import { createReadingNoteActionService } from "./readingNoteAction.js";
 import { createReadingService } from "./readingService.js";
 import { createRunStore } from "./runStore.js";
-import { scanJournalSources } from "./sourceScanner.js";
+import {
+  commitJournalSourceScan,
+  scanJournalSources,
+} from "./sourceScanner.js";
 import { createSourceStateStore } from "./sourceStateStore.js";
 import { SOURCE_REGISTRY } from "./sourceRegistry.js";
 import { createZoteroArchivalService } from "./zoteroArchival.js";
@@ -165,6 +169,25 @@ async function fileExists(filePath) {
   }
 }
 
+async function mapWithConcurrency(items, concurrency, task) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await task(items[index], index);
+    }
+  }
+  await Promise.all(
+    Array.from(
+      { length: Math.min(Math.max(concurrency, 1), items.length) },
+      worker,
+    ),
+  );
+  return results;
+}
+
 export function createJournalWorkflowService({
   env = process.env,
   fetchImpl = globalThis.fetch,
@@ -172,6 +195,7 @@ export function createJournalWorkflowService({
   runStore = createRunStore({ dataDir }),
   sourceStateStore = createSourceStateStore({ dataDir }),
   sourceScanner = scanJournalSources,
+  sourceScanCommitter = commitJournalSourceScan,
   candidateRanker = rankCandidates,
   guideGenerator = generateFiveMinuteGuide,
   translationGenerator = translatePaperBatch,
@@ -188,20 +212,32 @@ export function createJournalWorkflowService({
     baseUrl: env.PI_ZOTERO_BASE_URL || undefined,
     fetchImpl,
   }),
+  zoteroArchivalService = null,
+  obsidianPreviewService = null,
+  projectStatePreviewService = null,
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 } = {}) {
   const inFlight = new Map();
   const guideInFlight = new Map();
   const guideStartLocks = new Map();
   const translationInFlight = new Map();
+  const documentRetryInFlight = new Map();
+  const archiveCommitJobs = new Map();
+  const archiveStartLocks = new Map();
   let reading;
   let readingNoteAction;
   let obsidianPreview;
   let projectStatePreview;
   const pdfCacheDir = path.resolve(dataDir, "cache", "pdfs");
+  const pdfConcurrency = Math.min(
+    positiveInteger(env.PI_PDF_PREP_CONCURRENCY, 3),
+    5,
+  );
   const pollIntervalMs = positiveInteger(env.PI_MINERU_POLL_INTERVAL_MS, 10000);
   const pollTimeoutMs = positiveInteger(env.PI_MINERU_TIMEOUT_MS, 30 * 60 * 1000);
-  const modelMode = env.PI_MODEL_MODE === "live" ? "live" : "fixture";
+  // A missing mode must fail closed through the real adapters instead of
+  // silently turning a desktop run into fixture data.
+  const modelMode = resolveModelMode(env);
   const defaults = providerDefaults(env);
   const activeGuidePrompt = guideGenerator === generateFiveMinuteGuide
     ? promptRegistry.loadPrompt("five-minute-guide")
@@ -217,12 +253,13 @@ export function createJournalWorkflowService({
     projectRoot: path.resolve(env.PI_PROJECT_ROOT || "."),
     projectStatePath: env.PI_PROJECT_STATE_PATH || "project_state.md",
   });
-  const zoteroArchival = createZoteroArchivalService({
-    runStore,
-    zoteroAdapter,
-    getPaperGuide,
-    getPaperPdf,
-  });
+  const zoteroArchival = zoteroArchivalService
+    ?? createZoteroArchivalService({
+      runStore,
+      zoteroAdapter,
+      getPaperGuide,
+      getPaperPdf,
+    });
 
   async function update(runId, patch, event) {
     const run = await runStore.updateRun(runId, patch);
@@ -253,28 +290,60 @@ export function createJournalWorkflowService({
   async function preparePdfs(runId, candidates) {
     const papers = {};
     const files = [];
-    for (const paper of candidates) {
-      try {
-        const pdf = await ensurePdf(paper);
-        files.push({
-          filePath: pdf.file_path,
-          fileName: `${safeName(paper.paper_id)}.pdf`,
-          dataId: safeName(paper.paper_id),
+    const outcomes = await mapWithConcurrency(
+      candidates,
+      pdfConcurrency,
+      async (paper) => {
+        let outcome;
+        try {
+          const pdf = await ensurePdf(paper);
+          outcome = {
+            file: {
+              filePath: pdf.file_path,
+              fileName: `${safeName(paper.paper_id)}.pdf`,
+              dataId: safeName(paper.paper_id),
+            },
+            state: {
+              status: "pdf_ready",
+              pdf_sha256: pdf.sha256,
+              pdf_bytes: pdf.byte_length,
+              pdf_cache_hit: pdf.cache_hit,
+              error: null,
+            },
+          };
+        } catch (error) {
+          outcome = {
+            file: null,
+            state: {
+              status: "pdf_failed",
+              error: publicError(error),
+            },
+          };
+        }
+        await update(runId, (current) => ({
+          status: "preparing_documents",
+          phase: "pdf_download",
+          mineru: {
+            ...current.mineru,
+            status: "preparing_pdfs",
+            papers: {
+              ...(current.mineru?.papers ?? {}),
+              [paper.paper_id]: outcome.state,
+            },
+          },
+        }), {
+          type: "pdf_paper_prepared",
+          paper_id: paper.paper_id,
+          status: outcome.state.status,
         });
-        papers[paper.paper_id] = {
-          status: "pdf_ready",
-          pdf_sha256: pdf.sha256,
-          pdf_bytes: pdf.byte_length,
-          pdf_cache_hit: pdf.cache_hit,
-          error: null,
-        };
-      } catch (error) {
-        papers[paper.paper_id] = {
-          status: "pdf_failed",
-          error: publicError(error),
-        };
-      }
-    }
+        return outcome;
+      },
+    );
+    outcomes.forEach((outcome, index) => {
+      const paper = candidates[index];
+      papers[paper.paper_id] = outcome.state;
+      if (outcome.file) files.push(outcome.file);
+    });
     await update(runId, (current) => ({
       status: "preparing_documents",
       phase: "pdf_download",
@@ -516,6 +585,7 @@ export function createJournalWorkflowService({
         sourceStateStore,
         fetchImpl,
         openAlexMailto: env.PI_OPENALEX_MAILTO || "",
+        deferCursorCommit: true,
       });
       await update(runId, {
         status: "ranking",
@@ -524,8 +594,19 @@ export function createJournalWorkflowService({
       }, { type: "candidate_ranking_started" });
 
       let ranking;
+      let currentProjectContext = null;
       try {
-        const currentProjectContext = await projectContext.read();
+        currentProjectContext = await projectContext.read();
+      } catch (error) {
+        if (modelMode === "live") throw error;
+        ranking = {
+          candidates: deterministicCandidateRanking(scan.candidateBatch.candidates),
+          source: "deterministic_fallback",
+          error: publicError(error),
+        };
+      }
+      if (currentProjectContext) {
+        try {
         ranking = await candidateRanker({
           papers: scan.candidateBatch.candidates,
           projectContext: currentProjectContext.state,
@@ -536,12 +617,13 @@ export function createJournalWorkflowService({
         });
         ranking.project_context_source_path = currentProjectContext.source_path;
         ranking.project_context_revision = currentProjectContext.revision;
-      } catch (error) {
-        ranking = {
-          candidates: deterministicCandidateRanking(scan.candidateBatch.candidates),
-          source: "deterministic_fallback",
-          error: publicError(error),
-        };
+        } catch (error) {
+          ranking = {
+            candidates: deterministicCandidateRanking(scan.candidateBatch.candidates),
+            source: "deterministic_fallback",
+            error: publicError(error),
+          };
+        }
       }
       const candidates = ranking.candidates.map((paper) => ({
         ...paper,
@@ -578,6 +660,17 @@ export function createJournalWorkflowService({
         candidate_count: candidates.length,
         source: ranking.source,
       });
+      if (scan.cursor_commit_pending) {
+        await sourceScanCommitter({
+          runId,
+          runStore,
+          sourceStateStore,
+          requiredArtifacts: [
+            "inputs/candidates.json",
+            "audit/candidate-ranking.json",
+          ],
+        });
+      }
       const prepared = await preparePdfs(runId, candidates);
       await startMineru(runId, prepared.files, prepared.papers);
       return await runStore.getRun(runId);
@@ -597,10 +690,20 @@ export function createJournalWorkflowService({
     providerId = defaults.providerId,
     modelId = defaults.modelId,
   } = {}) {
-    const run = await runStore.createRun({
-      trigger,
-      sourceIds: SOURCE_REGISTRY.map((source) => source.source_id),
-    });
+    const creation = typeof runStore.createOrReuseActiveRun === "function"
+      ? await runStore.createOrReuseActiveRun({
+          trigger,
+          sourceIds: SOURCE_REGISTRY.map((source) => source.source_id),
+        })
+      : {
+          run: await runStore.createRun({
+            trigger,
+            sourceIds: SOURCE_REGISTRY.map((source) => source.source_id),
+          }),
+          created: true,
+        };
+    const { run } = creation;
+    if (!creation.created) return run;
     const completion = executeRun(run.run_id, { providerId, modelId })
       .finally(() => inFlight.delete(run.run_id));
     inFlight.set(run.run_id, completion);
@@ -611,6 +714,9 @@ export function createJournalWorkflowService({
     if (inFlight.has(runId)) return runStore.getRun(runId);
     let run = await runStore.getRun(runId);
     if (!run) return null;
+    if (run.archive_batch?.status === "committing") {
+      return resumeArchiveCommit(runId, run);
+    }
     if (run.status === "committing" && run.zotero?.status === "committing") {
       return zoteroArchival.resumeCommit(runId);
     }
@@ -672,6 +778,130 @@ export function createJournalWorkflowService({
       .finally(() => inFlight.delete(runId));
     inFlight.set(runId, completion);
     return resumedRun;
+  }
+
+  async function retryPaperDocument(runId, paperId, {
+    clientRequestId,
+  } = {}) {
+    if (!isNonEmptyString(clientRequestId)) {
+      throw artifactError(
+        "DOCUMENT_RETRY_REQUEST_ID_REQUIRED",
+        "逐篇重试必须提供稳定的请求标识",
+        400,
+      );
+    }
+    const activeRetry = documentRetryInFlight.get(runId);
+    if (activeRetry) {
+      if (
+        activeRetry.paperId === paperId
+        && activeRetry.clientRequestId === clientRequestId
+      ) {
+        return runStore.getRun(runId);
+      }
+      throw artifactError(
+        "DOCUMENT_PREPARATION_BUSY",
+        "当前已有一篇候选全文正在重试",
+      );
+    }
+    const { run, paper } = await runPaper(runId, paperId);
+    const currentState = run.mineru?.papers?.[paperId];
+    if (currentState?.status === "ready") return run;
+    if (
+      run.mineru?.status === "remote_running"
+      || Object.values(run.mineru?.papers ?? {}).some(
+        (state) => /^mineru_(pending|running|converting|waiting-file)$/.test(
+          state?.status ?? "",
+        ),
+      )
+    ) {
+      throw artifactError(
+        "DOCUMENT_PREPARATION_BUSY",
+        "当前仍有候选全文正在处理中，请完成后再逐篇重试",
+      );
+    }
+    const retrying = await update(runId, (current) => ({
+      status: "preparing_documents",
+      phase: "pdf_download",
+      paused_reason: null,
+      mineru: {
+        ...current.mineru,
+        status: "preparing_pdfs",
+        papers: {
+          ...(current.mineru?.papers ?? {}),
+          [paperId]: {
+            ...(current.mineru?.papers?.[paperId] ?? {}),
+            status: "pdf_retrying",
+            retry_request_id: clientRequestId,
+            error: null,
+          },
+        },
+      },
+    }), {
+      type: "pdf_paper_retry_started",
+      paper_id: paperId,
+    });
+    const operation = (async () => {
+      try {
+        const pdf = await ensurePdf(paper);
+        const latest = await runStore.getRun(runId);
+        const papers = {
+          ...(latest.mineru?.papers ?? {}),
+          [paperId]: {
+            status: "pdf_ready",
+            pdf_sha256: pdf.sha256,
+            pdf_bytes: pdf.byte_length,
+            pdf_cache_hit: pdf.cache_hit,
+            error: null,
+          },
+        };
+        await update(runId, (current) => ({
+          mineru: {
+            ...current.mineru,
+            papers,
+          },
+        }), {
+          type: "pdf_paper_prepared",
+          paper_id: paperId,
+          status: "pdf_ready",
+          retry: true,
+        });
+        await startMineru(runId, [{
+          filePath: pdf.file_path,
+          fileName: `${safeName(paperId)}.pdf`,
+          dataId: safeName(paperId),
+        }], papers);
+      } catch (error) {
+        await update(runId, (current) => ({
+          status: "review_ready",
+          phase: "candidate_review",
+          paused_reason: "该篇全文准备失败，可稍后再次重试",
+          mineru: {
+            ...current.mineru,
+            status: Object.values(current.mineru?.papers ?? {}).some(
+              (state) => state?.status === "ready",
+            ) ? "partial" : "failed",
+            papers: {
+              ...(current.mineru?.papers ?? {}),
+              [paperId]: {
+                ...(current.mineru?.papers?.[paperId] ?? {}),
+                status: "pdf_failed",
+                error: publicError(error),
+              },
+            },
+          },
+        }), {
+          type: "pdf_paper_retry_failed",
+          paper_id: paperId,
+          error: publicError(error),
+        });
+      }
+    })().finally(() => documentRetryInFlight.delete(runId));
+    documentRetryInFlight.set(runId, {
+      paperId,
+      clientRequestId,
+      operation,
+    });
+    return retrying;
   }
 
   async function runPaper(runId, paperId) {
@@ -1648,13 +1878,13 @@ export function createJournalWorkflowService({
     defaultProviderId: defaults.providerId,
     defaultModelId: defaults.modelId,
   });
-  obsidianPreview = env.PI_OBSIDIAN_NOTE_DIR
+  obsidianPreview = obsidianPreviewService ?? (env.PI_OBSIDIAN_NOTE_DIR
     ? createObsidianPreviewService({
         runStore,
         getPaperReading: reading.getReading,
         obsidianNoteDir: env.PI_OBSIDIAN_NOTE_DIR,
       })
-    : null;
+    : null);
   readingNoteAction = env.PI_OBSIDIAN_NOTE_DIR
     ? createReadingNoteActionService({
         runStore,
@@ -1663,22 +1893,24 @@ export function createJournalWorkflowService({
         obsidianNoteDir: env.PI_OBSIDIAN_NOTE_DIR,
       })
     : null;
-  projectStatePreview = env.PI_PROJECT_ROOT && env.PI_PROJECT_STATE_PATH
+  projectStatePreview = projectStatePreviewService
+    ?? (env.PI_PROJECT_ROOT && env.PI_PROJECT_STATE_PATH
     ? createProjectStatePreviewService({
         runStore,
         getPaperReading: reading.getReading,
         projectRoot: env.PI_PROJECT_ROOT,
         projectStatePath: env.PI_PROJECT_STATE_PATH,
       })
-    : null;
+    : null);
 
-  function createObsidianPreview(runId) {
+  async function createObsidianPreview(runId) {
     if (!obsidianPreview) {
       throw artifactError(
         "OBSIDIAN_NOT_CONFIGURED",
         "尚未配置 Obsidian 精读笔记目录",
       );
     }
+    await reading.assertCanonicalForArchive(runId);
     return obsidianPreview.createPreview(runId);
   }
 
@@ -1733,13 +1965,14 @@ export function createJournalWorkflowService({
     return obsidianPreview.getPreview(runId);
   }
 
-  function createProjectStatePreview(runId) {
+  async function createProjectStatePreview(runId) {
     if (!projectStatePreview) {
       throw artifactError(
         "PROJECT_STATE_NOT_CONFIGURED",
         "尚未配置项目状态 Markdown",
       );
     }
+    await reading.assertCanonicalForArchive(runId);
     return projectStatePreview.createPreview(runId);
   }
 
@@ -1753,13 +1986,487 @@ export function createJournalWorkflowService({
     return projectStatePreview.getPreview(runId);
   }
 
+  function archiveRequestHash(value) {
+    return `sha256:${createHash("sha256")
+      .update(JSON.stringify(value))
+      .digest("hex")}`;
+  }
+
+  function requireArchiveRequestId(value) {
+    const requestId = String(value ?? "").trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(requestId)) {
+      throw artifactError(
+        "ARCHIVE_APPROVAL_REQUEST_INVALID",
+        "归档确认请求标识无效",
+        400,
+      );
+    }
+    return requestId;
+  }
+
+  function archiveRequestIdentity(runId, request) {
+    const clientRequestId = requireArchiveRequestId(request?.clientRequestId);
+    const selectedTargets = [
+      request?.obsidian ? "obsidian" : null,
+      request?.zotero ? "zotero" : null,
+      request?.projectState ? "project_state" : null,
+    ].filter(Boolean);
+    if (selectedTargets.length === 0) {
+      throw artifactError(
+        "ARCHIVE_APPROVAL_EMPTY",
+        "至少选择一项归档写入",
+        400,
+      );
+    }
+    return {
+      clientRequestId,
+      selectedTargets,
+      fingerprint: archiveRequestHash({
+        run_id: runId,
+        client_request_id: clientRequestId,
+        obsidian: request.obsidian ?? null,
+        zotero: request.zotero ?? null,
+        project_state: request.projectState ?? null,
+      }),
+    };
+  }
+
+  async function validateArchiveCommit(runId, request) {
+    const run = await runStore.getRun(runId);
+    if (!run) throw artifactError("RUN_NOT_FOUND", "运行不存在", 404);
+    const identity = archiveRequestIdentity(runId, request);
+    if (request.obsidian) {
+      if (!obsidianPreview) {
+        throw artifactError(
+          "OBSIDIAN_NOT_CONFIGURED",
+          "尚未配置 Obsidian 精读笔记目录",
+        );
+      }
+      await obsidianPreview.validateCommit(runId, request.obsidian);
+    }
+    if (request.zotero) {
+      await zoteroArchival.validateCommit(runId, request.zotero);
+    }
+    if (request.projectState) {
+      if (!projectStatePreview) {
+        throw artifactError(
+          "PROJECT_STATE_NOT_CONFIGURED",
+          "尚未配置项目状态 Markdown",
+        );
+      }
+      await projectStatePreview.validateCommit(runId, request.projectState);
+    }
+    return {
+      ...identity,
+    };
+  }
+
+  function archiveRequirementState(current) {
+    const decisions = current.paper_decisions ?? {};
+    const requiresReadingArchive = Object.values(decisions).includes("read");
+    const requiresZotero = Object.values(decisions).some(
+      (decision) => decision === "collect" || decision === "read",
+    );
+    const readingPaperIds = Object.entries(decisions)
+      .filter(([, decision]) => decision === "read")
+      .map(([paperId]) => paperId);
+    const zoteroPaperIds = Object.entries(decisions)
+      .filter(([, decision]) => decision === "collect" || decision === "read")
+      .map(([paperId]) => paperId);
+    const obsidianByPaper = new Map((current.obsidian?.proposals ?? []).map(
+      (proposal) => [proposal.paper_id, proposal],
+    ));
+    const zoteroByPaper = new Map((current.zotero?.proposals ?? []).map(
+      (proposal) => [proposal.paper_id, proposal],
+    ));
+    const obsidianCompleted = !requiresReadingArchive
+      || readingPaperIds.every(
+        (paperId) => obsidianByPaper.get(paperId)?.status === "committed",
+      );
+    const projectStateRequired = requiresReadingArchive;
+    const projectStateCompleted = !projectStateRequired
+      || current.project_state?.status === "completed";
+    const zoteroCompleted = !requiresZotero
+      || zoteroPaperIds.every(
+        (paperId) => zoteroByPaper.get(paperId)?.status === "committed",
+      );
+    const blocked = (
+      readingPaperIds.some((paperId) => {
+        const proposal = obsidianByPaper.get(paperId);
+        return proposal && (
+          proposal.actionable === false
+          || proposal.status === "blocked"
+        );
+      })
+      || zoteroPaperIds.some((paperId) => {
+        const proposal = zoteroByPaper.get(paperId);
+        return proposal && (
+          proposal.actionable === false
+          || proposal.status === "blocked"
+        );
+      })
+      || (
+        Boolean(current.project_state?.proposal_id)
+        && current.project_state?.actionable === false
+      )
+    );
+    return {
+      blocked,
+      complete: obsidianCompleted && projectStateCompleted && zoteroCompleted,
+      obsidianCompleted,
+      projectStateCompleted,
+      zoteroCompleted,
+    };
+  }
+
+  async function finishArchiveBatch(runId, batch, {
+    error = null,
+  } = {}) {
+    const current = await runStore.getRun(runId);
+    const {
+      blocked,
+      complete,
+    } = archiveRequirementState(current);
+    const anyCommitted = (
+      current.obsidian?.status === "completed"
+      || current.project_state?.status === "completed"
+      || (current.zotero?.proposals ?? []).some(
+        (proposal) => proposal.status === "committed",
+      )
+    );
+    const completedAt = new Date().toISOString();
+    const status = complete
+      ? "completed"
+      : blocked
+        ? "manual_action_required"
+        : anyCommitted
+          ? "partial"
+          : "awaiting_approval";
+    const archiveStatus = complete
+      ? "completed"
+      : blocked
+        ? "manual_action_required"
+        : error
+          ? "failed"
+          : "partial";
+    const updated = await runStore.updateRun(runId, {
+      status,
+      phase: complete
+        ? "archive_completed"
+        : status === "manual_action_required"
+          ? "archive_manual_action"
+          : "archive_preview",
+      paused_reason: complete
+        ? null
+        : blocked
+          ? "部分归档项需要人工处理；已成功写入不会重复执行"
+          : error?.message
+            ?? "归档尚未全部完成，可只重试失败项",
+      archive_batch: {
+        ...batch,
+        status: archiveStatus,
+        last_error: error ? publicError(error) : null,
+        completed_at: completedAt,
+        updated_at: completedAt,
+      },
+    });
+    await runStore.appendEvent(runId, {
+      type: "archive_batch_completed",
+      batch_id: batch.batch_id,
+      status: archiveStatus,
+      error: error ? publicError(error) : null,
+      at: completedAt,
+    });
+    return updated;
+  }
+
+  async function executeArchiveCommit(runId, request, batch) {
+    try {
+      if (request.simulateObsidianFailure && request.obsidian) {
+        throw artifactError(
+          "OBSIDIAN_WRITE_SIMULATED_FAILURE",
+          "模拟 Obsidian 写入失败",
+          500,
+        );
+      }
+      if (request.obsidian) {
+        const beforeObsidian = await runStore.getRun(runId);
+        const next = archiveRequirementState(beforeObsidian).obsidianCompleted
+          ? beforeObsidian
+          : await obsidianPreview.commit(runId, {
+              clientRequestId: `${batch.client_request_id}:obsidian`,
+              ...request.obsidian,
+            });
+        if (!archiveRequirementState(next).obsidianCompleted) {
+          throw artifactError(
+            "OBSIDIAN_WRITE_INCOMPLETE",
+            next.obsidian?.last_error?.message
+              ?? "仍有精读论文未完成 Obsidian 写入与核验",
+            409,
+          );
+        }
+      }
+      if (request.zotero) {
+        const current = await runStore.getRun(runId);
+        if (!archiveRequirementState(current).obsidianCompleted) {
+          throw artifactError(
+            "ARCHIVE_DEPENDENCY_PENDING",
+            "请先完成并核验 Obsidian 精读笔记，再写入 Zotero",
+            409,
+          );
+        }
+        if (!archiveRequirementState(current).zoteroCompleted) {
+          if (current.zotero?.status === "committing") {
+            await zoteroArchival.resumeCommit(runId);
+          } else {
+            await zoteroArchival.startCommit(runId, request.zotero);
+          }
+          await zoteroArchival.waitForCommit(runId);
+        }
+        await runStore.updateRun(runId, {
+          status: "committing",
+          phase: "archive_commit",
+          paused_reason: null,
+        });
+        const next = await runStore.getRun(runId);
+        if (!archiveRequirementState(next).zoteroCompleted) {
+          const error = artifactError(
+            "ZOTERO_WRITE_INCOMPLETE",
+            next.zotero?.last_error?.message
+              ?? next.paused_reason
+              ?? "Zotero 写入尚未全部核验",
+            409,
+          );
+          error.retryable = next.zotero?.status !== "blocked";
+          throw error;
+        }
+      }
+      if (request.projectState) {
+        const current = await runStore.getRun(runId);
+        const requirements = archiveRequirementState(current);
+        if (
+          !requirements.obsidianCompleted
+          || !requirements.zoteroCompleted
+        ) {
+          throw artifactError(
+            "ARCHIVE_DEPENDENCY_PENDING",
+            "请先完成并核验 Obsidian 与 Zotero 归档，再更新项目状态",
+            409,
+          );
+        }
+        const next = requirements.projectStateCompleted
+          ? current
+          : await projectStatePreview.commit(runId, {
+              clientRequestId: `${batch.client_request_id}:project-state`,
+              ...request.projectState,
+            });
+        if (next.project_state?.status !== "completed") {
+          throw artifactError(
+            "PROJECT_STATE_WRITE_INCOMPLETE",
+            next.project_state?.last_error?.message ?? "项目状态写入尚未核验",
+            409,
+          );
+        }
+      }
+      return finishArchiveBatch(runId, batch);
+    } catch (error) {
+      return finishArchiveBatch(runId, batch, { error });
+    }
+  }
+
+  async function resumeArchiveCommit(runId, currentRun = null) {
+    if (archiveCommitJobs.has(runId)) return runStore.getRun(runId);
+    const run = currentRun ?? await runStore.getRun(runId);
+    const batch = run?.archive_batch;
+    if (
+      !batch
+      || batch.status !== "committing"
+      || typeof batch.artifact_path !== "string"
+    ) {
+      return run;
+    }
+    let artifact;
+    try {
+      artifact = await runStore.readArtifact(runId, batch.artifact_path);
+    } catch {
+      return finishArchiveBatch(runId, batch, {
+        error: artifactError(
+          "ARCHIVE_BATCH_RECOVERY_CORRUPT",
+          "联合归档恢复记录缺失或损坏，需要重新生成精确预览",
+          409,
+        ),
+      });
+    }
+    const request = {
+      obsidian: artifact?.request?.obsidian ?? null,
+      zotero: artifact?.request?.zotero ?? null,
+      projectState: artifact?.request?.project_state ?? null,
+      simulateObsidianFailure: false,
+    };
+    const fingerprint = archiveRequestHash({
+      run_id: runId,
+      client_request_id: batch.client_request_id,
+      obsidian: request.obsidian,
+      zotero: request.zotero,
+      project_state: request.projectState,
+    });
+    if (
+      artifact?.batch_id !== batch.batch_id
+      || artifact?.request_fingerprint !== batch.request_fingerprint
+      || fingerprint !== batch.request_fingerprint
+    ) {
+      return finishArchiveBatch(runId, batch, {
+        error: artifactError(
+          "ARCHIVE_BATCH_RECOVERY_CORRUPT",
+          "联合归档恢复记录校验失败，需要重新生成精确预览",
+          409,
+        ),
+      });
+    }
+    await runStore.appendEvent(runId, {
+      type: "archive_batch_resumed",
+      batch_id: batch.batch_id,
+      at: new Date().toISOString(),
+    });
+    await runStore.updateRun(runId, {
+      status: "committing",
+      phase: "archive_commit",
+      paused_reason: null,
+    });
+    const job = executeArchiveCommit(runId, request, batch)
+      .finally(() => archiveCommitJobs.delete(runId));
+    archiveCommitJobs.set(runId, job);
+    return runStore.getRun(runId);
+  }
+
+  async function getRun(runId) {
+    const run = await runStore.getRun(runId);
+    if (
+      run?.archive_batch?.status === "committing"
+      || run?.status === "committing"
+    ) return resumeRun(runId);
+    return run;
+  }
+
+  async function listRuns() {
+    const runs = await runStore.listRuns();
+    await Promise.all(runs
+      .filter((run) => (
+        run.archive_batch?.status === "committing"
+        || run.status === "committing"
+      ))
+      .map((run) => resumeRun(run.run_id)));
+    return runStore.listRuns();
+  }
+
+  function withArchiveStartLock(runId, task) {
+    const previous = archiveStartLocks.get(runId) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(task);
+    archiveStartLocks.set(runId, operation);
+    return operation.finally(() => {
+      if (archiveStartLocks.get(runId) === operation) {
+        archiveStartLocks.delete(runId);
+      }
+    });
+  }
+
+  async function startArchiveCommit(runId, request = {}) {
+    return withArchiveStartLock(runId, async () => {
+      await reading.assertCanonicalForArchive(runId);
+      const identity = archiveRequestIdentity(runId, request);
+      const current = await runStore.getRun(runId);
+      if (!current) throw artifactError("RUN_NOT_FOUND", "运行不存在", 404);
+      if (
+        current.archive_batch?.client_request_id === identity.clientRequestId
+      ) {
+        if (
+          current.archive_batch.request_fingerprint
+          !== identity.fingerprint
+        ) {
+          throw artifactError(
+            "ARCHIVE_APPROVAL_REQUEST_CONFLICT",
+            "同一归档确认请求标识已用于不同预览内容",
+            409,
+          );
+        }
+        return current;
+      }
+      if (
+        archiveCommitJobs.has(runId)
+        || current.archive_batch?.status === "committing"
+      ) {
+        throw artifactError(
+          "ARCHIVE_APPROVAL_IN_PROGRESS",
+          "当前已有联合归档正在执行，请等待完成后再重试",
+          409,
+        );
+      }
+      const validated = await validateArchiveCommit(runId, request);
+      const approvedAt = new Date().toISOString();
+      const batch = {
+        schema_version: 1,
+        batch_id: `archive-${validated.fingerprint.slice(7, 23)}`,
+        client_request_id: validated.clientRequestId,
+        request_fingerprint: validated.fingerprint,
+        selected_targets: validated.selectedTargets,
+        status: "committing",
+        approved_at: approvedAt,
+        completed_at: null,
+        last_error: null,
+        updated_at: approvedAt,
+      };
+      const artifactPath = `archive-batches/${batch.batch_id}.json`;
+      await runStore.writeArtifact(runId, artifactPath, {
+        ...batch,
+        request: {
+          obsidian: request.obsidian ?? null,
+          zotero: request.zotero ?? null,
+          project_state: request.projectState ?? null,
+        },
+      });
+      batch.artifact_path = artifactPath;
+      const started = await runStore.updateRun(runId, {
+        status: "committing",
+        phase: "archive_commit",
+        paused_reason: null,
+        archive_batch: batch,
+      });
+      await runStore.appendEvent(runId, {
+        type: "archive_batch_approved",
+        batch_id: batch.batch_id,
+        selected_targets: batch.selected_targets,
+        at: approvedAt,
+      });
+      const job = executeArchiveCommit(runId, request, batch)
+        .finally(() => archiveCommitJobs.delete(runId));
+      archiveCommitJobs.set(runId, job);
+      return started;
+    });
+  }
+
+  function waitForArchiveCommit(runId) {
+    return archiveCommitJobs.get(runId) ?? Promise.resolve(runStore.getRun(runId));
+  }
+
+  async function createZoteroProposal(runId, options) {
+    await reading.assertCanonicalForArchive(runId);
+    return zoteroArchival.createProposal(runId, options);
+  }
+
+  async function startZoteroCommit(runId, request) {
+    await reading.assertCanonicalForArchive(runId);
+    return zoteroArchival.startCommit(runId, request);
+  }
+
   return Object.freeze({
     askReadingQuestion: reading.askQuestion,
     abandonReadingNoteProposal,
     commitReadingNoteProposal,
     createReadingNoteProposal,
+    pinReadingConclusion: reading.pinConclusion,
+    promoteReadingConversation: reading.promoteConversation,
     generateReadingStage: reading.generateStage,
-    getRun: runStore.getRun,
+    getRun,
     getPaperDocument,
     getPaperGuide,
     getPaperImage,
@@ -1776,21 +2483,27 @@ export function createJournalWorkflowService({
     getZoteroProposal: zoteroArchival.getProposal,
     getZoteroStatus: zoteroAdapter.status,
     getZoteroTargets: zoteroArchival.getTargets,
-    listRuns: runStore.listRuns,
+    listRuns,
+    readEvents: runStore.readEvents,
     resumeRun,
+    retryPaperDocument,
     restartReadingFromGuide: reading.restartFromGuide,
     resetPaperReading: reading.resetPaperReading,
     createReadingConversation: reading.createConversation,
     switchReadingConversation: reading.switchConversation,
+    unpinReadingConclusion: reading.unpinConclusion,
     savePaperDecisions: reading.setDecisions,
     saveReadingPosition: reading.savePosition,
     sendReadingChatMessage: reading.sendChatMessage,
     startGuides,
     startRun,
-    createZoteroProposal: zoteroArchival.createProposal,
+    subscribeEvents: runStore.subscribeEvents,
+    createZoteroProposal,
     createObsidianPreview,
     createProjectStatePreview,
-    startZoteroCommit: zoteroArchival.startCommit,
+    startArchiveCommit,
+    startZoteroCommit,
+    waitForArchiveCommit,
     waitForGuides,
     waitForRun,
     waitForZoteroCommit: zoteroArchival.waitForCommit,

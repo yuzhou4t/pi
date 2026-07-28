@@ -3,7 +3,10 @@ import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createSourceStateStore } from "./sourceStateStore.js";
+import {
+  createSourceStateStore,
+  SourceStateConflictError,
+} from "./sourceStateStore.js";
 
 test("source state separates first seen time from publication time", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-source-state-"));
@@ -49,4 +52,76 @@ test("a failed source attempt preserves its previous cursor", async () => {
     observedAt: "2026-07-30T08:00:00.000Z",
   });
   assert.deepEqual(state.sources["source-1"].cursor, { token: "stable" });
+});
+
+test("scan transactions commit with CAS and are idempotent by transaction id", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-source-cas-"));
+  const store = createSourceStateStore({
+    dataDir,
+    now: () => new Date("2026-07-27T08:00:00.000Z"),
+  });
+  const sourceScans = [{
+    source_id: "source-1",
+    status: "success",
+    next_cursor: { token: "next" },
+    papers: [{
+      dedupe_key: "doi:10.1000/transaction",
+      first_seen_at: "2026-07-27T08:00:00.000Z",
+    }],
+    error: null,
+  }];
+
+  const first = await store.commitScanTransaction({
+    transactionId: "scan:run-1",
+    expectedRevision: 0,
+    sourceScans,
+    observedAt: "2026-07-27T08:00:00.000Z",
+  });
+  const repeated = await store.commitScanTransaction({
+    transactionId: "scan:run-1",
+    expectedRevision: 0,
+    sourceScans,
+    observedAt: "2026-07-27T08:00:00.000Z",
+  });
+
+  assert.equal(first.already_committed, false);
+  assert.equal(first.revision, 1);
+  assert.equal(repeated.already_committed, true);
+  assert.equal(repeated.revision, 1);
+  assert.deepEqual(repeated.state.sources["source-1"].cursor, { token: "next" });
+  assert.equal(repeated.state.applied_transactions.length, 1);
+});
+
+test("concurrent transactions from the same source-state revision cannot last-write-win", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-source-conflict-"));
+  const firstStore = createSourceStateStore({ dataDir });
+  const secondStore = createSourceStateStore({ dataDir });
+  const scan = (token) => [{
+    source_id: "source-1",
+    status: "success",
+    next_cursor: { token },
+    papers: [],
+    error: null,
+  }];
+
+  const results = await Promise.allSettled([
+    firstStore.commitScanTransaction({
+      transactionId: "scan:run-a",
+      expectedRevision: 0,
+      sourceScans: scan("a"),
+      observedAt: "2026-07-27T08:00:00.000Z",
+    }),
+    secondStore.commitScanTransaction({
+      transactionId: "scan:run-b",
+      expectedRevision: 0,
+      sourceScans: scan("b"),
+      observedAt: "2026-07-27T08:00:00.000Z",
+    }),
+  ]);
+
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  const rejected = results.find((result) => result.status === "rejected");
+  assert.equal(rejected.reason instanceof SourceStateConflictError, true);
+  assert.equal(rejected.reason.code, "SOURCE_STATE_CONFLICT");
+  assert.equal((await firstStore.load()).revision, 1);
 });

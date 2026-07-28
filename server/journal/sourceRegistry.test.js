@@ -26,6 +26,14 @@ test("every source has primary, fallback, adapter, and a DBLP path", () => {
     assert.equal(source.name, source.venue);
     assert.equal(source.type, source.source_type);
   }
+  assert.equal(
+    SOURCE_REGISTRY.filter((source) => source.fallback.kind === "crossref-api").length,
+    4,
+  );
+  assert.equal(
+    SOURCE_REGISTRY.filter((source) => source.fallback.kind === "dblp-index").length,
+    7,
+  );
 });
 
 test("source lookup is explicit and unknown ids do not silently fall back", () => {

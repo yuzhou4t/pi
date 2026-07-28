@@ -157,12 +157,14 @@ export function PaperReaderFullBlock({
         className={`paper-reader-figure${active ? " is-active" : ""}`}
         id={block.id}
         data-reader-block-id={block.id}
-        role="button"
-        tabIndex="0"
+        role={active ? "button" : undefined}
+        tabIndex={active ? 0 : undefined}
         aria-current={active ? "location" : undefined}
-        aria-label={`把图表设为当前阅读位置：${copy || "图表"}`}
+        aria-label={active ? `当前阅读图表：${copy || "图表"}` : undefined}
         onClick={() => onActivate(block.id)}
-        onKeyDown={(event) => activateOnKeyboard(event, () => onActivate(block.id))}
+        onKeyDown={active
+          ? (event) => activateOnKeyboard(event, () => onActivate(block.id))
+          : undefined}
       >
         {block.imageUrl ? (
           <img
@@ -186,12 +188,14 @@ export function PaperReaderFullBlock({
       className={`paper-reader-full-block is-${block.kind}${active ? " is-active" : ""}`}
       id={block.id}
       data-reader-block-id={block.id}
-      role="button"
-      tabIndex="0"
+      role={active ? "button" : undefined}
+      tabIndex={active ? 0 : undefined}
       aria-current={active ? "location" : undefined}
-      aria-label={`把这一段设为当前阅读位置：${copy.slice(0, 80)}`}
+      aria-label={active ? `当前阅读段落：${copy.slice(0, 80)}` : undefined}
       onClick={() => onActivate(block.id)}
-      onKeyDown={(event) => activateOnKeyboard(event, () => onActivate(block.id))}
+      onKeyDown={active
+        ? (event) => activateOnKeyboard(event, () => onActivate(block.id))
+        : undefined}
     >
       {language === "zh" && zh ? (
         <div className="paper-reader-zh is-only" data-reader-zh="true">
@@ -1202,7 +1206,7 @@ export function PaperReader({
               ) : null}
 
               <p className="paper-reader-anchor-note">
-                选择同一段中的文字，可把可核验的原文引用加入右侧论文 Agent。
+                选择同一段中的文字，可把可核验的原文引用加入论文 Agent。
               </p>
 
               <footer className="paper-reader-navigation">
@@ -1227,7 +1231,7 @@ export function PaperReader({
               <header className="paper-reader-document-heading">
                 <span>结构化全文</span>
                 <h3 ref={contentTitleRef} tabIndex="-1">{paperDocument.title ?? paper.title}</h3>
-                <p>点击段落可记录当前位置；选择同一段文字，可连同原文位置一起交给右侧论文 Agent。</p>
+                <p>点击段落可记录当前位置；选择同一段文字，可连同原文位置一起交给论文 Agent。</p>
               </header>
               {(paperDocument.blocks ?? []).map((block) => (
                 <PaperReaderFullBlock

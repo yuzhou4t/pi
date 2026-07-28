@@ -18,6 +18,9 @@ import {
   createProjectWorkTools,
   getProjectWorkDefaultThinkingLevel,
   getProjectWorkThinkingLevels,
+  PROJECT_WORK_DEFAULT_TOOL_NAMES,
+  PROJECT_WORK_PREVIEW_TOOL_NAME,
+  PROJECT_WORK_REPAIR_TOOL_NAMES,
   readProjectWorkOverlayTextFile,
 } from "./piSessionHost.js";
 
@@ -105,6 +108,54 @@ test("project-work session host forwards image attachments to Pi steer", async (
   );
 });
 
+test("project-work session host exposes Pi follow-up queue primitives without a shell bridge", async () => {
+  const source = await readFile(new URL("./piSessionHost.js", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /followUp\(text,\s*images\)\s*\{\s*return session\.followUp\(text,\s*images\);\s*\}/,
+  );
+  assert.match(source, /replaceFollowUps\(messages\)/);
+  assert.match(
+    source,
+    /clearQueue\(\)\s*\{\s*return session\.clearQueue\(\);\s*\}/,
+  );
+  assert.doesNotMatch(source, /child_process.*followUp/s);
+});
+
+test("project-work session host retries by branching before the last durable user message", async () => {
+  const source = await readFile(new URL("./piSessionHost.js", import.meta.url), "utf8");
+  assert.match(source, /retryLastTurn\(options = \{\}\)/);
+  assert.match(source, /session\.getUserMessagesForForking\(\)\.at\(-1\)/);
+  assert.match(source, /session\.navigateTree\(target\.entryId,\s*\{\s*summarize: false/);
+  assert.match(source, /session\.sendUserMessage\(content\)/);
+  assert.doesNotMatch(source, /child_process.*retryLastTurn/s);
+});
+
+test("verification repair exposes only contained overlay tools and a hidden bound failure turn", async () => {
+  assert.deepEqual(PROJECT_WORK_REPAIR_TOOL_NAMES, [
+    "read",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "update_plan",
+  ]);
+  for (const blockedName of [
+    "ask_user",
+    "request_verification",
+    "request_preview",
+  ]) {
+    assert.equal(PROJECT_WORK_REPAIR_TOOL_NAMES.includes(blockedName), false);
+  }
+  const source = await readFile(new URL("./piSessionHost.js", import.meta.url), "utf8");
+  assert.match(source, /repairVerification\(\{/);
+  assert.match(source, /customType: "pi_agent_verification_failure"/);
+  assert.match(source, /display: false/);
+  assert.match(source, /triggerTurn: true/);
+  assert.doesNotMatch(source, /child_process.*repairVerification/s);
+});
+
 test("project-work turn guidance modifies only the current system prompt", async () => {
   let guidance = "Review only for this turn.";
   let beforeAgentStart = null;
@@ -162,6 +213,181 @@ test("project-work thinking levels follow each Pi model's runtime capability map
     getProjectWorkDefaultThinkingLevel(mappedModel, "max"),
     "max",
   );
+});
+
+test("controlled Uvicorn, Vite, and static previews use closed schemas and stay inactive by default", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-preview-tool-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const baseRoot = path.join(temporaryRoot, "base");
+  const workspaceRoot = path.join(temporaryRoot, "workspace");
+  await Promise.all([
+    mkdir(projectRoot),
+    mkdir(baseRoot),
+    mkdir(workspaceRoot),
+  ]);
+  const requests = [];
+  const tools = await createProjectWorkTools({
+    projectRoot,
+    baseRoot,
+    workspaceRoot,
+    onPlan: async () => {},
+    onVerificationRequest: async () => ({ id: "verification-1" }),
+    onPreviewRequest: async (request) => {
+      requests.push(request);
+      return {
+        id: `preview-${requests.length}`,
+        requestHash: `sha256:${String(requests.length).repeat(64)}`,
+        executionPolicyMode: requests.length === 2
+          ? "manual_review"
+          : "auto_review",
+      };
+    },
+  });
+  const requestPreview = toolByName(
+    tools,
+    PROJECT_WORK_PREVIEW_TOOL_NAME,
+  );
+  const uvicornRequest = {
+    runtime: "python_uvicorn",
+    cwd: "backend",
+    app: "app.main:app",
+    route: "/reader/",
+    title: "读者端",
+  };
+  const viteRequest = {
+    runtime: "vite",
+    cwd: ".",
+    route: "/",
+    title: "Vite 端",
+  };
+  const staticRequest = {
+    runtime: "static",
+    cwd: "dist",
+    route: "/index.html",
+    title: "静态端",
+  };
+
+  const autoResult = await requestPreview.execute(
+    "request-preview-uvicorn",
+    uvicornRequest,
+  );
+  const manualResult = await requestPreview.execute(
+    "request-preview-vite",
+    viteRequest,
+  );
+  await requestPreview.execute("request-preview-static", staticRequest);
+
+  assert.deepEqual(requests, [
+    uvicornRequest,
+    viteRequest,
+    staticRequest,
+  ]);
+  assert.match(
+    autoResult.content[0].text,
+    /preview-1.*automatically open.*do not give.*manual start commands/i,
+  );
+  assert.match(
+    manualResult.content[0].text,
+    /preview-2.*has not started.*exact in-app confirmation/i,
+  );
+  assert.deepEqual(autoResult.details, {
+    id: "preview-1",
+    requestHash: `sha256:${"1".repeat(64)}`,
+  });
+  assert.deepEqual(
+    requestPreview.parameters.anyOf.map((variant) => ({
+      runtime: variant.properties.runtime.const,
+      additionalProperties: variant.additionalProperties,
+      acceptsApp: Object.hasOwn(variant.properties, "app"),
+    })),
+    [
+      {
+        runtime: "python_uvicorn",
+        additionalProperties: false,
+        acceptsApp: true,
+      },
+      {
+        runtime: "vite",
+        additionalProperties: false,
+        acceptsApp: false,
+      },
+      {
+        runtime: "static",
+        additionalProperties: false,
+        acceptsApp: false,
+      },
+    ],
+  );
+  assert.equal(
+    PROJECT_WORK_DEFAULT_TOOL_NAMES.includes(PROJECT_WORK_PREVIEW_TOOL_NAME),
+    false,
+  );
+});
+
+test("ask_user returns durable answered and cancelled outcomes without implying approval", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-ask-user-tool-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const baseRoot = path.join(temporaryRoot, "base");
+  const workspaceRoot = path.join(temporaryRoot, "workspace");
+  await Promise.all([
+    mkdir(projectRoot),
+    mkdir(baseRoot),
+    mkdir(workspaceRoot),
+  ]);
+  const outcomes = [{
+    id: "ask-user-1",
+    status: "answered",
+    answers: [{ questionId: "scope", value: "backend" }],
+  }, {
+    id: "ask-user-2",
+    status: "cancelled",
+    answers: [],
+  }];
+  const requests = [];
+  const tools = await createProjectWorkTools({
+    projectRoot,
+    baseRoot,
+    workspaceRoot,
+    onPlan: async () => {},
+    onVerificationRequest: async () => ({ id: "verification-1" }),
+    onAskUserRequest: async (request) => {
+      requests.push(request);
+      return outcomes.shift();
+    },
+  });
+  const askUser = toolByName(tools, "ask_user");
+  const question = {
+    questions: [{
+      id: "scope",
+      prompt: "选择实现范围",
+      kind: "single_choice",
+      options: [{
+        id: "backend",
+        label: "后端",
+      }, {
+        id: "frontend",
+        label: "前端",
+      }],
+    }],
+  };
+
+  const answered = await askUser.execute("ask-answered", question);
+  const cancelled = await askUser.execute("ask-cancelled", question);
+
+  assert.deepEqual(requests, [question, question]);
+  assert.deepEqual(answered.details, {
+    id: "ask-user-1",
+    status: "answered",
+    answers: [{ questionId: "scope", value: "backend" }],
+  });
+  assert.deepEqual(cancelled.details, {
+    id: "ask-user-2",
+    status: "cancelled",
+    answers: [],
+  });
+  assert.equal(PROJECT_WORK_DEFAULT_TOOL_NAMES.includes("ask_user"), true);
 });
 
 test("contained project tools read live files and keep writes in the sparse review overlay", async (t) => {

@@ -1,8 +1,34 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { after } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { createServer } from "vite";
+import { createServer as createViteServer } from "vite";
+
+let sharedViteServerPromise = null;
+
+async function createServer(options) {
+  sharedViteServerPromise ??= createViteServer({
+    ...options,
+    server: {
+      ...options.server,
+      warmup: { clientFiles: [] },
+    },
+    optimizeDeps: {
+      noDiscovery: true,
+      include: [],
+    },
+  });
+  const server = await sharedViteServerPromise;
+  return {
+    ssrLoadModule: server.ssrLoadModule.bind(server),
+    close: async () => {},
+  };
+}
+
+after(async () => {
+  if (!sharedViteServerPromise) return;
+  await (await sharedViteServerPromise).close();
+});
 
 test("failed guide generation keeps the paper selected and exposes a clear retry state", async () => {
   const vite = await createServer({
@@ -60,6 +86,60 @@ test("failed guide generation keeps the paper selected and exposes a clear retry
     assert.match(html, /已选择 1\/2 篇/);
     assert.match(html, /重新生成五分钟导读/);
     assert.match(html, /type="checkbox"[^>]*checked=""/);
+  } finally {
+    await vite.close();
+  }
+});
+
+test("a failed paper exposes a scoped full-text retry without implementation jargon", async () => {
+  const vite = await createServer({
+    root: process.cwd(),
+    appType: "custom",
+    logLevel: "silent",
+    server: { middlewareMode: true },
+  });
+  try {
+    const { WorkflowWorkspace } = await vite.ssrLoadModule(
+      "/src/components/WorkflowWorkspace.jsx",
+    );
+    const paper = {
+      id: "paper-live-retry",
+      title: "A paper awaiting full text",
+      authors: ["Author"],
+      venue: "arXiv",
+      isDemo: false,
+      mineruStatus: "parse_failed",
+      mineruRunStatus: "partial",
+      selectionSummary: "研究可恢复的论文处理流程。",
+      projectImpact: "用于验证逐篇恢复。",
+    };
+    const html = renderToStaticMarkup(React.createElement(WorkflowWorkspace, {
+      papers: [paper],
+      run: {
+        source: "live",
+        runId: "run-live-retry",
+        status: "review_ready",
+        selectedPaperIds: [],
+        selectablePaperIds: [],
+        preparedGuideIds: [],
+        proposals: [],
+      },
+      journalRunState: {
+        status: "ready",
+        run: {
+          status: "review_ready",
+          phase: "candidate_review",
+          candidates: [paper],
+          mineru: { status: "partial" },
+        },
+      },
+      candidateSummaryState: { items: [] },
+      onRetryPaperDocument() {},
+    }));
+
+    assert.match(html, /全文准备失败/);
+    assert.match(html, /重试全文准备/);
+    assert.doesNotMatch(html, /MinerU|PDF|上传|解析服务/);
   } finally {
     await vite.close();
   }
@@ -222,6 +302,8 @@ test("a persisted live reading run shows recovery instead of a fake empty paper 
     assert.match(html, /不会先显示一个空的阅读列表/);
     assert.equal(html.includes("0/0 篇已整理"), false);
     assert.doesNotMatch(html, /选择一篇论文继续阅读/);
+    assert.doesNotMatch(html, /Context Ledgers for Verifiable Long-Horizon Agents/);
+    assert.doesNotMatch(html, /内置候选|示例论文/);
     assert.doesNotMatch(html, /workflow-step-flow/);
   } finally {
     await vite.close();
@@ -393,54 +475,58 @@ test("live guide, paper workbench, and archive handoff render in the validated o
     );
     assert.match(archiveHtml, /生成归档精确预览/);
 
-    const approvalHtml = renderToStaticMarkup(React.createElement(WorkflowWorkspace, {
-      ...common,
-      obsidianUiState: {
-        runId: "run-live-1",
-        status: "ready",
-        error: null,
-        preview: {
-          proposalHash: "sha256:obsidian",
-          proposals: [{
-            id: "obsidian-paper-live-1",
-            paperIds: [paper.id],
-            target: "obsidian",
-            title: "2026-Author-Live-paper--abcd1234.md",
-            targetLocator: "/vault/论文精读/2026-Author-Live-paper--abcd1234.md",
-            preview: ["新建文件"],
-            markdown: "# Live paper\n\n## 1. 研究问题\n",
-            contentHash: "sha256:content",
-            targetVersionOrHash: "sha256:target",
-            actionable: true,
-          }],
-        },
+    const readyObsidianPreview = {
+      runId: "run-live-1",
+      status: "ready",
+      error: null,
+      preview: {
+        proposalHash: "sha256:obsidian",
+        proposals: [{
+          id: "obsidian-paper-live-1",
+          paperIds: [paper.id],
+          target: "obsidian",
+          title: "2026-Author-Live-paper--abcd1234.md",
+          targetLocator: "/vault/论文精读/2026-Author-Live-paper--abcd1234.md",
+          preview: ["新建文件"],
+          markdown: "# Live paper\n\n## 1. 研究问题\n",
+          contentHash: "sha256:content",
+          targetVersionOrHash: "sha256:target",
+          actionable: true,
+          selected: true,
+        }],
       },
-      projectStateUiState: {
-        runId: "run-live-1",
-        status: "ready",
-        error: null,
-        preview: {
-          proposalId: "project-state-preview-1",
-          proposalHash: "sha256:project-state-preview",
-          proposal: {
-            id: "project-state-preview-1",
-            paperIds: [paper.id],
-            target: "project_state",
-            title: "PRODUCT_MEETING.md",
-            targetLocator: "/project/PRODUCT_MEETING.md",
-            preview: ["追加 1 篇精读论文的项目影响与下一步"],
-            markdown: "<!-- pi-agent:project-state-run:run-live-1 -->\n## 摘要正文\n",
-            contentHash: "sha256:project-state-append",
-            targetVersionOrHash: "sha256:project-state-target",
-            actionable: true,
-            diff: {
-              beforeHash: "sha256:project-state-before",
-              afterHash: "sha256:project-state-after",
-              appendText: "\n\n<!-- exact-append -->\n## 本轮确认的项目更新\n",
-            },
+    };
+    const readyProjectStatePreview = {
+      runId: "run-live-1",
+      status: "ready",
+      error: null,
+      preview: {
+        proposalId: "project-state-preview-1",
+        proposalHash: "sha256:project-state-preview",
+        proposal: {
+          id: "project-state-preview-1",
+          paperIds: [paper.id],
+          target: "project_state",
+          title: "PRODUCT_MEETING.md",
+          targetLocator: "/project/PRODUCT_MEETING.md",
+          preview: ["追加 1 篇精读论文的项目影响与下一步"],
+          markdown: "<!-- pi-agent:project-state-run:run-live-1 -->\n## 摘要正文\n",
+          contentHash: "sha256:project-state-append",
+          targetVersionOrHash: "sha256:project-state-target",
+          actionable: true,
+          selected: true,
+          diff: {
+            beforeHash: "sha256:project-state-before",
+            afterHash: "sha256:project-state-after",
+            appendText: "\n\n<!-- exact-append -->\n## 本轮确认的项目更新\n",
           },
         },
       },
+    };
+    const approvalHtml = renderToStaticMarkup(React.createElement(WorkflowWorkspace, {
+      ...common,
+      obsidianUiState: readyObsidianPreview,
+      projectStateUiState: readyProjectStatePreview,
       run: {
         source: "live",
         runId: "run-live-1",
@@ -463,26 +549,69 @@ test("live guide, paper workbench, and archive handoff render in the validated o
         }],
       },
     }));
-    assert.match(approvalHtml, /Obsidian · 仅预览/);
-    assert.match(approvalHtml, /完整精读 Markdown/);
-    assert.match(approvalHtml, /项目状态 · 仅预览/);
+    assert.match(approvalHtml, /Obsidian 精读笔记/);
+    assert.match(approvalHtml, /完整笔记正文、目标文件与内容哈希/);
+    assert.match(approvalHtml, /项目状态更新/);
     assert.match(approvalHtml, /\/project\/PRODUCT_MEETING\.md/);
-    assert.match(approvalHtml, /查看将追加的完整 Markdown/);
+    assert.match(approvalHtml, /查看将追加的完整内容/);
     assert.match(approvalHtml, /exact-append/);
     assert.match(approvalHtml, /本轮确认的项目更新/);
     assert.doesNotMatch(approvalHtml, /摘要正文/);
     assert.match(approvalHtml, /sha256:project-state-before/);
     assert.match(approvalHtml, /sha256:project-state-after/);
     assert.ok(
-      approvalHtml.indexOf("Obsidian · 仅预览")
-        < approvalHtml.indexOf("项目状态 · 仅预览"),
+      approvalHtml.indexOf("Obsidian 精读笔记")
+        < approvalHtml.indexOf("项目状态更新"),
     );
     assert.ok(
-      approvalHtml.indexOf("项目状态 · 仅预览")
+      approvalHtml.indexOf("项目状态更新")
         < approvalHtml.indexOf("<h3>Zotero</h3>"),
     );
-    assert.match(approvalHtml, /等待接入联合写入/);
-    assert.match(approvalHtml, /Zotero、Obsidian 与项目状态都不会发生变化/);
+    assert.match(approvalHtml, /确认写入所选内容/);
+    assert.match(approvalHtml, /写后逐项读回核验/);
+
+    const partialRecoveryHtml = renderToStaticMarkup(React.createElement(WorkflowWorkspace, {
+      ...common,
+      journalRunState: {
+        status: "ready",
+        run: {
+          status: "partial",
+          phase: "archive_commit",
+          archiveBatch: { status: "failed" },
+          obsidian: { status: "completed" },
+          zotero: { status: "completed" },
+          projectState: { status: "failed" },
+        },
+      },
+      obsidianUiState: readyObsidianPreview,
+      projectStateUiState: readyProjectStatePreview,
+      onRetryFailed() {},
+      run: {
+        source: "live",
+        runId: "run-live-1",
+        status: "partial",
+        selectedPaperIds: [paper.id],
+        preparedGuideIds: [paper.id],
+        guideChoices: { [paper.id]: "read" },
+        activePaperId: paper.id,
+        readingStatusByPaperId: { [paper.id]: "complete" },
+        proposals: [{
+          id: "zotero-paper-live-1",
+          paperIds: [paper.id],
+          target: "zotero",
+          title: "新建题录并附加全文与导读",
+          targetLocator: "我的文库 / 研究 / AI 前沿论文",
+          preview: ["动作：新建题录"],
+          selected: true,
+          actionable: true,
+          status: "committed",
+        }],
+      },
+    }));
+    assert.match(partialRecoveryHtml, /项目状态更新/);
+    assert.match(partialRecoveryHtml, /确认写入所选内容/);
+    assert.match(partialRecoveryHtml, /workflow-approval-stage/);
+    assert.doesNotMatch(partialRecoveryHtml, /workflow-result-stage is-partial/);
   } finally {
     await vite.close();
   }

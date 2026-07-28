@@ -102,6 +102,16 @@ function yearOf(value) {
   return match?.[0] ?? "";
 }
 
+function publicationDatePrecision(value, explicitPrecision) {
+  const explicit = compactString(explicitPrecision).toLowerCase();
+  if (["day", "month", "year", "unknown"].includes(explicit)) return explicit;
+  const date = compactString(value);
+  if (/^\d{4}-\d{2}-\d{2}(?:[T\s].*)?$/.test(date)) return "day";
+  if (/^\d{4}-\d{2}$/.test(date)) return "month";
+  if (/^\d{4}$/.test(date)) return "year";
+  return "unknown";
+}
+
 function minTemporal(values) {
   const filtered = uniqueStrings(values);
   return filtered.sort()[0] ?? null;
@@ -191,6 +201,10 @@ export function normalizePaper(rawPaper, {
     venue: compactString(rawPaper?.venue),
     paper_type: compactString(rawPaper?.paper_type) || "paper",
     published_at: compactString(rawPaper?.published_at) || null,
+    publication_date_precision: publicationDatePrecision(
+      rawPaper?.published_at,
+      rawPaper?.publication_date_precision,
+    ),
     issue_date: compactString(rawPaper?.issue_date) || null,
     first_seen_at: compactString(rawPaper?.first_seen_at) || normalizedObservedAt,
     observed_at: normalizedObservedAt,
@@ -269,10 +283,13 @@ function mergeGroup(group) {
   const members = pickMembers(group);
   const best = members[0];
   const pick = (field) => members.map((paper) => paper[field]).find((value) => value !== null && value !== "");
+  const publishedAt = minTemporal(members.map((paper) => paper.published_at));
+  const publishedMember = members.find((paper) => paper.published_at === publishedAt);
   const merged = {
     ...best,
     authors: [...longestArray(members, "authors")],
-    published_at: minTemporal(members.map((paper) => paper.published_at)),
+    published_at: publishedAt,
+    publication_date_precision: publishedMember?.publication_date_precision ?? "unknown",
     issue_date: minTemporal(members.map((paper) => paper.issue_date)),
     first_seen_at: minTemporal(members.map((paper) => paper.first_seen_at)),
     observed_at: maxTemporal(members.map((paper) => paper.observed_at)),

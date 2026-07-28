@@ -65,6 +65,9 @@ export async function enrichPaperWithOpenAlex(paper, {
       ...paper,
       abstract: abstract || paper.abstract,
       published_at: work.publication_date || paper.published_at,
+      publication_date_precision: work.publication_date
+        ? "day"
+        : paper.publication_date_precision,
       pdf_url: paper.pdf_url || pdfUrl,
       pdf_candidates: [...new Set([...(paper.pdf_candidates ?? []), pdfUrl].filter(Boolean))],
       cited_by_count: citedByCount,

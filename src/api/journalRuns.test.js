@@ -4,7 +4,9 @@ import {
   abandonJournalAgentNoteProposal,
   askJournalReadingQuestion,
   commitJournalAgentNoteProposal,
+  commitArchiveBatch,
   createJournalAgentNoteProposal,
+  createJournalReadingConversation,
   commitZoteroProposal,
   createObsidianPreview,
   createProjectStatePreview,
@@ -32,8 +34,12 @@ import {
   mapZoteroProposal,
   mapZoteroTargets,
   pauseJournalPaperTranslation,
+  pinJournalReadingConclusion,
+  promoteJournalReadingConversation,
+  resumeJournalRun,
   restartJournalReadingFromGuide,
   resetJournalPaperReading,
+  retryJournalPaperDocument,
   saveJournalPaperDecisions,
   saveJournalReadingPosition,
   sendJournalReadingChatMessage,
@@ -41,6 +47,8 @@ import {
   startJournalGuides,
   startJournalPaperTranslation,
   startJournalRun,
+  subscribeJournalRun,
+  unpinJournalReadingConclusion,
 } from "./journalRuns.js";
 
 function withFetch(handler, task) {
@@ -54,6 +62,8 @@ function withFetch(handler, task) {
 const runBody = {
   run_id: "journal-run-1",
   project_id: "pi-agent-product",
+  runtime_schema_version: 1,
+  lifecycle: "awaiting_review",
   status: "review_ready",
   phase: "candidate_review",
   created_at: "2026-07-23T07:00:00.000Z",
@@ -111,6 +121,8 @@ test("journal runs keep classic origin and MinerU state visible", () => {
   assert.equal(run.candidates[0].evidenceScope, "全文已解析，尚未完成精读核验");
   assert.equal(run.candidates[0].isDemo, false);
   assert.equal(run.projectId, "pi-agent-product");
+  assert.equal(run.runtimeSchemaVersion, 1);
+  assert.equal(run.lifecycle, "awaiting_review");
   assert.equal(run.createdAt, "2026-07-23T07:00:00.000Z");
   assert.equal(run.phase, "candidate_review");
   assert.equal(run.scanSummary.source_count, 11);
@@ -134,13 +146,19 @@ test("journal run summaries keep the active paper conversation for read-only res
           chat: {
             id: "reading-conversation-1",
             status: "ready",
+            branch_type: "canonical",
+            promotion_status: "canonical",
             turns: [],
           },
           active_conversation_id: "reading-conversation-1",
+          canonical_conversation_id: "reading-conversation-1",
           conversations: [{
             id: "reading-conversation-1",
             title: "主研读",
             turn_count: 0,
+            branch_type: "canonical",
+            promotion_status: "canonical",
+            canonical: true,
             active: true,
           }],
         },
@@ -154,6 +172,8 @@ test("journal run summaries keep the active paper conversation for read-only res
   );
   assert.equal(run.readings.papers["paper-1"].position.blockId, "block-7");
   assert.equal(run.readings.papers["paper-1"].conversations[0].title, "主研读");
+  assert.equal(run.readings.papers["paper-1"].chat.branchType, "canonical");
+  assert.equal(run.readings.papers["paper-1"].conversations[0].canonical, true);
 });
 
 test("start and poll use the local journal endpoints", async () => {
@@ -169,8 +189,138 @@ test("start and poll use the local journal endpoints", async () => {
     await fetchJournalRun("journal-run-1");
   });
   assert.equal(calls[0].url, "/api/v1/journal-runs");
-  assert.equal(JSON.parse(calls[0].options.body).provider_id, "deepseek");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
+    provider_id: "deepseek",
+    model_id: "deepseek-v4-flash",
+  });
   assert.equal(calls[1].url, "/api/v1/journal-runs/journal-run-1");
+});
+
+test("resume and reading branch creation send the versioned JSON mutation envelope", async () => {
+  const calls = [];
+  await withFetch(async (url, options = {}) => {
+    calls.push({ url, options });
+    return new Response(JSON.stringify(
+      url.endsWith("/resume") ? runBody : readingBody,
+    ), {
+      status: url.endsWith("/resume") ? 202 : 201,
+      headers: { "content-type": "application/json" },
+    });
+  }, async () => {
+    await resumeJournalRun("journal-run-1");
+    await createJournalReadingConversation({
+      runId: "journal-run-1",
+      paperId: "paper-1",
+      clientRequestId: "create-reading-conversation-1",
+    });
+  });
+
+  assert.deepEqual(calls.map((call) => ({
+    url: call.url,
+    contentType: call.options.headers["content-type"],
+    body: JSON.parse(call.options.body),
+  })), [{
+    url: "/api/v1/journal-runs/journal-run-1/resume",
+    contentType: "application/json",
+    body: { schema_version: 1 },
+  }, {
+    url: "/api/v1/journal-runs/journal-run-1/papers/paper-1/reading/conversations",
+    contentType: "application/json",
+    body: {
+      schema_version: 1,
+      client_request_id: "create-reading-conversation-1",
+    },
+  }]);
+});
+
+test("generated mutation ids survive an uncertain network failure until a response arrives", async () => {
+  const bodies = [];
+  let attempt = 0;
+  await withFetch(async (_url, options = {}) => {
+    bodies.push(JSON.parse(options.body));
+    attempt += 1;
+    if (attempt === 1) throw new TypeError("fetch failed");
+    return new Response(JSON.stringify(runBody), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }, async () => {
+    await assert.rejects(
+      restartJournalReadingFromGuide({ runId: "journal-run-network-retry" }),
+      /fetch failed/,
+    );
+    await restartJournalReadingFromGuide({
+      runId: "journal-run-network-retry",
+    });
+  });
+
+  assert.equal(typeof bodies[0].client_request_id, "string");
+  assert.equal(
+    bodies[1].client_request_id,
+    bodies[0].client_request_id,
+  );
+});
+
+test("journal run subscriptions resume after the snapshot watermark", () => {
+  class FakeEventSource {
+    constructor(url) {
+      this.url = url;
+      this.listeners = new Map();
+      this.closed = false;
+    }
+
+    addEventListener(type, listener) {
+      this.listeners.set(type, listener);
+    }
+
+    removeEventListener(type) {
+      this.listeners.delete(type);
+    }
+
+    close() {
+      this.closed = true;
+    }
+
+    emit(type, payload) {
+      this.listeners.get(type)?.(payload);
+    }
+  }
+  let source;
+  const runs = [];
+  const unsubscribe = subscribeJournalRun({
+    runId: "journal-run-1",
+    afterSeq: 4,
+    eventSourceFactory: class extends FakeEventSource {
+      constructor(url) {
+        super(url);
+        source = this;
+      }
+    },
+    onRun: (run, metadata) => runs.push({ run, metadata }),
+  });
+  assert.equal(
+    source.url,
+    "/api/v1/journal-runs/journal-run-1/events?after_seq=4",
+  );
+  source.emit("snapshot", {
+    data: JSON.stringify({
+      schema_version: 1,
+      snapshot_watermark: 7,
+      last_seq: 7,
+      run: {
+        ...runBody,
+        snapshot_watermark: 7,
+        last_event_seq: 7,
+      },
+      events: [{ seq: 7, type: "run_ready" }],
+    }),
+  });
+  assert.equal(runs[0].run.lastEventSeq, 7);
+  assert.equal(runs[0].metadata.snapshotWatermark, 7);
+  assert.equal(runs[0].metadata.events[0].seq, 7);
+  unsubscribe();
+  assert.equal(source.closed, true);
 });
 
 test("journal run request errors keep the server message for the inline status", async () => {
@@ -416,7 +566,13 @@ const readingBody = {
     open_questions: [],
   }],
   chat: {
+    id: "reading-conversation-1",
+    title: "主研读",
     status: "ready",
+    branch_type: "canonical",
+    parent_checkpoint: null,
+    promotion_status: "canonical",
+    promoted_at: null,
     turns: [{
       id: "chat-turn-1",
       client_request_id: "client-chat-1",
@@ -475,6 +631,61 @@ const readingBody = {
     }],
     updated_at: "2026-07-23T09:04:00.000Z",
   },
+  active_conversation_id: "reading-conversation-1",
+  canonical_conversation_id: "reading-conversation-1",
+  conversations: [{
+    id: "reading-conversation-1",
+    title: "主研读",
+    turn_count: 1,
+    branch_type: "canonical",
+    parent_checkpoint: null,
+    promotion_status: "canonical",
+    promoted_at: null,
+    canonical: true,
+    active: true,
+    updated_at: "2026-07-23T09:04:00.000Z",
+  }, {
+    id: "reading-conversation-branch",
+    title: "方法复核",
+    turn_count: 2,
+    branch_type: "scratch",
+    parent_checkpoint: {
+      conversation_id: "reading-conversation-1",
+      turn_id: "chat-turn-1",
+      turn_count: 1,
+      checkpoint_hash: "sha256:checkpoint",
+      created_at: "2026-07-23T09:05:00.000Z",
+    },
+    promotion_status: "not_promoted",
+    promoted_at: null,
+    canonical: false,
+    active: false,
+    updated_at: "2026-07-23T09:06:00.000Z",
+  }],
+  pinned_conclusions: [{
+    schema_version: 1,
+    conclusion_id: "pinned-conclusion-1",
+    source_conversation_id: "reading-conversation-1",
+    source_turn_id: "chat-turn-1",
+    source_input_hash: "sha256:chat-input",
+    content: "这是原文中的核心问题。",
+    content_hash: "sha256:conclusion",
+    citations: [{
+      block_id: "block-00000000000000000001",
+      path: ["Introduction"],
+      ordinal: 1,
+      start_offset: 0,
+      end_offset: 8,
+      quote: "Original",
+      source_hash: "sha256:quote",
+      support: "该选文直接提出问题。",
+    }],
+    confirmed_by: "local-user",
+    status: "pinned",
+    pinned_at: "2026-07-23T09:06:00.000Z",
+    unpinned_at: null,
+    updated_at: "2026-07-23T09:06:00.000Z",
+  }],
   agent_actions: {
     schema_version: 1,
     status: "proposal_ready",
@@ -502,6 +713,14 @@ test("paper reading maps stage results, exact block references, and durable ques
   assert.equal(reading.questions[0].clientRequestId, "client-question-1");
   assert.equal(reading.questions[0].answer, "核心矛盾是长期状态与单次执行之间的断裂。");
   assert.equal(reading.chat.status, "ready");
+  assert.equal(reading.chat.branchType, "canonical");
+  assert.equal(reading.canonicalConversationId, "reading-conversation-1");
+  assert.equal(reading.conversations[0].canonical, true);
+  assert.equal(reading.conversations[1].branchType, "scratch");
+  assert.equal(
+    reading.conversations[1].parentCheckpoint.checkpointHash,
+    "sha256:checkpoint",
+  );
   assert.equal(reading.chat.turns[0].reference.blockId, "block-00000000000000000001");
   assert.equal(reading.chat.turns[0].citations[0].support, "该选文直接提出问题。");
   assert.equal(reading.chat.turns[0].providerId, "deepseek");
@@ -511,6 +730,12 @@ test("paper reading maps stage results, exact block references, and durable ques
   assert.equal(reading.chat.turns[0].includeProjectContext, true);
   assert.equal(reading.chat.turns[0].noteAction.proposalId, "agent-note-1");
   assert.equal(reading.chat.turns[0].noteAction.diff.after, "# Paper");
+  assert.equal(reading.pinnedConclusions[0].conclusionId, "pinned-conclusion-1");
+  assert.equal(reading.pinnedConclusions[0].sourceTurnId, "chat-turn-1");
+  assert.equal(
+    reading.pinnedConclusions[0].citations[0].support,
+    "该选文直接提出问题。",
+  );
   assert.equal(reading.agentActions.status, "proposal_ready");
 });
 
@@ -583,6 +808,7 @@ test("reading workflow requests match the server routes and snake-case contracts
       runId: "journal-run-1",
       paperId: "paper-1",
       text: "这部分和我们的工作流有什么关系？",
+      roundId: "orientation",
       reference: {
         documentRevision: "sha256:abc",
         blockId: "block-00000000000000000001",
@@ -603,6 +829,7 @@ test("reading workflow requests match the server routes and snake-case contracts
     });
     await restartJournalReadingFromGuide({
       runId: "journal-run-1",
+      clientRequestId: "restart-reading-1",
     });
   });
 
@@ -636,11 +863,13 @@ test("reading workflow requests match the server routes and snake-case contracts
   assert.deepEqual(JSON.parse(calls[6].options.body), {
     schema_version: 1,
     from_step: "guide",
+    client_request_id: "restart-reading-1",
   });
   assert.deepEqual(JSON.parse(calls[4].options.body), {
     schema_version: 1,
     client_request_id: "client-chat-1",
     text: "这部分和我们的工作流有什么关系？",
+    round_id: "orientation",
     reference: {
       document_revision: "sha256:abc",
       block_id: "block-00000000000000000001",
@@ -700,6 +929,61 @@ test("paper chat client preserves a request-id conflict response", async () => {
       && error.status === 409
       && error.retryable === false
     ),
+  );
+});
+
+test("reading branch promotion and pinned conclusions use explicit durable mutations", async () => {
+  const calls = [];
+  await withFetch(async (url, options = {}) => {
+    calls.push({ url, options });
+    return new Response(JSON.stringify(readingBody), {
+      status: url.endsWith("/pin") ? 201 : 200,
+      headers: { "content-type": "application/json" },
+    });
+  }, async () => {
+    await promoteJournalReadingConversation({
+      runId: "journal-run-1",
+      paperId: "paper-1",
+      conversationId: "reading-conversation-branch",
+      clientRequestId: "promote-request-1",
+      confirmedBy: "local-user",
+    });
+    await pinJournalReadingConclusion({
+      runId: "journal-run-1",
+      paperId: "paper-1",
+      turnId: "chat-turn-1",
+      clientRequestId: "pin-request-1",
+      confirmedBy: "local-user",
+    });
+    await unpinJournalReadingConclusion({
+      runId: "journal-run-1",
+      paperId: "paper-1",
+      conclusionId: "pinned-conclusion-1",
+      clientRequestId: "unpin-request-1",
+      confirmedBy: "local-user",
+    });
+  });
+
+  assert.deepEqual(calls.map((call) => call.url), [
+    "/api/v1/journal-runs/journal-run-1/papers/paper-1/reading/conversations/reading-conversation-branch/promote",
+    "/api/v1/journal-runs/journal-run-1/papers/paper-1/reading/chat/turns/chat-turn-1/pin",
+    "/api/v1/journal-runs/journal-run-1/papers/paper-1/reading/pinned-conclusions/pinned-conclusion-1/unpin",
+  ]);
+  assert.deepEqual(
+    calls.map((call) => JSON.parse(call.options.body)),
+    [{
+      schema_version: 1,
+      client_request_id: "promote-request-1",
+      confirmed_by: "local-user",
+    }, {
+      schema_version: 1,
+      client_request_id: "pin-request-1",
+      confirmed_by: "local-user",
+    }, {
+      schema_version: 1,
+      client_request_id: "unpin-request-1",
+      confirmed_by: "local-user",
+    }],
   );
 });
 
@@ -789,7 +1073,7 @@ test("Obsidian preview stays preview-only and uses no caller-selected path", asy
     schema_version: 1,
     run_id: "journal-run-1",
     status: "preview_ready",
-    write_capability: "preview_only",
+    write_capability: "hash_bound_commit",
     external_write_performed: false,
     target_directory: "/vault/论文精读",
     source_hash: "sha256:source",
@@ -817,7 +1101,7 @@ test("Obsidian preview stays preview-only and uses no caller-selected path", asy
     }],
   };
   const mapped = mapObsidianPreview(body);
-  assert.equal(mapped.writeCapability, "preview_only");
+  assert.equal(mapped.writeCapability, "hash_bound_commit");
   assert.equal(mapped.externalWritePerformed, false);
   assert.equal(mapped.proposals[0].target, "obsidian");
   assert.equal(mapped.proposals[0].markdown, "# Paper\n");
@@ -856,7 +1140,7 @@ test("project-state preview maps the exact append and accepts no caller-selected
     schema_version: 1,
     run_id: "journal-run-1",
     target_type: "project_state",
-    write_capability: "preview_only",
+    write_capability: "hash_bound_commit",
     external_write_performed: false,
     status: "preview_ready",
     source_hash: "sha256:source",
@@ -902,7 +1186,7 @@ test("project-state preview maps the exact append and accepts no caller-selected
   };
 
   const mapped = mapProjectStatePreview(body);
-  assert.equal(mapped.writeCapability, "preview_only");
+  assert.equal(mapped.writeCapability, "hash_bound_commit");
   assert.equal(mapped.externalWritePerformed, false);
   assert.equal(mapped.proposal.target, "project_state");
   assert.equal(mapped.proposal.title, "PRODUCT_MEETING.md");
@@ -1101,28 +1385,23 @@ test("Zotero mappers preserve the exact per-paper approval bindings", () => {
   assert.equal(run.zotero.proposals[0].title, "Classic agent paper");
 });
 
-test("Zotero requests keep preview generation read-only until an explicit hash-bound commit", async () => {
+test("Zotero preview stays read-only and the legacy commit client surfaces the ArchiveBatch migration", async () => {
   const calls = [];
   await withFetch(async (url, options = {}) => {
     calls.push({ url, options });
     let body = zoteroProposalBody;
     if (url === "/api/v1/zotero/targets") body = zoteroTargetBody;
     if (url.endsWith("/zotero/commit")) {
-      body = {
-        ...runBody,
-        status: "committing",
-        zotero: {
-          status: "committing",
-          target: zoteroProposalBody.target,
-          decisions: zoteroProposalBody.decisions,
-          proposal_id: zoteroProposalBody.proposal_id,
-          proposal_hash: zoteroProposalBody.proposal_hash,
-          proposals: zoteroProposalBody.proposals.map((proposal) => ({
-            ...proposal,
-            status: "committing",
-          })),
+      return new Response(JSON.stringify({
+        error: {
+          code: "ZOTERO_COMMIT_DEPRECATED",
+          message: "旧版 Zotero 单独确认入口已停用，请通过联合归档预览确认写入",
+          retryable: false,
         },
-      };
+      }), {
+        status: 410,
+        headers: { "content-type": "application/json" },
+      });
     }
     return new Response(JSON.stringify(body), {
       status: options.method === "POST" ? 202 : 200,
@@ -1136,16 +1415,21 @@ test("Zotero requests keep preview generation read-only until an explicit hash-b
       decisions: { "paper-1": "collect" },
     });
     await fetchZoteroProposal("journal-run-1");
-    const committed = await commitZoteroProposal({
-      runId: "journal-run-1",
-      proposalHash: "sha256:proposal",
-      operations: [{
-        proposalId: "zotero-paper-1-abc",
-        contentHash: "sha256:content",
-        targetVersionOrHash: "sha256:target",
-      }],
-    });
-    assert.equal(committed.status, "committing");
+    await assert.rejects(
+      commitZoteroProposal({
+        runId: "journal-run-1",
+        proposalHash: "sha256:proposal",
+        operations: [{
+          proposalId: "zotero-paper-1-abc",
+          contentHash: "sha256:content",
+          targetVersionOrHash: "sha256:target",
+        }],
+      }),
+      (error) => (
+        error.code === "ZOTERO_COMMIT_DEPRECATED"
+        && error.status === 410
+      ),
+    );
   });
 
   assert.deepEqual(calls.map((call) => call.url), [
@@ -1167,6 +1451,87 @@ test("Zotero requests keep preview generation read-only until an explicit hash-b
       content_hash: "sha256:content",
       target_version_or_hash: "sha256:target",
     }],
+  });
+});
+
+test("ArchiveBatch sends one request with exact bindings for all selected targets", async () => {
+  const calls = [];
+  const committed = await withFetch(async (url, options = {}) => {
+    calls.push({ url, options });
+    return new Response(JSON.stringify({
+      ...runBody,
+      status: "committing",
+      archive_batch: {
+        batch_id: "archive-1",
+        status: "committing",
+        selected_targets: ["obsidian", "zotero", "project_state"],
+      },
+    }), {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  }, () => commitArchiveBatch({
+    runId: "journal-run-1",
+    clientRequestId: "archive-request-1",
+    obsidian: {
+      proposalHash: "sha256:obsidian-proposal",
+      operations: [{
+        proposalId: "obsidian-1",
+        contentHash: "sha256:obsidian-content",
+        targetVersionOrHash: "sha256:obsidian-target",
+      }],
+    },
+    zotero: {
+      proposalHash: "sha256:zotero-proposal",
+      operations: [{
+        proposalId: "zotero-1",
+        contentHash: "sha256:zotero-content",
+        targetVersionOrHash: "sha256:zotero-target",
+      }],
+    },
+    projectState: {
+      proposalHash: "sha256:project-proposal",
+      operation: {
+        proposalId: "project-state-1",
+        contentHash: "sha256:project-content",
+        targetVersionOrHash: "sha256:project-target",
+      },
+    },
+  }));
+
+  assert.equal(committed.archiveBatch.status, "committing");
+  assert.equal(
+    calls[0].url,
+    "/api/v1/journal-runs/journal-run-1/archive/commit",
+  );
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
+    client_request_id: "archive-request-1",
+    obsidian: {
+      proposal_hash: "sha256:obsidian-proposal",
+      operations: [{
+        proposal_id: "obsidian-1",
+        content_hash: "sha256:obsidian-content",
+        target_version_or_hash: "sha256:obsidian-target",
+      }],
+    },
+    zotero: {
+      proposal_hash: "sha256:zotero-proposal",
+      operations: [{
+        proposal_id: "zotero-1",
+        content_hash: "sha256:zotero-content",
+        target_version_or_hash: "sha256:zotero-target",
+      }],
+    },
+    project_state: {
+      proposal_hash: "sha256:project-proposal",
+      operation: {
+        proposal_id: "project-state-1",
+        content_hash: "sha256:project-content",
+        target_version_or_hash: "sha256:project-target",
+      },
+    },
+    simulate_obsidian_failure: false,
   });
 });
 
@@ -1326,6 +1691,43 @@ test("paper documents without a string revision are rejected", () => {
   );
 });
 
+test("one failed paper can retry full-text preparation without re-running ready papers", async () => {
+  const calls = [];
+  const nextRunBody = {
+    ...runBody,
+    status: "review_ready",
+    mineru: {
+      ...runBody.mineru,
+      papers: {
+        ...runBody.mineru.papers,
+        "paper-2": { status: "uploading" },
+      },
+    },
+  };
+  const retried = await withFetch(async (url, options = {}) => {
+    calls.push({ url, options });
+    return new Response(JSON.stringify(nextRunBody), {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  }, () => retryJournalPaperDocument({
+    runId: "journal-run-1",
+    paperId: "paper-2",
+    clientRequestId: "document-retry-1",
+  }));
+
+  assert.equal(retried.id, "journal-run-1");
+  assert.equal(
+    calls[0].url,
+    "/api/v1/journal-runs/journal-run-1/papers/paper-2/document/retry",
+  );
+  assert.equal(calls[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
+    client_request_id: "document-retry-1",
+  });
+});
+
 test("clearing one paper's reading progress posts the reset endpoint", async () => {
   const calls = [];
   const run = await withFetch(async (url, options = {}) => {
@@ -1337,6 +1739,7 @@ test("clearing one paper's reading progress posts the reset endpoint", async () 
   }, () => resetJournalPaperReading({
     runId: "journal-run-1",
     paperId: "paper-1",
+    clientRequestId: "reset-reading-1",
   }));
 
   assert.equal(run.id, "journal-run-1");
@@ -1345,5 +1748,8 @@ test("clearing one paper's reading progress posts the reset endpoint", async () 
     calls[0].url,
     "/api/v1/journal-runs/journal-run-1/papers/paper-1/reading/reset",
   );
-  assert.deepEqual(JSON.parse(calls[0].options.body), { schema_version: 1 });
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
+    client_request_id: "reset-reading-1",
+  });
 });

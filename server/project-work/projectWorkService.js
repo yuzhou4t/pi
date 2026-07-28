@@ -7,37 +7,58 @@ import {
   realpath,
   rm,
   rmdir,
+  writeFile,
 } from "node:fs/promises";
 import path from "node:path";
 import { createMineruCloudAdapter } from "../mineruCloud.js";
+import { migrateRuntimeEnvelope } from "../runtimeSchema.js";
 import {
   createConversationDocumentService,
   hasActiveConversationDocuments,
   publicConversationDocument,
 } from "./conversationDocuments.js";
+import {
+  AUTO_REVIEW_POLICY_VERSION,
+  isExecutionPolicyMode,
+  normalizeExecutionPolicy,
+  reviewAutoChangeSet,
+  reviewAutoPreview,
+  reviewAutoVerification,
+} from "./autoReviewPolicy.js";
 import { createConversationStore } from "./conversationStore.js";
 import {
   ProjectWorkError,
   projectWorkError,
   safeProjectWorkError,
 } from "./errors.js";
+import { inspectGitEvidence } from "./gitEvidence.js";
 import {
   createPiSessionFactory,
   PROJECT_WORK_DEFAULT_TOOL_NAMES,
+  PROJECT_WORK_PREVIEW_TOOL_NAME,
+  PROJECT_WORK_REPAIR_TOOL_NAMES,
   readProjectWorkOverlayTextFile,
 } from "./piSessionHost.js";
+import { createProjectPreviewSupervisor } from "./previewSupervisor.js";
 import { resolveProjectWorkTurn } from "./projectWorkWorkflows.js";
 import { createMacOSProjectPicker } from "./macosProjectPicker.js";
 import { normalizeProjectWorkImages } from "./projectWorkImages.js";
 import { createProjectRegistry, publicProject } from "./projectRegistry.js";
+import { normalizeTurnUsage } from "./turnEvidence.js";
 import { createVerificationRunner } from "./verificationRunner.js";
 import {
+  applyBoundFileTransitions,
   applySelectedChangeSet,
   createFilteredProjectSnapshot,
   getProjectFileTree,
+  getProjectOverlayFileTree,
   normalizeProjectPath,
+  readBoundFileState,
+  readProjectImageFile,
+  readProjectOverlayImageFile,
   readProjectTextFile,
   recomputeChangeSet,
+  sha256,
 } from "./workspace.js";
 
 const SELECTION_TTL_MS = 10 * 60 * 1_000;
@@ -69,7 +90,76 @@ const COMPACTION_REASONS = new Set([
   "threshold",
   "overflow",
 ]);
+const FOLLOW_UP_STATUSES = new Set([
+  "queued",
+  "delivered",
+  "cancelled",
+  "failed",
+]);
+const ASK_USER_REQUEST_STATUSES = new Set([
+  "pending",
+  "answered",
+  "cancelled",
+]);
+const ASK_USER_QUESTION_KINDS = new Set([
+  "single_choice",
+  "multiple_choice",
+  "text",
+]);
+const APPLY_JOURNAL_STATUSES = new Set([
+  "prepared",
+  "applied",
+  "rolled_back",
+  "recovery_blocked",
+  "undone",
+]);
+const APPLY_UNDO_STATUSES = new Set([
+  "unavailable",
+  "available",
+  "used",
+  "blocked",
+]);
+const CONVERSATION_OPERATION_STATUSES = new Set([
+  "running",
+  "completed",
+  "failed",
+  "interrupted",
+]);
+const CONVERSATION_OPERATION_TYPES = new Set([
+  "retry_last_turn",
+  "settlement",
+  "verification_repair",
+]);
+const MAX_VERIFICATION_REPAIR_ATTEMPTS = 2;
+const PREVIEW_RUNTIMES = new Set([
+  "python_uvicorn",
+  "vite",
+  "static",
+]);
+const PREVIEW_REQUEST_FIELDS = new Set([
+  "runtime",
+  "cwd",
+  "app",
+  "route",
+  "title",
+]);
 const CLIENT_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
+const STRUCTURED_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/;
+const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
+const CONTROLLED_PREVIEW_GUIDANCE = [
+  "Only when the user explicitly asks to start or open a local web preview, use request_preview with one exact server-controlled recipe.",
+  "Use python_uvicorn with a project-relative cwd and an import target such as app.main:app; use vite only for the project's already-installed Vite; use static only for files served by Pi Agent's bundled static server.",
+  "Always provide the exact project-relative cwd and loopback route. request_preview accepts no custom command, arguments, host, port, environment, install step, inline code, network action, reload mode, or watcher.",
+  "Do not substitute request_verification and do not claim the preview opened until the app reports that result.",
+].join(" ");
+const AUTO_PREVIEW_GUIDANCE = [
+  "This bound-project turn runs under the user's auto-review policy.",
+  "A registered preview is reviewed only after this turn settles and starts automatically only if the normalized recipe remains safe.",
+].join(" ");
+const MANUAL_PREVIEW_GUIDANCE = [
+  "This bound-project turn uses manual review.",
+  "A registered preview remains stopped until the user confirms the exact preview id and request hash in the app. The request itself is not approval.",
+].join(" ");
 
 function nullableNonNegativeNumber(value) {
   if (value === null || value === undefined) return null;
@@ -119,6 +209,7 @@ function defaultCompactionState(autoEnabled = true) {
     estimatedTokensAfter: null,
     willRetry: false,
     completedAt: null,
+    resumeStatus: null,
   };
 }
 
@@ -137,6 +228,351 @@ function normalizedCompactionState(value, {
     completedAt: typeof value?.completedAt === "string"
       ? value.completedAt
       : null,
+    resumeStatus: typeof value?.resumeStatus === "string"
+      ? value.resumeStatus
+      : null,
+  };
+}
+
+function normalizedConversationMessages(conversation) {
+  let nextMessageSeq = 0;
+  let nextTurnSeq = 0;
+  let activeTurnId = null;
+  const turnSequences = new Map();
+  const assistantAttempts = new Map();
+  return (conversation.messages ?? []).map((message) => {
+    const persistedMessageSeq = Number.isSafeInteger(message?.messageSeq)
+      && message.messageSeq > nextMessageSeq
+      ? message.messageSeq
+      : null;
+    const messageSeq = persistedMessageSeq ?? nextMessageSeq + 1;
+    nextMessageSeq = messageSeq;
+
+    let turnId = compactText(message?.turnId, 180) || null;
+    if (!turnId && message?.role === "user") {
+      turnId = compactText(message?.id, 180) || `turn-${messageSeq}`;
+    }
+    turnId ||= activeTurnId;
+    if (!turnId) turnId = `turn-${messageSeq}`;
+    if (message?.role === "user") activeTurnId = turnId;
+
+    let turnSeq = turnSequences.get(turnId);
+    if (!turnSeq) {
+      const persistedTurnSeq = Number.isSafeInteger(message?.turnSeq)
+        && message.turnSeq > nextTurnSeq
+        ? message.turnSeq
+        : null;
+      turnSeq = persistedTurnSeq ?? nextTurnSeq + 1;
+      nextTurnSeq = turnSeq;
+      turnSequences.set(turnId, turnSeq);
+    }
+
+    let attempt = null;
+    if (message?.role === "assistant") {
+      const derivedAttempt = (assistantAttempts.get(turnId) ?? 0) + 1;
+      attempt = Number.isSafeInteger(message?.attempt) && message.attempt > 0
+        ? message.attempt
+        : derivedAttempt;
+      assistantAttempts.set(turnId, Math.max(derivedAttempt, attempt));
+    }
+    return {
+      ...message,
+      messageSeq,
+      turnId,
+      turnSeq,
+      ...(attempt === null ? {} : { attempt }),
+    };
+  });
+}
+
+function nextMessageSequence(conversation) {
+  return (normalizedConversationMessages(conversation).at(-1)?.messageSeq ?? 0) + 1;
+}
+
+function nextTurnSequence(conversation) {
+  return normalizedConversationMessages(conversation)
+    .reduce((maximum, message) => Math.max(maximum, message.turnSeq ?? 0), 0) + 1;
+}
+
+function normalizedReadState(conversation, messages = normalizedConversationMessages(
+  conversation,
+)) {
+  const latestMessageSeq = messages.at(-1)?.messageSeq ?? 0;
+  const persistedWatermark = Number.isSafeInteger(
+    conversation.readState?.lastReadMessageSeq,
+  ) && conversation.readState.lastReadMessageSeq >= 0
+    ? conversation.readState.lastReadMessageSeq
+    : 0;
+  const lastReadMessageSeq = Math.min(persistedWatermark, latestMessageSeq);
+  const isUnreadAssistant = (message) => (
+    message.role === "assistant"
+    && message.isFinal !== false
+    && ["completed", "failed"].includes(message.status)
+    && message.messageSeq > lastReadMessageSeq
+  );
+  const latestAssistantMessageSeq = messages
+    .filter((message) => (
+      message.role === "assistant"
+      && message.isFinal !== false
+      && ["completed", "failed"].includes(message.status)
+    ))
+    .at(-1)?.messageSeq ?? 0;
+  return {
+    lastReadMessageSeq,
+    latestMessageSeq,
+    latestAssistantMessageSeq,
+    unreadCount: messages.filter(isUnreadAssistant).length,
+    readAt: typeof conversation.readState?.readAt === "string"
+      ? conversation.readState.readAt
+      : null,
+  };
+}
+
+function publicTurnEvidence(evidence) {
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+    return null;
+  }
+  const usage = normalizeTurnUsage(evidence.usage);
+  const hasContext = evidence.contextUsage
+    && typeof evidence.contextUsage === "object"
+    && !Array.isArray(evidence.contextUsage);
+  const providerId = compactText(evidence.providerId, 120) || null;
+  const modelId = compactText(evidence.modelId, 200) || null;
+  const thinkingLevel = compactText(evidence.thinkingLevel, 80) || null;
+  if (!providerId && !modelId && !thinkingLevel && !usage && !hasContext) {
+    return null;
+  }
+  return {
+    schemaVersion: 1,
+    providerId,
+    modelId,
+    thinkingLevel,
+    usage,
+    contextUsage: hasContext
+      ? normalizedContextUsage(evidence.contextUsage)
+      : null,
+    capturedAt: typeof evidence.capturedAt === "string"
+      ? evidence.capturedAt
+      : null,
+  };
+}
+
+function publicConversationMessage(message) {
+  return {
+    id: message.id,
+    messageSeq: message.messageSeq,
+    turnId: message.turnId,
+    turnSeq: message.turnSeq,
+    attempt: message.role === "assistant" ? message.attempt : null,
+    retryOperationId: compactText(message.retryOperationId, 180) || null,
+    verificationRepairOperationId: compactText(
+      message.verificationRepairOperationId,
+      180,
+    ) || null,
+    repairAttempt: message.role === "assistant"
+      && Number.isSafeInteger(message.repairAttempt)
+      && message.repairAttempt > 0
+      ? message.repairAttempt
+      : null,
+    role: message.role,
+    text: message.text,
+    images: Array.isArray(message.images)
+      ? message.images.map((image) => ({
+          fileName: compactText(image?.fileName, 160, "图片"),
+          mimeType: compactText(image?.mimeType, 80),
+          byteLength: Number.isSafeInteger(image?.byteLength)
+            ? image.byteLength
+            : 0,
+        }))
+      : [],
+    status: message.status,
+    isFinal: message.role === "assistant" ? message.isFinal !== false : null,
+    providerId: message.providerId ?? null,
+    modelId: message.modelId ?? null,
+    thinkingLevel: message.thinkingLevel ?? null,
+    workflowId: message.workflowId ?? null,
+    capabilities: Array.isArray(message.capabilities)
+      ? [...message.capabilities]
+      : [],
+    turnEvidence: publicTurnEvidence(message.turnEvidence),
+    createdAt: message.createdAt,
+  };
+}
+
+function publicConversationOperation(operation) {
+  if (!operation || typeof operation !== "object" || Array.isArray(operation)) {
+    return null;
+  }
+  return {
+    id: compactText(operation.id, 180) || null,
+    clientRequestId: compactText(operation.clientRequestId, 180) || null,
+    type: CONVERSATION_OPERATION_TYPES.has(operation.type)
+      ? operation.type
+      : "settlement",
+    status: CONVERSATION_OPERATION_STATUSES.has(operation.status)
+      ? operation.status
+      : "failed",
+    turnId: compactText(operation.turnId, 180) || null,
+    targetAssistantMessageId: compactText(
+      operation.targetAssistantMessageId,
+      180,
+    ) || null,
+    resultAssistantMessageId: compactText(
+      operation.resultAssistantMessageId,
+      180,
+    ) || null,
+    phase: compactText(operation.phase, 80) || null,
+    commandId: compactText(operation.commandId, 180) || null,
+    commandBindingHash: SHA256_PATTERN.test(
+      String(operation.commandBindingHash ?? ""),
+    )
+      ? operation.commandBindingHash
+      : null,
+    repairAttemptCount: Number.isSafeInteger(operation.repairAttemptCount)
+      && operation.repairAttemptCount >= 0
+      ? operation.repairAttemptCount
+      : 0,
+    maxRepairAttempts: Number.isSafeInteger(operation.maxRepairAttempts)
+      && operation.maxRepairAttempts > 0
+      ? operation.maxRepairAttempts
+      : null,
+    validationAttemptIds: Array.isArray(operation.validationAttemptIds)
+      ? operation.validationAttemptIds
+        .map((id) => compactText(id, 180))
+        .filter(Boolean)
+      : [],
+    lastFailedAttemptId: compactText(
+      operation.lastFailedAttemptId,
+      180,
+    ) || null,
+    resumeStatus: compactText(operation.resumeStatus, 80, "idle"),
+    startedAt: typeof operation.startedAt === "string"
+      ? operation.startedAt
+      : null,
+    completedAt: typeof operation.completedAt === "string"
+      ? operation.completedAt
+      : null,
+    error: operation.error && typeof operation.error === "object"
+      ? {
+          code: compactText(
+            operation.error.code,
+            120,
+            "PROJECT_WORK_OPERATION_FAILED",
+          ),
+          message: compactText(
+            operation.error.message,
+            300,
+            "会话操作未完成",
+          ),
+          retryable: operation.error.retryable === true,
+        }
+      : null,
+  };
+}
+
+function conversationTurns(conversation) {
+  const operations = (conversation.operations ?? [])
+    .map(publicConversationOperation)
+    .filter(Boolean);
+  const grouped = new Map();
+  for (const message of normalizedConversationMessages(conversation)) {
+    const turn = grouped.get(message.turnId) ?? {
+      id: message.turnId,
+      turnSeq: message.turnSeq,
+      messages: [],
+    };
+    turn.messages.push(publicConversationMessage(message));
+    grouped.set(message.turnId, turn);
+  }
+  return [...grouped.values()]
+    .map((turn) => {
+      const assistants = turn.messages.filter(
+        (message) => message.role === "assistant",
+      );
+      const latestAssistant = assistants.at(-1) ?? null;
+      const finalAssistant = assistants
+        .filter((message) => message.isFinal !== false)
+        .at(-1) ?? latestAssistant;
+      const user = turn.messages.find((message) => message.role === "user")
+        ?? null;
+      const turnOperations = operations.filter(
+        (operation) => operation.turnId === turn.id,
+      );
+      return {
+        id: turn.id,
+        turnSeq: turn.turnSeq,
+        status: finalAssistant?.status
+          ?? user?.status
+          ?? "accepted",
+        messages: turn.messages,
+        assistantAttemptCount: new Set(
+          assistants.map((message) => message.attempt ?? 1),
+        ).size,
+        latestAssistantMessageId: latestAssistant?.id ?? null,
+        turnEvidence: finalAssistant?.turnEvidence ?? null,
+        operations: turnOperations,
+        createdAt: user?.createdAt ?? turn.messages[0]?.createdAt ?? null,
+        updatedAt: turn.messages.at(-1)?.createdAt ?? null,
+      };
+    })
+    .sort((left, right) => left.turnSeq - right.turnSeq);
+}
+
+function publicFollowUpItem(item) {
+  return {
+    id: compactText(item?.id, 180) || null,
+    messageId: compactText(item?.messageId, 180) || null,
+    text: String(item?.text ?? "").slice(0, 32_000),
+    status: FOLLOW_UP_STATUSES.has(item?.status) ? item.status : "failed",
+    createdAt: typeof item?.createdAt === "string" ? item.createdAt : null,
+    deliveredAt: typeof item?.deliveredAt === "string"
+      ? item.deliveredAt
+      : null,
+    cancelledAt: typeof item?.cancelledAt === "string"
+      ? item.cancelledAt
+      : null,
+    failedAt: typeof item?.failedAt === "string" ? item.failedAt : null,
+  };
+}
+
+function publicAskUserRequest(request) {
+  return {
+    id: compactText(request?.id, 180) || null,
+    status: ASK_USER_REQUEST_STATUSES.has(request?.status)
+      ? request.status
+      : "cancelled",
+    questions: Array.isArray(request?.questions)
+      ? request.questions.map((question) => ({
+          id: compactText(question?.id, 80) || null,
+          label: compactText(question?.label, 80),
+          prompt: compactText(question?.prompt, 500),
+          kind: ASK_USER_QUESTION_KINDS.has(question?.kind)
+            ? question.kind
+            : "text",
+          required: question?.required !== false,
+          options: Array.isArray(question?.options)
+            ? question.options.map((option) => ({
+                id: compactText(option?.id, 80) || null,
+                label: compactText(option?.label, 120),
+                description: compactText(option?.description, 240),
+              }))
+            : [],
+        }))
+      : [],
+    answers: Array.isArray(request?.answers)
+      ? structuredClone(request.answers)
+      : [],
+    source: request?.source === "agent_tool"
+      ? "agent_tool"
+      : "project_api",
+    resumeStatus: compactText(request?.resumeStatus, 80, "idle"),
+    createdAt: typeof request?.createdAt === "string" ? request.createdAt : null,
+    answeredAt: typeof request?.answeredAt === "string"
+      ? request.answeredAt
+      : null,
+    cancelledAt: typeof request?.cancelledAt === "string"
+      ? request.cancelledAt
+      : null,
   };
 }
 
@@ -146,6 +582,187 @@ function compactText(value, maxLength, fallback = "") {
     .trim()
     .replaceAll(/\s+/g, " ");
   return normalized.slice(0, maxLength) || fallback;
+}
+
+function structuredId(value, label) {
+  const id = String(value ?? "").trim();
+  if (!STRUCTURED_ID_PATTERN.test(id)) {
+    throw projectWorkError(
+      "PROJECT_WORK_ASK_USER_INVALID",
+      `${label}标识无效`,
+      400,
+    );
+  }
+  return id;
+}
+
+function normalizeAskUserQuestions(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 8) {
+    throw projectWorkError(
+      "PROJECT_WORK_ASK_USER_INVALID",
+      "问题请求必须包含 1 到 8 个问题",
+      400,
+    );
+  }
+  const questionIds = new Set();
+  return value.map((question, questionIndex) => {
+    const id = structuredId(
+      question?.id ?? `question-${questionIndex + 1}`,
+      "问题",
+    );
+    if (questionIds.has(id)) {
+      throw projectWorkError(
+        "PROJECT_WORK_ASK_USER_INVALID",
+        "问题标识不能重复",
+        400,
+      );
+    }
+    questionIds.add(id);
+    const prompt = compactText(question?.prompt, 500);
+    if (!prompt) {
+      throw projectWorkError(
+        "PROJECT_WORK_ASK_USER_INVALID",
+        "每个问题都必须包含提示文字",
+        400,
+      );
+    }
+    const kind = ASK_USER_QUESTION_KINDS.has(question?.kind)
+      ? question.kind
+      : "text";
+    const rawOptions = Array.isArray(question?.options) ? question.options : [];
+    if (
+      kind !== "text"
+      && (rawOptions.length < 2 || rawOptions.length > 12)
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_ASK_USER_INVALID",
+        "选择题必须包含 2 到 12 个选项",
+        400,
+      );
+    }
+    if (kind === "text" && rawOptions.length > 0) {
+      throw projectWorkError(
+        "PROJECT_WORK_ASK_USER_INVALID",
+        "文本问题不能包含选项",
+        400,
+      );
+    }
+    const optionIds = new Set();
+    const options = rawOptions.map((option, optionIndex) => {
+      const optionId = structuredId(
+        option?.id ?? `option-${optionIndex + 1}`,
+        "选项",
+      );
+      const label = compactText(option?.label, 120);
+      if (!label || optionIds.has(optionId)) {
+        throw projectWorkError(
+          "PROJECT_WORK_ASK_USER_INVALID",
+          "选项必须有不重复的标识和显示文字",
+          400,
+        );
+      }
+      optionIds.add(optionId);
+      return {
+        id: optionId,
+        label,
+        description: compactText(option?.description, 240),
+      };
+    });
+    return {
+      id,
+      label: compactText(question?.label, 80),
+      prompt,
+      kind,
+      required: question?.required !== false,
+      options,
+    };
+  });
+}
+
+function normalizeAskUserAnswers(request, value) {
+  if (!Array.isArray(value)) {
+    throw projectWorkError(
+      "PROJECT_WORK_ASK_USER_ANSWER_INVALID",
+      "问题回答必须是列表",
+      400,
+    );
+  }
+  const questions = new Map(
+    (request.questions ?? []).map((question) => [question.id, question]),
+  );
+  const seen = new Set();
+  const answers = value.map((answer) => {
+    const questionId = structuredId(answer?.questionId, "问题");
+    const question = questions.get(questionId);
+    if (!question || seen.has(questionId)) {
+      throw projectWorkError(
+        "PROJECT_WORK_ASK_USER_ANSWER_INVALID",
+        "问题回答包含未知或重复的问题",
+        400,
+      );
+    }
+    seen.add(questionId);
+    if (question.kind === "multiple_choice") {
+      if (!Array.isArray(answer?.value)) {
+        throw projectWorkError(
+          "PROJECT_WORK_ASK_USER_ANSWER_INVALID",
+          "多选题回答必须是选项列表",
+          400,
+        );
+      }
+      const values = [...new Set(answer.value.map((item) => String(item).trim()))];
+      const optionIds = new Set(question.options.map((option) => option.id));
+      if (
+        values.some((item) => !optionIds.has(item))
+        || (question.required && values.length === 0)
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_ASK_USER_ANSWER_INVALID",
+          "多选题回答包含无效选项",
+          400,
+        );
+      }
+      return { questionId, value: values };
+    }
+    const answerValue = String(answer?.value ?? "").trim();
+    if (answerValue.length > 4_000) {
+      throw projectWorkError(
+        "PROJECT_WORK_ASK_USER_ANSWER_INVALID",
+        "单项回答不能超过 4000 个字符",
+        400,
+      );
+    }
+    if (question.required && !answerValue) {
+      throw projectWorkError(
+        "PROJECT_WORK_ASK_USER_ANSWER_INVALID",
+        "必答问题不能为空",
+        400,
+      );
+    }
+    if (
+      question.kind === "single_choice"
+      && answerValue
+      && !question.options.some((option) => option.id === answerValue)
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_ASK_USER_ANSWER_INVALID",
+        "单选题回答包含无效选项",
+        400,
+      );
+    }
+    return { questionId, value: answerValue };
+  });
+  const missingRequired = (request.questions ?? []).some((question) => (
+    question.required !== false && !seen.has(question.id)
+  ));
+  if (missingRequired) {
+    throw projectWorkError(
+      "PROJECT_WORK_ASK_USER_ANSWER_INVALID",
+      "请回答所有必答问题",
+      400,
+    );
+  }
+  return answers;
 }
 
 function normalizeClientRequestId(value, idFactory) {
@@ -244,9 +861,124 @@ function conversationWorkspaceKind(conversation) {
   );
 }
 
+function normalizedWorkspaceRecord(conversation, at = null) {
+  const conversationKind = conversationWorkspaceKind(conversation);
+  const kind = conversationKind === "scratch" ? "scratch" : "sparse_overlay";
+  const defaults = {
+    schemaVersion: 1,
+    id: `workspace-${conversation.id}`,
+    kind,
+    isolation: kind === "scratch" ? "private_scratch" : "review_overlay",
+    recovery: "apply_journal_v1",
+    recoverableIsolation: kind === "scratch",
+    automaticApplyAllowed: kind === "scratch",
+    status: "ready",
+    rootLabel: kind === "scratch"
+      ? STANDALONE_ROOT_LABEL
+      : compactText(conversation.rootLabel, 160) || null,
+    revision: 1,
+    createdAt: conversation.createdAt ?? at,
+    updatedAt: conversation.createdAt ?? at,
+  };
+  const source = conversation.workspace;
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return defaults;
+  }
+  const sourceMatchesKind = source.kind === kind;
+  return {
+    ...defaults,
+    recoverableIsolation: sourceMatchesKind
+      && source.recoverableIsolation === true,
+    automaticApplyAllowed: sourceMatchesKind
+      && source.recoverableIsolation === true
+      && source.automaticApplyAllowed === true,
+    status: ["ready", "recovering", "recovery_blocked"].includes(source.status)
+      ? source.status
+      : "ready",
+    revision: Number.isSafeInteger(source.revision) && source.revision > 0
+      ? source.revision
+      : 1,
+    createdAt: typeof source.createdAt === "string"
+      ? source.createdAt
+      : defaults.createdAt,
+    updatedAt: typeof source.updatedAt === "string"
+      ? source.updatedAt
+      : defaults.updatedAt,
+  };
+}
+
+function publicWorkspaceRecord(conversation) {
+  return structuredClone(normalizedWorkspaceRecord(conversation));
+}
+
+function publicApplyJournalRecord(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    return null;
+  }
+  return {
+    schemaVersion: 1,
+    id: compactText(record.id, 180) || null,
+    status: APPLY_JOURNAL_STATUSES.has(record.status)
+      ? record.status
+      : "recovery_blocked",
+    changeSetId: compactText(record.changeSetId, 180) || null,
+    changeSetHash: compactText(record.changeSetHash, 180) || null,
+    files: Array.isArray(record.files)
+      ? record.files.map((file) => ({
+          fileId: compactText(file?.fileId, 180) || null,
+          path: normalizeProjectPath(file?.path),
+          baseHash: typeof file?.baseHash === "string" ? file.baseHash : null,
+          afterHash: typeof file?.afterHash === "string" ? file.afterHash : null,
+        }))
+      : [],
+    createdAt: typeof record.createdAt === "string" ? record.createdAt : null,
+    appliedAt: typeof record.appliedAt === "string" ? record.appliedAt : null,
+    finalizedAt: typeof record.finalizedAt === "string"
+      ? record.finalizedAt
+      : null,
+    recoveredAt: typeof record.recoveredAt === "string"
+      ? record.recoveredAt
+      : null,
+    undoneAt: typeof record.undoneAt === "string" ? record.undoneAt : null,
+    error: record.error && typeof record.error === "object"
+      ? {
+          code: compactText(
+            record.error.code,
+            120,
+            "PROJECT_WORK_APPLY_RECOVERY_BLOCKED",
+          ),
+          message: compactText(
+            record.error.message,
+            300,
+            "应用记录需要人工检查",
+          ),
+        }
+      : null,
+    undo: {
+      status: APPLY_UNDO_STATUSES.has(record.undo?.status)
+        ? record.undo.status
+        : "unavailable",
+      hash: typeof record.undo?.hash === "string" ? record.undo.hash : null,
+      usedAt: typeof record.undo?.usedAt === "string"
+        ? record.undo.usedAt
+        : null,
+    },
+  };
+}
+
 function publicConversationSummary(conversation) {
   const workspaceKind = conversationWorkspaceKind(conversation);
+  const messages = normalizedConversationMessages(conversation);
+  const readState = normalizedReadState(conversation, messages);
   return {
+    ...migrateRuntimeEnvelope(conversation, {
+      domain: "project_work",
+      pendingQuestion: conversation.status === "awaiting_user",
+      pendingReview: conversation.status === "awaiting_confirmation",
+      verifying: conversation.status === "verifying",
+      recovering: conversation.status === "recovering",
+      stopped: ["aborted", "stopped", "error"].includes(conversation.status),
+    }),
     id: conversation.id,
     projectId: conversation.projectId,
     workspaceKind,
@@ -259,47 +991,106 @@ function publicConversationSummary(conversation) {
     providerId: conversation.providerId ?? null,
     modelId: conversation.modelId,
     thinkingLevel: conversation.thinkingLevel,
+    executionPolicy: normalizeExecutionPolicy(conversation.executionPolicy),
     pendingChangeFileCount: (
       conversation.activeChangeSet?.status === "ready"
       && Array.isArray(conversation.activeChangeSet.files)
     )
       ? conversation.activeChangeSet.files.length
       : 0,
+    unreadCount: readState.unreadCount,
+    latestMessageSeq: readState.latestMessageSeq,
+    lastReadMessageSeq: readState.lastReadMessageSeq,
     lastEventSeq: conversation.lastEventSeq ?? 0,
     createdAt: conversation.createdAt,
     updatedAt: conversation.updatedAt,
   };
 }
 
-function publicConversationState(conversation, lastEventSeq) {
+function publicPreviewState(preview) {
+  if (!preview || typeof preview !== "object" || Array.isArray(preview)) {
+    return null;
+  }
+  let recipe = null;
+  try {
+    recipe = previewRecipeSummary(preview.recipe ?? preview);
+  } catch {
+    // Persisted legacy or malformed previews remain visible without executable data.
+  }
+  const executionPolicyMode = preview.executionPolicyMode === "auto_review"
+    ? "auto_review"
+    : "manual_review";
+  return {
+    id: compactText(preview.id, 180) || null,
+    requestId: compactText(preview.requestId, 180) || null,
+    requestHash: SHA256_PATTERN.test(String(preview.requestHash ?? ""))
+      ? preview.requestHash
+      : null,
+    executionPolicyMode,
+    confirmationRequired: (
+      executionPolicyMode === "manual_review"
+      && preview.status === "requested"
+    ),
+    status: [
+      "requested",
+      "starting",
+      "ready",
+      "failed",
+      "blocked",
+      "stopped",
+    ].includes(preview.status)
+      ? preview.status
+      : "failed",
+    recipe,
+    url: typeof preview.url === "string"
+      && /^http:\/\/127\.0\.0\.1:\d{4,5}\//.test(preview.url)
+      ? preview.url
+      : null,
+    title: compactText(preview.title, 120, "项目网页预览"),
+    confirmedAt: typeof preview.confirmedAt === "string"
+      ? preview.confirmedAt
+      : null,
+    startedAt: typeof preview.startedAt === "string" ? preview.startedAt : null,
+    openedAt: typeof preview.openedAt === "string" ? preview.openedAt : null,
+    completedAt: typeof preview.completedAt === "string"
+      ? preview.completedAt
+      : null,
+    error: preview.error && typeof preview.error === "object"
+      ? {
+          code: compactText(preview.error.code, 120, "PROJECT_WORK_PREVIEW_FAILED"),
+          message: compactText(preview.error.message, 300, "本机预览没有成功启动"),
+        }
+      : null,
+  };
+}
+
+function publicConversationState(conversation, lastEventSeq, {
+  turnLimit = 20,
+} = {}) {
+  const allMessages = normalizedConversationMessages(conversation);
+  const turnSequences = [...new Set(
+    allMessages
+      .map((message) => message.turnSeq)
+      .filter((value) => Number.isSafeInteger(value) && value > 0),
+  )].sort((left, right) => left - right);
+  const normalizedTurnLimit = Number.isSafeInteger(turnLimit)
+    ? Math.min(Math.max(turnLimit, 1), 100)
+    : 20;
+  const visibleTurnSequences = turnSequences.slice(-normalizedTurnLimit);
+  const firstVisibleTurnSeq = visibleTurnSequences[0] ?? null;
+  const messages = firstVisibleTurnSeq === null
+    ? allMessages
+    : allMessages.filter((message) => message.turnSeq >= firstVisibleTurnSeq);
+  const hasMoreTurns = turnSequences.length > visibleTurnSequences.length;
   return {
     ...publicConversationSummary({
       ...conversation,
       lastEventSeq,
     }),
-    messages: (conversation.messages ?? []).map((message) => ({
-      id: message.id,
-      role: message.role,
-      text: message.text,
-      images: Array.isArray(message.images)
-        ? message.images.map((image) => ({
-            fileName: compactText(image?.fileName, 160, "图片"),
-            mimeType: compactText(image?.mimeType, 80),
-            byteLength: Number.isSafeInteger(image?.byteLength)
-              ? image.byteLength
-              : 0,
-          }))
-        : [],
-      status: message.status,
-      providerId: message.providerId ?? null,
-      modelId: message.modelId ?? null,
-      thinkingLevel: message.thinkingLevel ?? null,
-      workflowId: message.workflowId ?? null,
-      capabilities: Array.isArray(message.capabilities)
-        ? [...message.capabilities]
-        : [],
-      createdAt: message.createdAt,
-    })),
+    messages: messages.map(publicConversationMessage),
+    readState: normalizedReadState(conversation, allMessages),
+    hasMoreTurns,
+    nextBeforeTurnSeq: hasMoreTurns ? firstVisibleTurnSeq : null,
     plan: conversation.plan ? structuredClone(conversation.plan) : null,
     activeChangeSet: conversation.activeChangeSet
       ? structuredClone(conversation.activeChangeSet)
@@ -310,10 +1101,21 @@ function publicConversationState(conversation, lastEventSeq) {
     workspaceSnapshot: conversation.workspaceSnapshot
       ? structuredClone(conversation.workspaceSnapshot)
       : null,
+    workspace: publicWorkspaceRecord(conversation),
+    applyJournal: (conversation.applyJournal ?? [])
+      .map(publicApplyJournalRecord)
+      .filter(Boolean),
     contextUsage: normalizedContextUsage(conversation.contextUsage),
     compaction: normalizedCompactionState(conversation.compaction),
     documents: (conversation.documents ?? [])
       .map(publicConversationDocument)
+      .filter(Boolean),
+    preview: publicPreviewState(conversation.preview),
+    followUpQueue: (conversation.followUpQueue ?? []).map(publicFollowUpItem),
+    askUserRequests: (conversation.askUserRequests ?? [])
+      .map(publicAskUserRequest),
+    operations: (conversation.operations ?? [])
+      .map(publicConversationOperation)
       .filter(Boolean),
     lastError: conversation.lastError ? structuredClone(conversation.lastError) : null,
   };
@@ -524,6 +1326,176 @@ function normalizeVerificationRequest(request) {
   };
 }
 
+function verificationBindingHash({ command, resolvedScript }) {
+  return sha256({
+    schemaVersion: 1,
+    command: {
+      file: command?.file ?? null,
+      args: Array.isArray(command?.args) ? command.args : [],
+      cwd: command?.cwd ?? "",
+    },
+    resolvedScript: resolvedScript ?? null,
+  });
+}
+
+function normalizePreviewRequest(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    throw projectWorkError(
+      "PROJECT_WORK_PREVIEW_REQUEST_INVALID",
+      "本机预览请求无效",
+      400,
+    );
+  }
+  if (Object.keys(request).some((field) => !PREVIEW_REQUEST_FIELDS.has(field))) {
+    throw projectWorkError(
+      "PROJECT_WORK_PREVIEW_PROFILE_INVALID",
+      "本机预览只接受固定运行方式、目录、页面路径和标题",
+      400,
+    );
+  }
+  if (!PREVIEW_RUNTIMES.has(request.runtime)) {
+    throw projectWorkError(
+      "PROJECT_WORK_PREVIEW_RUNTIME_INVALID",
+      "当前只支持受控的 Uvicorn、项目 Vite 或静态本机预览",
+      400,
+    );
+  }
+  let cwd;
+  try {
+    cwd = normalizeProjectPath(
+      request.cwd ?? "",
+      { allowEmpty: true },
+    ) || ".";
+  } catch {
+    throw projectWorkError(
+      "PROJECT_WORK_PREVIEW_CWD_INVALID",
+      "预览目录必须位于当前项目内",
+      400,
+    );
+  }
+  let app = null;
+  if (request.runtime === "python_uvicorn") {
+    app = String(request.app ?? "").trim();
+    if (
+      app.length > 200
+      || !/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$/.test(app)
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_PREVIEW_APP_INVALID",
+        "Uvicorn 应用入口无效",
+        400,
+      );
+    }
+  } else if (request.app !== undefined && request.app !== null) {
+    throw projectWorkError(
+      "PROJECT_WORK_PREVIEW_APP_INVALID",
+      "Vite 与静态预览不接受应用入口",
+      400,
+    );
+  }
+  const route = String(request?.route ?? "/").trim() || "/";
+  let parsedRoute;
+  try {
+    parsedRoute = new URL(route, "http://127.0.0.1");
+  } catch {
+    throw projectWorkError(
+      "PROJECT_WORK_PREVIEW_ROUTE_INVALID",
+      "预览页面路径无效",
+      400,
+    );
+  }
+  if (
+    route.length > 500
+    || !route.startsWith("/")
+    || route.startsWith("//")
+    || parsedRoute.origin !== "http://127.0.0.1"
+    || parsedRoute.username
+    || parsedRoute.password
+    || parsedRoute.search
+    || parsedRoute.hash
+  ) {
+    throw projectWorkError(
+      "PROJECT_WORK_PREVIEW_ROUTE_INVALID",
+      "预览页面必须是当前本机服务内的路径",
+      400,
+    );
+  }
+  return {
+    runtime: request.runtime,
+    cwd,
+    app,
+    route: parsedRoute.pathname,
+    title: compactText(request?.title, 120, "项目网页预览"),
+  };
+}
+
+function previewRequestContract(request) {
+  return {
+    schemaVersion: 1,
+    runtime: request.runtime,
+    cwd: request.cwd,
+    app: request.runtime === "python_uvicorn" ? request.app : null,
+    route: request.route,
+    title: request.title,
+  };
+}
+
+function previewRequestHash(request) {
+  return sha256(previewRequestContract(request));
+}
+
+function previewRecipeSummary(request) {
+  const normalized = normalizePreviewRequest({
+    runtime: request?.runtime,
+    cwd: request?.cwd,
+    ...(request?.runtime === "python_uvicorn"
+      ? { app: request?.app }
+      : {}),
+    route: request?.route,
+    title: request?.title,
+  });
+  const command = normalized.runtime === "python_uvicorn"
+    ? {
+        executable: "project-virtualenv-python",
+        argv: [
+          "-m",
+          "uvicorn",
+          normalized.app,
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "<assigned-loopback-port>",
+        ],
+      }
+    : normalized.runtime === "vite"
+      ? {
+          executable: "node_modules/.bin/vite",
+          argv: [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "<assigned-loopback-port>",
+            "--strictPort",
+          ],
+        }
+      : {
+          executable: "pi-agent-bundled-static-server",
+          argv: [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "<assigned-loopback-port>",
+          ],
+        };
+  return {
+    runtime: normalized.runtime,
+    cwd: normalized.cwd,
+    app: normalized.app,
+    route: normalized.route,
+    command,
+  };
+}
+
 async function resolvePackageScript({
   projectRoot,
   baseRoot,
@@ -663,8 +1635,11 @@ export function createProjectWorkService({
     documentPollIntervalMs,
   ),
   snapshotter = createFilteredProjectSnapshot,
+  changeApplier = applySelectedChangeSet,
+  gitInspector = inspectGitEvidence,
   picker = createMacOSProjectPicker(),
   runner = createVerificationRunner(),
+  previewSupervisor = createProjectPreviewSupervisor(),
   now = () => new Date(),
   idFactory = randomUUID,
 } = {}) {
@@ -684,6 +1659,9 @@ export function createProjectWorkService({
   const activeMessageClaims = new Map();
   const verificationControllers = new Map();
   const applyQueues = new Map();
+  const followUpMutationQueues = new Map();
+  const askUserWaiters = new Map();
+  const autoReviewSettlements = new Set();
   const deletingConversations = new Set();
   const deletingProjects = new Set();
   const documentOperationCounts = new Map();
@@ -803,7 +1781,7 @@ export function createProjectWorkService({
     ) {
       throw projectWorkError(
         "PROJECT_WORK_CONVERSATION_DELETE_BUSY",
-        "工作会话仍有正在运行的 Agent、验证、PDF 解析或修改应用操作",
+        "工作会话仍有正在运行的 Agent、验证、资料解析或修改应用操作",
         409,
         true,
       );
@@ -869,16 +1847,11 @@ export function createProjectWorkService({
   }
 
   async function appendEvent(conversationId, type, data = {}) {
-    const event = await conversationStore.appendEvent(conversationId, {
+    return conversationStore.appendEvent(conversationId, {
       type,
       at: timestamp(),
       data,
     });
-    await conversationStore.update(conversationId, {
-      lastEventSeq: event.seq,
-      updatedAt: event.at,
-    });
-    return event;
   }
 
   async function sanitizeForConversation(conversationId, value) {
@@ -911,6 +1884,228 @@ export function createProjectWorkService({
       ...(typeof patch === "function" ? patch(current) : patch),
       updatedAt: timestamp(),
     }));
+  }
+
+  function stableStatusAfterOperation(current, resumeStatus = "idle") {
+    if (
+      current.activeChangeSet?.status === "ready"
+      && Array.isArray(current.activeChangeSet.files)
+      && current.activeChangeSet.files.length > 0
+    ) {
+      return "awaiting_confirmation";
+    }
+    if (
+      typeof resumeStatus === "string"
+      && !BUSY_CONVERSATION_STATUSES.has(resumeStatus)
+      && resumeStatus !== "awaiting_user"
+    ) {
+      return resumeStatus;
+    }
+    return "idle";
+  }
+
+  async function updateConversationOperation(
+    conversationId,
+    operationId,
+    patch,
+  ) {
+    let updatedOperation = null;
+    const conversation = await updateConversation(conversationId, (current) => ({
+      operations: (current.operations ?? []).map((operation) => {
+        if (operation.id !== operationId) return operation;
+        updatedOperation = {
+          ...operation,
+          ...(typeof patch === "function" ? patch(operation, current) : patch),
+        };
+        return updatedOperation;
+      }),
+    }));
+    if (!updatedOperation) {
+      throw projectWorkError(
+        "PROJECT_WORK_OPERATION_NOT_FOUND",
+        "会话操作记录不存在",
+        404,
+      );
+    }
+    return {
+      conversation,
+      operation: updatedOperation,
+    };
+  }
+
+  async function failConversationOperation(
+    conversationId,
+    operationId,
+    error,
+    {
+      type = "settlement",
+      turnId = null,
+      resumeStatus = "idle",
+      preserveSuccessfulAnswer = false,
+    } = {},
+  ) {
+    const safeError = safeProjectWorkError(error);
+    const completedAt = timestamp();
+    let failedOperation = null;
+    const conversation = await updateConversation(conversationId, (current) => {
+      const messages = normalizedConversationMessages(current);
+      const hasSuccessfulAnswer = preserveSuccessfulAnswer || messages.some(
+        (message) => (
+          message.role === "assistant"
+          && message.status === "completed"
+          && message.isFinal !== false
+          && (!turnId || message.turnId === turnId)
+        ),
+      );
+      const existing = (current.operations ?? []).find(
+        (operation) => operation.id === operationId,
+      );
+      failedOperation = {
+        ...(existing ?? {
+          id: operationId,
+          type,
+          turnId,
+          targetAssistantMessageId: null,
+          resultAssistantMessageId: null,
+          resumeStatus,
+          startedAt: completedAt,
+        }),
+        status: "failed",
+        completedAt,
+        error: safeError,
+      };
+      const operations = existing
+        ? (current.operations ?? []).map((operation) => (
+            operation.id === operationId ? failedOperation : operation
+          ))
+        : [...(current.operations ?? []), failedOperation].slice(-100);
+      return {
+        operations,
+        status: hasSuccessfulAnswer
+          ? stableStatusAfterOperation(current, resumeStatus)
+          : "error",
+        lastError: hasSuccessfulAnswer ? null : safeError,
+      };
+    });
+    await appendEvent(conversationId, "operation.failed", {
+      operation: publicConversationOperation(failedOperation),
+    });
+    return {
+      conversation,
+      operation: failedOperation,
+      error: safeError,
+    };
+  }
+
+  async function interruptConversationOperation(
+    conversationId,
+    operationId,
+    error,
+  ) {
+    const safeError = safeProjectWorkError(error);
+    const completedAt = timestamp();
+    let interruptedOperation = null;
+    const conversation = await updateConversation(conversationId, (current) => {
+      const existing = (current.operations ?? []).find(
+        (operation) => operation.id === operationId,
+      );
+      if (!existing) {
+        throw projectWorkError(
+          "PROJECT_WORK_OPERATION_NOT_FOUND",
+          "会话操作记录不存在",
+          404,
+        );
+      }
+      interruptedOperation = {
+        ...existing,
+        status: "interrupted",
+        completedAt,
+        error: safeError,
+      };
+      return {
+        operations: (current.operations ?? []).map((operation) => (
+          operation.id === operationId ? interruptedOperation : operation
+        )),
+        status: stableStatusAfterOperation(current, existing.resumeStatus),
+        lastError: null,
+      };
+    });
+    await appendEvent(conversationId, "operation.interrupted", {
+      operation: publicConversationOperation(interruptedOperation),
+    });
+    return {
+      conversation,
+      operation: interruptedOperation,
+    };
+  }
+
+  async function ensureWorkspaceRecord(conversationId) {
+    let conversation = await conversationStore.get(conversationId);
+    const workspace = normalizedWorkspaceRecord(conversation, timestamp());
+    const executionPolicy = normalizeExecutionPolicy(
+      conversation.executionPolicy,
+    );
+    const shouldDowngrade = (
+      conversationWorkspaceKind(conversation) === "bound_project"
+      && executionPolicy.mode === "auto_review"
+      && workspace.automaticApplyAllowed !== true
+    );
+    const workspaceChanged = JSON.stringify(conversation.workspace ?? null)
+      !== JSON.stringify(workspace);
+    if (!workspaceChanged && !shouldDowngrade) return conversation;
+    const changedAt = timestamp();
+    conversation = await updateConversation(conversationId, (current) => {
+      const currentWorkspace = normalizedWorkspaceRecord(current, changedAt);
+      const currentPolicy = normalizeExecutionPolicy(current.executionPolicy);
+      const downgradeCurrent = (
+        conversationWorkspaceKind(current) === "bound_project"
+        && currentPolicy.mode === "auto_review"
+        && currentWorkspace.automaticApplyAllowed !== true
+      );
+      return {
+        workspace: {
+          ...currentWorkspace,
+          updatedAt: changedAt,
+        },
+        ...(downgradeCurrent
+          ? {
+              executionPolicy: {
+                mode: "manual_review",
+                revision: currentPolicy.revision + 1,
+                policyVersion: AUTO_REVIEW_POLICY_VERSION,
+              },
+            }
+          : {}),
+      };
+    });
+    if (workspaceChanged) {
+      await appendEvent(conversationId, "workspace.recorded", {
+        workspace: publicWorkspaceRecord(conversation),
+      });
+    }
+    if (shouldDowngrade) {
+      await appendEvent(conversationId, "execution_policy.downgraded", {
+        requestedMode: "auto_review",
+        mode: "manual_review",
+        reasonCode: "workspace_isolation_unavailable",
+        revision: normalizeExecutionPolicy(
+          conversation.executionPolicy,
+        ).revision,
+      });
+    }
+    return conversationStore.get(conversationId);
+  }
+
+  function withFollowUpMutation(conversationId, operation) {
+    const previous = followUpMutationQueues.get(conversationId)
+      ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    followUpMutationQueues.set(conversationId, current);
+    return current.finally(() => {
+      if (followUpMutationQueues.get(conversationId) === current) {
+        followUpMutationQueues.delete(conversationId);
+      }
+    });
   }
 
   function runtimeAutoCompactionEnabled(runtime, currentValue = true) {
@@ -966,6 +2161,44 @@ export function createProjectWorkService({
     });
   }
 
+  async function attachTurnContextEvidence(
+    conversationId,
+    turnSettings,
+    contextUsage,
+  ) {
+    if (!turnSettings?.turnId) return;
+    await updateConversation(conversationId, (current) => {
+      const messages = [...(current.messages ?? [])];
+      const messageIndex = messages.findLastIndex((message) => (
+        message.role === "assistant"
+        && message.turnId === turnSettings.turnId
+        && (
+          !turnSettings.retryOperationId
+          || message.retryOperationId === turnSettings.retryOperationId
+        )
+      ));
+      if (messageIndex < 0) return {};
+      const message = messages[messageIndex];
+      messages[messageIndex] = {
+        ...message,
+        turnEvidence: {
+          ...(message.turnEvidence ?? {
+            schemaVersion: 1,
+            providerId: message.providerId ?? turnSettings.providerId ?? null,
+            modelId: message.modelId ?? turnSettings.modelId ?? null,
+            thinkingLevel: message.thinkingLevel
+              ?? turnSettings.thinkingLevel
+              ?? null,
+            usage: null,
+            capturedAt: message.createdAt ?? timestamp(),
+          }),
+          contextUsage: normalizedContextUsage(contextUsage),
+        },
+      };
+      return { messages };
+    });
+  }
+
   async function recordCompactionStart(runtime, event) {
     const reason = COMPACTION_REASONS.has(event?.reason) ? event.reason : null;
     let publicCompaction;
@@ -977,6 +2210,12 @@ export function createProjectWorkService({
         ),
         status: "running",
         reason,
+        resumeStatus: (
+          current.status === "compacting"
+          && reason === "manual"
+        )
+          ? currentCompaction.resumeStatus
+          : null,
       };
       return { compaction: publicCompaction };
     });
@@ -1023,6 +2262,7 @@ export function createProjectWorkService({
         estimatedTokensAfter,
         willRetry,
         completedAt,
+        resumeStatus: currentCompaction.resumeStatus,
       };
       return {
         contextUsage,
@@ -1063,7 +2303,11 @@ export function createProjectWorkService({
     return normalized;
   }
 
-  async function recordVerificationRequest(conversationId, request) {
+  async function recordVerificationRequest(
+    conversationId,
+    request,
+    turnSettings,
+  ) {
     const normalized = normalizeVerificationRequest(request);
     normalized.checks = await Promise.all(normalized.checks.map((check) => (
       sanitizeForConversation(conversationId, check)
@@ -1080,12 +2324,24 @@ export function createProjectWorkService({
       },
       normalized.command,
     );
+    const safeResolvedScript = resolvedScript
+      ? await sanitizeForConversation(conversationId, resolvedScript)
+      : null;
     const verification = {
       id: `verification-${idFactory()}`,
       ...normalized,
-      resolvedScript: resolvedScript
-        ? await sanitizeForConversation(conversationId, resolvedScript)
+      turnId: compactText(turnSettings?.turnId, 160) || null,
+      workflowId: compactText(turnSettings?.workflowId, 120) || null,
+      executionPolicyRevision: Number.isSafeInteger(
+        turnSettings?.executionPolicyRevision,
+      )
+        ? turnSettings.executionPolicyRevision
         : null,
+      resolvedScript: safeResolvedScript,
+      bindingHash: verificationBindingHash({
+        command: normalized.command,
+        resolvedScript: safeResolvedScript,
+      }),
       status: "requested",
       exitCode: null,
       durationMs: null,
@@ -1099,15 +2355,105 @@ export function createProjectWorkService({
     }));
     await appendEvent(conversationId, "verification.requested", {
       id: verification.id,
+      turnId: verification.turnId,
       command: verification.command,
       checks: verification.checks,
     });
     return verification;
   }
 
-  async function refreshChangeSet(conversationId) {
+  async function recordPreviewRequest(
+    conversationId,
+    request,
+    turnSettings,
+  ) {
+    const normalized = normalizePreviewRequest(request);
+    const conversation = await conversationStore.get(conversationId);
+    const executionPolicy = normalizeExecutionPolicy(
+      conversation.executionPolicy,
+    );
+    if (
+      conversationWorkspaceKind(conversation) !== "bound_project"
+      || !["manual_review", "auto_review"].includes(
+        turnSettings?.executionPolicyMode,
+      )
+      || executionPolicy.mode !== turnSettings.executionPolicyMode
+      || executionPolicy.revision !== turnSettings?.executionPolicyRevision
+      || turnSettings?.workflowId
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_PREVIEW_NOT_ALLOWED",
+        "受控本机预览只在当前项目的普通任务中可用",
+        409,
+      );
+    }
+    const createdAt = timestamp();
+    const requestHash = previewRequestHash(normalized);
+    const previewRequest = {
+      id: `preview-request-${idFactory()}`,
+      ...normalized,
+      requestHash,
+      turnId: compactText(turnSettings?.turnId, 160),
+      workflowId: null,
+      executionPolicyMode: executionPolicy.mode,
+      executionPolicyRevision: executionPolicy.revision,
+      status: "requested",
+      blockedReason: null,
+      createdAt,
+      completedAt: null,
+    };
+    await updateConversation(conversationId, (current) => {
+      const duplicate = (current.previewRequests ?? []).some((item) => (
+        item.turnId === previewRequest.turnId
+        && ["requested", "starting"].includes(item.status)
+      ));
+      if (duplicate) {
+        throw projectWorkError(
+          "PROJECT_WORK_PREVIEW_ALREADY_REQUESTED",
+          "当前任务已经登记了一项本机预览",
+          409,
+        );
+      }
+      return {
+        previewRequests: [
+          ...(current.previewRequests ?? []).slice(-19),
+          previewRequest,
+        ],
+        preview: {
+          id: `preview-${idFactory()}`,
+          requestId: previewRequest.id,
+          status: "requested",
+          url: null,
+          title: previewRequest.title,
+          requestHash,
+          executionPolicyMode: previewRequest.executionPolicyMode,
+          recipe: previewRecipeSummary(previewRequest),
+          startedAt: null,
+          openedAt: null,
+          completedAt: null,
+          error: null,
+        },
+      };
+    });
+    await appendEvent(conversationId, "preview.requested", {
+      id: previewRequest.id,
+      turnId: previewRequest.turnId,
+      status: "requested",
+      artifactId: "preview",
+      title: previewRequest.title,
+      requestHash,
+      executionPolicyMode: previewRequest.executionPolicyMode,
+      detail: previewRequest.executionPolicyMode === "manual_review"
+        ? "已登记受控本机预览，等待明确确认"
+        : "已登记受控本机预览，等待本轮安全判断",
+    });
+    return previewRequest;
+  }
+
+  async function refreshChangeSet(conversationId, turnSettings = null) {
     const conversation = await conversationStore.get(conversationId);
     const paths = conversationPaths(conversationId);
+    const priorChangeSet = conversation.activeChangeSet;
     const changeSet = {
       ...await recomputeChangeSet({
         conversationId,
@@ -1115,6 +2461,21 @@ export function createProjectWorkService({
         workspaceRoot: paths.workspaceRoot,
         allowDeletes: conversation.workspaceSnapshot?.mode !== "sparse_overlay",
       }),
+      turnId: compactText(
+        turnSettings?.turnId ?? priorChangeSet?.turnId,
+        160,
+      ) || null,
+      workflowId: compactText(
+        turnSettings?.workflowId ?? priorChangeSet?.workflowId,
+        120,
+      ) || null,
+      executionPolicyRevision: Number.isSafeInteger(
+        turnSettings?.executionPolicyRevision,
+      )
+        ? turnSettings.executionPolicyRevision
+        : Number.isSafeInteger(priorChangeSet?.executionPolicyRevision)
+          ? priorChangeSet.executionPolicyRevision
+          : null,
       createdAt: timestamp(),
       appliedAt: null,
     };
@@ -1124,8 +2485,437 @@ export function createProjectWorkService({
       hash: changeSet.hash,
       status: changeSet.status,
       stats: changeSet.stats,
+      turnId: changeSet.turnId,
     });
     return changeSet;
+  }
+
+  async function recordAutoReviewDecision(
+    conversationId,
+    actionType,
+    actionId,
+    result,
+    turnSettings,
+  ) {
+    await appendEvent(conversationId, "auto_review.decision", {
+      actionType,
+      actionId,
+      decision: result.decision,
+      reasonCode: result.reasonCode,
+      policyVersion: result.policyVersion,
+      policyRevision: turnSettings.executionPolicyRevision,
+      turnId: turnSettings.turnId,
+    });
+  }
+
+  async function blockAutoVerification(
+    conversationId,
+    verification,
+    result,
+  ) {
+    await updateConversation(conversationId, (current) => ({
+      verifications: (current.verifications ?? []).map((item) => (
+        item.id === verification.id
+          ? {
+              ...item,
+              status: "blocked",
+              blockedReason: result.reasonCode,
+              completedAt: timestamp(),
+            }
+          : item
+      )),
+    }));
+  }
+
+  async function updatePreviewRequest(
+    conversationId,
+    requestId,
+    patch,
+  ) {
+    return updateConversation(conversationId, (current) => ({
+      previewRequests: (current.previewRequests ?? []).map((item) => (
+        item.id === requestId ? { ...item, ...patch } : item
+      )),
+      preview: current.preview?.requestId === requestId
+        ? { ...current.preview, ...patch }
+        : current.preview,
+    }));
+  }
+
+  async function launchClaimedPreview(conversationId, previewRequest) {
+    await appendEvent(conversationId, "preview.starting", {
+      id: previewRequest.id,
+      status: "starting",
+      artifactId: "preview",
+      title: previewRequest.title,
+      detail: "正在启动受控本机预览",
+    });
+    try {
+      const conversation = await conversationStore.get(conversationId);
+      const workspace = await resolveConversationWorkspace(conversation);
+      const started = await previewSupervisor.start({
+        key: conversationId,
+        projectRoot: workspace.projectRoot,
+        request: previewRequest,
+      });
+      await updatePreviewRequest(conversationId, previewRequest.id, {
+        status: "ready",
+        url: started.url,
+        title: started.title,
+        startedAt: started.startedAt,
+        openedAt: started.openedAt,
+        completedAt: started.openedAt,
+        error: null,
+      });
+      await appendEvent(conversationId, "preview.ready", {
+        id: previewRequest.id,
+        status: "ready",
+        artifactId: "preview",
+        url: started.url,
+        detail: "本机预览已就绪",
+      });
+      await appendEvent(conversationId, "preview.opened", {
+        id: previewRequest.id,
+        status: "ready",
+        artifactId: "preview",
+        url: started.url,
+        detail: "已在系统默认浏览器打开本机预览",
+      });
+      return true;
+    } catch (error) {
+      const completedAt = timestamp();
+      const message = await sanitizeForConversation(
+        conversationId,
+        compactText(error?.message, 300, "本机预览没有成功启动"),
+      );
+      await updatePreviewRequest(conversationId, previewRequest.id, {
+        status: "failed",
+        completedAt,
+        error: {
+          code: typeof error?.code === "string"
+            ? error.code.slice(0, 120)
+            : "PROJECT_WORK_PREVIEW_FAILED",
+          message,
+        },
+      });
+      await appendEvent(conversationId, "preview.failed", {
+        id: previewRequest.id,
+        status: "failed",
+        artifactId: "preview",
+        detail: message,
+      });
+      return false;
+    }
+  }
+
+  async function settleAutoPreview(
+    runtime,
+    changeApplied,
+    turnSettings,
+  ) {
+    const conversationId = runtime.conversationId;
+    const current = await conversationStore.get(conversationId);
+    const previewRequest = (current.previewRequests ?? []).find((item) => (
+      item.status === "requested"
+      && item.turnId === turnSettings.turnId
+      && item.executionPolicyMode === "auto_review"
+      && item.executionPolicyRevision === turnSettings.executionPolicyRevision
+    ));
+    if (!previewRequest) return;
+
+    const previewDecision = reviewAutoPreview(previewRequest, {
+      workflowId: turnSettings.workflowId,
+      turnId: turnSettings.turnId,
+      workspaceKind: conversationWorkspaceKind(current),
+      executionPolicyRevision: turnSettings.executionPolicyRevision,
+      changeApplied,
+    });
+    await recordAutoReviewDecision(
+      conversationId,
+      "preview",
+      previewRequest.id,
+      previewDecision,
+      turnSettings,
+    );
+    if (previewDecision.decision !== "allow") {
+      const completedAt = timestamp();
+      await updatePreviewRequest(conversationId, previewRequest.id, {
+        status: "blocked",
+        blockedReason: previewDecision.reasonCode,
+        completedAt,
+        error: {
+          code: "PROJECT_WORK_PREVIEW_BLOCKED",
+          message: "本机预览没有通过本轮安全判断",
+        },
+      });
+      await appendEvent(conversationId, "preview.blocked", {
+        id: previewRequest.id,
+        status: "blocked",
+        artifactId: "preview",
+        reasonCode: previewDecision.reasonCode,
+        detail: "本机预览未启动",
+      });
+      return;
+    }
+
+    await updatePreviewRequest(conversationId, previewRequest.id, {
+      status: "starting",
+      blockedReason: null,
+      error: null,
+    });
+    await launchClaimedPreview(conversationId, previewRequest);
+  }
+
+  async function startPreview(conversationId, {
+    previewId,
+    requestHash,
+  } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    if (
+      typeof previewId !== "string"
+      || !previewId.trim()
+      || previewId.length > 180
+      || !SHA256_PATTERN.test(String(requestHash ?? ""))
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_PREVIEW_CONFIRMATION_REQUIRED",
+        "启动本机预览必须绑定当前预览标识和请求哈希",
+        400,
+      );
+    }
+
+    let claimedRequest;
+    const confirmedAt = timestamp();
+    await updateConversation(conversationId, (current) => {
+      if (conversationWorkspaceKind(current) !== "bound_project") {
+        throw projectWorkError(
+          "PROJECT_WORK_PREVIEW_PROJECT_REQUIRED",
+          "本机预览只能从已连接项目的会话启动",
+          409,
+        );
+      }
+      if (
+        BUSY_CONVERSATION_STATUSES.has(current.status)
+        || current.status === "awaiting_user"
+        || autoReviewSettlements.has(conversationId)
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_PREVIEW_BUSY",
+          "当前会话还有操作正在运行",
+          409,
+        );
+      }
+      const preview = current.preview;
+      if (
+        !preview
+        || preview.id !== previewId
+        || preview.status !== "requested"
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_PREVIEW_NOT_FOUND",
+          "可确认的本机预览不存在",
+          404,
+        );
+      }
+      const request = (current.previewRequests ?? []).find(
+        (item) => (
+          item.id === preview.requestId
+          && item.status === "requested"
+        ),
+      );
+      if (!request) {
+        throw projectWorkError(
+          "PROJECT_WORK_PREVIEW_NOT_FOUND",
+          "可确认的本机预览不存在",
+          404,
+        );
+      }
+      const executionPolicy = normalizeExecutionPolicy(
+        current.executionPolicy,
+      );
+      if (
+        request.executionPolicyMode !== "manual_review"
+        || executionPolicy.mode !== "manual_review"
+        || executionPolicy.revision !== request.executionPolicyRevision
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_PREVIEW_POLICY_STALE",
+          "本机预览请求的审批方式已经变化，请重新发起",
+          409,
+          true,
+        );
+      }
+      const normalized = normalizePreviewRequest({
+        runtime: request.runtime,
+        cwd: request.cwd,
+        ...(request.runtime === "python_uvicorn" ? { app: request.app } : {}),
+        route: request.route,
+        title: request.title,
+      });
+      const computedHash = previewRequestHash(normalized);
+      if (
+        requestHash !== computedHash
+        || request.requestHash !== computedHash
+        || preview.requestHash !== computedHash
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_PREVIEW_STALE",
+          "本机预览请求已变化，请重新核对后确认",
+          409,
+          true,
+        );
+      }
+      claimedRequest = {
+        ...request,
+        ...normalized,
+        status: "starting",
+        blockedReason: null,
+        confirmedAt,
+      };
+      return {
+        previewRequests: (current.previewRequests ?? []).map((item) => (
+          item.id === request.id ? claimedRequest : item
+        )),
+        preview: {
+          ...preview,
+          status: "starting",
+          confirmationRequired: false,
+          confirmedAt,
+          error: null,
+        },
+      };
+    });
+    await appendEvent(conversationId, "preview.confirmed", {
+      id: claimedRequest.id,
+      previewId,
+      requestHash,
+      artifactId: "preview",
+      detail: "已确认并锁定本机预览请求",
+    });
+    await launchClaimedPreview(conversationId, claimedRequest);
+    return snapshot(conversationId);
+  }
+
+  function changeSetBindings(changeSet) {
+    return changeSet.files.map((file) => ({
+      fileId: file.id,
+      baseHash: file.baseHash,
+      afterHash: file.afterHash,
+    }));
+  }
+
+  async function settleAutoReview(runtime, changeSet, turnSettings) {
+    const conversationId = runtime.conversationId;
+    const hasChanges = changeSet.files.length > 0;
+    autoReviewSettlements.add(conversationId);
+    try {
+      let changeApplied = !hasChanges;
+      if (hasChanges) {
+        const changeDecision = reviewAutoChangeSet(changeSet, {
+          workflowId: turnSettings.workflowId,
+        });
+        await recordAutoReviewDecision(
+          conversationId,
+          "change_set",
+          changeSet.id,
+          changeDecision,
+          turnSettings,
+        );
+        if (changeDecision.decision === "allow") {
+          await applyChangeSet(conversationId, {
+            changeSetId: changeSet.id,
+            changeSetHash: changeSet.hash,
+            files: changeSetBindings(changeSet),
+          }, {
+            autoReviewSettlement: true,
+            preserveConversationStatus: true,
+          });
+          changeApplied = true;
+        } else {
+          const blockedAt = timestamp();
+          const current = await conversationStore.get(conversationId);
+          const overlayCleared = ["sparse_overlay", "scratch"].includes(
+            current.workspaceSnapshot?.mode,
+          );
+          if (overlayCleared) {
+            await clearAppliedSparseOverlay(
+              conversationPaths(conversationId),
+              changeSet.files,
+            );
+          }
+          await updateConversation(conversationId, (latest) => ({
+            activeChangeSet: latest.activeChangeSet?.id === changeSet.id
+              ? {
+                  ...latest.activeChangeSet,
+                  status: "blocked",
+                  blockedReason: changeDecision.reasonCode,
+                  blockedAt,
+                  overlayCleared,
+                  files: latest.activeChangeSet.files.map((file) => ({
+                    ...file,
+                    actionable: false,
+                  })),
+                }
+              : latest.activeChangeSet,
+            status: latest.status,
+          }));
+        }
+      }
+
+      const current = await conversationStore.get(conversationId);
+      const currentTurnVerifications = (current.verifications ?? []).filter(
+        (verification) => (
+          verification.status === "requested"
+          && verification.turnId === turnSettings.turnId
+          && verification.executionPolicyRevision
+            === turnSettings.executionPolicyRevision
+        ),
+      );
+      for (const verification of currentTurnVerifications) {
+        const verificationDecision = changeApplied
+          ? reviewAutoVerification(verification, {
+              workflowId: turnSettings.workflowId,
+              turnId: turnSettings.turnId,
+            })
+          : {
+              decision: "deny",
+              reasonCode: "change_set_not_auto_applied",
+              policyVersion: AUTO_REVIEW_POLICY_VERSION,
+            };
+        await recordAutoReviewDecision(
+          conversationId,
+          "verification",
+          verification.id,
+          verificationDecision,
+          turnSettings,
+        );
+        if (verificationDecision.decision === "allow") {
+          await runVerification(conversationId, {
+            requestId: verification.id,
+          }, {
+            autoReviewSettlement: true,
+            preserveConversationStatus: true,
+          });
+        } else {
+          await blockAutoVerification(
+            conversationId,
+            verification,
+            verificationDecision,
+          );
+        }
+      }
+      await settleAutoPreview(runtime, changeApplied, turnSettings);
+      const settled = await conversationStore.get(conversationId);
+      return updateConversation(conversationId, {
+        status: settled.activeChangeSet?.status === "applied"
+          ? "applied"
+          : "idle",
+        lastError: null,
+      });
+    } finally {
+      autoReviewSettlements.delete(conversationId);
+    }
   }
 
   function queueRuntimeEvent(runtime, event) {
@@ -1208,25 +2998,43 @@ export function createProjectWorkService({
       case "agent_settled":
         await finishRuntimeThinking(runtime);
         try {
-          await refreshRuntimeContext(runtime);
-          const changeSet = await refreshChangeSet(conversationId);
-          const settledStatus = changeSet.files.length > 0
-            ? "awaiting_confirmation"
-            : "idle";
+          const contextConversation = await refreshRuntimeContext(runtime);
+          await attachTurnContextEvidence(
+            conversationId,
+            turnSettings,
+            contextConversation.contextUsage,
+          );
+          const changeSet = await refreshChangeSet(
+            conversationId,
+            turnSettings,
+          );
+          const settledConversation = turnSettings.executionPolicyMode
+            === "auto_review"
+            ? await settleAutoReview(runtime, changeSet, turnSettings)
+            : await updateConversation(conversationId, {
+                status: changeSet.files.length > 0
+                  ? "awaiting_confirmation"
+                  : "idle",
+                lastError: null,
+              });
+          const settledStatus = settledConversation.status;
           await appendEvent(conversationId, "agent.status", {
             status: settledStatus,
           });
-          await updateConversation(conversationId, {
-            status: settledStatus,
-            lastError: null,
-          });
         } catch (error) {
-          const safeError = safeProjectWorkError(error);
-          await updateConversation(conversationId, {
-            status: "error",
-            lastError: safeError,
+          await failConversationOperation(
+            conversationId,
+            `operation-${idFactory()}`,
+            error,
+            {
+              type: "settlement",
+              turnId: turnSettings.turnId ?? null,
+              resumeStatus: "idle",
+            },
+          );
+          await appendEvent(conversationId, "agent.status", {
+            status: (await conversationStore.get(conversationId)).status,
           });
-          await appendEvent(conversationId, "error", safeError);
         }
         break;
       case "turn_start":
@@ -1237,13 +3045,49 @@ export function createProjectWorkService({
         });
         break;
       case "turn_end":
+        {
+          const usage = normalizeTurnUsage(
+            event.message?.usage ?? event.usage,
+          );
         await appendEvent(conversationId, "turn.completed", {
           turnIndex: runtime.turnIndex,
           ...turnSettings,
+          usage,
         });
+        }
         break;
       case "message_start":
-        if (event.message?.role === "assistant") {
+        if (event.message?.role === "user") {
+          const userText = extractMessageText(event.message);
+          if (userText) {
+            const delivered = await markFollowUpDelivered(
+              conversationId,
+              userText,
+            );
+            if (delivered) {
+              const current = await conversationStore.get(conversationId);
+              const message = (current.messages ?? []).find(
+                (item) => item.id === delivered.messageId,
+              );
+              if (message) {
+                runtime.activeTurnSettings = {
+                  ...(runtime.activeTurnSettings ?? {}),
+                  turnId: message.turnId ?? message.id,
+                  turnSeq: message.turnSeq,
+                  attempt: 1,
+                  providerId: message.providerId ?? runtime.providerId,
+                  modelId: message.modelId ?? runtime.modelId,
+                  thinkingLevel: message.thinkingLevel
+                    ?? runtime.thinkingLevel,
+                  workflowId: message.workflowId ?? null,
+                  capabilities: Array.isArray(message.capabilities)
+                    ? [...message.capabilities]
+                    : [],
+                };
+              }
+            }
+          }
+        } else if (event.message?.role === "assistant") {
           runtime.activeAssistantId = `message-${idFactory()}`;
           runtime.assistantText = "";
           await appendEvent(conversationId, "message.started", {
@@ -1277,27 +3121,83 @@ export function createProjectWorkService({
             conversationId,
             extractMessageText(event.message) || runtime.assistantText,
           );
-          const status = event.message.stopReason === "error" ? "failed" : "completed";
-          const message = {
-            id: runtime.activeAssistantId,
-            role: "assistant",
-            text: fullText,
-            status,
-            ...turnSettings,
-            createdAt: timestamp(),
-          };
-          await updateConversation(conversationId, (current) => ({
-            messages: [...(current.messages ?? []), message],
-          }));
+          const status = ["error", "aborted"].includes(event.message.stopReason)
+            ? "failed"
+            : "completed";
+          const createdAt = timestamp();
+          let message;
+          await updateConversation(conversationId, (current) => {
+            const providerId = compactText(event.message.provider, 120)
+              || turnSettings.providerId
+              || null;
+            const modelId = compactText(
+              event.message.responseModel ?? event.message.model,
+              200,
+            ) || turnSettings.modelId || null;
+            const usage = normalizeTurnUsage(event.message.usage);
+            message = {
+              id: runtime.activeAssistantId,
+              messageSeq: nextMessageSequence(current),
+              turnId: turnSettings.turnId
+                ?? normalizedConversationMessages(current).at(-1)?.turnId
+                ?? runtime.activeAssistantId,
+              turnSeq: turnSettings.turnSeq
+                ?? normalizedConversationMessages(current).at(-1)?.turnSeq
+                ?? nextTurnSequence(current),
+              attempt: Number.isSafeInteger(turnSettings.attempt)
+                && turnSettings.attempt > 0
+                ? turnSettings.attempt
+                : 1,
+              role: "assistant",
+              text: fullText,
+              status,
+              isFinal: event.message.stopReason !== "toolUse",
+              ...turnSettings,
+              providerId,
+              modelId,
+              turnEvidence: {
+                schemaVersion: 1,
+                providerId,
+                modelId,
+                thinkingLevel: turnSettings.thinkingLevel ?? null,
+                usage,
+                contextUsage: null,
+                capturedAt: createdAt,
+              },
+              createdAt,
+            };
+            return {
+              messages: [...(current.messages ?? []), message],
+            };
+          });
           await appendEvent(conversationId, "message.completed", {
             id: message.id,
             role: message.role,
             text: message.text,
             status: message.status,
+            isFinal: message.isFinal,
+            turnId: message.turnId,
+            turnSeq: message.turnSeq,
+            attempt: message.attempt,
+            retryOperationId: message.retryOperationId ?? null,
+            verificationRepairOperationId:
+              message.verificationRepairOperationId ?? null,
+            repairAttempt: message.repairAttempt ?? null,
+            turnEvidence: publicTurnEvidence(message.turnEvidence),
           });
           runtime.activeAssistantId = null;
           runtime.assistantText = "";
         }
+        break;
+      case "queue_update":
+        await appendEvent(conversationId, "follow_up.queue_updated", {
+          steeringCount: Array.isArray(event.steering)
+            ? event.steering.length
+            : 0,
+          followUpCount: Array.isArray(event.followUp)
+            ? event.followUp.length
+            : 0,
+        });
         break;
       case "tool_execution_start":
         await appendEvent(
@@ -1409,6 +3309,16 @@ export function createProjectWorkService({
       onVerificationRequest: (request) => recordVerificationRequest(
         conversationId,
         request,
+        runtime.activeTurnSettings,
+      ),
+      onPreviewRequest: (request) => recordPreviewRequest(
+        conversationId,
+        request,
+        runtime.activeTurnSettings,
+      ),
+      onAskUserRequest: (request) => requestAgentInput(
+        conversationId,
+        request,
       ),
     });
     if (!runtime.host || typeof runtime.host.subscribe !== "function") {
@@ -1428,57 +3338,245 @@ export function createProjectWorkService({
 
   async function snapshot(conversationId, options = {}) {
     await documentService.resumeConversation(conversationId);
-    let conversation = await conversationStore.get(conversationId);
+    let conversation = await recoverOutstandingApplyJournals(conversationId);
     if (
       conversation.status === "verifying"
       && !verificationControllers.has(conversationId)
     ) {
+      const interruptedAt = timestamp();
+      const runningVerification = (conversation.verifications ?? []).find(
+        (verification) => verification.status === "running",
+      );
+      const runningRepairOperations = (conversation.operations ?? []).filter(
+        (operation) => (
+          operation.type === "verification_repair"
+          && operation.status === "running"
+        ),
+      );
+      const runningRepairIds = new Set(
+        runningRepairOperations.map((operation) => operation.id),
+      );
       conversation = await updateConversation(conversationId, (current) => ({
-        status: "interrupted",
+        status: stableStatusAfterOperation(
+          current,
+          runningRepairOperations.at(-1)?.resumeStatus
+            ?? runningVerification?.resumeStatus,
+        ),
         verifications: (current.verifications ?? []).map((verification) => (
           verification.status === "running"
             ? {
                 ...verification,
                 status: "interrupted",
-                completedAt: timestamp(),
+                completedAt: interruptedAt,
               }
             : verification
         )),
-        lastError: {
-          code: "PROJECT_WORK_VERIFICATION_INTERRUPTED",
-          message: "上一次验证未正常结束，可以重新运行",
-          retryable: true,
-        },
+        operations: (current.operations ?? []).map((operation) => (
+          runningRepairIds.has(operation.id)
+            ? {
+                ...operation,
+                status: "interrupted",
+                completedAt: interruptedAt,
+                error: {
+                  code: "PROJECT_WORK_VERIFICATION_REPAIR_INTERRUPTED",
+                  message: "验证修复在服务恢复前未完成，需要明确恢复后继续",
+                  retryable: true,
+                },
+              }
+            : operation
+        )),
+        lastError: null,
       }));
-      await appendEvent(conversationId, "agent.status", { status: "interrupted" });
+      await appendEvent(conversationId, "verification.interrupted", {
+        id: runningVerification?.id ?? null,
+        commandId: runningVerification?.commandId ?? null,
+      });
+      for (const operation of runningRepairOperations) {
+        await appendEvent(conversationId, "operation.interrupted", {
+          operationId: operation.id,
+          type: operation.type,
+          turnId: operation.turnId ?? null,
+        });
+      }
+    }
+    if (
+      !runtimes.has(conversationId)
+      && !activeMessageClaims.has(conversationId)
+    ) {
+      const runningRepairOperations = (conversation.operations ?? []).filter(
+        (operation) => (
+          operation.type === "verification_repair"
+          && operation.status === "running"
+        ),
+      );
+      if (runningRepairOperations.length > 0) {
+        const interruptedAt = timestamp();
+        const runningRepairIds = new Set(
+          runningRepairOperations.map((operation) => operation.id),
+        );
+        conversation = await updateConversation(conversationId, (current) => ({
+          status: stableStatusAfterOperation(
+            current,
+            runningRepairOperations.at(-1)?.resumeStatus,
+          ),
+          operations: (current.operations ?? []).map((operation) => (
+            runningRepairIds.has(operation.id)
+              ? {
+                  ...operation,
+                  status: "interrupted",
+                  completedAt: interruptedAt,
+                  error: {
+                    code: "PROJECT_WORK_VERIFICATION_REPAIR_INTERRUPTED",
+                    message: "验证修复在服务恢复前未完成，需要明确恢复后继续",
+                    retryable: true,
+                  },
+                }
+              : operation
+          )),
+          lastError: null,
+        }));
+        for (const operation of runningRepairOperations) {
+          await appendEvent(conversationId, "operation.interrupted", {
+            operationId: operation.id,
+            type: operation.type,
+            turnId: operation.turnId ?? null,
+          });
+        }
+      }
     }
     const staleCompaction = conversation.status === "compacting"
       || normalizedCompactionState(conversation.compaction).status === "running";
     if (
-      (conversation.status === "running" || staleCompaction)
+      staleCompaction
       && !runtimes.has(conversationId)
       && !activeMessageClaims.has(conversationId)
     ) {
       const interruptedAt = timestamp();
+      const compaction = normalizedCompactionState(conversation.compaction);
+      const interruptedAgentTurn = (
+        conversation.status === "running"
+        && !compaction.resumeStatus
+      );
       conversation = await updateConversation(conversationId, (current) => ({
-        status: "interrupted",
-        ...(current.status === "compacting"
-          || normalizedCompactionState(current.compaction).status === "running"
+        status: interruptedAgentTurn
+          ? "interrupted"
+          : compaction.resumeStatus || "idle",
+        compaction: {
+          ...normalizedCompactionState(current.compaction),
+          status: "aborted",
+          completedAt: interruptedAt,
+        },
+        ...(interruptedAgentTurn
           ? {
-              compaction: {
-                ...normalizedCompactionState(current.compaction),
-                status: "aborted",
-                completedAt: interruptedAt,
+              lastError: {
+                code: "PROJECT_WORK_SESSION_INTERRUPTED",
+                message: "上一次 Agent 操作未正常结束，可以重新发送任务继续",
+                retryable: true,
               },
             }
           : {}),
-        lastError: {
-          code: "PROJECT_WORK_SESSION_INTERRUPTED",
-          message: "上一次 Agent 操作未正常结束，可以重新发送任务继续",
-          retryable: true,
-        },
       }));
-      await appendEvent(conversationId, "agent.status", { status: "interrupted" });
+      await appendEvent(conversationId, "compaction.interrupted", {
+        reason: compaction.reason,
+      });
+      if (interruptedAgentTurn) {
+        await appendEvent(conversationId, "agent.status", {
+          status: "interrupted",
+        });
+      }
+    }
+    if (
+      conversation.status === "running"
+      && !runtimes.has(conversationId)
+      && !activeMessageClaims.has(conversationId)
+    ) {
+      const runningOperations = (conversation.operations ?? []).filter(
+        (operation) => operation.status === "running",
+      );
+      if (runningOperations.length > 0) {
+        const interruptedAt = timestamp();
+        const runningIds = new Set(
+          runningOperations.map((operation) => operation.id),
+        );
+        conversation = await updateConversation(conversationId, (current) => ({
+          status: stableStatusAfterOperation(
+            current,
+            runningOperations.at(-1)?.resumeStatus,
+          ),
+          operations: (current.operations ?? []).map((operation) => (
+            runningIds.has(operation.id)
+              ? {
+                  ...operation,
+                  status: "interrupted",
+                  completedAt: interruptedAt,
+                  error: {
+                    code: "PROJECT_WORK_OPERATION_INTERRUPTED",
+                    message: "上一次会话操作在服务恢复前未完成，可以重新执行",
+                    retryable: true,
+                  },
+                }
+              : operation
+          )),
+          lastError: null,
+        }));
+        for (const operation of runningOperations) {
+          await appendEvent(conversationId, "operation.interrupted", {
+            operationId: operation.id,
+            type: operation.type,
+            turnId: operation.turnId ?? null,
+          });
+        }
+        await appendEvent(conversationId, "agent.status", {
+          status: conversation.status,
+        });
+      } else {
+        conversation = await updateConversation(conversationId, {
+          status: "interrupted",
+          lastError: {
+            code: "PROJECT_WORK_SESSION_INTERRUPTED",
+            message: "上一次 Agent 操作未正常结束，可以重新发送任务继续",
+            retryable: true,
+          },
+        });
+        await appendEvent(conversationId, "agent.status", {
+          status: "interrupted",
+        });
+      }
+    }
+    if (
+      ["starting", "ready"].includes(conversation.preview?.status)
+      && !autoReviewSettlements.has(conversationId)
+      && typeof previewSupervisor.has === "function"
+      && previewSupervisor.has(conversationId) !== true
+    ) {
+      const completedAt = timestamp();
+      const requestId = conversation.preview.requestId;
+      conversation = await updateConversation(conversationId, (current) => ({
+        preview: {
+          ...current.preview,
+          status: "stopped",
+          completedAt,
+          error: {
+            code: "PROJECT_WORK_PREVIEW_STOPPED",
+            message: "上一次本机预览已经停止，可以重新发送打开请求",
+          },
+        },
+        previewRequests: (current.previewRequests ?? []).map((item) => (
+          item.id === requestId && ["starting", "ready"].includes(item.status)
+            ? {
+                ...item,
+                status: "stopped",
+                completedAt,
+              }
+            : item
+        )),
+      }));
+      await appendEvent(conversationId, "preview.stopped", {
+        id: requestId,
+        status: "stopped",
+        artifactId: "preview",
+        detail: "上一次本机预览已经停止",
+      });
     }
     const eventPage = await conversationStore.readEvents(conversationId, {
       afterSeq: options.afterSeq,
@@ -1729,7 +3827,7 @@ export function createProjectWorkService({
           : []),
       ]);
       const createdAt = timestamp();
-      const conversation = await conversationStore.create({
+      const initialConversation = {
         schemaVersion: 1,
         id: conversationId,
         projectId,
@@ -1741,11 +3839,18 @@ export function createProjectWorkService({
         modelId: selectedModel.modelId,
         modelRef: selectedModel.modelRef,
         thinkingLevel: selectedThinkingLevel,
+        executionPolicy: normalizeExecutionPolicy(),
         messages: [],
         plan: null,
         activeChangeSet: null,
         verifications: [],
+        previewRequests: [],
+        preview: null,
+        followUpQueue: [],
+        askUserRequests: [],
+        operations: [],
         documents: [],
+        applyJournal: [],
         workspaceSnapshot: {
           schemaVersion: 1,
           rulesVersion: 2,
@@ -1758,11 +3863,21 @@ export function createProjectWorkService({
         },
         contextUsage: defaultContextUsage(),
         compaction: defaultCompactionState(),
+        readState: {
+          lastReadMessageSeq: 0,
+          readAt: null,
+        },
+        readMutationReceipts: [],
         lastError: null,
         lastEventSeq: 0,
         createdAt,
         updatedAt: createdAt,
-      });
+      };
+      initialConversation.workspace = normalizedWorkspaceRecord(
+        initialConversation,
+        createdAt,
+      );
+      const conversation = await conversationStore.create(initialConversation);
       await appendEvent(conversationId, "conversation.created", {
         id: conversationId,
         projectId,
@@ -1843,6 +3958,129 @@ export function createProjectWorkService({
   async function getConversation(conversationId, options = {}) {
     assertActive();
     return snapshot(conversationId, options);
+  }
+
+  async function getConversationTurns(conversationId, {
+    beforeTurnSeq,
+    limit = 20,
+  } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    if (
+      beforeTurnSeq !== undefined
+      && (
+        !Number.isSafeInteger(beforeTurnSeq)
+        || beforeTurnSeq < 1
+      )
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_TURN_CURSOR_INVALID",
+        "会话历史游标无效",
+        400,
+      );
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw projectWorkError(
+        "PROJECT_WORK_TURN_LIMIT_INVALID",
+        "每页会话历史必须在 1 到 100 轮之间",
+        400,
+      );
+    }
+    const conversation = await conversationStore.get(conversationId);
+    const eligible = conversationTurns(conversation).filter(
+      (turn) => beforeTurnSeq === undefined || turn.turnSeq < beforeTurnSeq,
+    );
+    const start = Math.max(0, eligible.length - limit);
+    const turns = eligible.slice(start);
+    return {
+      schemaVersion: 1,
+      turns,
+      hasMore: start > 0,
+      nextBeforeTurnSeq: start > 0 ? turns[0]?.turnSeq ?? null : null,
+    };
+  }
+
+  async function markConversationRead(conversationId, {
+    throughMessageSeq,
+    clientRequestId,
+  } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const requestId = normalizeClientRequestId(clientRequestId, idFactory);
+    const requestFingerprint = sha256({
+      throughMessageSeq: throughMessageSeq ?? null,
+    });
+    if (
+      throughMessageSeq !== undefined
+      && (
+        !Number.isSafeInteger(throughMessageSeq)
+        || throughMessageSeq < 0
+      )
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_READ_WATERMARK_INVALID",
+        "会话已读位置无效",
+        400,
+      );
+    }
+    let changed = false;
+    let replayed = false;
+    let nextReadState;
+    await updateConversation(conversationId, (current) => {
+      const existingReceipt = (current.readMutationReceipts ?? []).find(
+        (receipt) => receipt.clientRequestId === requestId,
+      );
+      if (existingReceipt) {
+        if (existingReceipt.requestFingerprint !== requestFingerprint) {
+          throw projectWorkError(
+            "PROJECT_WORK_CLIENT_REQUEST_CONFLICT",
+            "同一客户端请求标识不能用于不同的已读位置",
+            409,
+          );
+        }
+        replayed = true;
+        return {};
+      }
+      const messages = normalizedConversationMessages(current);
+      const currentReadState = normalizedReadState(current, messages);
+      const requestedWatermark = throughMessageSeq
+        ?? currentReadState.latestAssistantMessageSeq;
+      if (requestedWatermark > currentReadState.latestMessageSeq) {
+        throw projectWorkError(
+          "PROJECT_WORK_READ_WATERMARK_STALE",
+          "会话已读位置超出当前历史，请刷新后重试",
+          409,
+          true,
+        );
+      }
+      const lastReadMessageSeq = Math.max(
+        currentReadState.lastReadMessageSeq,
+        requestedWatermark,
+      );
+      changed = lastReadMessageSeq !== currentReadState.lastReadMessageSeq;
+      nextReadState = {
+        lastReadMessageSeq,
+        readAt: changed ? timestamp() : currentReadState.readAt,
+      };
+      return {
+        readState: nextReadState,
+        readMutationReceipts: [
+          ...(current.readMutationReceipts ?? []),
+          {
+            clientRequestId: requestId,
+            requestFingerprint,
+            throughMessageSeq: requestedWatermark,
+            createdAt: timestamp(),
+          },
+        ].slice(-100),
+      };
+    });
+    if (changed && !replayed) {
+      await appendEvent(conversationId, "conversation.read", {
+        lastReadMessageSeq: nextReadState.lastReadMessageSeq,
+      });
+    }
+    return snapshot(conversationId);
   }
 
   async function createConversationDocument(conversationId, options = {}) {
@@ -1966,7 +4204,11 @@ export function createProjectWorkService({
     assertActive();
     assertConversationNotDeleting(conversationId);
     const conversation = await conversationStore.get(conversationId);
-    if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
+    if (
+      BUSY_CONVERSATION_STATUSES.has(conversation.status)
+      || Boolean(runtimes.get(conversationId)?.completion)
+      || autoReviewSettlements.has(conversationId)
+    ) {
       throw projectWorkError(
         "PROJECT_WORK_CONVERSATION_BUSY",
         "Agent 工作期间不能切换模型或思考强度",
@@ -1997,6 +4239,107 @@ export function createProjectWorkService({
         thinkingLevel: selection.thinkingLevel,
       });
     }
+    return snapshot(conversationId);
+  }
+
+  async function configureExecutionPolicy(conversationId, {
+    mode,
+    expectedRevision,
+  } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    if (!isExecutionPolicyMode(mode)) {
+      throw projectWorkError(
+        "PROJECT_WORK_EXECUTION_POLICY_INVALID",
+        "执行策略无效",
+        400,
+      );
+    }
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+      throw projectWorkError(
+        "PROJECT_WORK_EXECUTION_POLICY_REVISION_INVALID",
+        "执行策略版本无效",
+        400,
+      );
+    }
+    let nextPolicy;
+    let downgradeReason = null;
+    await updateConversation(conversationId, (current) => {
+      if (
+        BUSY_CONVERSATION_STATUSES.has(current.status)
+        || activeMessageClaims.has(conversationId)
+        || Boolean(runtimes.get(conversationId)?.completion)
+        || verificationControllers.has(conversationId)
+        || autoReviewSettlements.has(conversationId)
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_CONVERSATION_BUSY",
+          "Agent 工作期间不能切换执行策略",
+          409,
+        );
+      }
+      const currentPolicy = normalizeExecutionPolicy(current.executionPolicy);
+      if (currentPolicy.revision !== expectedRevision) {
+        throw projectWorkError(
+          "PROJECT_WORK_EXECUTION_POLICY_STALE",
+          "执行策略已变化，请刷新后重试",
+          409,
+          true,
+        );
+      }
+      const workspace = normalizedWorkspaceRecord(current, timestamp());
+      const effectiveMode = (
+        mode === "auto_review"
+        && conversationWorkspaceKind(current) === "bound_project"
+        && workspace.automaticApplyAllowed !== true
+      )
+        ? "manual_review"
+        : mode;
+      if (effectiveMode !== mode) {
+        downgradeReason = "workspace_isolation_unavailable";
+      }
+      if (
+        effectiveMode === "auto_review"
+        && current.activeChangeSet?.files?.length > 0
+        && [
+          "pending",
+          "proposed",
+          "ready",
+          "awaiting_confirmation",
+          "awaiting_approval",
+        ].includes(current.activeChangeSet.status)
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_AUTO_REVIEW_PENDING_CHANGE",
+          "请先处理当前待审阅修改，再开启替我审批",
+          409,
+        );
+      }
+      nextPolicy = {
+        mode: effectiveMode,
+        revision: currentPolicy.revision + 1,
+        policyVersion: AUTO_REVIEW_POLICY_VERSION,
+      };
+      return {
+        executionPolicy: nextPolicy,
+        workspace,
+      };
+    });
+    await appendEvent(
+      conversationId,
+      downgradeReason
+        ? "execution_policy.downgraded"
+        : "execution_policy.changed",
+      {
+        ...nextPolicy,
+        ...(downgradeReason
+          ? {
+              requestedMode: mode,
+              reasonCode: downgradeReason,
+            }
+          : {}),
+      },
+    );
     return snapshot(conversationId);
   }
 
@@ -2035,7 +4378,9 @@ export function createProjectWorkService({
       modelId,
       thinkingLevel,
     });
-    const existingConversation = await conversationStore.get(conversationId);
+    const existingConversation = await recoverOutstandingApplyJournals(
+      conversationId,
+    );
     const existingMessage = (existingConversation.messages ?? []).find(
       (message) => message.clientRequestId === requestId,
     );
@@ -2069,6 +4414,8 @@ export function createProjectWorkService({
     let selectedThinkingLevel;
     let selection;
     let selectionChanged = false;
+    let previewAllowed = false;
+    let previewToolActive = false;
     let turnSettings;
     let userMessage;
     try {
@@ -2091,6 +4438,8 @@ export function createProjectWorkService({
         if (
           activeMessageClaims.has(conversationId)
           || BUSY_CONVERSATION_STATUSES.has(current.status)
+          || current.status === "awaiting_user"
+          || autoReviewSettlements.has(conversationId)
         ) {
           throw projectWorkError(
             "PROJECT_WORK_CONVERSATION_BUSY",
@@ -2123,15 +4472,50 @@ export function createProjectWorkService({
         );
         selectionChanged = selection.modelRef !== current.modelRef
           || selection.thinkingLevel !== current.thinkingLevel;
+        const executionPolicy = normalizeExecutionPolicy(
+          current.executionPolicy,
+        );
+        previewAllowed = conversationWorkspaceKind(current) === "bound_project"
+          && !turn.workflowId;
+        if (
+          executionPolicy.mode === "auto_review"
+          && current.activeChangeSet?.files?.length > 0
+          && (
+            [
+              "pending",
+              "proposed",
+              "ready",
+              "awaiting_confirmation",
+              "awaiting_approval",
+            ].includes(current.activeChangeSet.status)
+            || (
+              current.activeChangeSet.status === "blocked"
+              && current.activeChangeSet.overlayCleared !== true
+            )
+          )
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_AUTO_REVIEW_PENDING_CHANGE",
+            "替我审批不能接管上一轮未处理的修改",
+            409,
+          );
+        }
         turnSettings = {
+          turnId: proposedMessageId,
+          turnSeq: nextTurnSequence(current),
+          attempt: 1,
           providerId: selection.providerId,
           modelId: selection.modelId,
           thinkingLevel: selection.thinkingLevel,
           workflowId: turn.workflowId,
           capabilities: turn.capabilityIds,
+          executionPolicyMode: executionPolicy.mode,
+          executionPolicyRevision: executionPolicy.revision,
+          executionPolicyVersion: executionPolicy.policyVersion,
         };
         userMessage = {
           id: proposedMessageId,
+          messageSeq: nextMessageSequence(current),
           role: "user",
           text: messageText,
           images: normalizedImages.map(({ metadata }) => metadata),
@@ -2156,6 +4540,7 @@ export function createProjectWorkService({
             ? conversationTitleFromMessage(messageText)
             : current.title,
           status: "running",
+          plan: null,
           messages: [...(current.messages ?? []), userMessage],
           lastError: null,
         };
@@ -2196,7 +4581,10 @@ export function createProjectWorkService({
         await refreshRuntimeContext(runtime);
       }
       if (typeof runtime.host.setActiveToolsByName !== "function") {
-        if (turn.workflowId || turn.capabilityIds.length > 0) {
+        if (
+          turn.workflowId
+          || turn.capabilityIds.length > 0
+        ) {
           throw projectWorkError(
             "PROJECT_WORK_TOOL_SELECTION_UNAVAILABLE",
             "当前 Pi 会话不能按本轮切换工具",
@@ -2204,7 +4592,12 @@ export function createProjectWorkService({
           );
         }
       } else {
-        runtime.host.setActiveToolsByName(turn.toolNames);
+        runtime.host.setActiveToolsByName(
+          previewAllowed
+            ? [...turn.toolNames, PROJECT_WORK_PREVIEW_TOOL_NAME]
+            : turn.toolNames,
+        );
+        previewToolActive = previewAllowed;
       }
       if (typeof runtime.host.setThinkingLevel !== "function") {
         if (runtime.thinkingLevel !== selectedThinkingLevel) {
@@ -2269,7 +4662,17 @@ export function createProjectWorkService({
       .then(() => runtime.host.prompt(
         `${messageText}${promptContext}`,
         {
-          turnGuidance: turn.guidance,
+          turnGuidance: [
+            turn.guidance,
+            previewToolActive
+              ? [
+                  CONTROLLED_PREVIEW_GUIDANCE,
+                  turnSettings.executionPolicyMode === "auto_review"
+                    ? AUTO_PREVIEW_GUIDANCE
+                    : MANUAL_PREVIEW_GUIDANCE,
+                ].join("\n")
+              : "",
+          ].filter(Boolean).join("\n"),
           ...(normalizedImages.length > 0 ? {
             images: normalizedImages.map(({ image }) => image),
           } : {}),
@@ -2277,12 +4680,35 @@ export function createProjectWorkService({
       ))
       .then(() => runtime.eventQueue)
       .catch(async (error) => {
-        const safeError = safeProjectWorkError(error);
-        await updateConversation(conversationId, {
-          status: "error",
-          lastError: safeError,
-        });
-        await appendEvent(conversationId, "error", safeError);
+        const current = await conversationStore.get(conversationId);
+        const hasSuccessfulAnswer = normalizedConversationMessages(
+          current,
+        ).some((message) => (
+          message.role === "assistant"
+          && message.turnId === turnSettings.turnId
+          && message.status === "completed"
+          && message.isFinal !== false
+        ));
+        if (hasSuccessfulAnswer) {
+          await failConversationOperation(
+            conversationId,
+            `operation-${idFactory()}`,
+            error,
+            {
+              type: "settlement",
+              turnId: turnSettings.turnId,
+              resumeStatus: "idle",
+              preserveSuccessfulAnswer: true,
+            },
+          );
+        } else {
+          const safeError = safeProjectWorkError(error);
+          await updateConversation(conversationId, {
+            status: "error",
+            lastError: safeError,
+          });
+          await appendEvent(conversationId, "error", safeError);
+        }
       })
       .finally(async () => {
         try {
@@ -2309,6 +4735,745 @@ export function createProjectWorkService({
       });
     runtime.completion = completion;
     return snapshot(conversationId);
+  }
+
+  async function retryLastTurn(conversationId, {
+    clientRequestId,
+  } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const requestId = normalizeClientRequestId(clientRequestId, idFactory);
+    const existingConversation = await conversationStore.get(conversationId);
+    if ((existingConversation.operations ?? []).some((item) => (
+      item.type === "retry_last_turn"
+      && item.clientRequestId === requestId
+    ))) {
+      return snapshot(conversationId);
+    }
+    const catalog = await listModels();
+    const operationId = `operation-${idFactory()}`;
+    const startedAt = timestamp();
+    let operation;
+    let turn;
+    let turnSettings;
+    let previewAllowed = false;
+    let previewToolActive = false;
+    let preserveSuccessfulAnswer = false;
+    let selectedConversation;
+    let replayed = false;
+    await updateConversation(conversationId, (current) => {
+      if ((current.operations ?? []).some((item) => (
+        item.type === "retry_last_turn"
+        && item.clientRequestId === requestId
+      ))) {
+        replayed = true;
+        return {};
+      }
+      if (
+        activeMessageClaims.has(conversationId)
+        || BUSY_CONVERSATION_STATUSES.has(current.status)
+        || current.status === "awaiting_user"
+        || current.status === "awaiting_confirmation"
+        || Boolean(runtimes.get(conversationId)?.completion)
+        || autoReviewSettlements.has(conversationId)
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_CONVERSATION_BUSY",
+          "当前会话还有操作或修改审阅尚未完成",
+          409,
+        );
+      }
+      if ((current.askUserRequests ?? []).some(
+        (request) => request.status === "pending",
+      )) {
+        throw projectWorkError(
+          "PROJECT_WORK_ASK_USER_PENDING",
+          "请先回答或取消当前问题，再重试上一轮",
+          409,
+        );
+      }
+      if ((current.followUpQueue ?? []).some(
+        (item) => item.status === "queued",
+      )) {
+        throw projectWorkError(
+          "PROJECT_WORK_FOLLOW_UP_PENDING",
+          "请先处理待发送的后续消息，再重试上一轮",
+          409,
+        );
+      }
+      if (
+        Array.isArray(current.activeChangeSet?.files)
+        && current.activeChangeSet.files.length > 0
+        && !["applied", "cancelled"].includes(current.activeChangeSet.status)
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_RETRY_REVIEW_PENDING",
+          "请先处理上一轮待审阅修改，再重试该轮",
+          409,
+        );
+      }
+      const messages = normalizedConversationMessages(current);
+      const userMessage = [...messages].reverse().find((message) => (
+        message.role === "user"
+        && !["queued", "cancelled", "failed"].includes(message.status)
+      ));
+      if (!userMessage) {
+        throw projectWorkError(
+          "PROJECT_WORK_RETRY_UNAVAILABLE",
+          "当前会话没有可重试的上一轮",
+          409,
+        );
+      }
+      const assistants = messages.filter((message) => (
+        message.role === "assistant"
+        && message.turnId === userMessage.turnId
+      ));
+      const targetAssistant = assistants
+        .filter((message) => message.isFinal !== false)
+        .at(-1) ?? assistants.at(-1) ?? null;
+      preserveSuccessfulAnswer = targetAssistant?.status === "completed";
+      turn = resolveProjectWorkTurn({
+        workflowId: userMessage.workflowId,
+        capabilityIds: userMessage.capabilities,
+        capabilityStatus: catalog.capabilities,
+        hasImages: Array.isArray(userMessage.images)
+          && userMessage.images.length > 0,
+      });
+      const executionPolicy = normalizeExecutionPolicy(
+        current.executionPolicy,
+      );
+      previewAllowed = conversationWorkspaceKind(current) === "bound_project"
+        && !turn.workflowId;
+      const attempt = assistants.reduce(
+        (maximum, message) => Math.max(maximum, message.attempt ?? 1),
+        0,
+      ) + 1;
+      turnSettings = {
+        turnId: userMessage.turnId,
+        turnSeq: userMessage.turnSeq,
+        attempt,
+        retryOperationId: operationId,
+        providerId: current.providerId ?? userMessage.providerId ?? null,
+        modelId: current.modelId ?? userMessage.modelId ?? null,
+        thinkingLevel: current.thinkingLevel
+          ?? userMessage.thinkingLevel
+          ?? null,
+        workflowId: turn.workflowId,
+        capabilities: turn.capabilityIds,
+        executionPolicyMode: executionPolicy.mode,
+        executionPolicyRevision: executionPolicy.revision,
+        executionPolicyVersion: executionPolicy.policyVersion,
+      };
+      operation = {
+        id: operationId,
+        clientRequestId: requestId,
+        type: "retry_last_turn",
+        status: "running",
+        turnId: userMessage.turnId,
+        targetAssistantMessageId: targetAssistant?.id ?? null,
+        resultAssistantMessageId: null,
+        resumeStatus: current.status,
+        startedAt,
+        completedAt: null,
+        error: null,
+      };
+      selectedConversation = {
+        providerId: current.providerId,
+        modelId: current.modelId,
+        modelRef: current.modelRef,
+        thinkingLevel: current.thinkingLevel,
+      };
+      return {
+        status: "running",
+        operations: [...(current.operations ?? []), operation].slice(-100),
+        lastError: null,
+      };
+    });
+    if (replayed) return snapshot(conversationId);
+    await appendEvent(conversationId, "operation.started", {
+      operation: publicConversationOperation(operation),
+    });
+
+    let runtime = null;
+    try {
+      runtime = await getRuntime(conversationId);
+      if (
+        selectedConversation.modelRef
+        && selectedConversation.modelRef !== runtime.modelRef
+      ) {
+        if (typeof runtime.host.setModel !== "function") {
+          throw projectWorkError(
+            "PROJECT_WORK_MODEL_SWITCH_UNAVAILABLE",
+            "当前 Pi 会话不能切换模型",
+            409,
+          );
+        }
+        await runtime.host.setModel(selectedConversation.modelRef);
+        runtime.providerId = selectedConversation.providerId;
+        runtime.modelId = selectedConversation.modelId;
+        runtime.modelRef = selectedConversation.modelRef;
+      }
+      if (
+        selectedConversation.thinkingLevel
+        && selectedConversation.thinkingLevel !== runtime.thinkingLevel
+      ) {
+        if (typeof runtime.host.setThinkingLevel !== "function") {
+          throw projectWorkError(
+            "PROJECT_WORK_THINKING_LEVEL_SWITCH_UNAVAILABLE",
+            "当前 Pi 会话不能切换思考强度",
+            409,
+          );
+        }
+        runtime.thinkingLevel = runtime.host.setThinkingLevel(
+          selectedConversation.thinkingLevel,
+        );
+      }
+      if (typeof runtime.host.retryLastTurn !== "function") {
+        throw projectWorkError(
+          "PROJECT_WORK_RETRY_UNAVAILABLE",
+          "当前 Pi 会话不能安全重试上一轮",
+          409,
+          true,
+        );
+      }
+      if (typeof runtime.host.setActiveToolsByName === "function") {
+        runtime.host.setActiveToolsByName(
+          previewAllowed
+            ? [...turn.toolNames, PROJECT_WORK_PREVIEW_TOOL_NAME]
+            : turn.toolNames,
+        );
+        previewToolActive = previewAllowed;
+      }
+      runtime.activeTurnSettings = turnSettings;
+    } catch (error) {
+      await failConversationOperation(
+        conversationId,
+        operationId,
+        error,
+        {
+          type: "retry_last_turn",
+          turnId: operation.turnId,
+          resumeStatus: operation.resumeStatus,
+          preserveSuccessfulAnswer,
+        },
+      ).catch(() => undefined);
+      if (runtime) {
+        runtime.completion = null;
+        runtime.activeTurnSettings = null;
+      }
+      throw error;
+    }
+
+    const completion = Promise.resolve()
+      .then(() => runtime.host.retryLastTurn({
+        turnGuidance: [
+          turn.guidance,
+          previewToolActive
+            ? [
+                CONTROLLED_PREVIEW_GUIDANCE,
+                turnSettings.executionPolicyMode === "auto_review"
+                  ? AUTO_PREVIEW_GUIDANCE
+                  : MANUAL_PREVIEW_GUIDANCE,
+              ].join("\n")
+            : "",
+        ].filter(Boolean).join("\n"),
+      }))
+      .then(() => runtime.eventQueue)
+      .then(async () => {
+        const current = await conversationStore.get(conversationId);
+        const resultMessage = [...(current.messages ?? [])].reverse().find(
+          (message) => (
+            message.role === "assistant"
+            && message.retryOperationId === operationId
+            && message.isFinal !== false
+          ),
+        );
+        if (!resultMessage || resultMessage.status !== "completed") {
+          throw projectWorkError(
+            "PROJECT_WORK_RETRY_FAILED",
+            "上一轮重试没有生成可用回答",
+            502,
+            true,
+          );
+        }
+        const completedAt = timestamp();
+        const { operation: completedOperation } = await updateConversationOperation(
+          conversationId,
+          operationId,
+          {
+            status: "completed",
+            resultAssistantMessageId: resultMessage.id,
+            completedAt,
+            error: null,
+          },
+        );
+        await appendEvent(conversationId, "operation.completed", {
+          operation: publicConversationOperation(completedOperation),
+        });
+      })
+      .catch(async (error) => {
+        await failConversationOperation(
+          conversationId,
+          operationId,
+          error,
+          {
+            type: "retry_last_turn",
+            turnId: operation.turnId,
+            resumeStatus: operation.resumeStatus,
+            preserveSuccessfulAnswer,
+          },
+        );
+      })
+      .finally(async () => {
+        try {
+          const latest = await conversationStore.get(conversationId);
+          if (latest.status === "running") {
+            await updateConversation(conversationId, {
+              status: stableStatusAfterOperation(
+                latest,
+                operation.resumeStatus,
+              ),
+            });
+            await appendEvent(conversationId, "agent.status", {
+              status: stableStatusAfterOperation(
+                latest,
+                operation.resumeStatus,
+              ),
+            });
+          }
+        } finally {
+          try {
+            runtime.host.setActiveToolsByName?.(PROJECT_WORK_DEFAULT_TOOL_NAMES);
+          } catch {
+            // A future normal turn sets the default list again before prompting.
+          }
+          runtime.completion = null;
+          runtime.activeTurnSettings = null;
+        }
+      });
+    runtime.completion = completion;
+    return snapshot(conversationId);
+  }
+
+  async function markFollowUpDelivered(conversationId, text) {
+    let deliveredItem = null;
+    const deliveredAt = timestamp();
+    await updateConversation(conversationId, (current) => {
+      const match = (current.followUpQueue ?? []).find(
+        (item) => item.status === "queued" && item.text === text,
+      );
+      if (!match) return {};
+      deliveredItem = {
+        ...match,
+        status: "delivered",
+        deliveredAt,
+      };
+      return {
+        followUpQueue: (current.followUpQueue ?? []).map((item) => (
+          item.id === match.id ? deliveredItem : item
+        )),
+        messages: (current.messages ?? []).map((message) => (
+          message.id === match.messageId
+            ? { ...message, status: "completed" }
+            : message
+        )),
+      };
+    });
+    if (deliveredItem) {
+      await appendEvent(conversationId, "follow_up.delivered", {
+        id: deliveredItem.id,
+        messageId: deliveredItem.messageId,
+      });
+    }
+    return deliveredItem;
+  }
+
+  async function listFollowUps(conversationId, {
+    includeHistory = false,
+  } = {}) {
+    assertActive();
+    const conversation = await conversationStore.get(conversationId);
+    return (conversation.followUpQueue ?? [])
+      .filter((item) => includeHistory || item.status === "queued")
+      .map(publicFollowUpItem);
+  }
+
+  async function enqueueFollowUp(conversationId, { text } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const messageText = String(text ?? "").trim();
+    if (!messageText || messageText.length > 32_000) {
+      throw projectWorkError(
+        "PROJECT_WORK_FOLLOW_UP_INVALID",
+        "后续消息必须包含 1 到 32000 个字符",
+        400,
+      );
+    }
+    return withFollowUpMutation(conversationId, async () => {
+      const conversation = await conversationStore.get(conversationId);
+      const runtime = runtimes.get(conversationId);
+      if (
+        conversation.status !== "running"
+        || !runtime
+        || typeof runtime.host.followUp !== "function"
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_NOT_RUNNING",
+          "当前没有可追加后续消息的 Agent 操作",
+          409,
+        );
+      }
+      await runtime.eventQueue;
+      const createdAt = timestamp();
+      const activeSettings = runtime.activeTurnSettings ?? {};
+      const item = {
+        id: `follow-up-${idFactory()}`,
+        messageId: `message-${idFactory()}`,
+        text: messageText,
+        status: "queued",
+        createdAt,
+        deliveredAt: null,
+        cancelledAt: null,
+        failedAt: null,
+      };
+      const message = {
+        id: item.messageId,
+        messageSeq: nextMessageSequence(conversation),
+        turnId: item.messageId,
+        turnSeq: nextTurnSequence(conversation),
+        attempt: 1,
+        role: "user",
+        text: messageText,
+        status: "queued",
+        providerId: activeSettings.providerId ?? conversation.providerId,
+        modelId: activeSettings.modelId ?? conversation.modelId,
+        thinkingLevel: activeSettings.thinkingLevel
+          ?? conversation.thinkingLevel,
+        workflowId: activeSettings.workflowId ?? null,
+        capabilities: Array.isArray(activeSettings.capabilities)
+          ? [...activeSettings.capabilities]
+          : [],
+        createdAt,
+      };
+      await updateConversation(conversationId, (current) => {
+        const currentQueue = current.followUpQueue ?? [];
+        const pending = currentQueue.filter((entry) => entry.status === "queued");
+        if (pending.length >= 50) {
+          throw projectWorkError(
+            "PROJECT_WORK_FOLLOW_UP_QUEUE_FULL",
+            "后续消息队列最多保留 50 条待处理消息",
+            409,
+          );
+        }
+        const history = currentQueue.filter(
+          (entry) => entry.status !== "queued",
+        ).slice(-50);
+        return {
+          followUpQueue: [...history, ...pending, item],
+          messages: [...(current.messages ?? []), message],
+        };
+      });
+      try {
+        await runtime.host.followUp(messageText);
+      } catch (error) {
+        const failedAt = timestamp();
+        await updateConversation(conversationId, (current) => ({
+          followUpQueue: (current.followUpQueue ?? []).map((entry) => (
+            entry.id === item.id
+              ? { ...entry, status: "failed", failedAt }
+              : entry
+          )),
+          messages: (current.messages ?? []).map((entry) => (
+            entry.id === item.messageId
+              ? { ...entry, status: "failed" }
+              : entry
+          )),
+        }));
+        await appendEvent(conversationId, "follow_up.failed", {
+          id: item.id,
+          messageId: item.messageId,
+          error: safeProjectWorkError(error),
+        });
+        throw error;
+      }
+      await appendEvent(conversationId, "follow_up.queued", {
+        id: item.id,
+        messageId: item.messageId,
+      });
+      return {
+        schemaVersion: 1,
+        item: publicFollowUpItem(item),
+        snapshot: await snapshot(conversationId),
+      };
+    });
+  }
+
+  async function cancelFollowUps(conversationId, {
+    itemId = null,
+    reason = "user",
+    rewriteRuntime = true,
+  } = {}) {
+    return withFollowUpMutation(conversationId, async () => {
+      let conversation = await conversationStore.get(conversationId);
+      const runtime = runtimes.get(conversationId);
+      if (runtime) {
+        await runtime.eventQueue;
+        conversation = await conversationStore.get(conversationId);
+      }
+      const queued = (conversation.followUpQueue ?? []).filter(
+        (item) => item.status === "queued",
+      );
+      const targets = itemId
+        ? queued.filter((item) => item.id === itemId)
+        : queued;
+      if (itemId && targets.length === 0) {
+        throw projectWorkError(
+          "PROJECT_WORK_FOLLOW_UP_NOT_FOUND",
+          "待处理的后续消息不存在",
+          404,
+        );
+      }
+      if (targets.length === 0) return [];
+
+      const targetIds = new Set(targets.map((item) => item.id));
+      if (
+        rewriteRuntime
+        && runtime
+        && conversation.status === "running"
+      ) {
+        if (typeof runtime.host.replaceFollowUps !== "function") {
+          throw projectWorkError(
+            "PROJECT_WORK_FOLLOW_UP_QUEUE_UNAVAILABLE",
+            "当前 Pi 会话不能修改后续消息队列",
+            409,
+          );
+        }
+        const remaining = (conversation.followUpQueue ?? []).filter(
+          (item) => item.status === "queued" && !targetIds.has(item.id),
+        );
+        await runtime.host.replaceFollowUps(remaining.map((item) => item.text));
+      }
+
+      const cancelledAt = timestamp();
+      await updateConversation(conversationId, (current) => ({
+        followUpQueue: (current.followUpQueue ?? []).map((item) => (
+          targetIds.has(item.id) && item.status === "queued"
+            ? { ...item, status: "cancelled", cancelledAt }
+            : item
+        )),
+        messages: (current.messages ?? []).map((message) => (
+          targets.some((item) => item.messageId === message.id)
+            ? { ...message, status: "cancelled" }
+            : message
+        )),
+      }));
+      await appendEvent(conversationId, "follow_up.cancelled", {
+        ids: [...targetIds],
+        reason,
+      });
+      return targets.map((item) => publicFollowUpItem({
+        ...item,
+        status: "cancelled",
+        cancelledAt,
+      }));
+    });
+  }
+
+  async function removeFollowUp(conversationId, itemId) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    return {
+      schemaVersion: 1,
+      cancelled: await cancelFollowUps(conversationId, { itemId }),
+    };
+  }
+
+  async function clearFollowUps(conversationId) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    return {
+      schemaVersion: 1,
+      cancelled: await cancelFollowUps(conversationId),
+    };
+  }
+
+  async function listAskUserRequests(conversationId, {
+    includeHistory = false,
+  } = {}) {
+    assertActive();
+    const conversation = await conversationStore.get(conversationId);
+    return (conversation.askUserRequests ?? [])
+      .filter((request) => includeHistory || request.status === "pending")
+      .map(publicAskUserRequest);
+  }
+
+  async function createAskUserRequest(conversationId, {
+    questions,
+  } = {}, {
+    source = "project_api",
+    allowRunning = false,
+  } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const normalizedQuestions = normalizeAskUserQuestions(questions);
+    const createdAt = timestamp();
+    let createdRequest;
+    await updateConversation(conversationId, (current) => {
+      if (
+        (
+          BUSY_CONVERSATION_STATUSES.has(current.status)
+          && !(allowRunning && current.status === "running")
+        )
+        || current.status === "awaiting_confirmation"
+        || autoReviewSettlements.has(conversationId)
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_CONVERSATION_BUSY",
+          "当前会话还有操作或修改审阅尚未完成",
+          409,
+        );
+      }
+      if ((current.askUserRequests ?? []).some(
+        (request) => request.status === "pending",
+      )) {
+        throw projectWorkError(
+          "PROJECT_WORK_ASK_USER_PENDING",
+          "当前会话已经有一组问题等待回答",
+          409,
+        );
+      }
+      createdRequest = {
+        id: `ask-user-${idFactory()}`,
+        status: "pending",
+        questions: normalizedQuestions,
+        answers: [],
+        source: source === "agent_tool" ? "agent_tool" : "project_api",
+        resumeStatus: current.status === "awaiting_user"
+          ? "idle"
+          : current.status,
+        createdAt,
+        answeredAt: null,
+        cancelledAt: null,
+      };
+      return {
+        status: "awaiting_user",
+        askUserRequests: [
+          ...(current.askUserRequests ?? []).slice(-49),
+          createdRequest,
+        ],
+      };
+    });
+    await appendEvent(conversationId, "ask_user.requested", {
+      id: createdRequest.id,
+      source: createdRequest.source,
+      questionCount: createdRequest.questions.length,
+    });
+    return {
+      schemaVersion: 1,
+      request: publicAskUserRequest(createdRequest),
+      snapshot: await snapshot(conversationId),
+    };
+  }
+
+  async function requestAgentInput(conversationId, { questions } = {}) {
+    const created = await createAskUserRequest(
+      conversationId,
+      { questions },
+      {
+        source: "agent_tool",
+        allowRunning: true,
+      },
+    );
+    const key = `${conversationId}:${created.request.id}`;
+    return new Promise((resolve) => {
+      askUserWaiters.set(key, resolve);
+      conversationStore.get(conversationId).then((current) => {
+        const request = (current.askUserRequests ?? []).find(
+          (item) => item.id === created.request.id,
+        );
+        if (!request || request.status === "pending") return;
+        if (askUserWaiters.get(key) !== resolve) return;
+        askUserWaiters.delete(key);
+        resolve(publicAskUserRequest(request));
+      }).catch(() => undefined);
+    });
+  }
+
+  async function settleAskUserRequest(
+    conversationId,
+    requestId,
+    {
+      answers = null,
+      cancelled = false,
+    } = {},
+  ) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    let settledRequest;
+    const settledAt = timestamp();
+    await updateConversation(conversationId, (current) => {
+      const request = (current.askUserRequests ?? []).find(
+        (item) => item.id === requestId && item.status === "pending",
+      );
+      if (!request) {
+        throw projectWorkError(
+          "PROJECT_WORK_ASK_USER_NOT_FOUND",
+          "等待回答的问题请求不存在",
+          404,
+        );
+      }
+      const normalizedAnswers = cancelled
+        ? []
+        : normalizeAskUserAnswers(request, answers);
+      settledRequest = {
+        ...request,
+        status: cancelled ? "cancelled" : "answered",
+        answers: normalizedAnswers,
+        answeredAt: cancelled ? null : settledAt,
+        cancelledAt: cancelled ? settledAt : null,
+      };
+      const requests = (current.askUserRequests ?? []).map((item) => (
+        item.id === request.id ? settledRequest : item
+      ));
+      const stillPending = requests.some((item) => item.status === "pending");
+      return {
+        status: current.status === "awaiting_user" && !stillPending
+          ? request.resumeStatus || "idle"
+          : current.status,
+        askUserRequests: requests,
+      };
+    });
+    await appendEvent(
+      conversationId,
+      cancelled ? "ask_user.cancelled" : "ask_user.answered",
+      {
+        id: settledRequest.id,
+        answerCount: settledRequest.answers.length,
+      },
+    );
+    const waiterKey = `${conversationId}:${settledRequest.id}`;
+    const waiter = askUserWaiters.get(waiterKey);
+    if (waiter) {
+      askUserWaiters.delete(waiterKey);
+      waiter(publicAskUserRequest(settledRequest));
+    }
+    return {
+      schemaVersion: 1,
+      request: publicAskUserRequest(settledRequest),
+      snapshot: await snapshot(conversationId),
+    };
+  }
+
+  async function answerAskUserRequest(conversationId, requestId, {
+    answers,
+  } = {}) {
+    return settleAskUserRequest(conversationId, requestId, { answers });
+  }
+
+  async function cancelAskUserRequest(conversationId, requestId) {
+    return settleAskUserRequest(conversationId, requestId, {
+      cancelled: true,
+    });
   }
 
   async function steerConversation(conversationId, { text } = {}) {
@@ -2361,13 +5526,65 @@ export function createProjectWorkService({
     assertConversationNotDeleting(conversationId);
     const conversation = await conversationStore.get(conversationId);
     const runtime = runtimes.get(conversationId);
+    if (autoReviewSettlements.has(conversationId)) {
+      throw projectWorkError(
+        "PROJECT_WORK_CONVERSATION_BUSY",
+        "替我审批正在完成安全判断，请稍后再试",
+        409,
+        true,
+      );
+    }
+    for (const request of (conversation.askUserRequests ?? []).filter(
+      (item) => item.status === "pending",
+    )) {
+      await settleAskUserRequest(conversationId, request.id, {
+        cancelled: true,
+      });
+    }
     const verificationController = verificationControllers.get(conversationId);
     verificationController?.abort();
+    let clearedRuntimeQueue = { steering: [], followUp: [] };
     if (runtime) {
+      await runtime.eventQueue;
+      if (typeof runtime.host.clearQueue === "function") {
+        clearedRuntimeQueue = await runtime.host.clearQueue()
+          ?? clearedRuntimeQueue;
+      }
+      await cancelFollowUps(conversationId, {
+        reason: "stopped",
+        rewriteRuntime: false,
+      });
       await runtime.host.abort();
       await runtime.eventQueue;
+    } else {
+      await cancelFollowUps(conversationId, {
+        reason: "stopped",
+        rewriteRuntime: false,
+      });
     }
-    if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
+    let cancelledQueuedMessages = 0;
+    await updateConversation(conversationId, (current) => ({
+      messages: (current.messages ?? []).map((message) => {
+        if (message.role !== "user" || message.status !== "queued") {
+          return message;
+        }
+        cancelledQueuedMessages += 1;
+        return { ...message, status: "cancelled" };
+      }),
+    }));
+    if (
+      cancelledQueuedMessages > 0
+      || clearedRuntimeQueue.steering?.length > 0
+      || clearedRuntimeQueue.followUp?.length > 0
+    ) {
+      await appendEvent(conversationId, "queue.cleared", {
+        reason: "stopped",
+        steeringCount: clearedRuntimeQueue.steering?.length ?? 0,
+        followUpCount: clearedRuntimeQueue.followUp?.length ?? 0,
+      });
+    }
+    const latest = await conversationStore.get(conversationId);
+    if (BUSY_CONVERSATION_STATUSES.has(latest.status)) {
       await updateConversation(conversationId, { status: "aborted" });
       await appendEvent(conversationId, "agent.status", { status: "aborted" });
     }
@@ -2378,7 +5595,11 @@ export function createProjectWorkService({
     assertActive();
     assertConversationNotDeleting(conversationId);
     const conversation = await conversationStore.get(conversationId);
-    if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
+    if (
+      BUSY_CONVERSATION_STATUSES.has(conversation.status)
+      || conversation.status === "awaiting_user"
+      || autoReviewSettlements.has(conversationId)
+    ) {
       throw projectWorkError(
         "PROJECT_WORK_CONVERSATION_BUSY",
         "Agent 正在工作，当前不能压缩上下文",
@@ -2386,6 +5607,7 @@ export function createProjectWorkService({
       );
     }
     const runtime = await getRuntime(conversationId);
+    const resumeStatus = conversation.status;
     await updateConversation(conversationId, (current) => {
       const currentCompaction = normalizedCompactionState(current.compaction);
       return {
@@ -2396,6 +5618,7 @@ export function createProjectWorkService({
           ),
           status: "running",
           reason: "manual",
+          resumeStatus,
         },
       };
     });
@@ -2415,8 +5638,7 @@ export function createProjectWorkService({
         });
       }
       await updateConversation(conversationId, {
-        status: "idle",
-        lastError: null,
+        status: resumeStatus,
       });
     } catch (error) {
       await runtime.eventQueue;
@@ -2433,10 +5655,12 @@ export function createProjectWorkService({
       }
       const safeError = safeProjectWorkError(error);
       await updateConversation(conversationId, {
-        status: "error",
-        lastError: safeError,
+        status: resumeStatus,
       });
-      await appendEvent(conversationId, "error", safeError);
+      await appendEvent(conversationId, "compaction.failed", {
+        reason: "manual",
+        error: safeError,
+      });
       throw error;
     }
     return snapshot(conversationId);
@@ -2454,6 +5678,12 @@ export function createProjectWorkService({
     return readProjectTextFile(project.rootPath, options);
   }
 
+  async function readProjectImage(projectId, options = {}) {
+    assertActive();
+    const project = await registry.get(projectId);
+    return readProjectImageFile(project.rootPath, options);
+  }
+
   async function readConversationFile(conversationId, options = {}) {
     assertActive();
     const conversation = await conversationStore.get(conversationId);
@@ -2467,17 +5697,37 @@ export function createProjectWorkService({
     });
   }
 
+  async function readConversationImage(conversationId, options = {}) {
+    assertActive();
+    const conversation = await conversationStore.get(conversationId);
+    const workspace = await resolveConversationWorkspace(conversation);
+    const paths = conversationPaths(conversationId);
+    return readProjectOverlayImageFile({
+      ...options,
+      projectRoot: workspace.projectRoot,
+      workspaceRoot: paths.workspaceRoot,
+    });
+  }
+
   async function getConversationTree(conversationId, options = {}) {
     assertActive();
     const conversation = await conversationStore.get(conversationId);
     const workspace = await resolveConversationWorkspace(conversation);
-    return getProjectFileTree(workspace.projectRoot, options);
+    const paths = conversationPaths(conversationId);
+    return getProjectOverlayFileTree({
+      ...options,
+      projectRoot: workspace.projectRoot,
+      workspaceRoot: paths.workspaceRoot,
+    });
   }
 
   async function getChangeSet(conversationId) {
     assertActive();
     const conversation = await conversationStore.get(conversationId);
-    if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
+    if (
+      BUSY_CONVERSATION_STATUSES.has(conversation.status)
+      || autoReviewSettlements.has(conversationId)
+    ) {
       throw projectWorkError(
         "PROJECT_WORK_CONVERSATION_BUSY",
         "Agent 正在准备修改，请稍后再审阅更改",
@@ -2485,6 +5735,31 @@ export function createProjectWorkService({
       );
     }
     return refreshChangeSet(conversationId);
+  }
+
+  async function getGitEvidence(conversationId) {
+    assertActive();
+    const conversation = await conversationStore.get(conversationId);
+    if (conversationWorkspaceKind(conversation) === "scratch") {
+      return {
+        available: false,
+        branch: null,
+        head: null,
+        staged: [],
+        unstaged: [],
+        untracked: [],
+        truncated: false,
+        reason: "not_a_git_worktree",
+      };
+    }
+    const workspace = await resolveConversationWorkspace(conversation);
+    return gitInspector(workspace.projectRoot);
+  }
+
+  async function getWorkspace(conversationId) {
+    assertActive();
+    const conversation = await recoverOutstandingApplyJournals(conversationId);
+    return publicWorkspaceRecord(conversation);
   }
 
   function withApplyLock(lockKey, operation) {
@@ -2516,22 +5791,553 @@ export function createProjectWorkService({
     )));
   }
 
-  async function applyChangeSet(conversationId, {
-    changeSetId,
-    changeSetHash,
-    files,
-  } = {}) {
+  function journalDirectory(paths, journalId) {
+    const storageKey = sha256(String(journalId)).slice(7, 39);
+    return path.join(paths.directory, "apply-journals", storageKey);
+  }
+
+  function journalBackupPath(paths, journalId, relativePath) {
+    const normalized = normalizeProjectPath(relativePath);
+    const root = path.join(journalDirectory(paths, journalId), "before");
+    const target = path.resolve(root, ...normalized.split("/"));
+    const relative = path.relative(root, target);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw projectWorkError(
+        "PROJECT_WORK_PATH_OUT_OF_SCOPE",
+        "路径必须位于项目文件夹内",
+        400,
+      );
+    }
+    return target;
+  }
+
+  function assertFileHash(state, expectedHash, message) {
+    if (
+      (expectedHash === null && state.exists)
+      || (
+        expectedHash !== null
+        && (!state.exists || state.hash !== expectedHash)
+      )
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_CHANGE_STALE",
+        message,
+        409,
+        true,
+      );
+    }
+  }
+
+  function selectedJournalChanges(changeSet, selectedFiles) {
+    if (!Array.isArray(selectedFiles) || selectedFiles.length === 0) {
+      throw projectWorkError(
+        "PROJECT_WORK_CHANGE_SELECTION_REQUIRED",
+        "至少选择一个要应用的文件",
+        400,
+      );
+    }
+    const selectedIds = new Set();
+    return selectedFiles.map((binding) => {
+      if (!binding || selectedIds.has(binding.fileId)) {
+        throw projectWorkError(
+          "PROJECT_WORK_CHANGE_SELECTION_INVALID",
+          "所选文件绑定无效",
+          400,
+        );
+      }
+      selectedIds.add(binding.fileId);
+      const change = changeSet.files.find((file) => file.id === binding.fileId);
+      if (
+        !change
+        || binding.baseHash !== change.baseHash
+        || binding.afterHash !== change.afterHash
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_CHANGE_BINDING_MISMATCH",
+          "更改内容已变化，请重新检查后再确认",
+          409,
+          true,
+        );
+      }
+      return change;
+    });
+  }
+
+  async function writeJournalBackup(paths, journalId, file, state) {
+    if (!state.exists) return;
+    const target = journalBackupPath(paths, journalId, file.path);
+    await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+    await writeFile(target, state.buffer, {
+      flag: "wx",
+      mode: 0o600,
+    });
+  }
+
+  async function readJournalBackup(paths, journal, file) {
+    if (file.beforeExists !== true) return null;
+    const target = journalBackupPath(paths, journal.id, file.path);
+    let targetStat;
+    let buffer;
+    try {
+      [targetStat, buffer] = await Promise.all([
+        lstat(target),
+        readFile(target),
+      ]);
+    } catch {
+      throw projectWorkError(
+        "PROJECT_WORK_RECOVERY_BACKUP_MISSING",
+        "应用记录的恢复副本缺失",
+        500,
+      );
+    }
+    if (!targetStat.isFile() || targetStat.isSymbolicLink()) {
+      throw projectWorkError(
+        "PROJECT_WORK_RECOVERY_BACKUP_INVALID",
+        "应用记录的恢复副本不安全",
+        500,
+      );
+    }
+    if (sha256(buffer) !== file.baseHash) {
+      throw projectWorkError(
+        "PROJECT_WORK_RECOVERY_BACKUP_INVALID",
+        "应用记录的恢复副本校验失败",
+        500,
+      );
+    }
+    return buffer;
+  }
+
+  async function updateApplyJournal(
+    conversationId,
+    journalId,
+    updater,
+    additionalPatch = {},
+  ) {
+    let nextJournal = null;
+    await updateConversation(conversationId, (current) => {
+      let found = false;
+      const applyJournal = (current.applyJournal ?? []).map((record) => {
+        if (record.id !== journalId) return record;
+        found = true;
+        nextJournal = updater(structuredClone(record));
+        return nextJournal;
+      });
+      if (!found) {
+        throw projectWorkError(
+          "PROJECT_WORK_APPLY_JOURNAL_NOT_FOUND",
+          "应用记录不存在",
+          404,
+        );
+      }
+      return {
+        ...additionalPatch,
+        applyJournal,
+      };
+    });
+    return nextJournal;
+  }
+
+  async function prepareApplyJournal({
+    conversation,
+    workspace,
+    paths,
+    changeSet,
+    selectedFiles,
+    preserveConversationStatus,
+  }) {
+    const selectedChanges = selectedJournalChanges(changeSet, selectedFiles);
+    const journalId = `apply-${idFactory()}`;
+    const journalFiles = [];
+    for (const change of selectedChanges) {
+      const [projectBefore, baseBefore, workspaceAfter] = await Promise.all([
+        readBoundFileState(workspace.projectRoot, change.path),
+        readBoundFileState(paths.baseRoot, change.path),
+        readBoundFileState(paths.workspaceRoot, change.path),
+      ]);
+      assertFileHash(
+        projectBefore,
+        change.baseHash,
+        "项目文件已发生变化，请重新检查更改",
+      );
+      assertFileHash(
+        baseBefore,
+        change.baseHash,
+        "工作快照已发生变化，请重新检查更改",
+      );
+      assertFileHash(
+        workspaceAfter,
+        change.afterHash,
+        "工作快照已发生变化，请重新检查更改",
+      );
+      await writeJournalBackup(
+        paths,
+        journalId,
+        change,
+        projectBefore,
+      );
+      journalFiles.push({
+        fileId: change.id,
+        path: change.path,
+        baseHash: change.baseHash,
+        afterHash: change.afterHash,
+        beforeExists: projectBefore.exists,
+        projectBeforeMode: projectBefore.mode,
+        baseBeforeMode: baseBefore.mode,
+        afterMode: workspaceAfter.mode,
+      });
+    }
+    const createdAt = timestamp();
+    const undoHash = sha256({
+      schemaVersion: 1,
+      conversationId: conversation.id,
+      journalId,
+      changeSetHash: changeSet.hash,
+      files: journalFiles.map((file) => ({
+        path: file.path,
+        baseHash: file.baseHash,
+        afterHash: file.afterHash,
+      })),
+    });
+    const journal = {
+      schemaVersion: 1,
+      id: journalId,
+      status: "prepared",
+      changeSetId: changeSet.id,
+      changeSetHash: changeSet.hash,
+      changeSet: structuredClone(changeSet),
+      files: journalFiles,
+      preserveConversationStatus: preserveConversationStatus === true,
+      resumeStatus: conversation.status,
+      createdAt,
+      appliedAt: null,
+      finalizedAt: null,
+      recoveredAt: null,
+      undoneAt: null,
+      error: null,
+      undo: {
+        status: "unavailable",
+        hash: undoHash,
+        usedAt: null,
+      },
+    };
+    await updateConversation(conversation.id, (current) => ({
+      applyJournal: [...(current.applyJournal ?? []), journal],
+    }));
+    await appendEvent(conversation.id, "apply_journal.prepared", {
+      journal: publicApplyJournalRecord(journal),
+    });
+    return journal;
+  }
+
+  async function recoveryTransitions(paths, journal, root, modeField) {
+    const transitions = [];
+    for (const file of journal.files) {
+      const current = await readBoundFileState(root, file.path);
+      if (current.hash === file.baseHash) continue;
+      if (current.hash !== file.afterHash) {
+        throw projectWorkError(
+          "PROJECT_WORK_APPLY_RECOVERY_STALE",
+          "项目文件在恢复期间又发生了变化，未自动覆盖",
+          409,
+          true,
+        );
+      }
+      transitions.push({
+        path: file.path,
+        expectedHash: file.afterHash,
+        targetBuffer: await readJournalBackup(paths, journal, file),
+        targetHash: file.baseHash,
+        targetMode: file[modeField],
+      });
+    }
+    return transitions;
+  }
+
+  async function markApplyRecoveryBlocked(conversationId, journalId, error) {
+    const safeError = safeProjectWorkError(error);
+    const blockedAt = timestamp();
+    const record = await updateApplyJournal(
+      conversationId,
+      journalId,
+      (current) => ({
+        ...current,
+        status: "recovery_blocked",
+        error: safeError,
+        recoveredAt: blockedAt,
+        undo: {
+          ...current.undo,
+          status: "blocked",
+        },
+      }),
+      {
+        workspace: {
+          ...normalizedWorkspaceRecord(
+            await conversationStore.get(conversationId),
+            blockedAt,
+          ),
+          status: "recovery_blocked",
+          updatedAt: blockedAt,
+        },
+      },
+    );
+    await appendEvent(conversationId, "apply_journal.recovery_blocked", {
+      journal: publicApplyJournalRecord(record),
+    });
+    return record;
+  }
+
+  async function recoverPreparedApplyJournal(
+    conversationId,
+    journal,
+    workspace,
+    paths,
+  ) {
+    try {
+      const recoveringAt = timestamp();
+      await updateConversation(conversationId, (current) => ({
+        workspace: {
+          ...normalizedWorkspaceRecord(current, recoveringAt),
+          status: "recovering",
+          updatedAt: recoveringAt,
+        },
+      }));
+      const [projectTransitions, baseTransitions] = await Promise.all([
+        recoveryTransitions(
+          paths,
+          journal,
+          workspace.projectRoot,
+          "projectBeforeMode",
+        ),
+        recoveryTransitions(
+          paths,
+          journal,
+          paths.baseRoot,
+          "baseBeforeMode",
+        ),
+      ]);
+      await applyBoundFileTransitions({
+        root: workspace.projectRoot,
+        transitions: projectTransitions,
+      });
+      await applyBoundFileTransitions({
+        root: paths.baseRoot,
+        transitions: baseTransitions,
+      });
+      const recoveredAt = timestamp();
+      const record = await updateApplyJournal(
+        conversationId,
+        journal.id,
+        (current) => ({
+          ...current,
+          status: "rolled_back",
+          recoveredAt,
+          error: null,
+          undo: {
+            ...current.undo,
+            status: "unavailable",
+          },
+        }),
+        {
+          workspace: {
+            ...normalizedWorkspaceRecord(
+              await conversationStore.get(conversationId),
+              recoveredAt,
+            ),
+            status: "ready",
+            updatedAt: recoveredAt,
+          },
+        },
+      );
+      await appendEvent(conversationId, "apply_journal.rolled_back", {
+        journal: publicApplyJournalRecord(record),
+      });
+      return record;
+    } catch (error) {
+      return markApplyRecoveryBlocked(conversationId, journal.id, error);
+    }
+  }
+
+  async function finalizeAppliedJournal(
+    conversationId,
+    journal,
+    workspace,
+    paths,
+  ) {
+    try {
+      for (const file of journal.files) {
+        const current = await readBoundFileState(workspace.projectRoot, file.path);
+        assertFileHash(
+          current,
+          file.afterHash,
+          "项目文件在应用完成前又发生了变化，未继续处理",
+        );
+      }
+      if (["sparse_overlay", "scratch"].includes(
+        (await conversationStore.get(conversationId)).workspaceSnapshot?.mode,
+      )) {
+        await clearAppliedSparseOverlay(paths, journal.files);
+      }
+      const appliedIds = new Set(journal.files.map((file) => file.fileId));
+      const appliedChangeSet = {
+        ...journal.changeSet,
+        status: appliedIds.size === journal.changeSet.files.length
+          ? "applied"
+          : "partially_applied",
+        files: journal.changeSet.files.map((file) => ({
+          ...file,
+          status: appliedIds.has(file.id) ? "applied" : "not_selected",
+        })),
+        appliedAt: journal.appliedAt,
+      };
+      const conversation = await conversationStore.get(conversationId);
+      const remainingChangeSet = {
+        ...await recomputeChangeSet({
+          conversationId,
+          baseRoot: paths.baseRoot,
+          workspaceRoot: paths.workspaceRoot,
+          allowDeletes: conversation.workspaceSnapshot?.mode !== "sparse_overlay",
+        }),
+        createdAt: timestamp(),
+        appliedAt: null,
+      };
+      const hasRemainingChanges = remainingChangeSet.status === "ready";
+      const finalizedAt = timestamp();
+      let finalizedJournal;
+      await updateConversation(conversationId, (latest) => {
+        const applyJournal = (latest.applyJournal ?? []).map((record) => {
+          if (record.id !== journal.id) return record;
+          finalizedJournal = {
+            ...record,
+            status: "applied",
+            finalizedAt,
+            error: null,
+            undo: {
+              ...record.undo,
+              status: "available",
+            },
+          };
+          return finalizedJournal;
+        });
+        return {
+          applyJournal,
+          activeChangeSet: hasRemainingChanges
+            ? remainingChangeSet
+            : appliedChangeSet,
+          status: journal.preserveConversationStatus
+            ? latest.status
+            : hasRemainingChanges
+              ? "awaiting_confirmation"
+              : "applied",
+          workspace: {
+            ...normalizedWorkspaceRecord(latest, finalizedAt),
+            status: "ready",
+            updatedAt: finalizedAt,
+          },
+        };
+      });
+      await appendEvent(conversationId, "change_set.applied", {
+        id: journal.changeSetId,
+        hash: journal.changeSetHash,
+        status: appliedChangeSet.status,
+        files: journal.files.map((file) => ({
+          fileId: file.fileId,
+          path: file.path,
+          baseHash: file.baseHash,
+          afterHash: file.afterHash,
+        })),
+        applyJournalId: journal.id,
+      });
+      return {
+        appliedChangeSet,
+        remainingChangeSet,
+        journal: finalizedJournal,
+      };
+    } catch (error) {
+      await markApplyRecoveryBlocked(conversationId, journal.id, error);
+      throw error;
+    }
+  }
+
+  async function recoverOutstandingApplyJournals(conversationId) {
+    let conversation = await ensureWorkspaceRecord(conversationId);
+    const pending = (conversation.applyJournal ?? []).filter((record) => (
+      record.status === "prepared"
+      || (record.status === "applied" && !record.finalizedAt)
+    ));
+    if (pending.length === 0) return conversation;
+    const workspace = await resolveConversationWorkspace(conversation);
+    const paths = conversationPaths(conversationId);
+    await withApplyLock(workspace.lockKey, async () => {
+      for (const candidate of pending) {
+        const current = await conversationStore.get(conversationId);
+        const journal = (current.applyJournal ?? []).find(
+          (record) => record.id === candidate.id,
+        );
+        if (!journal) continue;
+        if (journal.status === "prepared") {
+          await recoverPreparedApplyJournal(
+            conversationId,
+            journal,
+            workspace,
+            paths,
+          );
+        } else if (journal.status === "applied" && !journal.finalizedAt) {
+          await finalizeAppliedJournal(
+            conversationId,
+            journal,
+            workspace,
+            paths,
+          ).catch(() => undefined);
+        }
+      }
+    });
+    return conversationStore.get(conversationId);
+  }
+
+  async function applyChangeSet(
+    conversationId,
+    {
+      changeSetId,
+      changeSetHash,
+      files,
+    } = {},
+    {
+      autoReviewSettlement = false,
+      preserveConversationStatus = false,
+      repairOperationId = null,
+      repairAttempt = 0,
+      expectedCommandBindingHash = null,
+      suppressRepairLoop = false,
+    } = {},
+  ) {
     assertActive();
     assertConversationNotDeleting(conversationId);
-    const initial = await conversationStore.get(conversationId);
+    const initial = await recoverOutstandingApplyJournals(conversationId);
     const initialWorkspace = await resolveConversationWorkspace(initial);
     return withApplyLock(initialWorkspace.lockKey, async () => {
       assertConversationNotDeleting(conversationId);
       const conversation = await conversationStore.get(conversationId);
-      if (BUSY_CONVERSATION_STATUSES.has(conversation.status)) {
+      if (
+        (
+          BUSY_CONVERSATION_STATUSES.has(conversation.status)
+          || autoReviewSettlements.has(conversationId)
+        )
+        && !autoReviewSettlement
+      ) {
         throw projectWorkError(
           "PROJECT_WORK_CONVERSATION_BUSY",
           "Agent 正在准备修改，请稍后再应用更改",
+          409,
+        );
+      }
+      if (
+        conversation.activeChangeSet?.id === changeSetId
+        && conversation.activeChangeSet?.hash === changeSetHash
+        && conversation.activeChangeSet?.status === "blocked"
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_CHANGE_SET_BLOCKED",
+          "该修改已被替我审批阻止，不能直接应用",
           409,
         );
       }
@@ -2551,55 +6357,208 @@ export function createProjectWorkService({
           true,
         );
       }
-      const appliedFiles = await applySelectedChangeSet({
-        projectRoot: workspace.projectRoot,
-        baseRoot: paths.baseRoot,
-        workspaceRoot: paths.workspaceRoot,
+      const journal = await prepareApplyJournal({
+        conversation,
+        workspace,
+        paths,
         changeSet: current,
         selectedFiles: files,
+        preserveConversationStatus,
       });
-      if (["sparse_overlay", "scratch"].includes(conversation.workspaceSnapshot?.mode)) {
-        await clearAppliedSparseOverlay(paths, appliedFiles);
-      }
-      const appliedIds = new Set(appliedFiles.map((file) => file.fileId));
-      const appliedAt = timestamp();
-      const appliedChangeSet = {
-        ...current,
-        status: appliedIds.size === current.files.length
-          ? "applied"
-          : "partially_applied",
-        files: current.files.map((file) => ({
-          ...file,
-          status: appliedIds.has(file.id) ? "applied" : "not_selected",
-        })),
-        appliedAt,
-      };
-      const remainingChangeSet = {
-        ...await recomputeChangeSet({
-          conversationId,
+      try {
+        await changeApplier({
+          projectRoot: workspace.projectRoot,
           baseRoot: paths.baseRoot,
           workspaceRoot: paths.workspaceRoot,
-          allowDeletes: conversation.workspaceSnapshot?.mode !== "sparse_overlay",
+          changeSet: current,
+          selectedFiles: files,
+        });
+      } catch (error) {
+        await recoverPreparedApplyJournal(
+          conversationId,
+          journal,
+          workspace,
+          paths,
+        );
+        throw error;
+      }
+      const appliedAt = timestamp();
+      const appliedJournal = await updateApplyJournal(
+        conversationId,
+        journal.id,
+        (record) => ({
+          ...record,
+          status: "applied",
+          appliedAt,
+          error: null,
         }),
-        createdAt: timestamp(),
-        appliedAt: null,
-      };
-      const hasRemainingChanges = remainingChangeSet.status === "ready";
-      await updateConversation(conversationId, {
-        activeChangeSet: hasRemainingChanges
-          ? remainingChangeSet
-          : appliedChangeSet,
-        status: hasRemainingChanges
-          ? "awaiting_confirmation"
-          : "applied",
+      );
+      return finalizeAppliedJournal(
+        conversationId,
+        appliedJournal,
+        workspace,
+        paths,
+      );
+    });
+  }
+
+  async function listApplyJournal(conversationId) {
+    assertActive();
+    const conversation = await recoverOutstandingApplyJournals(conversationId);
+    return (conversation.applyJournal ?? [])
+      .map(publicApplyJournalRecord)
+      .filter(Boolean);
+  }
+
+  function subscribeConversationEvents(conversationId, listener) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    return conversationStore.subscribe(conversationId, listener);
+  }
+
+  async function undoApply(conversationId, applyId, { undoHash } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const initial = await recoverOutstandingApplyJournals(conversationId);
+    const workspace = await resolveConversationWorkspace(initial);
+    return withApplyLock(workspace.lockKey, async () => {
+      const conversation = await conversationStore.get(conversationId);
+      if (
+        BUSY_CONVERSATION_STATUSES.has(conversation.status)
+        || activeMessageClaims.has(conversationId)
+        || verificationControllers.has(conversationId)
+        || autoReviewSettlements.has(conversationId)
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_CONVERSATION_BUSY",
+          "当前会话仍有操作正在运行，暂时不能撤销",
+          409,
+        );
+      }
+      const journal = (conversation.applyJournal ?? []).find(
+        (record) => record.id === applyId,
+      );
+      if (!journal) {
+        throw projectWorkError(
+          "PROJECT_WORK_APPLY_JOURNAL_NOT_FOUND",
+          "应用记录不存在",
+          404,
+        );
+      }
+      if (
+        journal.status !== "applied"
+        || !journal.finalizedAt
+        || journal.undo?.status !== "available"
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_UNDO_UNAVAILABLE",
+          "这次应用当前不能撤销或已经撤销",
+          409,
+        );
+      }
+      if (
+        typeof undoHash !== "string"
+        || undoHash !== journal.undo.hash
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_UNDO_BINDING_MISMATCH",
+          "撤销内容已变化，请刷新后重试",
+          409,
+          true,
+        );
+      }
+      const paths = conversationPaths(conversationId);
+      try {
+        const transitions = [];
+        for (const file of journal.files) {
+          const current = await readBoundFileState(
+            workspace.projectRoot,
+            file.path,
+          );
+          assertFileHash(
+            current,
+            file.afterHash,
+            "项目文件已发生变化，未执行撤销",
+          );
+          transitions.push({
+            path: file.path,
+            expectedHash: file.afterHash,
+            targetBuffer: await readJournalBackup(paths, journal, file),
+            targetHash: file.baseHash,
+            targetMode: file.projectBeforeMode,
+          });
+        }
+        await applyBoundFileTransitions({
+          root: workspace.projectRoot,
+          transitions,
+        });
+      } catch (error) {
+        const blockedAt = timestamp();
+        await updateApplyJournal(
+          conversationId,
+          journal.id,
+          (record) => ({
+            ...record,
+            error: safeProjectWorkError(error),
+            undo: {
+              ...record.undo,
+              status: "blocked",
+            },
+          }),
+        );
+        await appendEvent(conversationId, "apply_journal.undo_blocked", {
+          id: journal.id,
+          at: blockedAt,
+          error: safeProjectWorkError(error),
+        });
+        throw error;
+      }
+      const undoneAt = timestamp();
+      const undone = await updateApplyJournal(
+        conversationId,
+        journal.id,
+        (record) => ({
+          ...record,
+          status: "undone",
+          undoneAt,
+          error: null,
+          undo: {
+            ...record.undo,
+            status: "used",
+            usedAt: undoneAt,
+          },
+        }),
+        {
+          status: (
+            conversation.activeChangeSet?.status === "ready"
+              ? "awaiting_confirmation"
+              : "idle"
+          ),
+          activeChangeSet: (
+            conversation.activeChangeSet?.id === journal.changeSetId
+            && ["applied", "partially_applied"].includes(
+              conversation.activeChangeSet?.status,
+            )
+          )
+            ? {
+                ...conversation.activeChangeSet,
+                status: "undone",
+                files: conversation.activeChangeSet.files.map((file) => ({
+                  ...file,
+                  status: journal.files.some(
+                    (journalFile) => journalFile.fileId === file.id,
+                  )
+                    ? "undone"
+                    : file.status,
+                })),
+              }
+            : conversation.activeChangeSet,
+        },
+      );
+      await appendEvent(conversationId, "apply_journal.undone", {
+        journal: publicApplyJournalRecord(undone),
       });
-      await appendEvent(conversationId, "change_set.applied", {
-        id: current.id,
-        hash: current.hash,
-        status: appliedChangeSet.status,
-        files: appliedFiles,
-      });
-      return { appliedChangeSet, remainingChangeSet };
+      return snapshot(conversationId);
     });
   }
 
@@ -2609,7 +6568,535 @@ export function createProjectWorkService({
     return structuredClone(conversation.verifications ?? []);
   }
 
-  async function runVerification(conversationId, { requestId } = {}) {
+  function verificationByCommandId(conversation, commandId) {
+    return (conversation.verifications ?? []).find(
+      (verification) => (
+        verification.id === commandId
+        && verification.status === "requested"
+      ),
+    ) ?? null;
+  }
+
+  function verificationAttemptById(conversation, attemptId) {
+    return (conversation.verifications ?? []).find(
+      (verification) => verification.id === attemptId,
+    ) ?? null;
+  }
+
+  function assertVerificationRepairInputs(conversation, operation) {
+    if ((conversation.askUserRequests ?? []).some(
+      (request) => request.status === "pending",
+    )) {
+      throw projectWorkError(
+        "PROJECT_WORK_VERIFICATION_REPAIR_AWAITING_USER",
+        "验证修复不会自动回答待处理问题",
+        409,
+        true,
+      );
+    }
+    if ((conversation.followUpQueue ?? []).some(
+      (item) => item.status === "queued",
+    )) {
+      throw projectWorkError(
+        "PROJECT_WORK_VERIFICATION_REPAIR_QUEUE_PENDING",
+        "验证修复不会自动处理待发送消息",
+        409,
+        true,
+      );
+    }
+    const verification = verificationByCommandId(
+      conversation,
+      operation.commandId,
+    );
+    if (!verification) {
+      throw projectWorkError(
+        "PROJECT_WORK_VERIFICATION_NOT_FOUND",
+        "绑定的验证命令不存在，需要用户重新确认",
+        409,
+        true,
+      );
+    }
+    const currentBindingHash = verification.bindingHash
+      ?? verificationBindingHash(verification);
+    if (currentBindingHash !== operation.commandBindingHash) {
+      throw projectWorkError(
+        "PROJECT_WORK_VERIFICATION_BINDING_CHANGED",
+        "验证命令绑定已变化，需要用户重新确认",
+        409,
+        true,
+      );
+    }
+    if (
+      conversation.activeChangeSet?.status !== "ready"
+      || !Array.isArray(conversation.activeChangeSet.files)
+      || conversation.activeChangeSet.files.length === 0
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_VERIFICATION_REPAIR_CHANGESET_MISSING",
+        "当前没有可继续修复并复测的待审阅修改",
+        409,
+        true,
+      );
+    }
+    return verification;
+  }
+
+  function verificationRepairTurnSettings(
+    conversation,
+    verification,
+    operation,
+    repairAttempt,
+  ) {
+    const messages = normalizedConversationMessages(conversation);
+    const userMessage = messages.find(
+      (message) => (
+        message.role === "user"
+        && message.turnId === verification.turnId
+      ),
+    );
+    const assistantAttempt = messages
+      .filter((message) => (
+        message.role === "assistant"
+        && message.turnId === verification.turnId
+      ))
+      .reduce(
+        (maximum, message) => Math.max(maximum, message.attempt ?? 1),
+        0,
+      ) + 1;
+    const executionPolicy = normalizeExecutionPolicy(
+      conversation.executionPolicy,
+    );
+    return {
+      turnId: verification.turnId ?? userMessage?.turnId ?? operation.turnId,
+      turnSeq: userMessage?.turnSeq
+        ?? messages.at(-1)?.turnSeq
+        ?? nextTurnSequence(conversation),
+      attempt: assistantAttempt,
+      verificationRepairOperationId: operation.id,
+      repairAttempt,
+      providerId: conversation.providerId ?? userMessage?.providerId ?? null,
+      modelId: conversation.modelId ?? userMessage?.modelId ?? null,
+      thinkingLevel: conversation.thinkingLevel
+        ?? userMessage?.thinkingLevel
+        ?? null,
+      workflowId: userMessage?.workflowId ?? verification.workflowId ?? null,
+      capabilities: Array.isArray(userMessage?.capabilities)
+        ? [...userMessage.capabilities]
+        : [],
+      executionPolicyMode: "manual_review",
+      executionPolicyRevision: executionPolicy.revision,
+      executionPolicyVersion: executionPolicy.policyVersion,
+    };
+  }
+
+  async function completeVerificationRepairOperation(
+    conversationId,
+    operationId,
+    verificationAttempt,
+  ) {
+    const completedAt = timestamp();
+    const { operation } = await updateConversationOperation(
+      conversationId,
+      operationId,
+      (current) => ({
+        status: "completed",
+        phase: "completed",
+        resultAssistantMessageId: current.resultAssistantMessageId ?? null,
+        validationAttemptIds: [
+          ...(current.validationAttemptIds ?? []),
+          verificationAttempt.id,
+        ].filter((id, index, values) => values.indexOf(id) === index),
+        lastFailedAttemptId: null,
+        completedAt,
+        error: null,
+      }),
+    );
+    await appendEvent(conversationId, "operation.completed", {
+      operation: publicConversationOperation(operation),
+    });
+    return verificationAttempt;
+  }
+
+  async function executeVerificationRepairOperation(
+    conversationId,
+    operationId,
+  ) {
+    let conversation = await conversationStore.get(conversationId);
+    let operation = (conversation.operations ?? []).find(
+      (item) => item.id === operationId,
+    );
+    if (!operation) {
+      throw projectWorkError(
+        "PROJECT_WORK_OPERATION_NOT_FOUND",
+        "验证修复操作不存在",
+        404,
+      );
+    }
+    let lastAttempt = verificationAttemptById(
+      conversation,
+      operation.lastFailedAttemptId,
+    );
+    let runtime;
+    try {
+      runtime = await getRuntime(conversationId);
+      if (
+        runtime.completion
+        || typeof runtime.host.repairVerification !== "function"
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_VERIFICATION_REPAIR_UNAVAILABLE",
+          "当前 Pi 会话不能安全继续验证修复",
+          409,
+          true,
+        );
+      }
+    } catch (error) {
+      await interruptConversationOperation(
+        conversationId,
+        operationId,
+        error,
+      );
+      return lastAttempt;
+    }
+
+    const perform = async () => {
+      let verifyExistingRepair = (
+        operation.phase === "verifying"
+        && operation.repairAttemptCount > 0
+      );
+      while (true) {
+        conversation = await conversationStore.get(conversationId);
+        operation = (conversation.operations ?? []).find(
+          (item) => item.id === operationId,
+        );
+        const verification = assertVerificationRepairInputs(
+          conversation,
+          operation,
+        );
+
+        if (!verifyExistingRepair) {
+          const repairAttempt = operation.repairAttemptCount + 1;
+          if (repairAttempt > operation.maxRepairAttempts) {
+            throw projectWorkError(
+              "PROJECT_WORK_VERIFICATION_REPAIR_LIMIT",
+              "验证修复已达到两次上限，需要用户检查当前修改",
+              409,
+            );
+          }
+          const turnSettings = verificationRepairTurnSettings(
+            conversation,
+            verification,
+            operation,
+            repairAttempt,
+          );
+          const { operation: repairingOperation } = await updateConversationOperation(
+            conversationId,
+            operationId,
+            {
+              status: "running",
+              phase: "repairing",
+              repairAttemptCount: repairAttempt,
+              completedAt: null,
+              error: null,
+            },
+          );
+          operation = repairingOperation;
+          await updateConversation(conversationId, {
+            status: "running",
+            lastError: null,
+          });
+          runtime.activeTurnSettings = turnSettings;
+          runtime.host.setActiveToolsByName?.(
+            PROJECT_WORK_REPAIR_TOOL_NAMES,
+          );
+          await appendEvent(conversationId, "verification.repair_started", {
+            operationId,
+            commandId: operation.commandId,
+            commandBindingHash: operation.commandBindingHash,
+            repairAttempt,
+            maxRepairAttempts: operation.maxRepairAttempts,
+          });
+          await runtime.host.repairVerification({
+            operationId,
+            commandBindingHash: operation.commandBindingHash,
+            repairAttempt,
+            maxRepairAttempts: operation.maxRepairAttempts,
+            command: verification.command,
+            checks: verification.checks,
+            failure: {
+              exitCode: lastAttempt?.exitCode ?? null,
+              timedOut: lastAttempt?.timedOut === true,
+              truncated: lastAttempt?.truncated === true,
+              output: lastAttempt?.output ?? "",
+            },
+          });
+          await runtime.eventQueue;
+          conversation = await conversationStore.get(conversationId);
+          const repairAnswer = [...(conversation.messages ?? [])].reverse().find(
+            (message) => (
+              message.role === "assistant"
+              && message.verificationRepairOperationId === operationId
+              && message.repairAttempt === repairAttempt
+              && message.isFinal !== false
+            ),
+          );
+          if (!repairAnswer || repairAnswer.status !== "completed") {
+            throw projectWorkError(
+              "PROJECT_WORK_VERIFICATION_REPAIR_FAILED",
+              "Pi 没有生成可复测的修复结果",
+              502,
+              true,
+            );
+          }
+          const { operation: verifyingOperation } = await updateConversationOperation(
+            conversationId,
+            operationId,
+            {
+              phase: "verifying",
+              resultAssistantMessageId: repairAnswer.id,
+            },
+          );
+          operation = verifyingOperation;
+        }
+
+        conversation = await conversationStore.get(conversationId);
+        operation = (conversation.operations ?? []).find(
+          (item) => item.id === operationId,
+        );
+        assertVerificationRepairInputs(conversation, operation);
+        const verificationAttempt = await runVerification(
+          conversationId,
+          { requestId: operation.commandId },
+          {
+            repairOperationId: operation.id,
+            repairAttempt: operation.repairAttemptCount,
+            expectedCommandBindingHash: operation.commandBindingHash,
+            suppressRepairLoop: true,
+          },
+        );
+        lastAttempt = verificationAttempt;
+        const { operation: recordedOperation } = await updateConversationOperation(
+          conversationId,
+          operationId,
+          (current) => ({
+            validationAttemptIds: [
+              ...(current.validationAttemptIds ?? []),
+              verificationAttempt.id,
+            ].filter((id, index, values) => values.indexOf(id) === index),
+            lastFailedAttemptId: verificationAttempt.status === "failed"
+              ? verificationAttempt.id
+              : null,
+          }),
+        );
+        operation = recordedOperation;
+        if (verificationAttempt.status === "passed") {
+          return completeVerificationRepairOperation(
+            conversationId,
+            operationId,
+            verificationAttempt,
+          );
+        }
+        if (
+          verificationAttempt.errorCode
+          === "PROJECT_WORK_VERIFICATION_BINDING_CHANGED"
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_VERIFICATION_BINDING_CHANGED",
+            "验证命令绑定已变化，需要用户重新确认",
+            409,
+            true,
+          );
+        }
+        if (operation.repairAttemptCount >= operation.maxRepairAttempts) {
+          throw projectWorkError(
+            "PROJECT_WORK_VERIFICATION_REPAIR_LIMIT",
+            "验证修复已达到两次上限，需要用户检查当前修改",
+            409,
+          );
+        }
+        verifyExistingRepair = false;
+      }
+    };
+
+    const completion = perform()
+      .catch(async (error) => {
+        const finalErrorCodes = new Set([
+          "PROJECT_WORK_VERIFICATION_BINDING_CHANGED",
+          "PROJECT_WORK_VERIFICATION_REPAIR_LIMIT",
+          "PROJECT_WORK_VERIFICATION_REPAIR_CHANGESET_MISSING",
+        ]);
+        if (finalErrorCodes.has(error?.code)) {
+          await failConversationOperation(
+            conversationId,
+            operationId,
+            error,
+            {
+              type: "verification_repair",
+              turnId: operation.turnId,
+              resumeStatus: operation.resumeStatus,
+              preserveSuccessfulAnswer: true,
+            },
+          );
+        } else {
+          await interruptConversationOperation(
+            conversationId,
+            operationId,
+            error,
+          );
+        }
+        return lastAttempt;
+      })
+      .finally(() => {
+        try {
+          runtime.host.setActiveToolsByName?.(PROJECT_WORK_DEFAULT_TOOL_NAMES);
+        } catch {
+          // The next accepted turn reapplies the default list.
+        }
+        runtime.activeTurnSettings = null;
+        runtime.completion = null;
+      });
+    runtime.completion = completion;
+    return completion;
+  }
+
+  async function startVerificationRepairLoop(conversationId, {
+    commandId,
+    commandBindingHash,
+    failedAttempt,
+    resumeStatus,
+  }) {
+    const operationId = `operation-${idFactory()}`;
+    const startedAt = timestamp();
+    let operation;
+    await updateConversation(conversationId, (current) => {
+      const verification = verificationByCommandId(current, commandId);
+      if (!verification) {
+        throw projectWorkError(
+          "PROJECT_WORK_VERIFICATION_NOT_FOUND",
+          "绑定的验证命令不存在，需要用户重新确认",
+          409,
+          true,
+        );
+      }
+      if ((current.operations ?? []).some((item) => (
+        item.type === "verification_repair"
+        && item.commandId === commandId
+        && ["running", "interrupted"].includes(item.status)
+      ))) {
+        throw projectWorkError(
+          "PROJECT_WORK_VERIFICATION_REPAIR_EXISTS",
+          "该验证命令已有可恢复的修复操作",
+          409,
+          true,
+        );
+      }
+      const messages = normalizedConversationMessages(current);
+      const targetAssistant = [...messages].reverse().find((message) => (
+        message.role === "assistant"
+        && message.turnId === verification.turnId
+        && message.status === "completed"
+        && message.isFinal !== false
+      ));
+      operation = {
+        id: operationId,
+        type: "verification_repair",
+        status: "running",
+        phase: "repairing",
+        turnId: verification.turnId,
+        commandId,
+        commandBindingHash,
+        targetAssistantMessageId: targetAssistant?.id ?? null,
+        resultAssistantMessageId: null,
+        repairAttemptCount: 0,
+        maxRepairAttempts: MAX_VERIFICATION_REPAIR_ATTEMPTS,
+        validationAttemptIds: [failedAttempt.id],
+        lastFailedAttemptId: failedAttempt.id,
+        resumeStatus,
+        startedAt,
+        completedAt: null,
+        error: null,
+      };
+      return {
+        operations: [...(current.operations ?? []), operation].slice(-100),
+      };
+    });
+    await appendEvent(conversationId, "operation.started", {
+      operation: publicConversationOperation(operation),
+    });
+    return executeVerificationRepairOperation(conversationId, operationId);
+  }
+
+  async function resumeVerificationRepair(conversationId, {
+    operationId,
+    clientRequestId,
+  } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const requestId = normalizeClientRequestId(clientRequestId, idFactory);
+    let operation;
+    let replayed = false;
+    await updateConversation(conversationId, (current) => {
+      const target = (current.operations ?? []).find(
+        (item) => item.id === operationId && item.type === "verification_repair",
+      );
+      if ((target?.resumeClientRequestIds ?? []).includes(requestId)) {
+        replayed = true;
+        operation = target;
+        return {};
+      }
+      operation = target?.status === "interrupted" ? target : null;
+      if (!operation) {
+        throw projectWorkError(
+          "PROJECT_WORK_VERIFICATION_REPAIR_NOT_RECOVERABLE",
+          "没有可恢复的验证修复操作",
+          409,
+        );
+      }
+      if (
+        operation.phase !== "verifying"
+        && operation.repairAttemptCount >= operation.maxRepairAttempts
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_VERIFICATION_REPAIR_LIMIT",
+          "验证修复已达到两次上限，需要用户检查当前修改",
+          409,
+        );
+      }
+      operation = {
+        ...operation,
+        status: "running",
+        resumeClientRequestIds: [
+          ...(operation.resumeClientRequestIds ?? []),
+          requestId,
+        ].slice(-20),
+        completedAt: null,
+        error: null,
+      };
+      return {
+        operations: (current.operations ?? []).map((item) => (
+          item.id === operationId ? operation : item
+        )),
+      };
+    });
+    if (replayed) return snapshot(conversationId);
+    await appendEvent(conversationId, "operation.resumed", {
+      operation: publicConversationOperation(operation),
+    });
+    return executeVerificationRepairOperation(conversationId, operationId);
+  }
+
+  async function runVerification(
+    conversationId,
+    { requestId } = {},
+    {
+      autoReviewSettlement = false,
+      preserveConversationStatus = false,
+      repairOperationId = null,
+      repairAttempt = 0,
+      expectedCommandBindingHash = null,
+      suppressRepairLoop = false,
+    } = {},
+  ) {
     assertActive();
     assertConversationNotDeleting(conversationId);
     const conversation = await conversationStore.get(conversationId);
@@ -2623,8 +7110,26 @@ export function createProjectWorkService({
         404,
       );
     }
+    const commandBindingHash = verification.bindingHash
+      ?? verificationBindingHash(verification);
     if (
-      BUSY_CONVERSATION_STATUSES.has(conversation.status)
+      expectedCommandBindingHash
+      && expectedCommandBindingHash !== commandBindingHash
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_VERIFICATION_BINDING_CHANGED",
+        "验证命令绑定已变化，需要用户重新确认",
+        409,
+        true,
+      );
+    }
+    if (
+      (
+        BUSY_CONVERSATION_STATUSES.has(conversation.status)
+        || conversation.status === "awaiting_user"
+        || autoReviewSettlements.has(conversationId)
+      )
+      && !autoReviewSettlement
       || verificationControllers.has(conversationId)
       || (conversation.verifications ?? []).some((item) => item.status === "running")
     ) {
@@ -2634,23 +7139,34 @@ export function createProjectWorkService({
         409,
       );
     }
-    if (
-      conversation.activeChangeSet
-      && !["clean", "applied"].includes(
-        conversation.activeChangeSet.status,
-      )
-    ) {
-      throw projectWorkError(
-        "PROJECT_WORK_CHANGES_NOT_APPLIED",
-        "请先确认或取消待审阅修改，再运行验证",
-        409,
-      );
-    }
     const workspace = await resolveConversationWorkspace(conversation);
     assertConversationNotDeleting(conversationId);
     const paths = conversationPaths(conversationId);
+    let verificationChangeSet = null;
+    if (
+      conversation.activeChangeSet
+      && !["clean", "applied", "undone"].includes(
+        conversation.activeChangeSet.status,
+      )
+    ) {
+      verificationChangeSet = await recomputeChangeSet({
+        conversationId,
+        baseRoot: paths.baseRoot,
+        workspaceRoot: paths.workspaceRoot,
+        allowDeletes: conversation.workspaceSnapshot?.mode !== "sparse_overlay",
+      });
+      if (verificationChangeSet.status !== "ready") {
+        throw projectWorkError(
+          "PROJECT_WORK_VERIFICATION_OVERLAY_STALE",
+          "待审阅修改已变化，请重新检查后再运行验证",
+          409,
+          true,
+        );
+      }
+    }
     const controller = new AbortController();
     verificationControllers.set(conversationId, controller);
+    const resumeStatus = conversation.status;
     const attempt = {
       ...verification,
       id: `verification-run-${idFactory()}`,
@@ -2660,8 +7176,16 @@ export function createProjectWorkService({
       durationMs: null,
       output: "",
       truncated: false,
+      resumeStatus,
       createdAt: timestamp(),
       completedAt: null,
+      changeSetId: verificationChangeSet?.id ?? null,
+      changeSetHash: verificationChangeSet?.hash ?? null,
+      commandBindingHash,
+      repairOperationId: compactText(repairOperationId, 180) || null,
+      repairAttempt: Number.isSafeInteger(repairAttempt) && repairAttempt > 0
+        ? repairAttempt
+        : 0,
     };
     const verificationDirectory = path.join(
       paths.directory,
@@ -2671,15 +7195,17 @@ export function createProjectWorkService({
     const verificationBaseRoot = path.join(verificationDirectory, "base");
     const verificationWorkspaceRoot = path.join(verificationDirectory, "workspace");
     await updateConversation(conversationId, (current) => ({
-      status: "verifying",
+      status: preserveConversationStatus ? current.status : "verifying",
       verifications: [...current.verifications, attempt],
     }));
     await appendEvent(conversationId, "verification.started", {
       id: attempt.id,
       commandId: verification.id,
       command: verification.command,
+      changeSetId: verificationChangeSet?.id ?? null,
     });
     let result;
+    let failureCode = null;
     try {
       const materialized = await createSnapshot({
         projectRoot: workspace.projectRoot,
@@ -2698,6 +7224,33 @@ export function createProjectWorkService({
           409,
           true,
         );
+      }
+      if (verificationChangeSet) {
+        const transitions = [];
+        for (const file of verificationChangeSet.files) {
+          const workspaceState = await readBoundFileState(
+            paths.workspaceRoot,
+            file.path,
+          );
+          assertFileHash(
+            workspaceState,
+            file.afterHash,
+            "待审阅修改已变化，请重新检查后再运行验证",
+          );
+          transitions.push({
+            path: file.path,
+            expectedHash: file.baseHash,
+            targetBuffer: workspaceState.exists
+              ? workspaceState.buffer
+              : null,
+            targetHash: file.afterHash,
+            targetMode: workspaceState.mode,
+          });
+        }
+        await applyBoundFileTransitions({
+          root: verificationWorkspaceRoot,
+          transitions,
+        });
       }
       const resolvedScript = await resolvePackageScript(
         {
@@ -2725,6 +7278,9 @@ export function createProjectWorkService({
         signal: controller.signal,
       });
     } catch (error) {
+      failureCode = error instanceof ProjectWorkError
+        ? error.code
+        : "PROJECT_WORK_VERIFICATION_START_FAILED";
       result = {
         exitCode: null,
         durationMs: null,
@@ -2762,10 +7318,13 @@ export function createProjectWorkService({
       output,
       truncated: result.truncated === true,
       timedOut: result.timedOut === true,
+      errorCode: failureCode,
       completedAt,
     };
     await updateConversation(conversationId, (current) => ({
-      status: status === "aborted" ? "aborted" : "idle",
+      status: preserveConversationStatus
+        ? current.status
+        : resumeStatus,
       verifications: current.verifications.map((item) => (
         item.id === attempt.id ? completed : item
       )),
@@ -2777,7 +7336,26 @@ export function createProjectWorkService({
       exitCode: completed.exitCode,
       durationMs: completed.durationMs,
       truncated: completed.truncated,
+      errorCode: completed.errorCode,
+      repairOperationId: completed.repairOperationId,
+      repairAttempt: completed.repairAttempt,
     });
+    if (
+      !suppressRepairLoop
+      && !autoReviewSettlement
+      && status === "failed"
+      && !completed.timedOut
+      && completed.exitCode !== null
+      && completed.changeSetHash
+      && !completed.errorCode
+    ) {
+      return startVerificationRepairLoop(conversationId, {
+        commandId: verification.id,
+        commandBindingHash,
+        failedAttempt: completed,
+        resumeStatus,
+      });
+    }
     return completed;
   }
 
@@ -2827,6 +7405,7 @@ export function createProjectWorkService({
         runtime?.unsubscribe?.();
         runtime?.host?.dispose?.();
         runtimes.delete(conversationId);
+        await previewSupervisor.stop?.(conversationId);
         await conversationStore.remove(conversationId);
         const conversationCount = (
           await conversationStore.list(workspaceKind === "scratch" ? null : projectId)
@@ -2901,6 +7480,8 @@ export function createProjectWorkService({
     let guardedConversationIds = [];
     const hasBusyConversation = (items) => items.some((conversation) => (
       BUSY_CONVERSATION_STATUSES.has(conversation.status)
+      || Boolean(runtimes.get(conversation.id)?.completion)
+      || autoReviewSettlements.has(conversation.id)
       || (documentOperationCounts.get(conversation.id) ?? 0) > 0
       || hasActiveConversationDocuments(conversation)
       || (conversation.verifications ?? []).some(
@@ -2920,7 +7501,7 @@ export function createProjectWorkService({
       if (hasBusyConversation(conversations)) {
         throw projectWorkError(
           "PROJECT_WORK_PROJECT_BUSY",
-          "项目仍有正在运行的 Agent、验证或 PDF 解析任务",
+          "项目仍有正在运行的 Agent、验证或资料解析任务",
           409,
         );
       }
@@ -2934,7 +7515,7 @@ export function createProjectWorkService({
       if (hasBusyConversation(latestConversations)) {
         throw projectWorkError(
           "PROJECT_WORK_PROJECT_BUSY",
-          "项目仍有正在运行的 Agent、验证或 PDF 解析任务",
+          "项目仍有正在运行的 Agent、验证或资料解析任务",
           409,
         );
       }
@@ -2943,6 +7524,7 @@ export function createProjectWorkService({
         runtime?.unsubscribe?.();
         runtime?.host?.dispose?.();
         runtimes.delete(conversation.id);
+        await previewSupervisor.stop?.(conversation.id);
         await conversationStore.remove(conversation.id);
       }
       await registry.remove(projectId);
@@ -2973,42 +7555,76 @@ export function createProjectWorkService({
     }
     runtimes.clear();
     activeMessageClaims.clear();
+    followUpMutationQueues.clear();
+    for (const resolve of askUserWaiters.values()) {
+      resolve({
+        id: null,
+        status: "cancelled",
+        questions: [],
+        answers: [],
+        source: "agent_tool",
+      });
+    }
+    askUserWaiters.clear();
     await Promise.allSettled(closing);
+    await previewSupervisor.dispose?.();
     await effectiveSessionFactory.dispose?.();
   }
 
   return Object.freeze({
+    answerAskUserRequest,
     abortConversation,
     applyChangeSet,
+    cancelAskUserRequest,
+    clearFollowUps,
     compactConversation,
     configureConversation,
+    configureExecutionPolicy,
+    createAskUserRequest,
     createConversation,
     createConversationDocument,
     createStandaloneConversation,
     dispose,
     getChangeSet,
     getConversation,
+    getConversationTurns,
     getConversationTree,
+    getGitEvidence,
     getProjectTree,
+    getWorkspace,
+    enqueueFollowUp,
+    listApplyJournal,
+    listAskUserRequests,
     listConversations,
+    listFollowUps,
     listModels,
     listProjects,
     listStandaloneConversations,
     listVerifications,
+    markConversationRead,
     pickProjectRoot,
     readConversationFile,
+    readConversationImage,
     readProjectFile,
+    readProjectImage,
     registerProject,
     removeConversation,
     removeConversationDocument,
+    removeFollowUp,
     removeProject,
     removeStandaloneConversation,
     renameConversation,
     renameStandaloneConversation,
     retryConversationDocument,
+    retryLastTurn,
+    resumeVerificationRepair,
     runVerification,
     sendMessage,
+    startPreview,
     steerConversation,
+    subscribeEvents: conversationStore.subscribe,
+    subscribeConversationEvents,
+    undoApply,
     uploadConversationDocument,
   });
 }

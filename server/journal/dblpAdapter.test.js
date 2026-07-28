@@ -57,6 +57,8 @@ test("publication parsing keeps bibliographic facts and derives known public PDF
   assert.equal(paper.doi, "10.1000/test");
   assert.equal(paper.pdf_url, "https://aclanthology.org/2026.acl-long.1.pdf");
   assert.equal(paper.abstract, "");
+  assert.equal(paper.published_at, "2026");
+  assert.equal(paper.publication_date_precision, "year");
 });
 
 test("publication parsing derives JMLR, PMLR, and NeurIPS public PDFs", () => {

@@ -77,6 +77,44 @@ test("structured project state is parsed without inferring prose sections", () =
   );
 });
 
+test("appended level-three headings cannot replace canonical level-two project state", () => {
+  const summary = summarizeProjectState([
+    "# 项目状态",
+    "",
+    "## 当前目标",
+    "",
+    "完成首个真实闭环。",
+    "",
+    "## 已确认决定",
+    "",
+    "- 保留 canonical 决定。",
+    "",
+    "## 开放问题",
+    "",
+    "- [ ] canonical 问题？",
+    "",
+    "## 下一步",
+    "",
+    "1. 完成 canonical 行动。",
+    "",
+    "### 已确认决定",
+    "",
+    "- 这只是追加记录，不得覆盖。",
+    "",
+    "### 开放问题",
+    "",
+    "- [ ] 这只是某次追加的问题。",
+    "",
+    "### 下一步",
+    "",
+    "1. 这只是某次追加的行动。",
+  ].join("\n"));
+
+  assert.deepEqual(summary.decisions, ["保留 canonical 决定。"]);
+  assert.deepEqual(summary.open_questions, ["canonical 问题？"]);
+  assert.deepEqual(summary.next_actions, ["完成 canonical 行动。"]);
+});
+
 test("project context rejects missing, non-Markdown, and symlink escapes", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "pi-project-context-"));
   const outside = await mkdtemp(path.join(os.tmpdir(), "pi-project-context-outside-"));

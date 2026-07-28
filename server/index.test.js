@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createApiServer, publicRun } from "./index.js";
+import { createApiServer, publicRun, shutdownApiServer } from "./index.js";
+import { projectWorkError } from "./project-work/errors.js";
 
 const candidateSummaryService = {
   config: {
@@ -10,6 +11,67 @@ const candidateSummaryService = {
   listProviders: async () => ({ providers: [] }),
   summarize: async () => ({ schema_version: 1, summaries: [] }),
 };
+
+test("API shutdown waits for disposal but bounds long-lived connections", async () => {
+  let closeCallback;
+  let idleClosed = 0;
+  let forcedClosed = 0;
+  let exits = 0;
+  const done = shutdownApiServer({
+    server: {
+      close(callback) {
+        closeCallback = callback;
+      },
+      closeIdleConnections() {
+        idleClosed += 1;
+      },
+      closeAllConnections() {
+        forcedClosed += 1;
+      },
+    },
+    dispose: async () => undefined,
+    timeoutMs: 5,
+    unrefTimeout: false,
+    onExit() {
+      exits += 1;
+    },
+  });
+
+  await done;
+  assert.equal(typeof closeCallback, "function");
+  assert.equal(idleClosed, 1);
+  assert.equal(forcedClosed, 1);
+  assert.equal(exits, 1);
+});
+
+test("API shutdown exits normally after server close and disposal", async () => {
+  let forcedClosed = 0;
+  let disposed = 0;
+  let exits = 0;
+  await shutdownApiServer({
+    server: {
+      close(callback) {
+        callback();
+      },
+      closeIdleConnections() {},
+      closeAllConnections() {
+        forcedClosed += 1;
+      },
+    },
+    dispose: async () => {
+      disposed += 1;
+    },
+    timeoutMs: 50,
+    unrefTimeout: false,
+    onExit() {
+      exits += 1;
+    },
+  });
+
+  assert.equal(disposed, 1);
+  assert.equal(forcedClosed, 0);
+  assert.equal(exits, 1);
+});
 
 function proposalArtifact() {
   return {
@@ -97,7 +159,7 @@ function obsidianArtifact() {
     schema_version: 1,
     run_id: "journal-test",
     target_type: "obsidian",
-    write_capability: "preview_only",
+    write_capability: "hash_bound_commit",
     external_write_performed: false,
     status: "preview_ready",
     configured_directory: "/private/configured-vault",
@@ -146,7 +208,7 @@ function projectStateArtifact() {
     schema_version: 1,
     run_id: "journal-test",
     target_type: "project_state",
-    write_capability: "preview_only",
+    write_capability: "hash_bound_commit",
     external_write_performed: false,
     status: "preview_ready",
     source_hash: "sha256:project-source",
@@ -383,11 +445,19 @@ async function startTestServer(
   journalWorkflowService,
   summaryService = candidateSummaryService,
   projectWorkService,
+  {
+    allowMissingJournalMutationOrigin = true,
+    projectWorkRuntimeUrl,
+    projectWorkRuntimeHealthProbe,
+  } = {},
 ) {
   const server = createApiServer({
     candidateSummaryService: summaryService,
     journalWorkflowService,
     projectWorkService,
+    allowMissingJournalMutationOrigin,
+    projectWorkRuntimeUrl,
+    projectWorkRuntimeHealthProbe,
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -401,6 +471,50 @@ async function startTestServer(
     }),
   };
 }
+
+test("gateway health exposes worker reachability and recovery state", async (t) => {
+  let reachable = false;
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    null,
+    {
+      projectWorkRuntimeUrl: "http://127.0.0.1:47920",
+      projectWorkRuntimeHealthProbe: async () => (
+        reachable
+          ? {
+              reachable: true,
+              runtimeRole: "worker",
+              runtimeSchemaVersion: 1,
+            }
+          : {
+              reachable: false,
+              runtimeRole: null,
+              runtimeSchemaVersion: null,
+            }
+      ),
+    },
+  );
+  t.after(server.close);
+
+  const recovering = await (
+    await fetch(`${server.baseUrl}/api/v1/health`)
+  ).json();
+  assert.equal(recovering.status, "degraded");
+  assert.equal(recovering.project_work, "recovering");
+  assert.equal(recovering.runtime_reachable, false);
+  assert.equal(recovering.runtime_worker_schema_version, null);
+
+  reachable = true;
+  const available = await (
+    await fetch(`${server.baseUrl}/api/v1/health`)
+  ).json();
+  assert.equal(available.status, "ok");
+  assert.equal(available.project_work, "available");
+  assert.equal(available.runtime_reachable, true);
+  assert.equal(available.runtime_worker_role, "worker");
+  assert.equal(available.runtime_worker_schema_version, 1);
+});
 
 test("project-work PDF routes use raw bytes and conversation-owned retry/remove actions", async (t) => {
   const calls = [];
@@ -645,6 +759,8 @@ test("project-work conversation menu routes stay project-scoped and return safe 
 test("standalone project-work conversation routes use the global scope and return safe data", async (t) => {
   const calls = [];
   const summary = {
+    runtime_schema_version: 1,
+    lifecycle: "idle",
     id: "conversation-standalone",
     projectId: null,
     workspaceKind: "scratch",
@@ -656,6 +772,9 @@ test("standalone project-work conversation routes use the global scope and retur
     modelId: "deepseek-v4-flash",
     thinkingLevel: "medium",
     pendingChangeFileCount: 0,
+    unreadCount: 0,
+    latestMessageSeq: 0,
+    lastReadMessageSeq: 0,
     lastEventSeq: 0,
     createdAt: "2026-07-25T00:00:00.000Z",
     updatedAt: "2026-07-25T00:00:00.000Z",
@@ -753,7 +872,13 @@ test("standalone project-work conversation routes use the global scope and retur
     {
       action: "tree",
       conversationId: "conversation-standalone",
-      options: { directory: "notes", depth: 2 },
+      options: {
+        directory: "notes",
+        depth: 2,
+        query: "",
+        cursor: undefined,
+        limit: undefined,
+      },
     },
     { action: "delete", conversationId: "conversation-standalone" },
   ]);
@@ -881,6 +1006,724 @@ test("project-work message routes accept bounded images and forward one-turn set
     (await oversizedSteer.json()).error.message,
     /256 KB/,
   );
+});
+
+test("project-work execution policy route forwards the CAS revision", async (t) => {
+  const calls = [];
+  const projectWorkService = {
+    configureExecutionPolicy: async (conversationId, options) => {
+      calls.push({ conversationId, options });
+      return {
+        conversation: {
+          id: conversationId,
+          executionPolicy: {
+            mode: options.mode,
+            revision: options.expectedRevision + 1,
+            policyVersion: 1,
+          },
+        },
+        events: [],
+      };
+    },
+  };
+  const server = await startTestServer({}, candidateSummaryService, projectWorkService);
+  t.after(server.close);
+
+  const response = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-policy/execution-policy`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "http://127.0.0.1:4173",
+      },
+      body: JSON.stringify({
+        schema_version: 1,
+        mode: "auto_review",
+        expected_revision: 3,
+      }),
+    },
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls, [{
+    conversationId: "conversation-policy",
+    options: {
+      mode: "auto_review",
+      expectedRevision: 3,
+    },
+  }]);
+  assert.deepEqual((await response.json()).conversation.executionPolicy, {
+    mode: "auto_review",
+    revision: 4,
+    policyVersion: 1,
+  });
+});
+
+test("project-work preview start route requires loopback origin and exact hash-bound request fields", async (t) => {
+  const calls = [];
+  const acceptedHash = `sha256:${"a".repeat(64)}`;
+  const staleHash = `sha256:${"b".repeat(64)}`;
+  const projectWorkService = {
+    startPreview: async (conversationId, options) => {
+      calls.push({ conversationId, options });
+      if (options.requestHash === staleHash) {
+        throw projectWorkError(
+          "PROJECT_WORK_PREVIEW_STALE",
+          "本机预览请求已变化，请重新核对后确认",
+          409,
+          true,
+        );
+      }
+      return {
+        schemaVersion: 1,
+        conversation: {
+          id: conversationId,
+          projectId: "project-one",
+          status: "awaiting_confirmation",
+          preview: {
+            id: options.previewId,
+            requestHash: options.requestHash,
+            status: "ready",
+            url: "http://127.0.0.1:48080/",
+          },
+        },
+        events: [],
+      };
+    },
+  };
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+  const endpoint = `${server.baseUrl}/api/v1/project-work/conversations/conversation%2Fpreview/previews/preview%2Fmanual/start`;
+  const headers = {
+    "content-type": "application/json",
+    origin: "http://127.0.0.1:4173",
+  };
+  const requestBody = (requestHash = acceptedHash) => JSON.stringify({
+    schema_version: 1,
+    client_request_id: "project-preview:confirm-1",
+    request_hash: requestHash,
+  });
+
+  const accepted = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: requestBody(),
+  });
+  assert.equal(accepted.status, 200);
+  assert.equal((await accepted.json()).conversation.preview.status, "ready");
+  assert.deepEqual(calls[0], {
+    conversationId: "conversation/preview",
+    options: {
+      previewId: "preview/manual",
+      requestHash: acceptedHash,
+    },
+  });
+
+  const missingOrigin = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: requestBody(),
+  });
+  assert.equal(missingOrigin.status, 403);
+  assert.equal(
+    (await missingOrigin.json()).error.code,
+    "PROJECT_WORK_ORIGIN_REQUIRED",
+  );
+
+  const remoteOrigin = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: "https://remote.example",
+    },
+    body: requestBody(),
+  });
+  assert.equal(remoteOrigin.status, 403);
+  assert.equal(
+    (await remoteOrigin.json()).error.code,
+    "ORIGIN_NOT_ALLOWED",
+  );
+
+  const missingRequestId = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      schema_version: 1,
+      request_hash: acceptedHash,
+    }),
+  });
+  assert.equal(missingRequestId.status, 400);
+  assert.equal(
+    (await missingRequestId.json()).error.code,
+    "PROJECT_WORK_CLIENT_REQUEST_ID_INVALID",
+  );
+
+  const extraField = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      schema_version: 1,
+      client_request_id: "project-preview:confirm-extra",
+      request_hash: acceptedHash,
+      command: "npm run dev",
+    }),
+  });
+  assert.equal(extraField.status, 400);
+  assert.equal(
+    (await extraField.json()).error.code,
+    "PROJECT_WORK_PREVIEW_START_REQUEST_INVALID",
+  );
+
+  const stale = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: requestBody(staleHash),
+  });
+  assert.equal(stale.status, 409);
+  const staleBody = await stale.json();
+  assert.deepEqual(staleBody.error, {
+    code: "PROJECT_WORK_PREVIEW_STALE",
+    message: "本机预览请求已变化，请重新核对后确认",
+    retryable: true,
+  });
+  assert.equal(calls.length, 2);
+});
+
+test("project-work follow-up and ask-user routes keep queueing separate from answers", async (t) => {
+  const calls = [];
+  const projectWorkService = {
+    listFollowUps: async (conversationId, options) => {
+      calls.push({ method: "listFollowUps", conversationId, options });
+      return [{ id: "follow-up-1", status: "queued" }];
+    },
+    enqueueFollowUp: async (conversationId, options) => {
+      calls.push({ method: "enqueueFollowUp", conversationId, options });
+      return {
+        schemaVersion: 1,
+        item: { id: "follow-up-1", status: "queued", text: options.text },
+      };
+    },
+    removeFollowUp: async (conversationId, itemId) => {
+      calls.push({ method: "removeFollowUp", conversationId, itemId });
+      return { schemaVersion: 1, cancelled: [{ id: itemId }] };
+    },
+    clearFollowUps: async (conversationId) => {
+      calls.push({ method: "clearFollowUps", conversationId });
+      return { schemaVersion: 1, cancelled: [] };
+    },
+    listAskUserRequests: async (conversationId, options) => {
+      calls.push({ method: "listAskUserRequests", conversationId, options });
+      return [{ id: "ask-user-1", status: "pending" }];
+    },
+    createAskUserRequest: async (conversationId, options) => {
+      calls.push({ method: "createAskUserRequest", conversationId, options });
+      return {
+        schemaVersion: 1,
+        request: { id: "ask-user-1", status: "pending" },
+      };
+    },
+    answerAskUserRequest: async (conversationId, requestId, options) => {
+      calls.push({
+        method: "answerAskUserRequest",
+        conversationId,
+        requestId,
+        options,
+      });
+      return {
+        schemaVersion: 1,
+        request: { id: requestId, status: "answered" },
+      };
+    },
+    cancelAskUserRequest: async (conversationId, requestId) => {
+      calls.push({
+        method: "cancelAskUserRequest",
+        conversationId,
+        requestId,
+      });
+      return {
+        schemaVersion: 1,
+        request: { id: requestId, status: "cancelled" },
+      };
+    },
+  };
+  const server = await startTestServer({}, candidateSummaryService, projectWorkService);
+  t.after(server.close);
+  const base = `${server.baseUrl}/api/v1/project-work/conversations/conversation-control`;
+  const mutationHeaders = {
+    "content-type": "application/json",
+    origin: "http://127.0.0.1:4173",
+  };
+
+  assert.equal((await fetch(`${base}/follow-ups?include_history=true`)).status, 200);
+  assert.equal((await fetch(`${base}/follow-ups`, {
+    method: "POST",
+    headers: mutationHeaders,
+    body: JSON.stringify({ schema_version: 1, text: "完成后继续" }),
+  })).status, 202);
+  assert.equal((await fetch(`${base}/follow-ups/follow-up-1`, {
+    method: "DELETE",
+    headers: { origin: "http://127.0.0.1:4173" },
+  })).status, 200);
+  assert.equal((await fetch(`${base}/follow-ups`, {
+    method: "DELETE",
+    headers: { origin: "http://127.0.0.1:4173" },
+  })).status, 200);
+
+  assert.equal((await fetch(`${base}/questions?include_history=true`)).status, 200);
+  assert.equal((await fetch(`${base}/questions`, {
+    method: "POST",
+    headers: mutationHeaders,
+    body: JSON.stringify({
+      schema_version: 1,
+      questions: [{
+        id: "scope",
+        prompt: "选择范围",
+        kind: "single_choice",
+        options: [{
+          id: "backend",
+          label: "后端",
+        }, {
+          id: "frontend",
+          label: "前端",
+        }],
+      }],
+    }),
+  })).status, 201);
+  assert.equal((await fetch(`${base}/questions/ask-user-1/answer`, {
+    method: "POST",
+    headers: mutationHeaders,
+    body: JSON.stringify({
+      schema_version: 1,
+      answers: [{
+        question_id: "scope",
+        value: "backend",
+      }],
+    }),
+  })).status, 200);
+  assert.equal((await fetch(`${base}/questions/ask-user-2/cancel`, {
+    method: "POST",
+    headers: mutationHeaders,
+    body: JSON.stringify({ schema_version: 1 }),
+  })).status, 200);
+
+  assert.deepEqual(calls, [{
+    method: "listFollowUps",
+    conversationId: "conversation-control",
+    options: { includeHistory: true },
+  }, {
+    method: "enqueueFollowUp",
+    conversationId: "conversation-control",
+    options: { text: "完成后继续" },
+  }, {
+    method: "removeFollowUp",
+    conversationId: "conversation-control",
+    itemId: "follow-up-1",
+  }, {
+    method: "clearFollowUps",
+    conversationId: "conversation-control",
+  }, {
+    method: "listAskUserRequests",
+    conversationId: "conversation-control",
+    options: { includeHistory: true },
+  }, {
+    method: "createAskUserRequest",
+    conversationId: "conversation-control",
+    options: {
+      questions: [{
+        id: "scope",
+        label: undefined,
+        prompt: "选择范围",
+        kind: "single_choice",
+        required: undefined,
+        options: [{
+          id: "backend",
+          label: "后端",
+          description: undefined,
+        }, {
+          id: "frontend",
+          label: "前端",
+          description: undefined,
+        }],
+      }],
+    },
+  }, {
+    method: "answerAskUserRequest",
+    conversationId: "conversation-control",
+    requestId: "ask-user-1",
+    options: {
+      answers: [{
+        questionId: "scope",
+        value: "backend",
+      }],
+    },
+  }, {
+    method: "cancelAskUserRequest",
+    conversationId: "conversation-control",
+    requestId: "ask-user-2",
+  }]);
+});
+
+test("project-work turn, read, retry, and repair-resume routes preserve durable request ids", async (t) => {
+  const calls = [];
+  const state = {
+    schemaVersion: 1,
+    conversation: {
+      id: "conversation-history",
+      projectId: null,
+      workspaceKind: "scratch",
+      scope: "standalone",
+      rootLabel: "未连接文件夹",
+      title: "历史会话",
+      status: "idle",
+      messages: [],
+      lastEventSeq: 4,
+    },
+    events: [],
+    hasMoreEvents: false,
+  };
+  const projectWorkService = {
+    getConversationTurns: async (conversationId, options) => {
+      calls.push({ method: "getConversationTurns", conversationId, options });
+      return {
+        schemaVersion: 1,
+        turns: [{ id: "turn-11", turnSeq: 11 }],
+        hasMore: true,
+        nextBeforeTurnSeq: 11,
+      };
+    },
+    markConversationRead: async (conversationId, options) => {
+      calls.push({ method: "markConversationRead", conversationId, options });
+      return state;
+    },
+    retryLastTurn: async (conversationId, options) => {
+      calls.push({ method: "retryLastTurn", conversationId, options });
+      return state;
+    },
+    resumeVerificationRepair: async (conversationId, options) => {
+      calls.push({
+        method: "resumeVerificationRepair",
+        conversationId,
+        options,
+      });
+      return state;
+    },
+    getConversation: async (conversationId) => {
+      calls.push({ method: "getConversation", conversationId });
+      return state;
+    },
+  };
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+  const base =
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-history`;
+  const headers = {
+    "content-type": "application/json",
+    origin: "http://127.0.0.1:4173",
+  };
+
+  const turns = await fetch(`${base}/turns?before_turn_seq=12&limit=5`);
+  assert.equal(turns.status, 200);
+  assert.equal((await turns.json()).turns[0].turnSeq, 11);
+
+  const read = await fetch(`${base}/read`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      schema_version: 1,
+      client_request_id: "read:history-1",
+      through_message_seq: 19,
+    }),
+  });
+  assert.equal(read.status, 200);
+
+  const retry = await fetch(`${base}/retry-last-turn`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      schema_version: 1,
+      client_request_id: "retry:history-1",
+    }),
+  });
+  assert.equal(retry.status, 202);
+
+  const resume = await fetch(
+    `${base}/verification-repairs/operation%2Frepair-1/resume`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        schema_version: 1,
+        client_request_id: "repair:resume-1",
+      }),
+    },
+  );
+  assert.equal(resume.status, 202);
+  assert.deepEqual(calls, [{
+    method: "getConversationTurns",
+    conversationId: "conversation-history",
+    options: { beforeTurnSeq: 12, limit: 5 },
+  }, {
+    method: "markConversationRead",
+    conversationId: "conversation-history",
+    options: {
+      throughMessageSeq: 19,
+      clientRequestId: "read:history-1",
+    },
+  }, {
+    method: "retryLastTurn",
+    conversationId: "conversation-history",
+    options: { clientRequestId: "retry:history-1" },
+  }, {
+    method: "resumeVerificationRepair",
+    conversationId: "conversation-history",
+    options: {
+      operationId: "operation/repair-1",
+      clientRequestId: "repair:resume-1",
+    },
+  }, {
+    method: "getConversation",
+    conversationId: "conversation-history",
+  }]);
+});
+
+test("project-work apply journal routes expose safe history and hash-bound undo", async (t) => {
+  const calls = [];
+  const projectWorkService = {
+    getWorkspace: async (conversationId) => {
+      calls.push({ method: "getWorkspace", conversationId });
+      return {
+        schemaVersion: 1,
+        id: "workspace-conversation-apply",
+        kind: "sparse_overlay",
+        isolation: "review_overlay",
+        automaticApplyAllowed: false,
+        status: "ready",
+      };
+    },
+    getGitEvidence: async (conversationId) => {
+      calls.push({ method: "getGitEvidence", conversationId });
+      return {
+        available: true,
+        branch: "codex/runtime",
+        head: "abcdef",
+        staged: ["src/a.js"],
+        unstaged: [],
+        untracked: [],
+        truncated: false,
+      };
+    },
+    listApplyJournal: async (conversationId) => {
+      calls.push({ method: "listApplyJournal", conversationId });
+      return [{
+        id: "apply-1",
+        status: "applied",
+        undo: {
+          status: "available",
+          hash: "sha256:undo",
+        },
+      }];
+    },
+    undoApply: async (conversationId, applyId, options) => {
+      calls.push({
+        method: "undoApply",
+        conversationId,
+        applyId,
+        options,
+      });
+      return {
+        schemaVersion: 1,
+        conversation: {
+          id: conversationId,
+          applyJournal: [{
+            id: applyId,
+            status: "undone",
+          }],
+        },
+        events: [],
+      };
+    },
+  };
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+  const conversationBase = `${server.baseUrl}/api/v1/project-work/conversations/conversation-apply`;
+  const base = `${conversationBase}/applies`;
+
+  const workspaceResponse = await fetch(`${conversationBase}/workspace`);
+  assert.equal(workspaceResponse.status, 200);
+  assert.equal(
+    (await workspaceResponse.json()).workspace.automaticApplyAllowed,
+    false,
+  );
+  const gitResponse = await fetch(`${conversationBase}/git-evidence`);
+  assert.equal(gitResponse.status, 200);
+  assert.equal((await gitResponse.json()).git.branch, "codex/runtime");
+  const listResponse = await fetch(base);
+  assert.equal(listResponse.status, 200);
+  assert.deepEqual(await listResponse.json(), {
+    schemaVersion: 1,
+    applies: [{
+      id: "apply-1",
+      status: "applied",
+      undo: {
+        status: "available",
+        hash: "sha256:undo",
+      },
+    }],
+  });
+  const undoResponse = await fetch(`${base}/apply-1/undo`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: "http://127.0.0.1:4173",
+    },
+    body: JSON.stringify({
+      schema_version: 1,
+      undo_hash: "sha256:undo",
+    }),
+  });
+  assert.equal(undoResponse.status, 200);
+  assert.deepEqual(calls, [{
+    method: "getWorkspace",
+    conversationId: "conversation-apply",
+  }, {
+    method: "getGitEvidence",
+    conversationId: "conversation-apply",
+  }, {
+    method: "listApplyJournal",
+    conversationId: "conversation-apply",
+  }, {
+    method: "undoApply",
+    conversationId: "conversation-apply",
+    applyId: "apply-1",
+    options: {
+      undoHash: "sha256:undo",
+    },
+  }]);
+});
+
+test("project-work event endpoint resumes after seq and streams incremental snapshots", async (t) => {
+  const afterSequences = [];
+  let subscriptions = 0;
+  let unsubscriptions = 0;
+  const event = {
+    seq: 7,
+    type: "ask_user.requested",
+    at: "2026-07-27T10:00:00.000Z",
+    data: {
+      id: "ask-user-1",
+      questionCount: 1,
+    },
+  };
+  const gapEvent = {
+    seq: 8,
+    type: "agent.status",
+    at: "2026-07-27T10:00:01.000Z",
+    data: { status: "idle" },
+  };
+  const projectWorkService = {
+    async getConversation(conversationId, { afterSeq }) {
+      afterSequences.push(afterSeq);
+      const latestSeq = afterSequences.length >= 4 ? 8 : 7;
+      return {
+        schemaVersion: 1,
+        conversation: {
+          id: conversationId,
+          projectId: "project-1",
+          title: "控制面",
+          status: "awaiting_user",
+          messages: [],
+          askUserRequests: [{
+            id: "ask-user-1",
+            status: "pending",
+            questions: [{
+              id: "scope",
+              prompt: "选择范围",
+              kind: "single_choice",
+              required: true,
+              options: [
+                { id: "code", label: "代码" },
+                { id: "tests", label: "测试" },
+              ],
+            }],
+          }],
+          followUpQueue: [],
+          lastEventSeq: latestSeq,
+        },
+        events: [event, gapEvent].filter(
+          (item) => item.seq > afterSeq && item.seq <= latestSeq,
+        ),
+        hasMoreEvents: false,
+      };
+    },
+    subscribeEvents(conversationId, listener) {
+      assert.equal(conversationId, "conversation-events");
+      assert.equal(typeof listener, "function");
+      subscriptions += 1;
+      return () => {
+        unsubscriptions += 1;
+      };
+    },
+  };
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+  const endpoint = `${server.baseUrl}/api/v1/project-work/conversations/conversation-events/events`;
+
+  const pageResponse = await fetch(`${endpoint}?after_seq=6`);
+  assert.equal(pageResponse.status, 200);
+  const page = await pageResponse.json();
+  assert.equal(page.snapshot_watermark, 7);
+  assert.equal(page.last_seq, 7);
+  assert.equal(page.events[0].seq, 7);
+  assert.equal(page.conversation.askUserRequests[0].status, "pending");
+
+  const resumedResponse = await fetch(`${endpoint}?after_seq=1`, {
+    headers: { "last-event-id": "7" },
+  });
+  assert.equal(resumedResponse.status, 200);
+  assert.deepEqual((await resumedResponse.json()).events, []);
+
+  const controller = new AbortController();
+  const stream = await fetch(`${endpoint}?after_seq=6`, {
+    headers: { accept: "text/event-stream" },
+    signal: controller.signal,
+  });
+  assert.equal(stream.status, 200);
+  const reader = stream.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  while (!text.includes("event: snapshot")) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    text += decoder.decode(chunk.value, { stream: true });
+  }
+  assert.match(text, /id: 8/);
+  assert.match(text, /event: snapshot/);
+  assert.match(text, /"snapshot_watermark":8/);
+  assert.match(text, /"last_seq":8/);
+  assert.match(text, /"seq":8/);
+  controller.abort();
+  await reader.cancel().catch(() => undefined);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.deepEqual(afterSequences, [6, 7, 6, 6]);
+  assert.equal(subscriptions, 1);
+  assert.equal(unsubscriptions, 1);
 });
 
 test("candidate summaries use the server project-state source", async (t) => {
@@ -1077,20 +1920,15 @@ test("Zotero HTTP routes map request fields and return only safe previews", asyn
       }),
     },
   );
-  assert.equal(commitResponse.status, 202);
-  assert.equal(calls.commit.approval.proposalHash, "sha256:preview");
-  assert.deepEqual(calls.commit.approval.operations, [{
-    proposal_id: "zotero-paper-1",
-    content_hash: "sha256:content",
-    target_version_or_hash: "sha256:target",
-  }]);
-  const committed = await commitResponse.json();
-  const committedJson = JSON.stringify(committed);
-  assert.equal(committed.zotero.status, "committing");
-  assert.equal(committedJson.includes("artifact_path"), false);
-  assert.equal(committedJson.includes("connectorSession"), false);
-  assert.equal(committedJson.includes("connectorItemId"), false);
-  assert.equal(committedJson.includes("/private/"), false);
+  assert.equal(commitResponse.status, 410);
+  assert.equal(calls.commit, null);
+  assert.deepEqual(await commitResponse.json(), {
+    error: {
+      code: "ZOTERO_COMMIT_DEPRECATED",
+      message: "旧版 Zotero 单独确认入口已停用，请通过联合归档预览确认写入",
+      retryable: false,
+    },
+  });
 });
 
 test("Zotero HTTP failures use the workflow error envelope", async (t) => {
@@ -1115,6 +1953,321 @@ test("Zotero HTTP failures use the workflow error envelope", async (t) => {
       retryable: true,
     },
   });
+});
+
+test("ArchiveBatch HTTP route requires a loopback origin and preserves exact bindings", async (t) => {
+  let received = null;
+  const workflow = {
+    startArchiveCommit: async (runId, request) => {
+      received = { runId, request };
+      return {
+        ...committingRun(),
+        archive_batch: {
+          schema_version: 1,
+          batch_id: "archive-safe-1",
+          client_request_id: request.clientRequestId,
+          request_fingerprint: "sha256:must-not-leak",
+          selected_targets: ["obsidian", "zotero", "project_state"],
+          status: "committing",
+          artifact_path: "archive-batches/must-not-leak.json",
+          approved_at: "2026-07-23T12:03:00.000Z",
+          completed_at: null,
+          updated_at: "2026-07-23T12:03:00.000Z",
+        },
+      };
+    },
+  };
+  const server = await startTestServer(
+    workflow,
+    candidateSummaryService,
+    undefined,
+    { allowMissingJournalMutationOrigin: false },
+  );
+  t.after(server.close);
+  const endpoint =
+    `${server.baseUrl}/api/v1/journal-runs/journal-test/archive/commit`;
+  const body = {
+    schema_version: 1,
+    client_request_id: "archive-request-1",
+    obsidian: {
+      proposal_hash: "sha256:obsidian-preview",
+      operations: [{
+        proposal_id: "obsidian-preview-paper-1",
+        content_hash: "sha256:obsidian-content",
+        target_version_or_hash: "sha256:obsidian-target",
+      }],
+    },
+    zotero: {
+      proposal_hash: "sha256:zotero-preview",
+      operations: [{
+        proposal_id: "zotero-paper-1",
+        content_hash: "sha256:zotero-content",
+        target_version_or_hash: "sha256:zotero-target",
+      }],
+    },
+    project_state: {
+      proposal_hash: "sha256:project-preview",
+      operation: {
+        proposal_id: "project-state-preview-1",
+        content_hash: "sha256:project-content",
+        target_version_or_hash: "sha256:project-target",
+      },
+    },
+  };
+
+  const rejected = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  assert.equal(rejected.status, 403);
+  assert.equal(received, null);
+
+  const malformedRequestId = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: "http://127.0.0.1:4173",
+    },
+    body: JSON.stringify({
+      ...body,
+      client_request_id: "archive request with spaces",
+    }),
+  });
+  assert.equal(malformedRequestId.status, 400);
+  assert.equal(received, null);
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: "http://127.0.0.1:4173",
+    },
+    body: JSON.stringify(body),
+  });
+  assert.equal(response.status, 202);
+  assert.equal(received.runId, "journal-test");
+  assert.deepEqual(received.request, {
+    clientRequestId: "archive-request-1",
+    obsidian: {
+      proposalHash: "sha256:obsidian-preview",
+      operations: body.obsidian.operations,
+    },
+    zotero: {
+      proposalHash: "sha256:zotero-preview",
+      operations: body.zotero.operations,
+    },
+    projectState: {
+      proposalHash: "sha256:project-preview",
+      operation: body.project_state.operation,
+    },
+    simulateObsidianFailure: false,
+  });
+  const publicBody = await response.json();
+  assert.equal(publicBody.archive_batch.batch_id, "archive-safe-1");
+  const serialized = JSON.stringify(publicBody);
+  assert.equal(serialized.includes("request_fingerprint"), false);
+  assert.equal(serialized.includes("archive-batches/"), false);
+});
+
+test("Journal mutation entry routes require a versioned JSON envelope before dispatch", async (t) => {
+  const calls = [];
+  const workflow = {
+    startRun: async (options) => {
+      calls.push({ action: "start", options });
+      return committingRun();
+    },
+    resumeRun: async (runId) => {
+      calls.push({ action: "resume", runId });
+      return committingRun();
+    },
+    createReadingConversation: async (runId, paperId, options) => {
+      calls.push({ action: "conversation", runId, paperId, options });
+      return {
+        schema_version: 1,
+        run_id: runId,
+        paper_id: paperId,
+        status: "idle",
+      };
+    },
+    resetPaperReading: async (runId, paperId, options) => {
+      calls.push({ action: "reset", runId, paperId, options });
+      return committingRun();
+    },
+  };
+  const server = await startTestServer(
+    workflow,
+    candidateSummaryService,
+    undefined,
+    { allowMissingJournalMutationOrigin: false },
+  );
+  t.after(server.close);
+  const headers = {
+    origin: "http://127.0.0.1:4173",
+    "content-type": "application/json",
+  };
+
+  const invalidStart = await fetch(`${server.baseUrl}/api/v1/journal-runs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      provider_id: "deepseek",
+      model_id: "deepseek-v4-flash",
+    }),
+  });
+  assert.equal(invalidStart.status, 400);
+
+  const start = await fetch(`${server.baseUrl}/api/v1/journal-runs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      schema_version: 1,
+      provider_id: "deepseek",
+      model_id: "deepseek-v4-flash",
+    }),
+  });
+  assert.equal(start.status, 202);
+
+  const resumeWithoutJson = await fetch(
+    `${server.baseUrl}/api/v1/journal-runs/journal-test/resume`,
+    {
+      method: "POST",
+      headers: { origin: "http://127.0.0.1:4173" },
+    },
+  );
+  assert.equal(resumeWithoutJson.status, 415);
+
+  const resume = await fetch(
+    `${server.baseUrl}/api/v1/journal-runs/journal-test/resume`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ schema_version: 1 }),
+    },
+  );
+  assert.equal(resume.status, 202);
+
+  const invalidConversation = await fetch(
+    `${server.baseUrl}/api/v1/journal-runs/journal-test/papers/paper-1/reading/conversations`,
+    {
+      method: "POST",
+      headers,
+      body: "{}",
+    },
+  );
+  assert.equal(invalidConversation.status, 400);
+
+  const conversation = await fetch(
+    `${server.baseUrl}/api/v1/journal-runs/journal-test/papers/paper-1/reading/conversations`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        schema_version: 1,
+        client_request_id: "create-reading-conversation-1",
+      }),
+    },
+  );
+  assert.equal(conversation.status, 201);
+
+  const reset = await fetch(
+    `${server.baseUrl}/api/v1/journal-runs/journal-test/papers/paper-1/reading/reset`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        schema_version: 1,
+        client_request_id: "reset-reading-1",
+      }),
+    },
+  );
+  assert.equal(reset.status, 200);
+  assert.deepEqual(calls, [{
+    action: "start",
+    options: {
+      trigger: "manual",
+      providerId: "deepseek",
+      modelId: "deepseek-v4-flash",
+    },
+  }, {
+    action: "resume",
+    runId: "journal-test",
+  }, {
+    action: "conversation",
+    runId: "journal-test",
+    paperId: "paper-1",
+    options: {
+      clientRequestId: "create-reading-conversation-1",
+    },
+  }, {
+    action: "reset",
+    runId: "journal-test",
+    paperId: "paper-1",
+    options: {
+      clientRequestId: "reset-reading-1",
+    },
+  }]);
+});
+
+test("journal event endpoint resumes after a stable sequence and streams snapshot watermarks", async (t) => {
+  const run = {
+    ...committingRun(),
+    snapshot_watermark: 7,
+    last_event_seq: 7,
+  };
+  let subscriptions = 0;
+  let unsubscriptions = 0;
+  const workflow = {
+    getRun: async () => run,
+    readEvents: async (_runId, { afterSeq }) => ({
+      events: afterSeq < 7
+        ? [{
+            seq: 7,
+            type: "archive_batch_completed",
+            status: "partial",
+            at: "2026-07-23T12:04:00.000Z",
+            artifact_path: "/private/must-not-leak.json",
+          }]
+        : [],
+      hasMore: false,
+      lastSeq: 7,
+    }),
+    subscribeEvents: (_runId, _listener) => {
+      subscriptions += 1;
+      return () => {
+        unsubscriptions += 1;
+      };
+    },
+  };
+  const server = await startTestServer(workflow);
+  t.after(server.close);
+  const endpoint =
+    `${server.baseUrl}/api/v1/journal-runs/journal-test/events?after_seq=6`;
+  const response = await fetch(endpoint);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.snapshot_watermark, 7);
+  assert.equal(body.events[0].seq, 7);
+  assert.equal(JSON.stringify(body).includes("artifact_path"), false);
+
+  const controller = new AbortController();
+  const stream = await fetch(endpoint, {
+    headers: { accept: "text/event-stream" },
+    signal: controller.signal,
+  });
+  assert.equal(stream.status, 200);
+  const reader = stream.body.getReader();
+  const firstChunk = await reader.read();
+  const text = new TextDecoder().decode(firstChunk.value);
+  assert.match(text, /event: snapshot/);
+  assert.match(text, /"snapshot_watermark":7/);
+  controller.abort();
+  const unsubscribeDeadline = Date.now() + 1_000;
+  while (unsubscriptions === 0 && Date.now() < unsubscribeDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(subscriptions, 1);
+  assert.equal(unsubscriptions, 1);
 });
 
 test("publicRun excludes internal artifact paths and connector internals", () => {
@@ -1188,7 +2341,7 @@ test("Obsidian HTTP preview returns exact Markdown without exposing Run artifact
   assert.equal(response.status, 201);
   assert.equal(requestedRunId, "journal-test");
   const preview = await response.json();
-  assert.equal(preview.write_capability, "preview_only");
+  assert.equal(preview.write_capability, "hash_bound_commit");
   assert.equal(preview.external_write_performed, false);
   assert.equal(preview.proposals[0].markdown, artifact.proposals[0].markdown);
   assert.equal(preview.proposals[0].target_details.file_name, "2026-Ada-Paper--abcd1234.md");
@@ -1239,7 +2392,7 @@ test("project-state HTTP preview returns exact append content without exposing R
   assert.equal(response.status, 201);
   assert.equal(requestedRunId, "journal-test");
   const preview = await response.json();
-  assert.equal(preview.write_capability, "preview_only");
+  assert.equal(preview.write_capability, "hash_bound_commit");
   assert.equal(preview.external_write_performed, false);
   assert.equal(preview.proposal.markdown, artifact.proposal.markdown);
   assert.equal(preview.proposal.diff.append_text, artifact.proposal.diff.append_text);
@@ -1397,8 +2550,8 @@ test("reading HTTP routes preserve request fields and return durable stage state
       calls.position = { runId, paperId, options };
       return committingRun();
     },
-    restartReadingFromGuide: async (runId) => {
-      calls.restart = { runId };
+    restartReadingFromGuide: async (runId, options) => {
+      calls.restart = { runId, options };
       return committingRun();
     },
   };
@@ -1434,11 +2587,15 @@ test("reading HTTP routes preserve request fields and return durable stage state
       body: JSON.stringify({
         schema_version: 1,
         from_step: "guide",
+        client_request_id: "restart-reading-1",
       }),
     },
   );
   assert.equal(restartResponse.status, 200);
-  assert.deepEqual(calls.restart, { runId: "journal-test" });
+  assert.deepEqual(calls.restart, {
+    runId: "journal-test",
+    options: { clientRequestId: "restart-reading-1" },
+  });
 
   const readingResponse = await fetch(
     `${server.baseUrl}/api/v1/journal-runs/journal-test/papers/paper-1/reading`,
@@ -1489,6 +2646,23 @@ test("reading HTTP routes preserve request fields and return durable stage state
   assert.equal(calls.question.options.blockId, "block-1");
   assert.equal(calls.question.options.clientRequestId, "client-1");
 
+  calls.question = null;
+  const missingQuestionRequestId = await fetch(
+    `${server.baseUrl}/api/v1/journal-runs/journal-test/papers/paper-1/reading/questions`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: 1,
+        stage: "research-question",
+        text: "缺少稳定请求标识",
+        block_id: "block-1",
+      }),
+    },
+  );
+  assert.equal(missingQuestionRequestId.status, 400);
+  assert.equal(calls.question, null);
+
   const chatResponse = await fetch(
     `${server.baseUrl}/api/v1/journal-runs/journal-test/papers/paper-1/reading/chat/messages`,
     {
@@ -1498,6 +2672,7 @@ test("reading HTTP routes preserve request fields and return durable stage state
         schema_version: 1,
         client_request_id: "client-chat-1",
         text: "这部分是什么意思？",
+        round_id: "orientation",
         reference: {
           document_revision: "sha256:document",
           block_id: "block-1",
@@ -1516,6 +2691,7 @@ test("reading HTTP routes preserve request fields and return durable stage state
     paperId: "paper-1",
     options: {
       text: "这部分是什么意思？",
+      roundId: "orientation",
       reference: {
         document_revision: "sha256:document",
         block_id: "block-1",
@@ -1766,4 +2942,93 @@ test("translation routes use the server-owned profile and expose an idempotent p
     runId: "journal-test",
     paperId: "paper-1",
   });
+});
+
+test("project-work file routes forward bounded paging and serve validated image bytes", async (t) => {
+  const calls = [];
+  const imageBytes = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ]);
+  const projectWorkService = {
+    async getConversationTree(conversationId, options) {
+      calls.push({ action: "tree", conversationId, options });
+      return {
+        path: "",
+        query: "settings",
+        revision: "sha256:tree",
+        entries: [{
+          path: "assets/settings.png",
+          name: "settings.png",
+          type: "file",
+          previewKind: "image",
+          mimeType: "image/png",
+          overlay: "created",
+        }],
+        nextCursor: "page-2",
+        truncated: true,
+      };
+    },
+    async readConversationImage(conversationId, options) {
+      calls.push({ action: "image", conversationId, options });
+      return {
+        path: "assets/settings.png",
+        mimeType: "image/png",
+        byteLength: imageBytes.length,
+        hash: "sha256:image",
+        bytes: imageBytes,
+      };
+    },
+  };
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+
+  const treeResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-files/tree?query=settings&limit=25&cursor=page-1`,
+  );
+  assert.equal(treeResponse.status, 200);
+  assert.deepEqual(await treeResponse.json(), {
+    path: "",
+    query: "settings",
+    revision: "sha256:tree",
+    entries: [{
+      path: "assets/settings.png",
+      name: "settings.png",
+      type: "file",
+      previewKind: "image",
+      mimeType: "image/png",
+      overlay: "created",
+    }],
+    nextCursor: "page-2",
+    truncated: true,
+  });
+
+  const imageResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-files/image?path=assets%2Fsettings.png`,
+  );
+  assert.equal(imageResponse.status, 200);
+  assert.equal(imageResponse.headers.get("content-type"), "image/png");
+  assert.equal(imageResponse.headers.get("cache-control"), "private, no-store");
+  assert.equal(imageResponse.headers.get("x-content-type-options"), "nosniff");
+  assert.deepEqual(Buffer.from(await imageResponse.arrayBuffer()), imageBytes);
+  assert.deepEqual(calls, [{
+    action: "tree",
+    conversationId: "conversation-files",
+    options: {
+      directory: "",
+      depth: 3,
+      query: "settings",
+      limit: 25,
+      cursor: "page-1",
+    },
+  }, {
+    action: "image",
+    conversationId: "conversation-files",
+    options: {
+      filePath: "assets/settings.png",
+    },
+  }]);
 });

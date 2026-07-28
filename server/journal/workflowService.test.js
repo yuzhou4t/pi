@@ -140,6 +140,13 @@ test("workflow runs scan, ranks five papers, submits one MinerU batch, and becom
   const sourceStateStore = createSourceStateStore({ dataDir });
   const submitted = [];
   let resultDownloads = 0;
+  let activePdfDownloads = 0;
+  let maxPdfDownloads = 0;
+  let startedPdfDownloads = 0;
+  let releaseFirstPdfWave;
+  const firstPdfWave = new Promise((resolve) => {
+    releaseFirstPdfWave = resolve;
+  });
   const service = createJournalWorkflowService({
     env: {
       PI_DATA_DIR: dataDir,
@@ -147,6 +154,7 @@ test("workflow runs scan, ranks five papers, submits one MinerU batch, and becom
       PI_MINERU_API_TOKEN: "token",
       PI_MINERU_POLL_INTERVAL_MS: "1",
       PI_MINERU_TIMEOUT_MS: "1000",
+      PI_PDF_PREP_CONCURRENCY: "3",
     },
     dataDir,
     runStore,
@@ -176,8 +184,14 @@ test("workflow runs scan, ranks five papers, submits one MinerU batch, and becom
       usage: { input_tokens: 10, output_tokens: 5 },
     }),
     pdfDownloader: async ({ paperId, outputDir }) => {
+      activePdfDownloads += 1;
+      maxPdfDownloads = Math.max(maxPdfDownloads, activePdfDownloads);
+      startedPdfDownloads += 1;
+      if (startedPdfDownloads === 3) releaseFirstPdfWave();
+      await firstPdfWave;
       const filePath = path.join(outputDir, `${paperId}.pdf`);
       await writeFile(filePath, "%PDF-1.7\nmock");
+      activePdfDownloads -= 1;
       return {
         file_path: filePath,
         sha256: `hash-${paperId}`,
@@ -230,11 +244,75 @@ test("workflow runs scan, ranks five papers, submits one MinerU batch, and becom
   assert.equal(completed.mineru.status, "ready");
   assert.equal(Object.values(completed.mineru.papers).every((paper) => paper.status === "ready"), true);
   assert.equal(resultDownloads, 5);
+  assert.equal(maxPdfDownloads, 3);
+  const eventPage = await runStore.readEvents(started.run_id);
+  assert.equal(
+    eventPage.events.filter((event) => event.type === "pdf_paper_prepared").length,
+    5,
+  );
 
   await service.resumeRun(started.run_id);
   const resumed = await service.waitForRun(started.run_id);
   assert.equal(resumed.mineru.status, "ready");
   assert.equal(resultDownloads, 5);
+});
+
+test("live workflow fails closed before ranking or cursor commit when project state is missing", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-live-context-"));
+  const runStore = createRunStore({ dataDir });
+  const sourceStateStore = createSourceStateStore({ dataDir });
+  let rankingCalls = 0;
+  let commitCalls = 0;
+  let pdfCalls = 0;
+  const service = createJournalWorkflowService({
+    env: {
+      PI_DATA_DIR: dataDir,
+      PI_MODEL_MODE: "live",
+      PI_PROJECT_ROOT: dataDir,
+      PI_PROJECT_STATE_PATH: "project_state.md",
+    },
+    dataDir,
+    runStore,
+    sourceStateStore,
+    sourceScanner: async () => ({
+      summary: {
+        source_count: 11,
+        successful_source_count: 11,
+        failed_source_ids: [],
+      },
+      candidateBatch: {
+        mode: "new_papers",
+        candidates: candidates(),
+      },
+      cursor_commit_pending: true,
+    }),
+    sourceScanCommitter: async () => {
+      commitCalls += 1;
+    },
+    candidateRanker: async () => {
+      rankingCalls += 1;
+      return { candidates: candidates(), source: "model" };
+    },
+    pdfDownloader: async () => {
+      pdfCalls += 1;
+      throw new Error("must not download");
+    },
+    mineruAdapter: null,
+  });
+
+  const started = await service.startRun();
+  const failed = await service.waitForRun(started.run_id);
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.phase, "failed");
+  assert.equal(
+    failed.last_error.code,
+    "PROJECT_STATE_NOT_CONFIGURED",
+  );
+  assert.equal(rankingCalls, 0);
+  assert.equal(commitCalls, 0);
+  assert.equal(pdfCalls, 0);
+  assert.deepEqual(failed.candidates, []);
+  assert.equal((await sourceStateStore.load()).revision, 0);
 });
 
 test("workflow stays reviewable when MinerU is not configured", async () => {
@@ -269,6 +347,112 @@ test("workflow stays reviewable when MinerU is not configured", async () => {
   const completed = await service.waitForRun(started.run_id);
   assert.equal(completed.status, "review_ready");
   assert.equal(completed.mineru.status, "not_configured");
+});
+
+test("one failed paper can retry without reprocessing papers that are already ready", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-paper-retry-"));
+  const runStore = createRunStore({ dataDir });
+  const run = await runStore.createRun();
+  const papers = candidates();
+  await runStore.updateRun(run.run_id, {
+    status: "review_ready",
+    phase: "candidate_review",
+    candidates: papers,
+    mineru: {
+      status: "partial",
+      batch_id: "old-batch",
+      papers: Object.fromEntries(papers.map((paper, index) => [
+        paper.paper_id,
+        index === 4
+          ? {
+              status: "pdf_failed",
+              error: { code: "PDF_DOWNLOAD_FAILED", retryable: true },
+            }
+          : {
+              status: "ready",
+              markdown_chars: 100,
+              image_count: 0,
+            },
+      ])),
+    },
+  });
+  const submitted = [];
+  const service = createJournalWorkflowService({
+    env: {
+      PI_DATA_DIR: dataDir,
+      PI_MODEL_MODE: "fixture",
+      PI_MINERU_API_TOKEN: "token",
+      PI_MINERU_POLL_INTERVAL_MS: "1",
+      PI_MINERU_TIMEOUT_MS: "1000",
+    },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    pdfDownloader: async ({ paperId, outputDir }) => {
+      const filePath = path.join(outputDir, `${paperId}.pdf`);
+      await writeFile(filePath, "%PDF-1.7\nretry");
+      return {
+        file_path: filePath,
+        sha256: `hash-${paperId}`,
+        byte_length: 14,
+      };
+    },
+    mineruAdapter: {
+      submitBatch: async (files) => {
+        submitted.push(files.map((file) => file.dataId));
+        return {
+          batchId: "retry-batch",
+          state: "uploaded",
+          uploads: files.map((file) => ({
+            dataId: file.dataId,
+            fileName: file.fileName,
+            state: "uploaded",
+            error: null,
+          })),
+        };
+      },
+      getBatch: async () => ({
+        batchId: "retry-batch",
+        state: "done",
+        items: [{
+          dataId: "paper-5",
+          fileName: "paper-5.pdf",
+          state: "done",
+          fullZipUrl: "https://mineru.example/paper-5.zip",
+          progress: null,
+          error: null,
+        }],
+      }),
+      downloadResult: async () => ({
+        markdown: "# Paper 5\n\nRecovered.",
+        images: [],
+      }),
+    },
+  });
+
+  const retrying = await service.retryPaperDocument(run.run_id, "paper-5", {
+    clientRequestId: "retry-paper-5",
+  });
+  assert.equal(retrying.mineru.papers["paper-5"].status, "pdf_retrying");
+  assert.equal(
+    retrying.mineru.papers["paper-5"].retry_request_id,
+    "retry-paper-5",
+  );
+  let completed;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    completed = await runStore.getRun(run.run_id);
+    if (completed.mineru.papers["paper-5"].status === "ready") break;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.equal(completed.mineru.status, "ready");
+  assert.equal(completed.mineru.papers["paper-5"].status, "ready");
+  assert.deepEqual(submitted, [["paper-5"]]);
+  assert.equal(
+    papers.slice(0, 4).every(
+      (paper) => completed.mineru.papers[paper.paper_id].status === "ready",
+    ),
+    true,
+  );
 });
 
 test("workflow stays reviewable when none of the five PDFs can be downloaded", async () => {
@@ -308,6 +492,47 @@ test("workflow stays reviewable when none of the five PDFs can be downloaded", a
     Object.values(completed.mineru.papers).every((paper) => paper.status === "pdf_failed"),
     true,
   );
+});
+
+test("concurrent starts reuse one active project-week run and execute one scan", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-workflow-dedupe-"));
+  const runStore = createRunStore({ dataDir });
+  let scanCount = 0;
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    sourceScanner: async () => {
+      scanCount += 1;
+      return {
+        summary: { source_count: 11, successful_source_count: 11, failed_source_ids: [] },
+        candidateBatch: { mode: "new_papers", candidates: candidates() },
+      };
+    },
+    candidateRanker: async ({ papers }) => ({
+      candidates: papers.map((paper, index) => ({
+        ...paper,
+        rank: index + 1,
+        selection_summary: "一条足够长的论文选择说明。",
+        project_impact: "与项目相关。",
+      })),
+      source: "deterministic",
+    }),
+    pdfDownloader: async () => {
+      throw new Error("PDF_URL_UNAVAILABLE");
+    },
+    mineruAdapter: null,
+  });
+
+  const [first, second] = await Promise.all([
+    service.startRun(),
+    service.startRun(),
+  ]);
+  await service.waitForRun(first.run_id);
+
+  assert.equal(first.run_id, second.run_id);
+  assert.equal(scanCount, 1);
 });
 
 test("a run paused before MinerU submission can resume after the token is configured", async () => {
@@ -1324,4 +1549,450 @@ test("a translation for an older document revision reports stale", async () => {
   const stale = await service.getPaperTranslation(runId, "paper-1");
   assert.equal(stale.status, "stale");
   assert.deepEqual(stale.blocks, {});
+});
+
+test("ArchiveBatch stops before Zotero when any required Obsidian note is blocked", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-archive-dependency-"));
+  const runStore = createRunStore({ dataDir });
+  const run = await runStore.createRun();
+  await runStore.updateRun(run.run_id, {
+    status: "awaiting_approval",
+    phase: "archive_preview",
+    candidates: [
+      { paper_id: "paper-1", title: "Paper 1" },
+      { paper_id: "paper-2", title: "Paper 2" },
+    ],
+    paper_decisions: {
+      "paper-1": "read",
+      "paper-2": "read",
+    },
+    obsidian: {
+      status: "partially_blocked",
+      proposals: [
+        {
+          proposal_id: "obsidian-1",
+          paper_id: "paper-1",
+          actionable: true,
+          selected: true,
+          status: "draft",
+        },
+        {
+          proposal_id: "obsidian-2",
+          paper_id: "paper-2",
+          actionable: false,
+          selected: false,
+          status: "blocked",
+        },
+      ],
+    },
+    zotero: {
+      status: "awaiting_approval",
+      proposals: [
+        { proposal_id: "zotero-1", paper_id: "paper-1", status: "draft" },
+        { proposal_id: "zotero-2", paper_id: "paper-2", status: "draft" },
+      ],
+    },
+  });
+  let zoteroStarts = 0;
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    obsidianPreviewService: {
+      validateCommit: async () => undefined,
+      commit: async () => runStore.updateRun(run.run_id, (current) => ({
+        obsidian: {
+          ...current.obsidian,
+          status: "completed",
+          proposals: current.obsidian.proposals.map((proposal) => (
+            proposal.proposal_id === "obsidian-1"
+              ? { ...proposal, status: "committed" }
+              : proposal
+          )),
+        },
+      })),
+    },
+    zoteroArchivalService: {
+      validateCommit: async () => undefined,
+      startCommit: async () => {
+        zoteroStarts += 1;
+      },
+      waitForCommit: async () => undefined,
+      resumeCommit: async () => undefined,
+    },
+  });
+
+  await service.startArchiveCommit(run.run_id, {
+    clientRequestId: "archive-blocked-obsidian",
+    obsidian: {
+      proposalHash: "sha256:obsidian",
+      operations: [{
+        proposal_id: "obsidian-1",
+        content_hash: "sha256:content-1",
+        target_version_or_hash: "sha256:target-1",
+      }],
+    },
+    zotero: {
+      proposalHash: "sha256:zotero",
+      operations: [{
+        proposal_id: "zotero-1",
+        content_hash: "sha256:content-z1",
+        target_version_or_hash: "sha256:target-z1",
+      }],
+    },
+  });
+  const completed = await service.waitForArchiveCommit(run.run_id);
+  assert.equal(zoteroStarts, 0);
+  assert.equal(completed.status, "manual_action_required");
+  assert.equal(completed.archive_batch.status, "manual_action_required");
+  assert.equal(completed.obsidian.proposals[0].status, "committed");
+  assert.equal(completed.obsidian.proposals[1].status, "blocked");
+});
+
+test("ArchiveBatch serializes starts and replays a completed request idempotently", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-archive-idempotent-"));
+  const runStore = createRunStore({ dataDir });
+  const run = await runStore.createRun();
+  await runStore.updateRun(run.run_id, {
+    status: "awaiting_approval",
+    phase: "archive_preview",
+    candidates: [{ paper_id: "paper-1", title: "Paper 1" }],
+    paper_decisions: { "paper-1": "collect" },
+    zotero: {
+      status: "awaiting_approval",
+      proposals: [{
+        proposal_id: "zotero-1",
+        paper_id: "paper-1",
+        actionable: true,
+        selected: true,
+        status: "draft",
+      }],
+    },
+  });
+  let releaseCommit;
+  const commitGate = new Promise((resolve) => {
+    releaseCommit = resolve;
+  });
+  let validations = 0;
+  let starts = 0;
+  const zoteroArchivalService = {
+    validateCommit: async () => {
+      validations += 1;
+    },
+    startCommit: async () => {
+      starts += 1;
+      await commitGate;
+      await runStore.updateRun(run.run_id, (current) => ({
+        status: "completed",
+        zotero: {
+          ...current.zotero,
+          status: "completed",
+          proposals: current.zotero.proposals.map((proposal) => ({
+            ...proposal,
+            status: "committed",
+          })),
+        },
+      }));
+    },
+    waitForCommit: async () => undefined,
+    resumeCommit: async () => undefined,
+  };
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    zoteroArchivalService,
+  });
+  const request = {
+    clientRequestId: "archive-idempotent-1",
+    zotero: {
+      proposalHash: "sha256:zotero",
+      operations: [{
+        proposal_id: "zotero-1",
+        content_hash: "sha256:content",
+        target_version_or_hash: "sha256:target",
+      }],
+    },
+  };
+  await service.startArchiveCommit(run.run_id, request);
+  await assert.rejects(
+    service.startArchiveCommit(run.run_id, {
+      ...request,
+      clientRequestId: "archive-conflicting-2",
+    }),
+    (error) => error.code === "ARCHIVE_APPROVAL_IN_PROGRESS",
+  );
+  releaseCommit();
+  const completed = await service.waitForArchiveCommit(run.run_id);
+  assert.equal(completed.status, "completed");
+  assert.equal(starts, 1);
+  assert.equal(validations, 1);
+
+  const replayed = await service.startArchiveCommit(run.run_id, request);
+  assert.equal(replayed.archive_batch.status, "completed");
+  assert.equal(starts, 1);
+  assert.equal(validations, 1);
+});
+
+test("ArchiveBatch recovery skips verified child writes and continues only project state", async (t) => {
+  for (const [topStatus, recoveryEntry] of [
+    ["completed", "getRun"],
+    ["partial", "listRuns"],
+  ]) {
+    await t.test(`${topStatus} through ${recoveryEntry}`, async () => {
+      const dataDir = await mkdtemp(path.join(
+        os.tmpdir(),
+        `pi-archive-recovery-${topStatus}-`,
+      ));
+      const runStore = createRunStore({ dataDir });
+      const run = await runStore.createRun();
+      const obsidianRequest = {
+        proposalHash: "sha256:obsidian-preview",
+        operations: [{
+          proposal_id: "obsidian-1",
+          content_hash: "sha256:obsidian-content",
+          target_version_or_hash: "sha256:obsidian-target",
+        }],
+      };
+      const zoteroRequest = {
+        proposalHash: "sha256:zotero-preview",
+        operations: [{
+          proposal_id: "zotero-1",
+          content_hash: "sha256:zotero-content",
+          target_version_or_hash: "sha256:zotero-target",
+        }],
+      };
+      const projectStateRequest = {
+        proposalHash: "sha256:project-state-preview",
+        operation: {
+          proposal_id: "project-state-1",
+          content_hash: "sha256:project-state-content",
+          target_version_or_hash: "sha256:project-state-target",
+        },
+      };
+      const clientRequestId = `archive-recovery-${topStatus}`;
+      const requestFingerprint = `sha256:${createHash("sha256")
+        .update(JSON.stringify({
+          run_id: run.run_id,
+          client_request_id: clientRequestId,
+          obsidian: obsidianRequest,
+          zotero: zoteroRequest,
+          project_state: projectStateRequest,
+        }))
+        .digest("hex")}`;
+      const batchId = `archive-${requestFingerprint.slice(7, 23)}`;
+      const artifactPath = `archive-batches/${batchId}.json`;
+      const batch = {
+        schema_version: 1,
+        batch_id: batchId,
+        client_request_id: clientRequestId,
+        request_fingerprint: requestFingerprint,
+        selected_targets: ["obsidian", "zotero", "project_state"],
+        status: "committing",
+        approved_at: "2026-07-27T08:00:00.000Z",
+        completed_at: null,
+        last_error: null,
+        updated_at: "2026-07-27T08:00:00.000Z",
+        artifact_path: artifactPath,
+      };
+      await runStore.writeArtifact(run.run_id, artifactPath, {
+        ...batch,
+        request: {
+          obsidian: obsidianRequest,
+          zotero: zoteroRequest,
+          project_state: projectStateRequest,
+        },
+      });
+      await runStore.updateRun(run.run_id, {
+        status: topStatus,
+        phase: topStatus === "completed" ? "zotero_completed" : "zotero_partial",
+        candidates: [{ paper_id: "paper-1", title: "Paper 1" }],
+        paper_decisions: { "paper-1": "read" },
+        obsidian: {
+          status: "completed",
+          proposals: [{
+            proposal_id: "obsidian-1",
+            paper_id: "paper-1",
+            actionable: true,
+            selected: true,
+            status: "committed",
+          }],
+        },
+        zotero: {
+          status: topStatus === "completed" ? "completed" : "partial",
+          proposals: [
+            {
+              proposal_id: "zotero-1",
+              paper_id: "paper-1",
+              actionable: true,
+              selected: true,
+              status: "committed",
+            },
+            ...(topStatus === "partial"
+              ? [{
+                  proposal_id: "zotero-unrelated-blocked",
+                  paper_id: "paper-not-required",
+                  actionable: false,
+                  selected: false,
+                  status: "blocked",
+                }]
+              : []),
+          ],
+        },
+        project_state: {
+          status: "preview_ready",
+          proposal_id: "project-state-1",
+          actionable: true,
+        },
+        archive_batch: batch,
+      });
+
+      let obsidianCommits = 0;
+      let zoteroStarts = 0;
+      let zoteroResumes = 0;
+      let projectStateCommits = 0;
+      const service = createJournalWorkflowService({
+        env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+        dataDir,
+        runStore,
+        sourceStateStore: createSourceStateStore({ dataDir }),
+        obsidianPreviewService: {
+          commit: async () => {
+            obsidianCommits += 1;
+            return runStore.getRun(run.run_id);
+          },
+        },
+        zoteroArchivalService: {
+          startCommit: async () => {
+            zoteroStarts += 1;
+          },
+          resumeCommit: async () => {
+            zoteroResumes += 1;
+          },
+          waitForCommit: async () => runStore.getRun(run.run_id),
+        },
+        projectStatePreviewService: {
+          commit: async () => {
+            projectStateCommits += 1;
+            return runStore.updateRun(run.run_id, (current) => ({
+              project_state: {
+                ...current.project_state,
+                status: "completed",
+                committed_at: "2026-07-27T08:05:00.000Z",
+                verified_at: "2026-07-27T08:05:00.000Z",
+              },
+            }));
+          },
+        },
+      });
+
+      if (recoveryEntry === "getRun") {
+        await service.getRun(run.run_id);
+      } else {
+        await service.listRuns();
+      }
+      const recovered = await service.waitForArchiveCommit(run.run_id);
+      assert.equal(recovered.status, "completed");
+      assert.equal(recovered.archive_batch.status, "completed");
+      assert.equal(recovered.project_state.status, "completed");
+      assert.equal(projectStateCommits, 1);
+      assert.equal(obsidianCommits, 0);
+      assert.equal(zoteroStarts, 0);
+      assert.equal(zoteroResumes, 0);
+    });
+  }
+});
+
+test("workflow archive entrypoints fail closed while a scratch reading branch is active", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-archive-scratch-"));
+  const runStore = createRunStore({ dataDir });
+  const run = await runStore.createRun();
+  await runStore.updateRun(run.run_id, {
+    status: "draft_ready",
+    phase: "write_preview",
+    candidates: [{ paper_id: "paper-1", title: "Paper 1" }],
+    paper_decisions: { "paper-1": "read" },
+    readings: {
+      schema_version: 1,
+      status: "ready_for_preview",
+      paper_ids: ["paper-1"],
+      provider_id: null,
+      model_id: null,
+      last_error: null,
+      papers: {
+        "paper-1": {
+          status: "complete",
+          canonical_conversation_id: "conversation-canonical",
+          chat: {
+            id: "conversation-scratch",
+            status: "idle",
+            turns: [],
+            branch_type: "scratch",
+            parent_checkpoint: {
+              conversation_id: "conversation-canonical",
+              turn_id: null,
+              turn_count: 0,
+              checkpoint_hash: "sha256:checkpoint",
+              created_at: "2026-07-27T08:00:00.000Z",
+            },
+            promotion_status: "not_promoted",
+          },
+          archived_conversations: [{
+            id: "conversation-canonical",
+            status: "idle",
+            turns: [],
+            branch_type: "canonical",
+            parent_checkpoint: null,
+            promotion_status: "canonical",
+          }],
+        },
+      },
+    },
+  });
+  let previewCalls = 0;
+  let zoteroProposalCalls = 0;
+  let zoteroCommitCalls = 0;
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    obsidianPreviewService: {
+      createPreview: async () => {
+        previewCalls += 1;
+      },
+    },
+    projectStatePreviewService: {
+      createPreview: async () => {
+        previewCalls += 1;
+      },
+    },
+    zoteroArchivalService: {
+      createProposal: async () => {
+        zoteroProposalCalls += 1;
+      },
+      startCommit: async () => {
+        zoteroCommitCalls += 1;
+      },
+    },
+  });
+
+  for (const operation of [
+    () => service.createObsidianPreview(run.run_id),
+    () => service.createProjectStatePreview(run.run_id),
+    () => service.createZoteroProposal(run.run_id, {}),
+    () => service.startZoteroCommit(run.run_id, {}),
+    () => service.startArchiveCommit(run.run_id, {}),
+  ]) {
+    await assert.rejects(
+      operation(),
+      (error) => error.code === "READING_SCRATCH_ARCHIVE_BLOCKED",
+    );
+  }
+  assert.equal(previewCalls, 0);
+  assert.equal(zoteroProposalCalls, 0);
+  assert.equal(zoteroCommitCalls, 0);
+  assert.equal((await runStore.getRun(run.run_id)).archive_batch, undefined);
 });

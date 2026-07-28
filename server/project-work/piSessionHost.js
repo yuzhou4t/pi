@@ -46,10 +46,22 @@ export const PROJECT_WORK_DEFAULT_TOOL_NAMES = [
   "search_documents",
   "read_document",
   "update_plan",
+  "ask_user",
   "request_verification",
+];
+export const PROJECT_WORK_PREVIEW_TOOL_NAME = "request_preview";
+export const PROJECT_WORK_REPAIR_TOOL_NAMES = [
+  "read",
+  "edit",
+  "write",
+  "grep",
+  "find",
+  "ls",
+  "update_plan",
 ];
 const TOOL_NAMES = [
   ...PROJECT_WORK_DEFAULT_TOOL_NAMES,
+  PROJECT_WORK_PREVIEW_TOOL_NAME,
   ...EXTERNAL_RETRIEVAL_TOOL_NAMES,
 ];
 const MAX_TOOL_FILE_BYTES = 1024 * 1024;
@@ -68,16 +80,16 @@ const APP_GUIDANCE = [
   "Reads use the latest safe project files unless a proposed overlay file exists.",
   "Use only the provided contained file tools. They cannot access paths outside the project and review overlay.",
   "Keep the public plan current with update_plan.",
-  "Use request_verification to propose a bounded verification command; it never runs until the user explicitly starts it.",
-  "Edits are written only to the review overlay. Never claim that the live project changed before the app confirms an applied change set.",
+  "Use request_verification only to propose a bounded verification command. The app's deterministic server policy decides whether it waits, is blocked, or continues after the turn settles.",
+  "Edits are written only to the review overlay. Never claim that the live project changed before the app reports a successfully applied change set.",
 ].join("\n");
 const STANDALONE_GUIDANCE = [
   "This conversation is not connected to any user folder or project.",
   "You can access only this conversation's private scratch workspace through the provided contained file tools.",
   "Do not claim that you inspected, changed, or can discover files elsewhere on the user's computer.",
   "Keep the public plan current with update_plan.",
-  "Use request_verification to propose a bounded verification command; it never runs until the user explicitly starts it.",
-  "Edits remain proposed in the private review overlay until the user confirms them; confirmation saves them only inside this conversation's private scratch workspace.",
+  "Use request_verification only to propose a bounded verification command. The app's deterministic server policy decides whether it waits, is blocked, or continues after the turn settles.",
+  "Edits remain in the private review overlay until the app reports a successfully applied change set, and they can only be saved inside this conversation's private scratch workspace.",
 ].join("\n");
 const DOCUMENT_GUIDANCE = [
   "Conversation PDF documents are available only through list_documents, search_documents, and read_document.",
@@ -911,7 +923,9 @@ export async function createProjectWorkTools({
   documentAccess,
   externalRetrievalOptions,
   onPlan,
+  onAskUserRequest,
   onVerificationRequest,
+  onPreviewRequest,
 } = {}) {
   const roots = await canonicalOverlayRoots({
     projectRoot,
@@ -941,6 +955,45 @@ export async function createProjectWorkTools({
       return textResult("Plan updated", normalized);
     },
   });
+  const askUser = defineTool({
+    name: "ask_user",
+    label: "ask_user",
+    description: "Pause for durable user input needed to continue the task. An answer is a product decision, never approval to write files.",
+    promptSnippet: "Ask the user a durable bounded question",
+    executionMode: "sequential",
+    parameters: Type.Object({
+      questions: Type.Array(Type.Object({
+        id: Type.Optional(Type.String()),
+        label: Type.Optional(Type.String()),
+        prompt: Type.String(),
+        kind: Type.Optional(Type.Union([
+          Type.Literal("single_choice"),
+          Type.Literal("multiple_choice"),
+          Type.Literal("text"),
+        ])),
+        required: Type.Optional(Type.Boolean()),
+        options: Type.Optional(Type.Array(Type.Object({
+          id: Type.Optional(Type.String()),
+          label: Type.String(),
+          description: Type.Optional(Type.String()),
+        }), { minItems: 2, maxItems: 12 })),
+      }), { minItems: 1, maxItems: 8 }),
+    }, { additionalProperties: false }),
+    async execute(_toolCallId, request) {
+      if (typeof onAskUserRequest !== "function") {
+        throw new Error("Durable user questions are unavailable");
+      }
+      const settled = await onAskUserRequest(request);
+      return jsonTextResult({
+        status: settled.status,
+        answers: settled.answers ?? [],
+      }, {
+        id: settled.id,
+        status: settled.status,
+        answers: settled.answers ?? [],
+      });
+    },
+  });
   const requestVerification = defineTool({
     name: "request_verification",
     label: "request_verification",
@@ -958,6 +1011,47 @@ export async function createProjectWorkTools({
       return textResult(
         `Verification request ${created.id} is ready for user review. It has not run.`,
         { id: created.id },
+      );
+    },
+  });
+  const requestPreview = defineTool({
+    name: PROJECT_WORK_PREVIEW_TOOL_NAME,
+    label: PROJECT_WORK_PREVIEW_TOOL_NAME,
+    description: "Register a server-controlled loopback preview recipe. This is not a command runner.",
+    promptSnippet: "Register a controlled local preview request",
+    executionMode: "sequential",
+    parameters: Type.Union([
+      Type.Object({
+        runtime: Type.Literal("python_uvicorn"),
+        cwd: Type.String(),
+        app: Type.String(),
+        route: Type.String(),
+        title: Type.Optional(Type.String()),
+      }, { additionalProperties: false }),
+      Type.Object({
+        runtime: Type.Literal("vite"),
+        cwd: Type.String(),
+        route: Type.String(),
+        title: Type.Optional(Type.String()),
+      }, { additionalProperties: false }),
+      Type.Object({
+        runtime: Type.Literal("static"),
+        cwd: Type.String(),
+        route: Type.String(),
+        title: Type.Optional(Type.String()),
+      }, { additionalProperties: false }),
+    ]),
+    async execute(_toolCallId, request) {
+      const created = await onPreviewRequest(request);
+      const settlement = created.executionPolicyMode === "manual_review"
+        ? "It has not started and now requires the user's exact in-app confirmation."
+        : "After this turn settles, the app will review it and automatically open the loopback URL only if the recipe remains allowed.";
+      return textResult(
+        `Preview request ${created.id} is registered. ${settlement} Do not give the user shell commands, install commands, or manual start commands.`,
+        {
+          id: created.id,
+          requestHash: created.requestHash ?? null,
+        },
       );
     },
   });
@@ -1049,7 +1143,9 @@ export async function createProjectWorkTools({
     readDocument,
     ...externalRetrievalTools,
     updatePlan,
+    askUser,
     requestVerification,
+    requestPreview,
   ];
 }
 
@@ -1196,7 +1292,9 @@ export function createPiSessionFactory({
     workspaceKind = "bound_project",
     documentAccess,
     onPlan,
+    onAskUserRequest,
     onVerificationRequest,
+    onPreviewRequest,
   } = {}) => {
     const cwd = await realpath(workspaceRoot);
     const runtime = await runtimePromise;
@@ -1279,7 +1377,9 @@ export function createPiSessionFactory({
       documentAccess,
       externalRetrievalOptions,
       onPlan,
+      onAskUserRequest,
       onVerificationRequest,
+      onPreviewRequest,
     });
     const { session } = await createAgentSession({
       cwd,
@@ -1384,8 +1484,154 @@ export function createPiSessionFactory({
           pendingTurnGuidance = "";
         }
       },
+      async retryLastTurn(options = {}) {
+        if (session.isStreaming) {
+          throw projectWorkError(
+            "PROJECT_WORK_CONVERSATION_BUSY",
+            "Agent 正在工作，暂时不能重试上一轮",
+            409,
+          );
+        }
+        if (pendingTurnGuidance) {
+          throw projectWorkError(
+            "PROJECT_WORK_TURN_GUIDANCE_BUSY",
+            "当前 Pi 会话仍在处理上一轮指令",
+            409,
+          );
+        }
+        const target = session.getUserMessagesForForking().at(-1);
+        const userMessage = [...session.messages]
+          .reverse()
+          .find((message) => message.role === "user");
+        if (!target || !userMessage) {
+          throw projectWorkError(
+            "PROJECT_WORK_RETRY_UNAVAILABLE",
+            "当前会话没有可重试的上一轮",
+            409,
+          );
+        }
+        const content = structuredClone(userMessage.content);
+        pendingTurnGuidance = String(options.turnGuidance ?? "").trim();
+        try {
+          const navigation = await session.navigateTree(target.entryId, {
+            summarize: false,
+          });
+          if (navigation.cancelled) {
+            throw projectWorkError(
+              "PROJECT_WORK_RETRY_CANCELLED",
+              "上一轮重试已取消",
+              409,
+              true,
+            );
+          }
+          return await session.sendUserMessage(content);
+        } finally {
+          pendingTurnGuidance = "";
+        }
+      },
+      async repairVerification({
+        operationId,
+        commandBindingHash,
+        repairAttempt,
+        maxRepairAttempts,
+        command,
+        checks,
+        failure,
+      } = {}) {
+        if (session.isStreaming) {
+          throw projectWorkError(
+            "PROJECT_WORK_CONVERSATION_BUSY",
+            "Agent 正在工作，暂时不能开始验证修复",
+            409,
+          );
+        }
+        const payload = {
+          operationId: String(operationId ?? "").slice(0, 180),
+          commandBindingHash: String(commandBindingHash ?? "").slice(0, 80),
+          repairAttempt: Number.isSafeInteger(repairAttempt)
+            ? repairAttempt
+            : null,
+          maxRepairAttempts: Number.isSafeInteger(maxRepairAttempts)
+            ? maxRepairAttempts
+            : null,
+          command: {
+            file: String(command?.file ?? "").slice(0, 80),
+            args: Array.isArray(command?.args)
+              ? command.args.map((arg) => String(arg).slice(0, 1_000)).slice(0, 32)
+              : [],
+            cwd: String(command?.cwd ?? "").slice(0, 500),
+          },
+          checks: Array.isArray(checks)
+            ? checks.map((check) => String(check).slice(0, 200)).slice(0, 20)
+            : [],
+          failure: {
+            exitCode: Number.isInteger(failure?.exitCode)
+              ? failure.exitCode
+              : null,
+            timedOut: failure?.timedOut === true,
+            truncated: failure?.truncated === true,
+            output: String(failure?.output ?? "").slice(
+              0,
+              MAX_TOOL_OUTPUT_CHARS,
+            ),
+          },
+        };
+        const content = [
+          "A previously user-confirmed verification command failed inside the isolated verification workspace.",
+          "Fix only the project files available through the contained overlay tools.",
+          "Do not request, invent, replace, or run another command. Do not ask for write approval, apply changes to the real project, start a preview, enqueue follow-ups, or ask the user a question.",
+          "The application will rerun only the exact bound command after this repair turn. The resulting diff still requires the normal hash-bound user confirmation.",
+          JSON.stringify(payload),
+        ].join("\n\n");
+        return session.sendCustomMessage({
+          customType: "pi_agent_verification_failure",
+          content,
+          display: false,
+          details: {
+            schemaVersion: 1,
+            operationId: payload.operationId,
+            commandBindingHash: payload.commandBindingHash,
+            repairAttempt: payload.repairAttempt,
+          },
+        }, {
+          triggerTurn: true,
+        });
+      },
       steer(text, images) {
         return session.steer(text, images);
+      },
+      followUp(text, images) {
+        return session.followUp(text, images);
+      },
+      async replaceFollowUps(messages) {
+        if (!Array.isArray(messages)) {
+          throw projectWorkError(
+            "PROJECT_WORK_FOLLOW_UP_QUEUE_INVALID",
+            "后续消息队列必须是列表",
+            400,
+          );
+        }
+        const previous = session.clearQueue();
+        try {
+          for (const steering of previous.steering) {
+            await session.steer(steering);
+          }
+          for (const message of messages) {
+            await session.followUp(message);
+          }
+        } catch (error) {
+          session.clearQueue();
+          for (const steering of previous.steering) {
+            await session.steer(steering);
+          }
+          for (const message of previous.followUp) {
+            await session.followUp(message);
+          }
+          throw error;
+        }
+      },
+      clearQueue() {
+        return session.clearQueue();
       },
       abort() {
         return session.abort();

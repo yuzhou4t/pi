@@ -4,6 +4,7 @@ import {
   chooseApiPort,
   isPiAgentHealth,
   isPiAgentHtml,
+  isPiRuntimeHealth,
 } from "./pi-agent-local.mjs";
 
 test("the page marker and health payload must both identify Pi Agent", () => {
@@ -24,6 +25,16 @@ test("the page marker and health payload must both identify Pi Agent", () => {
   assert.equal(isPiAgentHealth({
     status: "ok",
     journal_workflow: "available",
+  }), false);
+  assert.equal(isPiRuntimeHealth({
+    status: "ok",
+    project_work: "available",
+    runtime_role: "worker",
+  }), true);
+  assert.equal(isPiRuntimeHealth({
+    status: "ok",
+    project_work: "available",
+    runtime_role: "gateway",
   }), false);
 });
 

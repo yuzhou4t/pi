@@ -163,6 +163,7 @@ test("left rail shows the selected work type, nested conversations, and one proj
         kind: "project_work",
         title: "修复设置页移动端遮挡",
         subtitle: "项目工作 · 修改待审阅",
+        unreadCount: 3,
       }],
       selectedConversationId: "work-1",
       workspaceKind: "project_work",
@@ -184,6 +185,7 @@ test("left rail shows the selected work type, nested conversations, and one proj
     assert.match(html, /在 方法研究 中新建会话/);
     assert.match(html, /打开“修复设置页移动端遮挡”的更多操作/);
     assert.match(html, /项目工作 · 修改待审阅/);
+    assert.match(html, /aria-label="3 条未读消息"/);
     assert.doesNotMatch(html, /收起左边栏/);
     assert.doesNotMatch(html, />会话</);
     assert.doesNotMatch(html, /后台运行/);

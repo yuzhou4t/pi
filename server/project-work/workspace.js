@@ -24,15 +24,49 @@ const MAX_SNAPSHOT_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_READ_BYTES = 1024 * 1024;
 const MAX_CHANGE_FILE_BYTES = 512 * 1024;
 const MAX_TREE_ENTRIES = 2_000;
+const DEFAULT_TREE_PAGE_SIZE = 160;
+const MAX_TREE_PAGE_SIZE = 500;
+const MAX_TREE_SEARCH_ENTRIES = 20_000;
+const MAX_TREE_QUERY_LENGTH = 120;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTERED_DIRECTORIES = new Set([
   ".git",
+  ".git-worktrees",
   ".pi",
   ".agents",
   ".codex",
   ".pi-agent",
+  ".pi-worktrees",
   ".venv",
+  ".worktree",
+  ".worktrees",
   "node_modules",
   "venv",
+]);
+const FILTERED_FILE_NAMES = new Set([
+  ".DS_Store",
+  ".ds_store",
+  ".netrc",
+  ".npmrc",
+  ".pypirc",
+  "credentials.json",
+  "id_ed25519",
+  "id_rsa",
+  "secret.json",
+  "secrets.json",
+]);
+const FILTERED_SECRET_EXTENSIONS = new Set([
+  ".key",
+  ".p12",
+  ".pem",
+  ".pfx",
+]);
+const IMAGE_MIME_BY_EXTENSION = new Map([
+  [".gif", "image/gif"],
+  [".jpeg", "image/jpeg"],
+  [".jpg", "image/jpeg"],
+  [".png", "image/png"],
+  [".webp", "image/webp"],
 ]);
 const SNAPSHOT_ONLY_DIRECTORIES = new Set([
   ".cache",
@@ -127,9 +161,17 @@ export function isFilteredProjectPath(relativePath) {
   const segments = normalized.split("/");
   if (segments.some((segment) => FILTERED_DIRECTORIES.has(segment))) return true;
   const baseName = segments.at(-1);
+  const lowerBaseName = baseName.toLowerCase();
+  const extension = path.posix.extname(baseName).toLowerCase();
   return (
-    baseName === ".env"
-    || (baseName.startsWith(".env.") && baseName !== ".env.example")
+    lowerBaseName === ".env"
+    || (
+      lowerBaseName.startsWith(".env.")
+      && lowerBaseName !== ".env.example"
+    )
+    || FILTERED_FILE_NAMES.has(baseName)
+    || FILTERED_FILE_NAMES.has(lowerBaseName)
+    || FILTERED_SECRET_EXTENSIONS.has(extension)
   );
 }
 
@@ -191,16 +233,31 @@ async function inspectExisting(root, relativePath, expectedKind) {
   const canonicalRoot = await canonicalDirectory(root);
   const { normalized, target } = resolveInside(canonicalRoot, relativePath);
   let targetStat;
-  let canonicalTarget;
   try {
-    [targetStat, canonicalTarget] = await Promise.all([lstat(target), realpath(target)]);
+    let current = canonicalRoot;
+    for (const segment of normalized.split("/")) {
+      current = path.join(current, segment);
+      targetStat = await lstat(current);
+      if (targetStat.isSymbolicLink()) {
+        throw projectWorkError(
+          "PROJECT_WORK_FILE_UNSAFE",
+          "项目路径不是可安全访问的普通文件或文件夹",
+          409,
+        );
+      }
+    }
   } catch {
+    if (targetStat?.isSymbolicLink()) {
+      throw projectWorkError(
+        "PROJECT_WORK_FILE_UNSAFE",
+        "项目路径不是可安全访问的普通文件或文件夹",
+        409,
+      );
+    }
     throw projectWorkError("PROJECT_WORK_FILE_NOT_FOUND", "项目文件不存在", 404);
   }
   if (
-    targetStat.isSymbolicLink()
-    || !isInside(canonicalRoot, canonicalTarget)
-    || (expectedKind === "file" && !targetStat.isFile())
+    (expectedKind === "file" && !targetStat.isFile())
     || (expectedKind === "directory" && !targetStat.isDirectory())
   ) {
     throw projectWorkError(
@@ -212,7 +269,7 @@ async function inspectExisting(root, relativePath, expectedKind) {
   return {
     canonicalRoot,
     normalized,
-    target: canonicalTarget,
+    target,
     stat: targetStat,
   };
 }
@@ -280,14 +337,356 @@ export async function readProjectTextFile(root, {
   };
 }
 
+function imageMimeForPath(relativePath) {
+  return IMAGE_MIME_BY_EXTENSION.get(
+    path.posix.extname(relativePath).toLowerCase(),
+  ) ?? null;
+}
+
+function publicTreeEntry(entry) {
+  const result = {
+    name: entry.name,
+    path: entry.path,
+    type: entry.type,
+    depth: entry.path.split("/").length - 1,
+  };
+  if (entry.type === "file") {
+    result.byteLength = entry.stat.size;
+    const mimeType = imageMimeForPath(entry.path);
+    if (mimeType) {
+      result.previewKind = "image";
+      result.mimeType = mimeType;
+    }
+  }
+  if (entry.overlay) result.overlay = entry.overlay;
+  return result;
+}
+
+function compareTreeEntries(left, right) {
+  if (left.type !== right.type) return left.type === "directory" ? -1 : 1;
+  return left.path.localeCompare(right.path, "en");
+}
+
+function normalizeTreeQuery(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string") {
+    throw projectWorkError(
+      "PROJECT_WORK_TREE_QUERY_INVALID",
+      "文件搜索条件无效",
+      400,
+    );
+  }
+  const normalized = value.trim();
+  if (normalized.length > MAX_TREE_QUERY_LENGTH) {
+    throw projectWorkError(
+      "PROJECT_WORK_TREE_QUERY_INVALID",
+      `文件搜索条件不能超过 ${MAX_TREE_QUERY_LENGTH} 个字符`,
+      400,
+    );
+  }
+  return normalized;
+}
+
+function normalizeTreePageSize(value, { paged }) {
+  if (!paged) return null;
+  if (value === undefined || value === null || value === "") {
+    return DEFAULT_TREE_PAGE_SIZE;
+  }
+  const normalized = Number(value);
+  if (
+    !Number.isSafeInteger(normalized)
+    || normalized < 1
+    || normalized > MAX_TREE_PAGE_SIZE
+  ) {
+    throw projectWorkError(
+      "PROJECT_WORK_TREE_LIMIT_INVALID",
+      `文件列表每页必须为 1–${MAX_TREE_PAGE_SIZE} 项`,
+      400,
+    );
+  }
+  return normalized;
+}
+
+function encodeTreeCursor(value) {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+function decodeTreeCursor(cursor, binding) {
+  if (!cursor) return 0;
+  if (typeof cursor !== "string" || cursor.length > 2_048) {
+    throw projectWorkError(
+      "PROJECT_WORK_TREE_CURSOR_INVALID",
+      "文件列表游标无效，请重新加载",
+      400,
+      true,
+    );
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+  } catch {
+    throw projectWorkError(
+      "PROJECT_WORK_TREE_CURSOR_INVALID",
+      "文件列表游标无效，请重新加载",
+      400,
+      true,
+    );
+  }
+  if (
+    parsed?.version !== 1
+    || parsed.scope !== binding.scope
+    || parsed.path !== binding.path
+    || parsed.query !== binding.query
+    || parsed.revision !== binding.revision
+    || !Number.isSafeInteger(parsed.offset)
+    || parsed.offset < 0
+  ) {
+    throw projectWorkError(
+      "PROJECT_WORK_TREE_CURSOR_STALE",
+      "文件列表已变化，请重新加载",
+      409,
+      true,
+    );
+  }
+  return parsed.offset;
+}
+
+async function readSafeDirectoryEntries(root, relativeDirectory) {
+  let inspected;
+  try {
+    if (relativeDirectory) {
+      inspected = await inspectExisting(root, relativeDirectory, "directory");
+    } else {
+      const canonicalRoot = await canonicalDirectory(root);
+      inspected = {
+        canonicalRoot,
+        normalized: "",
+        target: canonicalRoot,
+      };
+    }
+  } catch (error) {
+    if (error?.code === "PROJECT_WORK_FILE_NOT_FOUND") return new Map();
+    throw error;
+  }
+  const entries = await readdir(inspected.target, { withFileTypes: true });
+  const result = new Map();
+  for (const entry of entries) {
+    const relativePath = [inspected.normalized, entry.name]
+      .filter(Boolean)
+      .join("/");
+    if (isFilteredProjectPath(relativePath)) continue;
+    const target = path.join(inspected.target, entry.name);
+    const stat = await lstat(target);
+    if (stat.isSymbolicLink()) continue;
+    if (!stat.isDirectory() && !stat.isFile()) continue;
+    result.set(entry.name, {
+      name: entry.name,
+      path: relativePath,
+      target,
+      stat,
+      type: stat.isDirectory() ? "directory" : "file",
+    });
+  }
+  return result;
+}
+
+async function createProjectTreeReader(root) {
+  const canonicalRoot = await canonicalDirectory(root);
+  return {
+    scope: "project",
+    async assertDirectory(relativeDirectory) {
+      if (!relativeDirectory) return;
+      await inspectExisting(canonicalRoot, relativeDirectory, "directory");
+    },
+    async list(relativeDirectory) {
+      return [...(await readSafeDirectoryEntries(
+        canonicalRoot,
+        relativeDirectory,
+      )).values()];
+    },
+  };
+}
+
+async function createOverlayTreeReader({ projectRoot, workspaceRoot }) {
+  const [canonicalProjectRoot, canonicalWorkspaceRoot] = await Promise.all([
+    canonicalDirectory(projectRoot),
+    canonicalDirectory(workspaceRoot),
+  ]);
+  return {
+    scope: "conversation_overlay",
+    async assertDirectory(relativeDirectory) {
+      if (!relativeDirectory) return;
+      const [projectEntries, workspaceEntries] = await Promise.all([
+        readSafeDirectoryEntries(canonicalProjectRoot, relativeDirectory),
+        readSafeDirectoryEntries(canonicalWorkspaceRoot, relativeDirectory),
+      ]);
+      if (projectEntries.size === 0 && workspaceEntries.size === 0) {
+        const projectDirectory = await inspectExisting(
+          canonicalProjectRoot,
+          relativeDirectory,
+          "directory",
+        ).catch((error) => {
+          if (error?.code === "PROJECT_WORK_FILE_NOT_FOUND") return null;
+          throw error;
+        });
+        const workspaceDirectory = await inspectExisting(
+          canonicalWorkspaceRoot,
+          relativeDirectory,
+          "directory",
+        ).catch((error) => {
+          if (error?.code === "PROJECT_WORK_FILE_NOT_FOUND") return null;
+          throw error;
+        });
+        if (!projectDirectory && !workspaceDirectory) {
+          throw projectWorkError(
+            "PROJECT_WORK_FILE_NOT_FOUND",
+            "项目文件不存在",
+            404,
+          );
+        }
+      }
+    },
+    async list(relativeDirectory) {
+      const [projectEntries, workspaceEntries] = await Promise.all([
+        readSafeDirectoryEntries(canonicalProjectRoot, relativeDirectory),
+        readSafeDirectoryEntries(canonicalWorkspaceRoot, relativeDirectory),
+      ]);
+      const names = new Set([
+        ...projectEntries.keys(),
+        ...workspaceEntries.keys(),
+      ]);
+      return [...names].map((name) => {
+        const projectEntry = projectEntries.get(name);
+        const workspaceEntry = workspaceEntries.get(name);
+        if (!workspaceEntry) return projectEntry;
+        return {
+          ...workspaceEntry,
+          overlay: projectEntry
+            ? workspaceEntry.type === "file" && projectEntry.type === "file"
+              ? "modified"
+              : null
+            : "created",
+        };
+      });
+    },
+  };
+}
+
+async function collectSearchEntries(reader, startPath, query) {
+  const needle = query.toLocaleLowerCase("zh-CN");
+  const pending = [startPath];
+  const matches = [];
+  let scannedEntries = 0;
+  let scanTruncated = false;
+  while (pending.length > 0 && !scanTruncated) {
+    const relativeDirectory = pending.shift();
+    const entries = await reader.list(relativeDirectory);
+    entries.sort(compareTreeEntries);
+    for (const entry of entries) {
+      scannedEntries += 1;
+      if (scannedEntries > MAX_TREE_SEARCH_ENTRIES) {
+        scanTruncated = true;
+        break;
+      }
+      if (entry.path.toLocaleLowerCase("zh-CN").includes(needle)) {
+        matches.push(entry);
+      }
+      if (entry.type === "directory") pending.push(entry.path);
+    }
+  }
+  matches.sort(compareTreeEntries);
+  return { entries: matches, scannedEntries, scanTruncated };
+}
+
+async function getPagedTree(reader, {
+  directory,
+  query,
+  limit,
+  cursor,
+}) {
+  await reader.assertDirectory(directory);
+  const collected = query
+    ? await collectSearchEntries(reader, directory, query)
+    : {
+        entries: (await reader.list(directory)).sort(compareTreeEntries),
+        scannedEntries: null,
+        scanTruncated: false,
+      };
+  const revision = sha256(collected.entries.map((entry) => ({
+    path: entry.path,
+    type: entry.type,
+    size: entry.stat.size,
+    modifiedAt: Number(entry.stat.mtimeMs),
+    overlay: entry.overlay ?? null,
+  })));
+  const binding = {
+    scope: reader.scope,
+    path: directory,
+    query,
+    revision,
+  };
+  const offset = decodeTreeCursor(cursor, binding);
+  if (offset > collected.entries.length) {
+    throw projectWorkError(
+      "PROJECT_WORK_TREE_CURSOR_STALE",
+      "文件列表已变化，请重新加载",
+      409,
+      true,
+    );
+  }
+  const page = collected.entries.slice(offset, offset + limit);
+  const nextOffset = offset + page.length;
+  const hasNextPage = nextOffset < collected.entries.length;
+  return {
+    path: directory,
+    query: query || null,
+    revision,
+    entries: page.map(publicTreeEntry),
+    nextCursor: hasNextPage
+      ? encodeTreeCursor({
+          version: 1,
+          ...binding,
+          offset: nextOffset,
+        })
+      : null,
+    truncated: collected.scanTruncated || hasNextPage,
+    scanTruncated: collected.scanTruncated,
+    scannedEntries: collected.scannedEntries,
+  };
+}
+
 export async function getProjectFileTree(root, {
   directory = "",
   depth = 2,
+  query,
+  limit,
+  cursor,
 } = {}) {
+  const normalizedDirectory = directory
+    ? normalizeProjectPath(directory)
+    : "";
+  const normalizedQuery = normalizeTreeQuery(query);
+  const paged = Boolean(
+    normalizedQuery
+    || cursor
+    || limit !== undefined && limit !== null && limit !== "",
+  );
+  const pageSize = normalizeTreePageSize(limit, { paged });
+  if (paged) {
+    return getPagedTree(
+      await createProjectTreeReader(root),
+      {
+        directory: normalizedDirectory,
+        query: normalizedQuery,
+        limit: pageSize,
+        cursor,
+      },
+    );
+  }
   const normalizedDepth = Number.isInteger(depth) ? Math.min(Math.max(depth, 1), 5) : 2;
   const canonicalRoot = await canonicalDirectory(root);
-  const start = directory
-    ? await inspectExisting(canonicalRoot, directory, "directory")
+  const start = normalizedDirectory
+    ? await inspectExisting(canonicalRoot, normalizedDirectory, "directory")
     : {
         canonicalRoot,
         normalized: "",
@@ -312,10 +711,9 @@ export async function getProjectFileTree(root, {
       if (isFilteredProjectPath(relativePath)) continue;
       const targetPath = path.join(directoryPath, entry.name);
       const targetStat = await lstat(targetPath);
+      if (targetStat.isSymbolicLink()) continue;
       entryCount += 1;
-      if (targetStat.isSymbolicLink()) {
-        result.push({ name: entry.name, path: relativePath, type: "symlink" });
-      } else if (targetStat.isDirectory()) {
+      if (targetStat.isDirectory()) {
         const item = { name: entry.name, path: relativePath, type: "directory" };
         if (remainingDepth > 1) {
           item.children = await visit(targetPath, relativePath, remainingDepth - 1);
@@ -328,6 +726,11 @@ export async function getProjectFileTree(root, {
           type: "file",
           byteLength: targetStat.size,
         });
+        const mimeType = imageMimeForPath(relativePath);
+        if (mimeType) {
+          result.at(-1).previewKind = "image";
+          result.at(-1).mimeType = mimeType;
+        }
       }
     }
     return result;
@@ -338,6 +741,119 @@ export async function getProjectFileTree(root, {
     entries: await visit(start.target, start.normalized, normalizedDepth),
     truncated,
   };
+}
+
+export async function getProjectOverlayFileTree({
+  projectRoot,
+  workspaceRoot,
+  directory = "",
+  query,
+  limit,
+  cursor,
+} = {}) {
+  const normalizedDirectory = directory
+    ? normalizeProjectPath(directory)
+    : "";
+  const normalizedQuery = normalizeTreeQuery(query);
+  const pageSize = normalizeTreePageSize(limit, { paged: true });
+  return getPagedTree(
+    await createOverlayTreeReader({ projectRoot, workspaceRoot }),
+    {
+      directory: normalizedDirectory,
+      query: normalizedQuery,
+      limit: pageSize,
+      cursor,
+    },
+  );
+}
+
+function detectImageMime(buffer) {
+  if (
+    buffer.length >= 8
+    && buffer.subarray(0, 8).equals(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    )
+  ) {
+    return "image/png";
+  }
+  if (
+    buffer.length >= 3
+    && buffer[0] === 0xff
+    && buffer[1] === 0xd8
+    && buffer[2] === 0xff
+  ) {
+    return "image/jpeg";
+  }
+  if (
+    buffer.length >= 6
+    && ["GIF87a", "GIF89a"].includes(buffer.subarray(0, 6).toString("ascii"))
+  ) {
+    return "image/gif";
+  }
+  if (
+    buffer.length >= 12
+    && buffer.subarray(0, 4).toString("ascii") === "RIFF"
+    && buffer.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
+async function imageFromInspected(inspected) {
+  const expectedMimeType = imageMimeForPath(inspected.normalized);
+  if (!expectedMimeType) {
+    throw projectWorkError(
+      "PROJECT_WORK_IMAGE_TYPE_UNSUPPORTED",
+      "仅支持预览 PNG、JPEG、GIF 或 WebP 图片",
+      415,
+    );
+  }
+  if (inspected.stat.size < 1 || inspected.stat.size > MAX_IMAGE_BYTES) {
+    throw projectWorkError(
+      "PROJECT_WORK_IMAGE_TOO_LARGE",
+      "图片过大，不能在当前查看器中打开",
+      413,
+    );
+  }
+  const bytes = await readFile(inspected.target);
+  const mimeType = detectImageMime(bytes);
+  if (!mimeType || mimeType !== expectedMimeType) {
+    throw projectWorkError(
+      "PROJECT_WORK_IMAGE_INVALID",
+      "图片内容与文件类型不匹配",
+      415,
+    );
+  }
+  return {
+    path: inspected.normalized,
+    mimeType,
+    byteLength: bytes.length,
+    hash: sha256(bytes),
+    bytes,
+  };
+}
+
+export async function readProjectImageFile(root, { filePath } = {}) {
+  return imageFromInspected(await inspectExisting(root, filePath, "file"));
+}
+
+export async function readProjectOverlayImageFile({
+  projectRoot,
+  workspaceRoot,
+  filePath,
+} = {}) {
+  const normalized = normalizeProjectPath(filePath);
+  let workspaceFile;
+  try {
+    workspaceFile = await inspectExisting(workspaceRoot, normalized, "file");
+  } catch (error) {
+    if (error?.code !== "PROJECT_WORK_FILE_NOT_FOUND") throw error;
+  }
+  if (workspaceFile) return imageFromInspected(workspaceFile);
+  return imageFromInspected(
+    await inspectExisting(projectRoot, normalized, "file"),
+  );
 }
 
 function shouldSkipSnapshotPath(relativePath) {
@@ -734,6 +1250,103 @@ async function removeCreatedDirectories(createdDirectories) {
   for (const directory of [...createdDirectories].reverse()) {
     await rmdir(directory).catch(() => undefined);
   }
+}
+
+export async function readBoundFileState(root, relativePath) {
+  const canonicalRoot = await canonicalDirectory(root);
+  const state = await inspectFileState(canonicalRoot, relativePath);
+  return {
+    exists: state.exists,
+    buffer: state.buffer ? Buffer.from(state.buffer) : null,
+    hash: state.hash,
+    mode: state.mode,
+  };
+}
+
+export async function applyBoundFileTransitions({
+  root,
+  transitions,
+} = {}) {
+  if (!Array.isArray(transitions) || transitions.length === 0) {
+    return [];
+  }
+  const canonicalRoot = await canonicalDirectory(root);
+  const paths = new Set();
+  const operations = [];
+  for (const transition of transitions) {
+    const relativePath = normalizeProjectPath(transition?.path);
+    if (paths.has(relativePath)) {
+      throw projectWorkError(
+        "PROJECT_WORK_TRANSITION_INVALID",
+        "文件恢复列表包含重复路径",
+        400,
+      );
+    }
+    paths.add(relativePath);
+    const targetBuffer = transition?.targetBuffer === null
+      ? null
+      : Buffer.from(transition?.targetBuffer ?? "");
+    const targetHash = targetBuffer === null ? null : sha256(targetBuffer);
+    if (targetHash !== (transition?.targetHash ?? null)) {
+      throw projectWorkError(
+        "PROJECT_WORK_RECOVERY_BACKUP_INVALID",
+        "文件恢复副本校验失败",
+        500,
+      );
+    }
+    const before = await inspectFileState(canonicalRoot, relativePath);
+    assertExpectedState(before, transition?.expectedHash ?? null);
+    operations.push({
+      root: canonicalRoot,
+      relativePath,
+      expectedHash: transition?.expectedHash ?? null,
+      afterBuffer: targetBuffer,
+      afterMode: Number.isInteger(transition?.targetMode)
+        ? transition.targetMode
+        : 0o600,
+      expectedAfterHash: targetHash,
+      before,
+    });
+  }
+
+  const applied = [];
+  const createdDirectories = [];
+  try {
+    for (const operation of operations) {
+      await applyOperation(operation, createdDirectories);
+      applied.push(operation);
+    }
+    for (const operation of operations) {
+      const readBack = await inspectFileState(
+        operation.root,
+        operation.relativePath,
+      );
+      assertExpectedState(readBack, operation.expectedAfterHash);
+    }
+  } catch (error) {
+    const rollbackErrors = [];
+    for (const operation of [...applied].reverse()) {
+      try {
+        await restoreOperation(operation, createdDirectories);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    await removeCreatedDirectories(createdDirectories);
+    if (rollbackErrors.length > 0) {
+      throw projectWorkError(
+        "PROJECT_WORK_RECOVERY_ROLLBACK_FAILED",
+        "文件恢复失败，且无法完整回滚恢复操作",
+        500,
+      );
+    }
+    throw error;
+  }
+  return operations.map((operation) => ({
+    path: operation.relativePath,
+    beforeHash: operation.before.hash,
+    afterHash: operation.expectedAfterHash,
+  }));
 }
 
 export async function applySelectedChangeSet({

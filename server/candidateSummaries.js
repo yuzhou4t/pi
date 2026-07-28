@@ -12,6 +12,7 @@ import {
   DEEPSEEK_PROVIDER_ID,
   runDeepSeek,
 } from "./providers/deepseek.js";
+import { resolveModelMode } from "./modelMode.js";
 
 export const CANDIDATE_SUMMARY_PROMPT_VERSION = "candidate-summary-v2";
 
@@ -332,7 +333,9 @@ export function createCandidateSummaryService({
   codexProbe = probeCodexSubscription,
   deepseekRunner = runDeepSeek,
 } = {}) {
-  const mode = env.PI_MODEL_MODE === "live" ? "live" : "fixture";
+  // Live is the production default. Fixtures are available only when the
+  // launcher or a test opts in explicitly with PI_MODEL_MODE=fixture.
+  const mode = resolveModelMode(env);
   const defaultProviderId = env.PI_DEFAULT_PROVIDER === DEEPSEEK_PROVIDER_ID
     ? DEEPSEEK_PROVIDER_ID
     : DEFAULT_PROVIDER_ID;

@@ -1,5 +1,11 @@
 import { useCallback, useState } from "react";
-import { ArrowCounterClockwise, BookOpenText, Package, SidebarSimple } from "@phosphor-icons/react";
+import {
+  ArrowCounterClockwise,
+  ArrowLeft,
+  BookOpenText,
+  Package,
+  SidebarSimple,
+} from "@phosphor-icons/react";
 import { AgentArtifactLayout } from "./AgentArtifactLayout.jsx";
 import { usePersistentState } from "../hooks/usePersistentState.js";
 import { PaperReader } from "./PaperReader.jsx";
@@ -69,7 +75,7 @@ export function ReadingWorkbench({
       await onRestartFromGuide();
       setRestart({ open: false, pending: false, error: null });
     } catch (error) {
-      setRestart({ open: true, pending: false, error: error?.message ?? "暂时无法返回本周推荐文章" });
+      setRestart({ open: true, pending: false, error: error?.message ?? "暂时无法从导读重新开始" });
     }
   }, [onRestartFromGuide, restart.pending]);
 
@@ -117,6 +123,15 @@ export function ReadingWorkbench({
       )}
       headerActions={(
         <>
+          <button
+            className="header-meta-pill"
+            type="button"
+            onClick={onClose}
+            title="返回本周追踪，不清除研读进度"
+          >
+            <ArrowLeft size={13} weight="regular" aria-hidden="true" />
+            <span>返回本周追踪</span>
+          </button>
           {providers?.length ? (
             <ProviderMenu
               open={providerOpen}
@@ -133,10 +148,10 @@ export function ReadingWorkbench({
               className="header-meta-pill reading-restart-pill"
               type="button"
               onClick={() => setRestart({ open: true, pending: false, error: null })}
-              title="返回本周推荐文章，重新选择要研读的论文"
+              title="清除未完成的研读状态，从五分钟导读重新开始"
             >
               <ArrowCounterClockwise size={13} weight="regular" aria-hidden="true" />
-              <span>返回本周文章</span>
+              <span>从导读重新开始</span>
             </button>
           ) : null}
           {onOpenSkills ? (
@@ -215,7 +230,11 @@ export function ReadingWorkbench({
               ) : null}
             </div>
             <div className="reading-artifact-panel is-notes" hidden={artifactTab !== "notes"}>
-              <ReadingNotesPanel readerContext={readerContext} onOpenBlock={openCitation} />
+              <ReadingNotesPanel
+                readerContext={readerContext}
+                onOpenBlock={openCitation}
+                onReadingChange={onReaderReadingChange}
+              />
             </div>
             <div className="reading-artifact-panel is-state" hidden={artifactTab !== "state"}>
               <ProjectStateSection

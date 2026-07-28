@@ -68,6 +68,14 @@ test("fixture mode returns the explicit fallback without a provider call", async
   assert.equal(callCount, 0);
 });
 
+test("omitting PI_MODEL_MODE defaults to live and never enables fixtures", () => {
+  const service = createCandidateSummaryService({
+    env: {},
+    dataDir: null,
+  });
+  assert.equal(service.config.mode, "live");
+});
+
 test("request validation requires schema v2, an allowed provider/model, and no extra command fields", () => {
   for (const payload of [
     createPayload({ schema_version: 1 }),

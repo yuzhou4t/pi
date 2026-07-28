@@ -206,10 +206,10 @@ const proposals = [
     targetLabel: "Obsidian · 04_资料源/文章论文研读/Agent",
     operation: "为进入精读的论文创建可持续补充的主笔记",
     paperIds: ["paper-context-ledger", "paper-human-gates"],
-    preview: ["一篇论文对应一篇主笔记", "写入四阶段结论、用户问题与引用", "不覆盖已有同名文件"],
+    preview: ["一篇论文对应一篇主笔记", "写入已确认结论、用户问题与引用", "不覆盖已有同名文件"],
     previewByPaperId: {
-      "paper-context-ledger": ["创建精读主笔记：Context Ledgers", "写入该论文的四阶段结论、用户问题与引用"],
-      "paper-human-gates": ["创建精读主笔记：Human Gates", "写入该论文的四阶段结论、用户问题与引用"],
+      "paper-context-ledger": ["创建精读主笔记：Context Ledgers", "写入该论文的已确认结论、用户问题与引用"],
+      "paper-human-gates": ["创建精读主笔记：Human Gates", "写入该论文的已确认结论、用户问题与引用"],
     },
     isDemo: true,
   },

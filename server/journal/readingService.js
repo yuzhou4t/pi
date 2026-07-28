@@ -11,10 +11,21 @@ import {
 
 const PAPER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
+const ROUND_ID_PATTERN = /^[a-z][a-z0-9-]{0,79}$/;
 const MAX_INTERVENTIONS_PER_STAGE = 2;
-const CORE_READING_STAGES = READING_STAGE_ORDER.filter(
-  (stage) => stage !== "project-relation",
-);
+const READING_BRANCH_TYPES = new Set(["canonical", "scratch"]);
+const GUIDED_READING_ROUND_IDS = [
+  "field",
+  "background",
+  "gap",
+  "overview",
+  "modules",
+  "experiments",
+  "novelty",
+  "limitations",
+  "relations",
+  "transfer",
+];
 const READING_STATUSES = new Set([
   "guide_ready",
   "reading",
@@ -100,12 +111,16 @@ function emptyStageState() {
   };
 }
 
-function emptyChatState() {
+function emptyChatState(branchType = "canonical") {
   return {
     id: null,
     title: null,
     status: "idle",
     turns: [],
+    branch_type: branchType,
+    parent_checkpoint: null,
+    promotion_status: branchType === "canonical" ? "canonical" : "not_promoted",
+    promoted_at: null,
     created_at: null,
     updated_at: null,
   };
@@ -167,9 +182,67 @@ function emptyPaperState(documentRevision = null) {
     ),
     questions: [],
     chat: emptyChatState(),
+    canonical_conversation_id: "current",
     archived_conversations: [],
+    pinned_conclusions: [],
     agent_actions: emptyAgentActionsState(),
     updated_at: null,
+  };
+}
+
+function normalizeParentCheckpoint(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return {
+    conversation_id: typeof value.conversation_id === "string"
+      ? value.conversation_id
+      : null,
+    turn_id: typeof value.turn_id === "string" ? value.turn_id : null,
+    turn_count: Number.isSafeInteger(value.turn_count) && value.turn_count >= 0
+      ? value.turn_count
+      : 0,
+    checkpoint_hash: typeof value.checkpoint_hash === "string"
+      ? value.checkpoint_hash
+      : null,
+    created_at: value.created_at ?? null,
+  };
+}
+
+function inferLegacyRoundId(turn) {
+  if (typeof turn?.round_id === "string" && turn.round_id) {
+    return turn.round_id;
+  }
+  if (typeof turn?.question !== "string") return null;
+  const match = /^第\s*(10|[1-9])\s*步(?:\s*[·.：:、-]|\s)/.exec(
+    turn.question.trim(),
+  );
+  if (!match) return null;
+  return GUIDED_READING_ROUND_IDS[Number(match[1]) - 1] ?? null;
+}
+
+function normalizeConversation(value, fallbackBranchType = "scratch") {
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
+  const branchType = READING_BRANCH_TYPES.has(source.branch_type)
+    ? source.branch_type
+    : fallbackBranchType;
+  return {
+    ...emptyChatState(branchType),
+    ...source,
+    branch_type: branchType,
+    parent_checkpoint: normalizeParentCheckpoint(source.parent_checkpoint),
+    promotion_status: typeof source.promotion_status === "string"
+      ? source.promotion_status
+      : branchType === "canonical"
+        ? "canonical"
+        : "not_promoted",
+    promoted_at: source.promoted_at ?? null,
+    turns: Array.isArray(source.turns)
+      ? source.turns.map((turn) => ({
+          ...structuredClone(turn),
+          round_id: inferLegacyRoundId(turn),
+        }))
+      : [],
   };
 }
 
@@ -185,6 +258,35 @@ function normalizePaperState(value, documentRevision = null) {
         : {}),
     },
   ]));
+  const rawChat = value.chat && typeof value.chat === "object"
+    && !Array.isArray(value.chat)
+    ? value.chat
+    : {};
+  const rawArchived = Array.isArray(value.archived_conversations)
+    ? value.archived_conversations
+    : [];
+  const activeConversationId = rawChat.id ?? "current";
+  const declaredCanonical = typeof value.canonical_conversation_id === "string"
+    && value.canonical_conversation_id
+    ? value.canonical_conversation_id
+    : null;
+  const archivedCanonical = rawArchived.find(
+    (conversation) => conversation?.branch_type === "canonical",
+  )?.id ?? null;
+  const canonicalConversationId = declaredCanonical
+    ?? (rawChat.branch_type === "canonical" ? activeConversationId : null)
+    ?? archivedCanonical
+    ?? activeConversationId;
+  const chat = normalizeConversation(
+    rawChat,
+    activeConversationId === canonicalConversationId ? "canonical" : "scratch",
+  );
+  const archivedConversations = rawArchived.map((conversation) => (
+    normalizeConversation(
+      conversation,
+      conversation?.id === canonicalConversationId ? "canonical" : "scratch",
+    )
+  ));
   return {
     ...base,
     ...value,
@@ -195,13 +297,8 @@ function normalizePaperState(value, documentRevision = null) {
     },
     stages,
     questions: Array.isArray(value.questions) ? structuredClone(value.questions) : [],
-    chat: {
-      ...emptyChatState(),
-      ...(value.chat && typeof value.chat === "object" && !Array.isArray(value.chat)
-        ? value.chat
-        : {}),
-      turns: Array.isArray(value.chat?.turns) ? structuredClone(value.chat.turns) : [],
-    },
+    chat,
+    canonical_conversation_id: canonicalConversationId,
     agent_actions: {
       ...emptyAgentActionsState(),
       ...(value.agent_actions
@@ -213,8 +310,9 @@ function normalizePaperState(value, documentRevision = null) {
         ? structuredClone(value.agent_actions.proposals)
         : [],
     },
-    archived_conversations: Array.isArray(value.archived_conversations)
-      ? structuredClone(value.archived_conversations)
+    archived_conversations: archivedConversations,
+    pinned_conclusions: Array.isArray(value.pinned_conclusions)
+      ? structuredClone(value.pinned_conclusions)
       : [],
   };
 }
@@ -253,6 +351,7 @@ function chatCachePath(paperId, inputHash) {
 function chatRequestFingerprint({
   text,
   reference,
+  roundId,
   includeProjectContext,
   providerId,
   modelId,
@@ -272,6 +371,7 @@ function chatRequestFingerprint({
             start_offset: reference.start_offset,
             end_offset: reference.end_offset,
           },
+    round_id: roundId ?? null,
     include_project_context: includeProjectContext,
     provider_id: providerId,
     model_id: modelId,
@@ -398,7 +498,7 @@ function validateChatArtifact(artifact, {
     || artifact.result.paper_id !== paperId
     || typeof artifact.result.answer !== "string"
     || artifact.result.answer.trim().length < 2
-    || artifact.result.answer.length > 3_000
+    || artifact.result.answer.length > 6_000
     || !Array.isArray(artifact.result.citations)
     || artifact.result.citations.length > 8
   ) {
@@ -589,7 +689,7 @@ export function createReadingService({
   getRunPaper,
   getProjectContext,
   modelProviders,
-  modelMode = "fixture",
+  modelMode = "live",
   defaultProviderId = "codex-subscription",
   defaultModelId = "account-default",
   stageGenerator = generateReadingStage,
@@ -603,6 +703,7 @@ export function createReadingService({
     throw new Error("reading service dependencies are required");
   }
   const inFlight = new Map();
+  const mutationInFlight = new Map();
   const chatRequestInFlight = new Map();
   const chatGenerationInFlight = new Map();
   const chatMemoryCache = new Map();
@@ -611,6 +712,187 @@ export function createReadingService({
     const run = await runStore.updateRun(runId, patch);
     if (event) await runStore.appendEvent(runId, { ...event, at: run.updated_at });
     return run;
+  }
+
+  function mutationIdentity(operation, clientRequestId, payload) {
+    if (
+      typeof clientRequestId !== "string"
+      || !REQUEST_ID_PATTERN.test(clientRequestId)
+    ) {
+      throw readingError(
+        "JOURNAL_MUTATION_REQUEST_ID_REQUIRED",
+        "论文工作流修改必须提供稳定的请求标识",
+        400,
+      );
+    }
+    return {
+      operation,
+      clientRequestId,
+      fingerprint: sha256({
+        schema_version: 1,
+        operation,
+        payload,
+      }),
+    };
+  }
+
+  function mutationLedger(run) {
+    const value = run?.journal_mutations;
+    return {
+      schema_version: 1,
+      entries: value?.entries
+        && typeof value.entries === "object"
+        && !Array.isArray(value.entries)
+        ? structuredClone(value.entries)
+        : {},
+    };
+  }
+
+  function assertMutationRecord(record, identity) {
+    if (
+      record.operation !== identity.operation
+      || record.fingerprint !== identity.fingerprint
+    ) {
+      throw readingError(
+        "JOURNAL_MUTATION_REQUEST_CONFLICT",
+        "同一论文工作流请求标识已用于不同操作或内容",
+        409,
+      );
+    }
+  }
+
+  function storedMutationError(record) {
+    const error = record?.error;
+    return readingError(
+      error?.code ?? "JOURNAL_MUTATION_FAILED",
+      error?.message ?? "论文工作流修改未完成",
+      Number.isInteger(error?.status) ? error.status : 409,
+      Boolean(error?.retryable),
+    );
+  }
+
+  async function reserveMutation(runId, identity) {
+    let disposition = null;
+    const run = await runStore.updateRun(runId, (current) => {
+      const ledger = mutationLedger(current);
+      const existing = ledger.entries[identity.clientRequestId];
+      if (existing) {
+        assertMutationRecord(existing, identity);
+        disposition = {
+          kind: existing.status,
+          record: structuredClone(existing),
+        };
+        return { journal_mutations: ledger };
+      }
+      const startedAt = now().toISOString();
+      const record = {
+        schema_version: 1,
+        client_request_id: identity.clientRequestId,
+        operation: identity.operation,
+        fingerprint: identity.fingerprint,
+        status: "in_flight",
+        result: null,
+        error: null,
+        started_at: startedAt,
+        completed_at: null,
+      };
+      ledger.entries[identity.clientRequestId] = record;
+      disposition = { kind: "reserved", record };
+      return { journal_mutations: ledger };
+    });
+    return { ...disposition, run };
+  }
+
+  function completedMutationPatch(current, identity, patch, result) {
+    const ledger = mutationLedger(current);
+    const record = ledger.entries[identity.clientRequestId];
+    if (!record) {
+      throw readingError(
+        "JOURNAL_MUTATION_LEDGER_MISSING",
+        "论文工作流请求账本缺失",
+      );
+    }
+    assertMutationRecord(record, identity);
+    if (record.status === "completed") return { journal_mutations: ledger };
+    if (record.status !== "in_flight") throw storedMutationError(record);
+    ledger.entries[identity.clientRequestId] = {
+      ...record,
+      status: "completed",
+      result: structuredClone(result ?? null),
+      error: null,
+      completed_at: now().toISOString(),
+    };
+    return {
+      ...patch,
+      journal_mutations: ledger,
+    };
+  }
+
+  async function failMutation(runId, identity, error, patchFactory = null) {
+    const safe = {
+      ...publicError(error),
+      status: Number.isInteger(error?.status) ? error.status : 409,
+    };
+    return runStore.updateRun(runId, (current) => {
+      const ledger = mutationLedger(current);
+      const record = ledger.entries[identity.clientRequestId];
+      if (!record) return {};
+      assertMutationRecord(record, identity);
+      if (record.status !== "in_flight") return { journal_mutations: ledger };
+      ledger.entries[identity.clientRequestId] = {
+        ...record,
+        status: "failed",
+        error: safe,
+        completed_at: now().toISOString(),
+      };
+      const patch = typeof patchFactory === "function"
+        ? patchFactory(current, safe)
+        : {};
+      return {
+        ...patch,
+        journal_mutations: ledger,
+      };
+    });
+  }
+
+  function withDurableMutation(runId, identity, { replay, execute }) {
+    const key = `${runId}:${identity.clientRequestId}`;
+    const active = mutationInFlight.get(key);
+    if (active) {
+      if (active.identity.fingerprint !== identity.fingerprint
+        || active.identity.operation !== identity.operation) {
+        return Promise.reject(readingError(
+          "JOURNAL_MUTATION_REQUEST_CONFLICT",
+          "同一论文工作流请求标识已用于不同操作或内容",
+          409,
+        ));
+      }
+      return active.promise;
+    }
+    const promise = (async () => {
+      const reservation = await reserveMutation(runId, identity);
+      if (reservation.kind === "completed") {
+        return replay(reservation.record, reservation.run);
+      }
+      if (reservation.kind === "failed") {
+        throw storedMutationError(reservation.record);
+      }
+      try {
+        return await execute({
+          resuming: reservation.kind === "in_flight",
+          record: reservation.record,
+        });
+      } catch (error) {
+        await failMutation(runId, identity, error);
+        throw error;
+      }
+    })().finally(() => {
+      if (mutationInFlight.get(key)?.promise === promise) {
+        mutationInFlight.delete(key);
+      }
+    });
+    mutationInFlight.set(key, { identity, promise });
+    return promise;
   }
 
   async function setDecisions(runId, nextDecisions) {
@@ -684,9 +966,29 @@ export function createReadingService({
           "论文正文已经变化，需要重新开始精读",
         );
       }
+      const activeConversationId = paperState.chat.id ?? nextConversationId();
+      const canonicalConversationId = (
+        paperState.canonical_conversation_id
+        && paperState.canonical_conversation_id !== "current"
+      )
+        ? paperState.canonical_conversation_id
+        : activeConversationId;
       nextReadings.papers[paperId] = {
         ...paperState,
         document_revision: document.revision,
+        canonical_conversation_id: canonicalConversationId,
+        chat: {
+          ...paperState.chat,
+          id: activeConversationId,
+          branch_type: activeConversationId === canonicalConversationId
+            ? "canonical"
+            : "scratch",
+          promotion_status: activeConversationId === canonicalConversationId
+            ? paperState.chat.promotion_status === "promoted"
+              ? "promoted"
+              : "canonical"
+            : paperState.chat.promotion_status,
+        },
       };
     }
     return update(runId, (current) => {
@@ -762,48 +1064,60 @@ export function createReadingService({
     }
   }
 
-  async function restartFromGuide(runId) {
-    const run = await runStore.getRun(runId);
-    if (!run) {
-      throw readingError("RUN_NOT_FOUND", "运行不存在", 404);
-    }
-    assertRestartableFromGuide(run);
-    const restartedAt = now().toISOString();
-    const revision = sha256({
-      run_id: runId,
-      restarted_at: restartedAt,
-      nonce: idFactory(),
-    });
-    const snapshotPath = `restarts/${revision.slice(7)}.json`;
-    await runStore.writeArtifact(runId, snapshotPath, {
-      schema_version: 1,
-      run_id: runId,
-      from_step: "candidates",
-      paper_decisions: paperDecisions(run),
-      readings: normalizeReadings(run),
-      created_at: restartedAt,
-    });
-    const restarted = await update(runId, (current) => {
-      assertRestartableFromGuide(current);
-      return {
-        status: "review_ready",
-        phase: "candidate_review",
-        paused_reason: "已返回本周推荐文章，可重新选择要研读的论文",
-        paper_decisions: {},
-        readings: emptyReadings(),
-        reading_restart: {
-          revision,
+  async function restartFromGuide(runId, { clientRequestId } = {}) {
+    const identity = mutationIdentity(
+      "reading.restart_from_guide",
+      clientRequestId,
+      {
+        run_id: runId,
+        from_step: "guide",
+      },
+    );
+    return withDurableMutation(runId, identity, {
+      replay: (_record, run) => run,
+      execute: async () => {
+        const restartedAt = now().toISOString();
+        const revision = sha256({
+          run_id: runId,
+          operation: identity.operation,
+          client_request_id: identity.clientRequestId,
+          fingerprint: identity.fingerprint,
+        });
+        const snapshotPath = `restarts/${revision.slice(7)}.json`;
+        return update(runId, async (current) => {
+          assertRestartableFromGuide(current);
+          await runStore.writeArtifact(runId, snapshotPath, {
+            schema_version: 1,
+            run_id: runId,
+            from_step: "candidates",
+            paper_decisions: paperDecisions(current),
+            readings: normalizeReadings(current),
+            created_at: restartedAt,
+          });
+          return completedMutationPatch(current, identity, {
+            status: "review_ready",
+            phase: "candidate_review",
+            paused_reason: "已返回本周推荐文章，可重新选择要研读的论文",
+            paper_decisions: {},
+            readings: emptyReadings(),
+            reading_restart: {
+              revision,
+              from_step: "candidates",
+              restarted_at: restartedAt,
+            },
+          }, {
+            revision,
+            snapshot_artifact: snapshotPath,
+          });
+        }, {
+          type: "reading_restarted_from_guide",
           from_step: "candidates",
-          restarted_at: restartedAt,
-        },
-      };
-    }, {
-      type: "reading_restarted_from_guide",
-      from_step: "candidates",
-      revision,
-      snapshot_artifact: snapshotPath,
+          revision,
+          snapshot_artifact: snapshotPath,
+          client_request_id: identity.clientRequestId,
+        });
+      },
     });
-    return restarted;
   }
 
   function assertPaperResettable(run, paperId) {
@@ -829,83 +1143,108 @@ export function createReadingService({
     }
   }
 
-  async function resetPaperReading(runId, paperId) {
-    const { run } = await getRunPaper(runId, paperId);
-    if (paperDecisions(run)[paperId] !== "read") {
-      throw readingError(
-        "READING_RESET_NOT_ALLOWED",
-        "这篇论文不在研读列表中",
-      );
-    }
-    assertPaperResettable(run, paperId);
-    const resetAt = now().toISOString();
-    const revision = sha256({
-      run_id: runId,
-      paper_id: paperId,
-      reset_at: resetAt,
-      nonce: idFactory(),
-    });
-    const snapshotPath = `restarts/paper-${revision.slice(7)}.json`;
-    await runStore.writeArtifact(runId, snapshotPath, {
-      schema_version: 1,
-      run_id: runId,
-      paper_id: paperId,
-      reading: normalizePaperState(normalizeReadings(run).papers[paperId]),
-      created_at: resetAt,
-    });
-    return update(runId, (current) => {
-      assertPaperResettable(current, paperId);
-      const readings = normalizeReadings(current);
-      delete readings.papers[paperId];
-      readings.paper_ids = readings.paper_ids.filter((id) => id !== paperId);
-      readings.last_error = null;
-      // Deleting the reading record also withdraws the read decision, so the
-      // paper returns to the weekly candidate list for a fresh choice and the
-      // run status is recomputed from the remaining decisions.
-      const decisions = paperDecisions(current);
-      delete decisions[paperId];
-      const requested = (current.guides?.requested_paper_ids ?? []).filter(
-        (id) => current.guides?.papers?.[id]?.status === "ready",
-      );
-      const allDecided = requested.length > 0
-        && requested.every((id) => ["collect", "read"].includes(decisions[id]));
-      const readPaperIds = requested.filter((id) => decisions[id] === "read");
-      readings.status = allDecided && readPaperIds.length > 0 ? "reading" : "not_started";
-      return {
-        status: !allDecided
-          ? "guide_ready"
-          : readPaperIds.length > 0
+  async function resetPaperReading(runId, paperId, { clientRequestId } = {}) {
+    const identity = mutationIdentity(
+      "reading.reset_paper",
+      clientRequestId,
+      {
+        run_id: runId,
+        paper_id: paperId,
+      },
+    );
+    return withDurableMutation(runId, identity, {
+      replay: (_record, run) => run,
+      execute: async () => {
+        const resetAt = now().toISOString();
+        const revision = sha256({
+          run_id: runId,
+          paper_id: paperId,
+          operation: identity.operation,
+          client_request_id: identity.clientRequestId,
+          fingerprint: identity.fingerprint,
+        });
+        const snapshotPath = `restarts/paper-${revision.slice(7)}.json`;
+        return update(runId, async (current) => {
+          if (!current.candidates?.some(
+            (candidate) => candidate.paper_id === paperId,
+          )) {
+            throw readingError("PAPER_NOT_FOUND", "论文不存在", 404);
+          }
+          if (paperDecisions(current)[paperId] !== "read") {
+            throw readingError(
+              "READING_RESET_NOT_ALLOWED",
+              "这篇论文不在研读列表中",
+            );
+          }
+          assertPaperResettable(current, paperId);
+          const readings = normalizeReadings(current);
+          await runStore.writeArtifact(runId, snapshotPath, {
+            schema_version: 1,
+            run_id: runId,
+            paper_id: paperId,
+            reading: normalizePaperState(readings.papers[paperId]),
+            created_at: resetAt,
+          });
+          delete readings.papers[paperId];
+          readings.paper_ids = readings.paper_ids.filter((id) => id !== paperId);
+          readings.last_error = null;
+          // Deleting the reading record also withdraws the read decision, so the
+          // paper returns to the weekly candidate list for a fresh choice and the
+          // run status is recomputed from the remaining decisions.
+          const decisions = paperDecisions(current);
+          delete decisions[paperId];
+          const requested = (current.guides?.requested_paper_ids ?? []).filter(
+            (id) => current.guides?.papers?.[id]?.status === "ready",
+          );
+          const allDecided = requested.length > 0
+            && requested.every((id) => ["collect", "read"].includes(decisions[id]));
+          const readPaperIds = requested.filter((id) => decisions[id] === "read");
+          readings.status = allDecided && readPaperIds.length > 0
             ? "reading"
-            : "draft_ready",
-        phase: !allDecided
-          ? "guide_review"
-          : readPaperIds.length > 0
-            ? "close_reading"
-            : "write_preview",
-        paused_reason: !allDecided
-          ? "已删除一篇论文的研读记录，可重新决定这篇论文的处理方式"
-          : readPaperIds.length > 0
-            ? "已删除一篇论文的研读记录"
-            : "导读决定已完成，等待生成写入预览",
-        paper_decisions: decisions,
-        ...(current.zotero?.decisions?.[paperId]
-          ? {
-              zotero: {
-                ...current.zotero,
-                decisions: Object.fromEntries(
-                  Object.entries(current.zotero.decisions)
-                    .filter(([id]) => id !== paperId),
-                ),
-              },
-            }
-          : {}),
-        readings,
-      };
-    }, {
-      type: "paper_reading_reset",
-      paper_id: paperId,
-      revision,
-      snapshot_artifact: snapshotPath,
+            : "not_started";
+          const patch = {
+            status: !allDecided
+              ? "guide_ready"
+              : readPaperIds.length > 0
+                ? "reading"
+                : "draft_ready",
+            phase: !allDecided
+              ? "guide_review"
+              : readPaperIds.length > 0
+                ? "close_reading"
+                : "write_preview",
+            paused_reason: !allDecided
+              ? "已删除一篇论文的研读记录，可重新决定这篇论文的处理方式"
+              : readPaperIds.length > 0
+                ? "已删除一篇论文的研读记录"
+                : "导读决定已完成，等待生成写入预览",
+            paper_decisions: decisions,
+            ...(current.zotero?.decisions?.[paperId]
+              ? {
+                  zotero: {
+                    ...current.zotero,
+                    decisions: Object.fromEntries(
+                      Object.entries(current.zotero.decisions)
+                        .filter(([id]) => id !== paperId),
+                    ),
+                  },
+                }
+              : {}),
+            readings,
+          };
+          return completedMutationPatch(current, identity, patch, {
+            paper_id: paperId,
+            revision,
+            snapshot_artifact: snapshotPath,
+          });
+        }, {
+          type: "paper_reading_reset",
+          paper_id: paperId,
+          revision,
+          snapshot_artifact: snapshotPath,
+          client_request_id: identity.clientRequestId,
+        });
+      },
     });
   }
 
@@ -915,38 +1254,128 @@ export function createReadingService({
     return `conversation-${sha256({ seq: conversationSeq, nonce: idFactory() }).slice(7, 23)}`;
   }
 
-  async function createConversation(runId, paperId) {
-    await getRunPaper(runId, paperId);
-    const createdAt = now().toISOString();
-    await update(runId, (current) => {
-      const readings = normalizeReadings(current);
-      const paperState = normalizePaperState(readings.papers[paperId]);
-      const archived = [...paperState.archived_conversations];
-      if (paperState.chat.turns.length > 0) {
-        archived.unshift({
-          id: paperState.chat.id ?? nextConversationId(),
-          title: paperState.chat.title ?? conversationTitle(paperState.chat.turns),
-          created_at: paperState.chat.created_at ?? createdAt,
-          updated_at: paperState.chat.updated_at ?? createdAt,
-          turns: structuredClone(paperState.chat.turns),
+  function activeConversationId(paperState) {
+    return paperState.chat.id ?? "current";
+  }
+
+  function conversationCheckpoint(paperState, createdAt) {
+    const turnIds = paperState.chat.turns
+      .map((turn) => turn?.id)
+      .filter((id) => typeof id === "string");
+    return {
+      conversation_id: activeConversationId(paperState),
+      turn_id: turnIds.at(-1) ?? null,
+      turn_count: turnIds.length,
+      checkpoint_hash: sha256({
+        conversation_id: activeConversationId(paperState),
+        turn_ids: turnIds,
+      }),
+      created_at: createdAt,
+    };
+  }
+
+  function archivedConversation(paperState, conversationId, updatedAt) {
+    return {
+      ...paperState.chat,
+      id: conversationId,
+      title: paperState.chat.title ?? conversationTitle(paperState.chat.turns),
+      created_at: paperState.chat.created_at ?? updatedAt,
+      updated_at: paperState.chat.updated_at ?? updatedAt,
+      turns: structuredClone(paperState.chat.turns),
+    };
+  }
+
+  async function createConversation(runId, paperId, { clientRequestId } = {}) {
+    const identity = mutationIdentity(
+      "reading.create_conversation",
+      clientRequestId,
+      {
+        run_id: runId,
+        paper_id: paperId,
+      },
+    );
+    return withDurableMutation(runId, identity, {
+      replay: () => getReading(runId, paperId),
+      execute: async () => {
+        const createdAt = now().toISOString();
+        const newConversationId = `conversation-${sha256({
+          run_id: runId,
+          paper_id: paperId,
+          client_request_id: identity.clientRequestId,
+          fingerprint: identity.fingerprint,
+        }).slice(7, 23)}`;
+        await update(runId, (current) => {
+          if (!current.candidates?.some(
+            (candidate) => candidate.paper_id === paperId,
+          )) {
+            throw readingError("PAPER_NOT_FOUND", "论文不存在", 404);
+          }
+          assertPromotionAllowed(current);
+          const readings = normalizeReadings(current);
+          const paperState = normalizePaperState(readings.papers[paperId]);
+          const currentConversationId = paperState.chat.id ?? nextConversationId();
+          const canonicalConversationId = (
+            paperState.canonical_conversation_id
+            && paperState.canonical_conversation_id !== "current"
+          )
+            ? paperState.canonical_conversation_id
+            : currentConversationId;
+          const parentCheckpoint = conversationCheckpoint({
+            ...paperState,
+            chat: {
+              ...paperState.chat,
+              id: currentConversationId,
+            },
+          }, createdAt);
+          const archived = [...paperState.archived_conversations];
+          archived.unshift(archivedConversation(
+            {
+              ...paperState,
+              chat: {
+                ...paperState.chat,
+                id: currentConversationId,
+                branch_type: currentConversationId === canonicalConversationId
+                  ? "canonical"
+                  : "scratch",
+              },
+            },
+            currentConversationId,
+            createdAt,
+          ));
+          readings.papers[paperId] = {
+            ...paperState,
+            canonical_conversation_id: canonicalConversationId,
+            chat: {
+              ...emptyChatState("scratch"),
+              id: newConversationId,
+              title: null,
+              status: "idle",
+              turns: [],
+              branch_type: "scratch",
+              parent_checkpoint: parentCheckpoint,
+              promotion_status: "not_promoted",
+              created_at: createdAt,
+              updated_at: createdAt,
+            },
+            archived_conversations: archived,
+            updated_at: createdAt,
+          };
+          return completedMutationPatch(current, identity, {
+            readings,
+          }, {
+            paper_id: paperId,
+            conversation_id: newConversationId,
+            parent_checkpoint_hash: parentCheckpoint.checkpoint_hash,
+          });
+        }, {
+          type: "reading_conversation_created",
+          paper_id: paperId,
+          conversation_id: newConversationId,
+          client_request_id: identity.clientRequestId,
         });
-      }
-      readings.papers[paperId] = {
-        ...paperState,
-        chat: {
-          id: nextConversationId(),
-          title: null,
-          status: "idle",
-          turns: [],
-          created_at: createdAt,
-          updated_at: createdAt,
-        },
-        archived_conversations: archived,
-        updated_at: createdAt,
-      };
-      return { readings };
-    }, { type: "reading_conversation_created", paper_id: paperId });
-    return getReading(runId, paperId);
+        return getReading(runId, paperId);
+      },
+    });
   }
 
   async function switchConversation(runId, paperId, conversationId) {
@@ -968,17 +1397,21 @@ export function createReadingService({
       const targetIndex = archived.findIndex((entry) => entry.id === conversationId);
       if (targetIndex < 0) return { readings };
       const [target] = archived.splice(targetIndex, 1);
-      archived.unshift({
-        id: paperState.chat.id ?? nextConversationId(),
-        title: paperState.chat.title ?? conversationTitle(paperState.chat.turns),
-        created_at: paperState.chat.created_at ?? switchedAt,
-        updated_at: paperState.chat.updated_at ?? switchedAt,
-        turns: structuredClone(paperState.chat.turns),
-      });
+      const currentConversationId = activeConversationId(paperState);
+      archived.unshift(archivedConversation(
+        paperState,
+        currentConversationId,
+        switchedAt,
+      ));
       readings.papers[paperId] = {
         ...paperState,
         chat: {
-          id: target.id,
+          ...normalizeConversation(
+            target,
+            target.id === paperState.canonical_conversation_id
+              ? "canonical"
+              : "scratch",
+          ),
           title: target.title ?? null,
           status: "idle",
           turns: structuredClone(target.turns ?? []),
@@ -991,6 +1424,320 @@ export function createReadingService({
       return { readings };
     }, { type: "reading_conversation_switched", paper_id: paperId });
     return getReading(runId, paperId);
+  }
+
+  function requireMutationIdentity({ clientRequestId, confirmedBy } = {}) {
+    if (
+      typeof clientRequestId !== "string"
+      || !REQUEST_ID_PATTERN.test(clientRequestId)
+    ) {
+      throw readingError(
+        "READING_MUTATION_REQUEST_ID_REQUIRED",
+        "研读状态修改必须提供稳定的请求标识",
+        400,
+      );
+    }
+    const actor = typeof confirmedBy === "string" ? confirmedBy.trim() : "";
+    if (!actor || actor.length > 120) {
+      throw readingError(
+        "READING_CONFIRMED_BY_REQUIRED",
+        "研读状态修改必须记录确认人",
+        400,
+      );
+    }
+    return { clientRequestId, confirmedBy: actor };
+  }
+
+  function findConversation(paperState, conversationId) {
+    if (activeConversationId(paperState) === conversationId) {
+      return paperState.chat;
+    }
+    return paperState.archived_conversations.find(
+      (conversation) => conversation.id === conversationId,
+    ) ?? null;
+  }
+
+  function findTurn(paperState, turnId) {
+    const conversations = [
+      {
+        ...paperState.chat,
+        id: activeConversationId(paperState),
+      },
+      ...paperState.archived_conversations,
+    ];
+    for (const conversation of conversations) {
+      const turn = conversation.turns?.find((item) => item.id === turnId);
+      if (turn) return { conversation, turn };
+    }
+    return null;
+  }
+
+  function assertPromotionAllowed(run) {
+    const externalState = [
+      run.zotero?.status,
+      run.obsidian?.status,
+      run.project_state?.status,
+    ].find((status) => status && status !== "not_started");
+    if (externalState || run.archive_batch) {
+      throw readingError(
+        "READING_BRANCH_PROMOTION_LOCKED",
+        "归档预览或外部写入已经开始，不能再提升研读分支",
+      );
+    }
+    const committedAgentAction = Object.values(normalizeReadings(run).papers)
+      .some((value) => normalizePaperState(value).agent_actions.proposals
+        .some((proposal) => proposal?.status === "committed"));
+    if (committedAgentAction) {
+      throw readingError(
+        "READING_BRANCH_PROMOTION_LOCKED",
+        "已有论文 Agent 笔记完成写入，不能再提升研读分支",
+      );
+    }
+  }
+
+  async function promoteConversation(
+    runId,
+    paperId,
+    conversationId,
+    options = {},
+  ) {
+    const mutation = requireMutationIdentity(options);
+    const { run } = await getRunPaper(runId, paperId);
+    assertPromotionAllowed(run);
+    const paperState = normalizePaperState(normalizeReadings(run).papers[paperId]);
+    const target = findConversation(paperState, conversationId);
+    if (!target) {
+      throw readingError("READING_CONVERSATION_NOT_FOUND", "会话不存在", 404);
+    }
+    if (conversationId !== activeConversationId(paperState)) {
+      throw readingError(
+        "READING_BRANCH_NOT_ACTIVE",
+        "请先切换到该研读分支，再将它提升为正式研读",
+      );
+    }
+    if (
+      paperState.canonical_conversation_id === conversationId
+      && paperState.chat.branch_type === "canonical"
+    ) {
+      return getReading(runId, paperId);
+    }
+    const promotedAt = now().toISOString();
+    await update(runId, (current) => {
+      assertPromotionAllowed(current);
+      const readings = normalizeReadings(current);
+      const nextPaper = normalizePaperState(readings.papers[paperId]);
+      if (activeConversationId(nextPaper) !== conversationId) {
+        throw readingError(
+          "READING_BRANCH_NOT_ACTIVE",
+          "研读分支已经切换，请重新确认提升操作",
+        );
+      }
+      const previousCanonicalId = nextPaper.canonical_conversation_id;
+      readings.papers[paperId] = {
+        ...nextPaper,
+        canonical_conversation_id: conversationId,
+        chat: {
+          ...nextPaper.chat,
+          branch_type: "canonical",
+          promotion_status: "promoted",
+          promoted_at: promotedAt,
+        },
+        archived_conversations: nextPaper.archived_conversations.map(
+          (conversation) => (
+            conversation.id === previousCanonicalId
+              ? {
+                  ...conversation,
+                  branch_type: "scratch",
+                  promotion_status: "superseded",
+                }
+              : conversation
+          ),
+        ),
+        last_promotion: {
+          client_request_id: mutation.clientRequestId,
+          from_conversation_id: previousCanonicalId,
+          to_conversation_id: conversationId,
+          confirmed_by: mutation.confirmedBy,
+          promoted_at: promotedAt,
+        },
+        updated_at: promotedAt,
+      };
+      return { readings };
+    }, {
+      type: "reading_branch_promoted",
+      paper_id: paperId,
+      conversation_id: conversationId,
+      client_request_id: mutation.clientRequestId,
+    });
+    return getReading(runId, paperId);
+  }
+
+  async function pinConclusion(runId, paperId, turnId, options = {}) {
+    const mutation = requireMutationIdentity(options);
+    const { run } = await getRunPaper(runId, paperId);
+    const document = await getPaperDocument(runId, paperId);
+    const paperState = normalizePaperState(
+      normalizeReadings(run).papers[paperId],
+      document.revision,
+    );
+    const found = findTurn(paperState, turnId);
+    if (!found || found.turn.status !== "answered") {
+      throw readingError(
+        "PINNED_CONCLUSION_TURN_NOT_ANSWERED",
+        "只能固定已经完成回答的论文对话",
+      );
+    }
+    const existing = paperState.pinned_conclusions.find(
+      (conclusion) => conclusion.source_turn_id === turnId,
+    );
+    if (existing?.status === "pinned") return getReading(runId, paperId);
+    const cached = await readChatCache(
+      runId,
+      paperId,
+      found.turn.input_hash,
+      document,
+      {
+        strict: true,
+        inlineArtifact: found.turn.inline_artifact ?? null,
+      },
+    );
+    const content = cached.artifact.result.answer;
+    const citations = expandedChatCitations(cached.artifact);
+    if (citations.length < 1) {
+      throw readingError(
+        "PINNED_CONCLUSION_CITATIONS_REQUIRED",
+        "缺少可核验论文引用的回答不能固定为归档结论",
+      );
+    }
+    const pinnedAt = now().toISOString();
+    const conclusionId = existing?.conclusion_id
+      ?? `pinned-conclusion-${sha256({
+        run_id: runId,
+        paper_id: paperId,
+        conversation_id: found.conversation.id,
+        turn_id: turnId,
+      }).slice(7, 23)}`;
+    await update(runId, (current) => {
+      const readings = normalizeReadings(current);
+      const nextPaper = normalizePaperState(
+        readings.papers[paperId],
+        document.revision,
+      );
+      const currentFound = findTurn(nextPaper, turnId);
+      if (!currentFound || currentFound.turn.status !== "answered") {
+        throw readingError(
+          "PINNED_CONCLUSION_TURN_NOT_ANSWERED",
+          "来源回答已经变化，请刷新后重试",
+        );
+      }
+      const record = {
+        schema_version: 1,
+        conclusion_id: conclusionId,
+        source_conversation_id: found.conversation.id,
+        source_turn_id: turnId,
+        source_input_hash: found.turn.input_hash,
+        content,
+        content_hash: sha256(content),
+        citations: structuredClone(citations),
+        coverage_stages: [],
+        confirmed_by: mutation.confirmedBy,
+        status: "pinned",
+        client_request_id: mutation.clientRequestId,
+        pinned_at: pinnedAt,
+        unpinned_at: null,
+        updated_at: pinnedAt,
+      };
+      const recordIndex = nextPaper.pinned_conclusions.findIndex(
+        (conclusion) => conclusion.source_turn_id === turnId,
+      );
+      const pinnedConclusions = [...nextPaper.pinned_conclusions];
+      if (recordIndex >= 0) pinnedConclusions[recordIndex] = record;
+      else pinnedConclusions.push(record);
+      readings.papers[paperId] = {
+        ...nextPaper,
+        pinned_conclusions: pinnedConclusions,
+        updated_at: pinnedAt,
+      };
+      return { readings };
+    }, {
+      type: "reading_conclusion_pinned",
+      paper_id: paperId,
+      turn_id: turnId,
+      conclusion_id: conclusionId,
+      client_request_id: mutation.clientRequestId,
+    });
+    return getReading(runId, paperId);
+  }
+
+  async function unpinConclusion(
+    runId,
+    paperId,
+    conclusionId,
+    options = {},
+  ) {
+    const mutation = requireMutationIdentity(options);
+    const { run } = await getRunPaper(runId, paperId);
+    const paperState = normalizePaperState(normalizeReadings(run).papers[paperId]);
+    const existing = paperState.pinned_conclusions.find(
+      (conclusion) => conclusion.conclusion_id === conclusionId,
+    );
+    if (!existing) {
+      throw readingError(
+        "PINNED_CONCLUSION_NOT_FOUND",
+        "固定结论不存在",
+        404,
+      );
+    }
+    if (existing.status === "unpinned") return getReading(runId, paperId);
+    const unpinnedAt = now().toISOString();
+    await update(runId, (current) => {
+      const readings = normalizeReadings(current);
+      const nextPaper = normalizePaperState(readings.papers[paperId]);
+      readings.papers[paperId] = {
+        ...nextPaper,
+        pinned_conclusions: nextPaper.pinned_conclusions.map((conclusion) => (
+          conclusion.conclusion_id === conclusionId
+            ? {
+                ...conclusion,
+                status: "unpinned",
+                unpinned_by: mutation.confirmedBy,
+                unpin_request_id: mutation.clientRequestId,
+                unpinned_at: unpinnedAt,
+                updated_at: unpinnedAt,
+              }
+            : conclusion
+        )),
+        updated_at: unpinnedAt,
+      };
+      return { readings };
+    }, {
+      type: "reading_conclusion_unpinned",
+      paper_id: paperId,
+      conclusion_id: conclusionId,
+      client_request_id: mutation.clientRequestId,
+    });
+    return getReading(runId, paperId);
+  }
+
+  async function assertCanonicalForArchive(runId) {
+    const run = await runStore.getRun(runId);
+    if (!run) throw readingError("RUN_NOT_FOUND", "运行不存在", 404);
+    const readings = normalizeReadings(run);
+    for (const [paperId, decision] of Object.entries(paperDecisions(run))) {
+      if (decision !== "read") continue;
+      const paperState = normalizePaperState(readings.papers[paperId]);
+      const activeId = activeConversationId(paperState);
+      if (
+        paperState.chat.branch_type !== "canonical"
+        || paperState.canonical_conversation_id !== activeId
+      ) {
+        throw readingError(
+          "READING_SCRATCH_ARCHIVE_BLOCKED",
+          "当前打开的是临时研读分支；提升为正式研读后才能生成或提交归档",
+        );
+      }
+    }
+    return run;
   }
 
   async function stageArtifacts(runId, paperId, stageIds, document) {
@@ -1102,10 +1849,27 @@ export function createReadingService({
     }
   }
 
+  function isAuditOnlyChatTurn(turn, answer) {
+    if (typeof answer !== "string" || answer.trim().length < 10) return true;
+    const question = typeof turn?.question === "string"
+      ? turn.question.trim()
+      : "";
+    if (/^(?:测试换行|测试输入|test(?:ing)?)$/i.test(question)) return true;
+    if (
+      question === "c"
+      && /含义不明确|测试(?:排版|输入|功能)/.test(answer)
+    ) {
+      return true;
+    }
+    return /`(?:recent_turns|project_context|input_hash|prompt_version|references)`/.test(
+      answer,
+    );
+  }
+
   async function recentChatTurns(runId, paperId, paperState, document) {
     const turns = paperState.chat.turns
       .filter((turn) => turn.status === "answered" && typeof turn.input_hash === "string")
-      .slice(-4);
+      .slice(-8);
     const history = [];
     for (const turn of turns) {
       const cached = await readChatCache(
@@ -1118,9 +1882,13 @@ export function createReadingService({
           inlineArtifact: turn.inline_artifact ?? null,
         },
       );
+      const answer = cached.artifact.result.answer;
+      // Preserve legacy placeholders, test turns, and leaked internal fields for
+      // audit, but never let them poison a later model request.
+      if (isAuditOnlyChatTurn(turn, answer)) continue;
       history.push({
         question: turn.question,
-        answer: cached.artifact.result.answer,
+        answer,
       });
     }
     return history;
@@ -1222,6 +1990,7 @@ export function createReadingService({
   async function sendChatMessageUnlocked(runId, paperId, {
     text,
     reference = null,
+    roundId = null,
     clientRequestId,
     includeProjectContext = false,
     providerId = defaultProviderId,
@@ -1247,6 +2016,7 @@ export function createReadingService({
     const fingerprint = requestFingerprint ?? chatRequestFingerprint({
       text: question,
       reference,
+      roundId,
       includeProjectContext: includeProjectContext === true,
       providerId,
       modelId,
@@ -1342,6 +2112,7 @@ export function createReadingService({
             client_request_id: requestId,
             request_fingerprint: fingerprint,
             question: prepared.question,
+            round_id: roundId,
             status: "answered",
             reference: reference == null ? null : publicChatReference(cached.references[0]),
             input_hash: prepared.inputHash,
@@ -1384,11 +2155,12 @@ export function createReadingService({
       const nextPaper = normalizePaperState(nextReadings.papers[paperId], document.revision);
       const turns = [
         ...nextPaper.chat.turns,
-          {
-            id: turnId,
-            client_request_id: requestId,
-            request_fingerprint: fingerprint,
-            question: prepared.question,
+        {
+          id: turnId,
+          client_request_id: requestId,
+          request_fingerprint: fingerprint,
+          question: prepared.question,
+          round_id: roundId,
           status: "running",
           reference: reference == null
             ? null
@@ -1400,9 +2172,9 @@ export function createReadingService({
           artifact_json: cachePath,
           provider_id: providerId,
           model_id: modelId,
-            cache_hit: false,
-            cache_write_failed: false,
-            inline_artifact: null,
+          cache_hit: false,
+          cache_write_failed: false,
+          inline_artifact: null,
           project_context_status:
             prepared.projectContext?.status ?? "not_requested",
           project_context_requested: Boolean(prepared.projectContext),
@@ -1506,6 +2278,9 @@ export function createReadingService({
       reference: options?.reference ?? null,
       clientRequestId: options?.clientRequestId ?? null,
       includeProjectContext: options?.includeProjectContext === true,
+      roundId: options?.roundId == null
+        ? null
+        : String(options.roundId).trim(),
       providerId: options?.providerId ?? defaultProviderId,
       modelId: options?.modelId ?? defaultModelId,
     };
@@ -1523,6 +2298,16 @@ export function createReadingService({
       return Promise.reject(readingError(
         "READING_CHAT_INPUT_INVALID",
         "论文对话任务必须是 1 至 1000 个字符",
+        400,
+      ));
+    }
+    if (
+      normalized.roundId !== null
+      && !ROUND_ID_PATTERN.test(normalized.roundId)
+    ) {
+      return Promise.reject(readingError(
+        "READING_CHAT_ROUND_INVALID",
+        "导读轮次标识无效",
         400,
       ));
     }
@@ -1654,9 +2439,14 @@ export function createReadingService({
         id: turn.id,
         client_request_id: turn.client_request_id,
         question: turn.question,
+        round_id: turn.round_id ?? null,
         status: turn.status,
         reference: turn.reference ? structuredClone(turn.reference) : null,
         answer: artifact?.result.answer ?? null,
+        audit_only: Boolean(
+          turn.status === "answered"
+          && isAuditOnlyChatTurn(turn, artifact?.result.answer),
+        ),
         citations: artifact ? expandedChatCitations(artifact) : [],
         provider_id: turn.provider_id ?? artifact?.provenance.provider_id ?? null,
         model_id: turn.model_id ?? artifact?.provenance.model_id ?? null,
@@ -1711,15 +2501,26 @@ export function createReadingService({
         id: paperState.chat.id ?? "current",
         title: paperState.chat.title ?? conversationTitle(paperState.chat.turns),
         status: paperState.chat.status,
+        branch_type: paperState.chat.branch_type,
+        parent_checkpoint: structuredClone(paperState.chat.parent_checkpoint),
+        promotion_status: paperState.chat.promotion_status,
+        promoted_at: paperState.chat.promoted_at,
         turns: chatTurns,
         updated_at: paperState.chat.updated_at,
       },
       active_conversation_id: paperState.chat.id ?? "current",
+      canonical_conversation_id: paperState.canonical_conversation_id,
       conversations: [
         {
           id: paperState.chat.id ?? "current",
           title: paperState.chat.title ?? conversationTitle(paperState.chat.turns),
           turn_count: paperState.chat.turns.length,
+          branch_type: paperState.chat.branch_type,
+          parent_checkpoint: structuredClone(paperState.chat.parent_checkpoint),
+          promotion_status: paperState.chat.promotion_status,
+          promoted_at: paperState.chat.promoted_at,
+          canonical:
+            activeConversationId(paperState) === paperState.canonical_conversation_id,
           updated_at: paperState.chat.updated_at,
           active: true,
         },
@@ -1727,10 +2528,37 @@ export function createReadingService({
           id: entry.id,
           title: entry.title ?? conversationTitle(entry.turns),
           turn_count: Array.isArray(entry.turns) ? entry.turns.length : 0,
+          branch_type: entry.branch_type,
+          parent_checkpoint: structuredClone(entry.parent_checkpoint),
+          promotion_status: entry.promotion_status,
+          promoted_at: entry.promoted_at,
+          canonical: entry.id === paperState.canonical_conversation_id,
           updated_at: entry.updated_at ?? entry.created_at ?? null,
           active: false,
         })),
       ],
+      pinned_conclusions: paperState.pinned_conclusions.map((conclusion) => ({
+        schema_version: conclusion.schema_version ?? 1,
+        conclusion_id: conclusion.conclusion_id,
+        source_conversation_id: conclusion.source_conversation_id,
+        source_turn_id: conclusion.source_turn_id,
+        source_input_hash: conclusion.source_input_hash ?? null,
+        content: conclusion.content,
+        content_hash: conclusion.content_hash,
+        citations: Array.isArray(conclusion.citations)
+          ? structuredClone(conclusion.citations)
+          : [],
+        coverage_stages: Array.isArray(conclusion.coverage_stages)
+          ? conclusion.coverage_stages.filter(
+              (stage) => READING_STAGE_ORDER.includes(stage),
+            )
+          : [],
+        confirmed_by: conclusion.confirmed_by,
+        status: conclusion.status,
+        pinned_at: conclusion.pinned_at ?? null,
+        unpinned_at: conclusion.unpinned_at ?? null,
+        updated_at: conclusion.updated_at ?? null,
+      })),
       agent_actions: {
         schema_version: 1,
         status: paperState.agent_actions.status,
@@ -1765,17 +2593,6 @@ export function createReadingService({
       && paperState.document_revision !== document.revision
     ) {
       throw readingError("READING_DOCUMENT_CHANGED", "论文正文已经变化，需要重新开始精读");
-    }
-    const missingCoreStage = stage === "project-relation"
-      ? CORE_READING_STAGES.find(
-          (coreStage) => paperState.stages[coreStage].status !== "ready",
-        )
-      : null;
-    if (missingCoreStage) {
-      throw readingError(
-        "READING_STAGE_ORDER_INVALID",
-        "请先完成研究问题、方法机制和实验依据三个阅读镜头",
-      );
     }
     if (paperState.stages[stage].status === "ready") return getReading(runId, paperId);
     const startedAt = now().toISOString();
@@ -1925,8 +2742,8 @@ export function createReadingService({
             status: allComplete ? "draft_ready" : "reading",
             phase: allComplete ? "write_preview" : "close_reading",
             paused_reason: allComplete
-              ? "四阶段精读已完成，等待生成正式写入预览"
-              : "精读进度已保存，可继续下一阶段",
+              ? "归档所需证据已齐全，等待生成正式写入预览"
+              : "精读进度已保存，可继续阅读",
           } : {}),
           readings: nextReadings,
         };
@@ -1990,9 +2807,12 @@ export function createReadingService({
     stage,
     text,
     blockId = null,
-    clientRequestId = null,
+    clientRequestId,
     providerId = defaultProviderId,
     modelId = defaultModelId,
+  } = {}, {
+    identity,
+    resuming = false,
   } = {}) {
     if (!READING_STAGE_ORDER.includes(stage)) {
       throw readingError("READING_STAGE_INVALID", "未知的精读阶段", 400);
@@ -2001,10 +2821,7 @@ export function createReadingService({
     if (!question || question.length > 1_000) {
       throw readingError("READING_QUESTION_INVALID", "追问必须是 1 至 1000 个字符", 400);
     }
-    const requestId = clientRequestId ?? `question-request-${idFactory()}`;
-    if (!REQUEST_ID_PATTERN.test(requestId)) {
-      throw readingError("READING_QUESTION_INVALID", "追问请求标识格式无效", 400);
-    }
+    const requestId = clientRequestId;
     const { run, paper } = await getRunPaper(runId, paperId);
     const readings = normalizeReadings(run);
     const document = await getPaperDocument(runId, paperId);
@@ -2012,7 +2829,63 @@ export function createReadingService({
     const existing = paperState.questions.find(
       (item) => item.client_request_id === requestId,
     );
-    if (existing) return getReading(runId, paperId);
+    if (existing) {
+      if (resuming && existing.status === "running") {
+        const interrupted = readingError(
+          "READING_QUESTION_INTERRUPTED",
+          "上次追问未完成；为避免重复模型调用，请使用新的请求重新提交",
+          409,
+          true,
+        );
+        const failedAt = now().toISOString();
+        await failMutation(runId, identity, interrupted, (current, safe) => {
+          const nextReadings = normalizeReadings(current);
+          const nextPaper = normalizePaperState(
+            nextReadings.papers[paperId],
+            document.revision,
+          );
+          nextReadings.papers[paperId] = {
+            ...nextPaper,
+            questions: nextPaper.questions.map((item) => (
+              item.id === existing.id
+                ? {
+                    ...item,
+                    status: "failed",
+                    error: safe,
+                    answered_at: failedAt,
+                  }
+                : item
+            )),
+            updated_at: failedAt,
+          };
+          return { readings: nextReadings };
+        });
+        await runStore.appendEvent(runId, {
+          type: "reading_question_interrupted",
+          paper_id: paperId,
+          stage,
+          question_id: existing.id,
+          client_request_id: requestId,
+          at: failedAt,
+        });
+        throw interrupted;
+      }
+      if (existing.status === "answered") {
+        await update(runId, (current) => completedMutationPatch(
+          current,
+          identity,
+          {},
+          { paper_id: paperId, question_id: existing.id },
+        ));
+        return getReading(runId, paperId);
+      }
+      if (existing.status === "failed") {
+        throw storedMutationError({
+          error: existing.error,
+        });
+      }
+      return getReading(runId, paperId);
+    }
     const stageState = paperState.stages[stage];
     if (stageState.status !== "ready") {
       throw readingError("READING_STAGE_NOT_READY", "当前阶段完成后才能提交追问");
@@ -2135,51 +3008,89 @@ export function createReadingService({
           )),
           updated_at: answeredAt,
         };
-        return { readings: nextReadings };
+        return completedMutationPatch(current, identity, {
+          readings: nextReadings,
+        }, {
+          paper_id: paperId,
+          question_id: questionId,
+          content_hash: artifact.content_hash,
+        });
       }, {
         type: "reading_question_answered",
         paper_id: paperId,
         stage,
         question_id: questionId,
+        client_request_id: requestId,
       });
       return getReading(runId, paperId);
     } catch (error) {
       const safeError = publicError(error);
-      await update(runId, (current) => {
+      const failedAt = now().toISOString();
+      await failMutation(runId, identity, error, (current, ledgerError) => {
         const nextReadings = normalizeReadings(current);
         const nextPaper = normalizePaperState(nextReadings.papers[paperId], document.revision);
         nextReadings.papers[paperId] = {
           ...nextPaper,
           questions: nextPaper.questions.map((item) => (
             item.id === questionId
-              ? { ...item, status: "failed", error: safeError }
+              ? {
+                  ...item,
+                  status: "failed",
+                  error: ledgerError,
+                  answered_at: failedAt,
+                }
               : item
           )),
+          updated_at: failedAt,
         };
         return { readings: nextReadings };
-      }, {
+      });
+      await runStore.appendEvent(runId, {
         type: "reading_question_failed",
         paper_id: paperId,
         stage,
         question_id: questionId,
         error: safeError,
+        client_request_id: requestId,
+        at: failedAt,
       });
       throw error;
     }
   }
 
-  function askQuestion(runId, paperId, options) {
-    const requestId = options?.clientRequestId ?? null;
-    const key = requestId
-      ? `${runId}:${paperId}:question:${requestId}`
-      : null;
-    if (key && inFlight.has(key)) return inFlight.get(key);
-    const operation = askQuestionUnlocked(runId, paperId, options)
-      .finally(() => {
-        if (key) inFlight.delete(key);
-      });
-    if (key) inFlight.set(key, operation);
-    return operation;
+  async function askQuestion(runId, paperId, options) {
+    const normalized = {
+      ...options,
+      text: typeof options?.text === "string" ? options.text.trim() : "",
+      blockId: options?.blockId ?? null,
+      providerId: options?.providerId ?? defaultProviderId,
+      modelId: options?.modelId ?? defaultModelId,
+    };
+    const identity = mutationIdentity(
+      "reading.create_question",
+      options?.clientRequestId,
+      {
+        run_id: runId,
+        paper_id: paperId,
+        stage: normalized.stage ?? null,
+        text: normalized.text,
+        block_id: normalized.blockId,
+        provider_id: normalized.providerId,
+        model_id: normalized.modelId,
+      },
+    );
+    return withDurableMutation(runId, identity, {
+      replay: () => getReading(runId, paperId),
+      execute: ({ resuming }) => askQuestionUnlocked(
+        runId,
+        paperId,
+        {
+          ...normalized,
+          clientRequestId: identity.clientRequestId,
+        },
+        { identity, resuming },
+      ),
+    });
   }
 
   async function savePosition(runId, paperId, { mode, blockId } = {}) {
@@ -2302,9 +3213,12 @@ export function createReadingService({
   }
 
   return Object.freeze({
+    assertCanonicalForArchive,
     askQuestion,
     generateStage,
     getReading,
+    pinConclusion,
+    promoteConversation,
     restartFromGuide,
     resetPaperReading,
     createConversation,
@@ -2313,5 +3227,6 @@ export function createReadingService({
     savePosition,
     sendChatMessage,
     setDecisions,
+    unpinConclusion,
   });
 }

@@ -6,6 +6,7 @@ import test from "node:test";
 import { createRunStore } from "./runStore.js";
 import { createReadingService } from "./readingService.js";
 import {
+  generateReadingFollowUp,
   generateReadingStage,
   READING_STAGE_ORDER,
 } from "./readingGenerator.js";
@@ -62,6 +63,7 @@ function paperDocument() {
 
 async function setup({
   stageGenerator,
+  followUpGenerator,
   chatGenerator,
   chatPreparer,
   getProjectContext,
@@ -118,6 +120,7 @@ async function setup({
     },
     modelMode: "fixture",
     stageGenerator,
+    followUpGenerator,
     chatGenerator,
     chatPreparer,
     now: () => new Date("2026-07-23T09:00:00.000Z"),
@@ -176,16 +179,20 @@ test("collect-only decisions go directly to preview readiness without creating r
   assert.deepEqual(decided.readings.paper_ids, []);
 });
 
-test("core reading lenses are free-order, while project synthesis waits for all three", async () => {
+test("all four reading lenses are free-order while archival coverage still needs all four", async () => {
   const { service, runId } = await setup();
   await service.setDecisions(runId, { [paper.paper_id]: "read" });
 
-  const methodFirst = await service.generateStage(runId, paper.paper_id, "method");
-  assert.equal(methodFirst.stages.method.status, "ready");
-  await assert.rejects(
-    service.generateStage(runId, paper.paper_id, "project-relation"),
-    (error) => error.code === "READING_STAGE_ORDER_INVALID",
+  const projectFirst = await service.generateStage(
+    runId,
+    paper.paper_id,
+    "project-relation",
   );
+  assert.equal(projectFirst.stages["project-relation"].status, "ready");
+  assert.equal(projectFirst.status, "reading");
+  const methodSecond = await service.generateStage(runId, paper.paper_id, "method");
+  assert.equal(methodSecond.stages.method.status, "ready");
+  assert.equal(methodSecond.status, "reading");
   await assert.rejects(
     service.setDecisions(runId, { [paper.paper_id]: "collect" }),
     (error) => error.code === "PAPER_DECISION_LOCKED",
@@ -193,7 +200,7 @@ test("core reading lenses are free-order, while project synthesis waits for all 
 });
 
 test("restarting from the guide preserves the guide and clears unfinished reading state", async () => {
-  const { store, service, runId } = await setup();
+  const { store, service, runId, makeService } = await setup();
   await service.setDecisions(runId, { [paper.paper_id]: "read" });
   await service.generateStage(runId, paper.paper_id, "research-question");
   await service.savePosition(runId, paper.paper_id, {
@@ -201,7 +208,12 @@ test("restarting from the guide preserves the guide and clears unfinished readin
     blockId: paperDocument().blocks[5].block_id,
   });
 
-  const restarted = await service.restartFromGuide(runId);
+  await assert.rejects(
+    service.restartFromGuide(runId),
+    (error) => error.code === "JOURNAL_MUTATION_REQUEST_ID_REQUIRED",
+  );
+  const restartRequest = { clientRequestId: "restart-reading-1" };
+  const restarted = await service.restartFromGuide(runId, restartRequest);
   assert.equal(restarted.status, "review_ready");
   assert.equal(restarted.phase, "candidate_review");
   assert.equal(restarted.guides.status, "ready");
@@ -217,6 +229,19 @@ test("restarting from the guide preserves the guide and clears unfinished readin
   });
   assert.equal(restarted.reading_restart.from_step, "candidates");
   assert.equal(typeof restarted.reading_restart.revision, "string");
+  const replayed = await makeService().restartFromGuide(runId, restartRequest);
+  assert.equal(
+    replayed.reading_restart.revision,
+    restarted.reading_restart.revision,
+  );
+  assert.equal(
+    (await store.getRun(runId)).journal_mutations.entries["restart-reading-1"].status,
+    "completed",
+  );
+  await assert.rejects(
+    makeService().createConversation(runId, paper.paper_id, restartRequest),
+    (error) => error.code === "JOURNAL_MUTATION_REQUEST_CONFLICT",
+  );
 
   // Returning to the weekly candidates means decisions need guide_ready again before reading resumes.
   await store.updateRun(runId, { status: "guide_ready", phase: "guide_review" });
@@ -232,17 +257,33 @@ test("restarting from the guide preserves the guide and clears unfinished readin
     },
   });
   await assert.rejects(
-    service.restartFromGuide(runId),
+    service.restartFromGuide(runId, {
+      clientRequestId: "restart-reading-blocked",
+    }),
     (error) => error.code === "READING_RESTART_EXTERNAL_STATE",
   );
 });
 
 test("questions and reading position persist with validated block anchors", async () => {
-  const { service, runId } = await setup();
+  let generationCount = 0;
+  const { store, service, runId, makeService } = await setup({
+    followUpGenerator: async (options) => {
+      generationCount += 1;
+      return generateReadingFollowUp(options);
+    },
+  });
   await service.setDecisions(runId, { [paper.paper_id]: "read" });
   await service.generateStage(runId, paper.paper_id, "research-question");
   const blockId = paperDocument().blocks[4].block_id;
 
+  await assert.rejects(
+    service.askQuestion(runId, paper.paper_id, {
+      stage: "research-question",
+      text: "缺少稳定请求标识",
+      blockId,
+    }),
+    (error) => error.code === "JOURNAL_MUTATION_REQUEST_ID_REQUIRED",
+  );
   const answered = await service.askQuestion(runId, paper.paper_id, {
     stage: "research-question",
     text: "作者真正要解决的矛盾是什么？",
@@ -256,11 +297,40 @@ test("questions and reading position persist with validated block anchors", asyn
 
   const duplicate = await service.askQuestion(runId, paper.paper_id, {
     stage: "research-question",
-    text: "重复请求不应再次生成",
+    text: "作者真正要解决的矛盾是什么？",
     blockId,
     clientRequestId: "client-question-1",
   });
   assert.equal(duplicate.questions.length, 1);
+  assert.equal(generationCount, 1);
+
+  const restoredDuplicate = await makeService({
+    followUpGenerator: async (options) => {
+      generationCount += 1;
+      return generateReadingFollowUp(options);
+    },
+  }).askQuestion(runId, paper.paper_id, {
+    stage: "research-question",
+    text: "作者真正要解决的矛盾是什么？",
+    blockId,
+    clientRequestId: "client-question-1",
+  });
+  assert.equal(restoredDuplicate.questions.length, 1);
+  assert.equal(generationCount, 1);
+  assert.equal(
+    (await store.getRun(runId)).journal_mutations.entries["client-question-1"].status,
+    "completed",
+  );
+
+  await assert.rejects(
+    service.askQuestion(runId, paper.paper_id, {
+      stage: "research-question",
+      text: "相同请求标识不得承载另一道问题",
+      blockId,
+      clientRequestId: "client-question-1",
+    }),
+    (error) => error.code === "JOURNAL_MUTATION_REQUEST_CONFLICT",
+  );
 
   await service.savePosition(runId, paper.paper_id, {
     mode: "focused",
@@ -279,6 +349,59 @@ test("questions and reading position persist with validated block anchors", asyn
   }), (error) => error.code === "READING_BLOCK_NOT_FOUND");
 });
 
+test("an interrupted durable question never repeats the paid generator after restart", async () => {
+  let generationCount = 0;
+  let markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  const neverCompletes = new Promise(() => {});
+  const { store, service, runId, makeService } = await setup({
+    followUpGenerator: async () => {
+      generationCount += 1;
+      markStarted();
+      return neverCompletes;
+    },
+  });
+  await service.setDecisions(runId, { [paper.paper_id]: "read" });
+  await service.generateStage(runId, paper.paper_id, "research-question");
+  const options = {
+    stage: "research-question",
+    text: "这次调用在模型返回前中断",
+    blockId: paperDocument().blocks[4].block_id,
+    clientRequestId: "client-question-interrupted",
+  };
+  void service.askQuestion(runId, paper.paper_id, options);
+  await started;
+  assert.equal(
+    (await store.getRun(runId)).journal_mutations.entries[
+      options.clientRequestId
+    ].status,
+    "in_flight",
+  );
+
+  const restored = makeService({
+    followUpGenerator: async (generatorOptions) => {
+      generationCount += 1;
+      return generateReadingFollowUp(generatorOptions);
+    },
+  });
+  await assert.rejects(
+    restored.askQuestion(runId, paper.paper_id, options),
+    (error) => error.code === "READING_QUESTION_INTERRUPTED",
+  );
+  assert.equal(generationCount, 1);
+  const recovered = await store.getRun(runId);
+  assert.equal(
+    recovered.journal_mutations.entries[options.clientRequestId].status,
+    "failed",
+  );
+  assert.equal(
+    recovered.readings.papers[paper.paper_id].questions[0].status,
+    "failed",
+  );
+});
+
 test("paper chat is explicit, selection-anchored, durable, and idempotent", async () => {
   let generatorCalls = 0;
   const { service, runId } = await setup({
@@ -293,6 +416,7 @@ test("paper chat is explicit, selection-anchored, durable, and idempotent", asyn
   const start = block.text.indexOf(selected);
   const options = {
     text: "把这部分翻译成中文。",
+    roundId: "orientation",
     reference: {
       document_revision: paperDocument().revision,
       block_id: block.block_id,
@@ -313,6 +437,8 @@ test("paper chat is explicit, selection-anchored, durable, and idempotent", asyn
   assert.equal(answered.chat.turns[0].citations[0].block_id, block.block_id);
   assert.equal(answered.chat.turns[0].provider_id, "deepseek");
   assert.equal(answered.chat.turns[0].model_id, "deepseek-v4-flash");
+  assert.equal(answered.chat.turns[0].round_id, "orientation");
+  assert.equal(answered.chat.turns[0].audit_only, false);
   assert.equal(answered.questions.length, 0);
 
   const duplicate = await service.sendChatMessage(runId, paper.paper_id, options);
@@ -320,8 +446,101 @@ test("paper chat is explicit, selection-anchored, durable, and idempotent", asyn
   assert.equal(duplicate.chat.turns.length, 1);
 });
 
+test("legacy guided-reading prompts recover their durable round id", async () => {
+  const { store, service, runId, makeService } = await setup();
+  await service.setDecisions(runId, { [paper.paper_id]: "read" });
+  await service.sendChatMessage(runId, paper.paper_id, {
+    text: "第 1 步 · 领域定位。只回答一个问题：这篇论文属于哪个研究领域？",
+    roundId: "field",
+    clientRequestId: "client-legacy-round-1",
+  });
+
+  const stored = await store.getRun(runId);
+  stored.readings.papers[paper.paper_id].chat.turns[0].round_id = null;
+  await store.updateRun(runId, { readings: stored.readings });
+
+  const restored = await makeService().getReading(runId, paper.paper_id);
+  assert.equal(restored.chat.turns[0].round_id, "field");
+});
+
+test("legacy short answers remain auditable but never re-enter reading context", async () => {
+  const observedHistory = [];
+  const { service, runId } = await setup({
+    chatGenerator: async (options) => {
+      const generated = await generateReadingChatMessage(options);
+      return {
+        ...generated,
+        result: {
+          ...generated.result,
+          answer: "待核验",
+        },
+      };
+    },
+    chatPreparer: (options) => {
+      observedHistory.push(structuredClone(options.recentTurns ?? []));
+      return prepareReadingChatMessage(options);
+    },
+  });
+  await service.setDecisions(runId, { [paper.paper_id]: "read" });
+  const first = await service.sendChatMessage(runId, paper.paper_id, {
+    text: "第一轮历史回答。",
+    clientRequestId: "client-short-audit-1",
+  });
+  assert.equal(first.chat.turns[0].answer, "待核验");
+  assert.equal(first.chat.turns[0].audit_only, true);
+
+  await service.sendChatMessage(runId, paper.paper_id, {
+    text: "第二轮不应看到占位回答。",
+    clientRequestId: "client-short-audit-2",
+  });
+  assert.deepEqual(observedHistory.at(-1), []);
+});
+
+test("legacy test turns and leaked internal fields stay audit-only", async () => {
+  let generated = 0;
+  const observedHistory = [];
+  const { service, runId } = await setup({
+    chatGenerator: async (options) => {
+      generated += 1;
+      const artifact = await generateReadingChatMessage(options);
+      const answer = generated === 1
+        ? "测试换行已经完成，现在可以继续正常阅读论文。"
+        : generated === 2
+          ? "上一轮回答错误地暴露了 `recent_turns` 内部字段，不能进入阅读上下文。"
+          : artifact.result.answer;
+      return {
+        ...artifact,
+        result: { ...artifact.result, answer },
+      };
+    },
+    chatPreparer: (options) => {
+      observedHistory.push(structuredClone(options.recentTurns ?? []));
+      return prepareReadingChatMessage(options);
+    },
+  });
+  await service.setDecisions(runId, { [paper.paper_id]: "read" });
+
+  const first = await service.sendChatMessage(runId, paper.paper_id, {
+    text: "测试换行",
+    clientRequestId: "client-legacy-test-turn-1",
+  });
+  assert.equal(first.chat.turns[0].audit_only, true);
+
+  const second = await service.sendChatMessage(runId, paper.paper_id, {
+    text: "上一题答案是什么？",
+    clientRequestId: "client-legacy-test-turn-2",
+  });
+  assert.equal(second.chat.turns[1].audit_only, true);
+
+  await service.sendChatMessage(runId, paper.paper_id, {
+    text: "请重新概括论文的核心贡献。",
+    clientRequestId: "client-legacy-test-turn-3",
+  });
+  assert.deepEqual(observedHistory.at(-1), []);
+});
+
 test("paper chat supports multiple conversations with preserved history and switching", async () => {
-  const { service, runId } = await setup();
+  const { service, runId, makeService } = await setup();
   await service.setDecisions(runId, { [paper.paper_id]: "read" });
 
   const first = await service.sendChatMessage(runId, paper.paper_id, {
@@ -335,7 +554,16 @@ test("paper chat supports multiple conversations with preserved history and swit
   assert.equal(first.conversations.length, 1);
 
   // New conversation archives the first and starts empty.
-  const created = await service.createConversation(runId, paper.paper_id);
+  await assert.rejects(
+    service.createConversation(runId, paper.paper_id),
+    (error) => error.code === "JOURNAL_MUTATION_REQUEST_ID_REQUIRED",
+  );
+  const branchRequest = { clientRequestId: "create-reading-branch-1" };
+  const created = await service.createConversation(
+    runId,
+    paper.paper_id,
+    branchRequest,
+  );
   assert.equal(created.chat.turns.length, 0);
   assert.equal(created.conversations.length, 2);
   assert.equal(created.conversations[0].active, true);
@@ -343,6 +571,13 @@ test("paper chat supports multiple conversations with preserved history and swit
   assert.ok(archivedEntry, "first conversation should be archived");
   assert.equal(archivedEntry.turn_count, 1);
   assert.notEqual(created.active_conversation_id, archivedEntry.id);
+  const replayed = await makeService().createConversation(
+    runId,
+    paper.paper_id,
+    branchRequest,
+  );
+  assert.equal(replayed.active_conversation_id, created.active_conversation_id);
+  assert.equal(replayed.conversations.length, created.conversations.length);
 
   // Second conversation gets its own turn.
   const second = await service.sendChatMessage(runId, paper.paper_id, {
@@ -365,6 +600,176 @@ test("paper chat supports multiple conversations with preserved history and swit
   await assert.rejects(
     service.switchConversation(runId, paper.paper_id, "conversation-does-not-exist"),
     (error) => error.code === "READING_CONVERSATION_NOT_FOUND",
+  );
+});
+
+test("scratch reading branches persist their checkpoint and must be promoted before archive", async () => {
+  const { service, runId, makeService } = await setup();
+  await service.setDecisions(runId, { [paper.paper_id]: "read" });
+  const canonical = await service.sendChatMessage(runId, paper.paper_id, {
+    text: "这篇论文最重要的结论是什么？",
+    reference: null,
+    clientRequestId: "client-branch-canonical",
+  });
+  const canonicalId = canonical.active_conversation_id;
+  const canonicalTurnId = canonical.chat.turns[0].id;
+  assert.equal(canonical.chat.branch_type, "canonical");
+  assert.equal(canonical.canonical_conversation_id, canonicalId);
+
+  const scratch = await service.createConversation(
+    runId,
+    paper.paper_id,
+    { clientRequestId: "create-scratch-branch-1" },
+  );
+  const scratchId = scratch.active_conversation_id;
+  assert.equal(scratch.chat.branch_type, "scratch");
+  assert.equal(scratch.chat.promotion_status, "not_promoted");
+  assert.deepEqual(scratch.chat.parent_checkpoint, {
+    conversation_id: canonicalId,
+    turn_id: canonicalTurnId,
+    turn_count: 1,
+    checkpoint_hash: scratch.chat.parent_checkpoint.checkpoint_hash,
+    created_at: "2026-07-23T09:00:00.000Z",
+  });
+  assert.equal(
+    scratch.chat.parent_checkpoint.checkpoint_hash.startsWith("sha256:"),
+    true,
+  );
+  await assert.rejects(
+    service.assertCanonicalForArchive(runId),
+    (error) => error.code === "READING_SCRATCH_ARCHIVE_BLOCKED",
+  );
+
+  const restoredService = makeService();
+  const restoredScratch = await restoredService.getReading(runId, paper.paper_id);
+  assert.equal(restoredScratch.active_conversation_id, scratchId);
+  assert.equal(restoredScratch.chat.branch_type, "scratch");
+  assert.equal(
+    restoredScratch.chat.parent_checkpoint.conversation_id,
+    canonicalId,
+  );
+
+  const promoted = await restoredService.promoteConversation(
+    runId,
+    paper.paper_id,
+    scratchId,
+    {
+      clientRequestId: "client-promote-scratch",
+      confirmedBy: "local-user",
+    },
+  );
+  assert.equal(promoted.chat.branch_type, "canonical");
+  assert.equal(promoted.chat.promotion_status, "promoted");
+  assert.equal(promoted.canonical_conversation_id, scratchId);
+  assert.equal(
+    promoted.conversations.find((entry) => entry.id === canonicalId)
+      .promotion_status,
+    "superseded",
+  );
+  await restoredService.assertCanonicalForArchive(runId);
+
+  await restoredService.switchConversation(runId, paper.paper_id, canonicalId);
+  await assert.rejects(
+    restoredService.assertCanonicalForArchive(runId),
+    (error) => error.code === "READING_SCRATCH_ARCHIVE_BLOCKED",
+  );
+});
+
+test("answered turns become durable PinnedConclusions without approving any write", async () => {
+  const { store, service, runId, makeService } = await setup();
+  await service.setDecisions(runId, { [paper.paper_id]: "read" });
+  const block = paperDocument().blocks[4];
+  const selected = "evidence paragraph";
+  const start = block.text.indexOf(selected);
+  const answered = await service.sendChatMessage(runId, paper.paper_id, {
+    text: "固定这一结论供归档综合使用。",
+    reference: {
+      document_revision: paperDocument().revision,
+      block_id: block.block_id,
+      start_offset: start,
+      end_offset: start + selected.length,
+    },
+    clientRequestId: "client-pin-source-turn",
+  });
+  const turnId = answered.chat.turns[0].id;
+
+  const pinned = await service.pinConclusion(runId, paper.paper_id, turnId, {
+    clientRequestId: "client-pin-conclusion",
+    confirmedBy: "local-user",
+  });
+  assert.equal(pinned.pinned_conclusions.length, 1);
+  const conclusion = pinned.pinned_conclusions[0];
+  assert.equal(conclusion.source_turn_id, turnId);
+  assert.equal(conclusion.source_conversation_id, pinned.active_conversation_id);
+  assert.equal(conclusion.confirmed_by, "local-user");
+  assert.equal(conclusion.status, "pinned");
+  assert.equal(conclusion.content, answered.chat.turns[0].answer);
+  assert.equal(conclusion.citations.length > 0, true);
+  assert.equal(conclusion.citations[0].block_id, block.block_id);
+
+  const runAfterPin = await store.getRun(runId);
+  assert.equal(runAfterPin.status, "reading");
+  assert.equal(runAfterPin.zotero.status, "not_started");
+  assert.equal(runAfterPin.obsidian, undefined);
+  assert.equal(runAfterPin.project_state, undefined);
+  assert.equal(runAfterPin.archive_batch, undefined);
+
+  const restored = await makeService().getReading(runId, paper.paper_id);
+  assert.equal(restored.pinned_conclusions[0].status, "pinned");
+  assert.deepEqual(
+    restored.pinned_conclusions[0].citations,
+    conclusion.citations,
+  );
+
+  const unpinned = await makeService().unpinConclusion(
+    runId,
+    paper.paper_id,
+    conclusion.conclusion_id,
+    {
+      clientRequestId: "client-unpin-conclusion",
+      confirmedBy: "local-user",
+    },
+  );
+  assert.equal(unpinned.pinned_conclusions[0].status, "unpinned");
+  assert.equal(
+    (await store.getRun(runId)).archive_batch,
+    undefined,
+  );
+});
+
+test("an answer without verified citations cannot become a PinnedConclusion", async () => {
+  const { service, runId } = await setup({
+    chatGenerator: async (options) => {
+      const generated = await generateReadingChatMessage(options);
+      return {
+        ...generated,
+        result: {
+          ...generated.result,
+          citations: [],
+        },
+      };
+    },
+  });
+  await service.setDecisions(runId, { [paper.paper_id]: "read" });
+  const answered = await service.sendChatMessage(runId, paper.paper_id, {
+    text: "给出没有引用的回答。",
+    clientRequestId: "client-pin-without-citation-source",
+  });
+  await assert.rejects(
+    service.pinConclusion(
+      runId,
+      paper.paper_id,
+      answered.chat.turns[0].id,
+      {
+        clientRequestId: "client-pin-without-citation",
+        confirmedBy: "local-user",
+      },
+    ),
+    (error) => error.code === "PINNED_CONCLUSION_CITATIONS_REQUIRED",
+  );
+  assert.deepEqual(
+    (await service.getReading(runId, paper.paper_id)).pinned_conclusions,
+    [],
   );
 });
 
@@ -400,6 +805,7 @@ test("paper chat rejects a reused request id when any paid input changes", async
       },
     },
     { ...request, includeProjectContext: true },
+    { ...request, roundId: "orientation" },
     { ...request, providerId: "deepseek" },
     { ...request, modelId: "another-model" },
   ];
@@ -783,13 +1189,32 @@ test("deleting one paper's reading record withdraws the decision and returns it 
     blockId: paperDocument().blocks[5].block_id,
   });
 
-  const reset = await service.resetPaperReading(runId, paper.paper_id);
+  await assert.rejects(
+    service.resetPaperReading(runId, paper.paper_id),
+    (error) => error.code === "JOURNAL_MUTATION_REQUEST_ID_REQUIRED",
+  );
+  const resetRequest = { clientRequestId: "reset-reading-1" };
+  const reset = await service.resetPaperReading(
+    runId,
+    paper.paper_id,
+    resetRequest,
+  );
   assert.equal(reset.status, "guide_ready");
   assert.equal(reset.phase, "guide_review");
   assert.deepEqual(reset.paper_decisions, {});
   assert.deepEqual(reset.readings.paper_ids, []);
   assert.equal(reset.readings.status, "not_started");
   assert.equal(reset.readings.papers[paper.paper_id], undefined);
+  const replayed = await service.resetPaperReading(
+    runId,
+    paper.paper_id,
+    resetRequest,
+  );
+  assert.deepEqual(replayed.paper_decisions, reset.paper_decisions);
+  assert.equal(
+    replayed.journal_mutations.entries["reset-reading-1"].status,
+    "completed",
+  );
 
   // The paper can be chosen again and starts a completely fresh reading.
   await service.setDecisions(runId, { [paper.paper_id]: "read" });
@@ -807,7 +1232,11 @@ test("deleting a fully read paper's record steps the run back from draft_ready",
   }
   assert.equal((await store.getRun(runId)).status, "draft_ready");
 
-  const reset = await service.resetPaperReading(runId, paper.paper_id);
+  const reset = await service.resetPaperReading(
+    runId,
+    paper.paper_id,
+    { clientRequestId: "reset-complete-reading-1" },
+  );
   assert.equal(reset.status, "guide_ready");
   assert.equal(reset.phase, "guide_review");
   assert.equal(reset.readings.status, "not_started");
@@ -817,7 +1246,9 @@ test("deleting a fully read paper's record steps the run back from draft_ready",
 test("paper reading reset is blocked after external writes begin or without a read decision", async () => {
   const { store, service, runId } = await setup();
   await assert.rejects(
-    service.resetPaperReading(runId, paper.paper_id),
+    service.resetPaperReading(runId, paper.paper_id, {
+      clientRequestId: "reset-reading-not-selected",
+    }),
     (error) => error.code === "READING_RESET_NOT_ALLOWED",
   );
 
@@ -829,7 +1260,9 @@ test("paper reading reset is blocked after external writes begin or without a re
     },
   });
   await assert.rejects(
-    service.resetPaperReading(runId, paper.paper_id),
+    service.resetPaperReading(runId, paper.paper_id, {
+      clientRequestId: "reset-reading-external-state",
+    }),
     (error) => error.code === "READING_RESET_EXTERNAL_STATE",
   );
 });

@@ -127,14 +127,14 @@ test("live project workbench renders the honest empty states without starting wo
     assert.match(emptyConversationHtml, /命令显式运行/);
     assert.match(emptyConversationHtml, /只有显式发送才开始工作/);
     assert.match(emptyConversationHtml, /添加文件/);
-    assert.match(emptyConversationHtml, /上传 PDF/);
-    assert.match(emptyConversationHtml, /MinerU Cloud/);
+    assert.match(emptyConversationHtml, /添加资料/);
+    assert.doesNotMatch(emptyConversationHtml, /MinerU Cloud|上传 PDF/);
     assert.doesNotMatch(emptyConversationHtml, /aria-label="项目工件"/);
     assert.doesNotMatch(emptyConversationHtml, /Zotero|Obsidian|阅读镜头/);
   });
 });
 
-test("PDF state stays visible while MinerU parses without marking the Agent as running", async () => {
+test("paper material parsing stays visible without exposing the parser or marking the Agent as running", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench, hasProcessingDocuments }) => {
     const parsing = conversation({
       documents: [{
@@ -153,7 +153,8 @@ test("PDF state stays visible while MinerU parses without marking the Agent as r
       { project, conversation: parsing },
     ));
     assert.match(parsingHtml, /开发手册\.pdf/);
-    assert.match(parsingHtml, /正在由 MinerU 解析/);
+    assert.match(parsingHtml, /正在解析资料/);
+    assert.doesNotMatch(parsingHtml, /MinerU Cloud/);
     assert.match(parsingHtml, /等待任务/);
     assert.doesNotMatch(parsingHtml, /Agent 正在工作/);
 
@@ -327,6 +328,236 @@ test("manual context compaction waits for the first assistant reply", async () =
   });
 });
 
+test("execution policy control offers only confirmation and safe auto-review modes", async () => {
+  await withLiveWorkbench(({ ProjectExecutionPolicyControl }) => {
+    const changes = [];
+    const control = ProjectExecutionPolicyControl({
+      open: true,
+      onOpenChange: () => {},
+      executionPolicy: {
+        mode: "manual_review",
+        revision: 2,
+        policyVersion: 1,
+      },
+      running: false,
+      saving: false,
+      onChange: (mode) => changes.push(mode),
+    });
+    const html = renderToStaticMarkup(control);
+    assert.match(html, /工作权限/);
+    assert.match(html, /需确认/);
+    assert.match(html, /替我审批/);
+    assert.match(html, /高风险操作直接阻止/);
+    assert.doesNotMatch(html, /完全访问/);
+
+    const autoReviewOption = findElement(
+      control,
+      (element) => (
+        element.props.role === "radio"
+        && element.props["aria-checked"] === false
+      ),
+    );
+    autoReviewOption.props.onClick();
+    assert.deepEqual(changes, ["auto_review"]);
+
+    const runningHtml = renderToStaticMarkup(React.createElement(
+      ProjectExecutionPolicyControl,
+      {
+        open: true,
+        onOpenChange: () => {},
+        executionPolicy: { mode: "auto_review", revision: 3 },
+        running: true,
+        onChange: () => {},
+      },
+    ));
+    assert.match(runningHtml, /Agent 工作期间不能更改权限/);
+    assert.match(runningHtml, /disabled=""/);
+    assert.doesNotMatch(runningHtml, /role="dialog"/);
+  });
+});
+
+test("preview artifact confirms manual startup and exposes only a ready loopback URL", async () => {
+  await withLiveWorkbench(({ PreviewArtifact }) => {
+    const requestHash = `sha256:${"0123456789abcdef".repeat(4)}`;
+    let starts = 0;
+    const manualPreview = {
+      id: "preview-manual-1",
+      status: "requested",
+      executionPolicyMode: "manual_review",
+      confirmationRequired: true,
+      requestHash,
+      recipe: {
+        runtime: "vite",
+        cwd: "apps/web",
+        route: "/reader/",
+        command: {
+          argv: [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "<assigned-loopback-port>",
+            "--strictPort",
+          ],
+        },
+      },
+    };
+    const manualPanel = React.createElement(PreviewArtifact, {
+      preview: manualPreview,
+      onStart: () => {
+        starts += 1;
+      },
+    });
+    const manualHtml = renderToStaticMarkup(manualPanel);
+    assert.match(manualHtml, /等待你确认/);
+    assert.match(manualHtml, /核对本机预览/);
+    assert.match(manualHtml, /Vite 开发预览/);
+    assert.match(manualHtml, /apps\/web/);
+    assert.match(manualHtml, /\[&quot;--host&quot;,&quot;127\.0\.0\.1&quot;/);
+    assert.match(manualHtml, /01234567…89abcdef/);
+    assert.match(manualHtml, /确认启动本机预览/);
+    assert.match(manualHtml, /不会安装依赖或运行其他命令/);
+    assert.doesNotMatch(manualHtml, /sha256:|requestHash|\/Users\//);
+
+    const startButton = findElement(
+      PreviewArtifact({
+        preview: manualPreview,
+        onStart: () => {
+          starts += 1;
+        },
+      }),
+      (node) => (
+        node.type === "button"
+        && React.Children.toArray(node.props.children).includes("确认启动本机预览")
+      ),
+    );
+    assert.ok(startButton);
+    assert.equal(startButton.props.disabled, false);
+    startButton.props.onClick();
+    assert.equal(starts, 1);
+
+    const readyHtml = renderToStaticMarkup(React.createElement(
+      PreviewArtifact,
+      {
+        preview: {
+          status: "ready",
+          url: "http://127.0.0.1:48080/reader/",
+          title: "读者端",
+        },
+      },
+    ));
+    assert.match(readyHtml, /本机预览已就绪/);
+    assert.match(readyHtml, /在浏览器打开/);
+    assert.match(readyHtml, /http:\/\/127\.0\.0\.1:48080\/reader\//);
+    assert.match(
+      readyHtml,
+      /sandbox="allow-scripts allow-same-origin allow-forms"/,
+    );
+
+    const startingHtml = renderToStaticMarkup(React.createElement(
+      PreviewArtifact,
+      {
+        preview: {
+          status: "starting",
+          url: null,
+          title: "读者端",
+        },
+      },
+    ));
+    assert.match(startingHtml, /正在启动本机预览/);
+    assert.match(startingHtml, /无需手动运行命令/);
+    assert.doesNotMatch(startingHtml, /<iframe/);
+
+    const unsafeHtml = renderToStaticMarkup(React.createElement(
+      PreviewArtifact,
+      {
+        preview: {
+          status: "ready",
+          url: "https://example.com/",
+          title: "外部页面",
+        },
+      },
+    ));
+    assert.doesNotMatch(unsafeHtml, /<iframe|example\.com/);
+
+    const autoRequestedHtml = renderToStaticMarkup(React.createElement(
+      PreviewArtifact,
+      {
+        preview: {
+          ...manualPreview,
+          executionPolicyMode: "auto_review",
+          confirmationRequired: false,
+        },
+        onStart: () => {
+          starts += 1;
+        },
+      },
+    ));
+    assert.match(autoRequestedHtml, /等待自动安全判断/);
+    assert.match(autoRequestedHtml, /页面不会自行发起启动/);
+    assert.doesNotMatch(autoRequestedHtml, /确认启动本机预览/);
+    assert.equal(starts, 1);
+
+    const unsafeRequestHtml = renderToStaticMarkup(React.createElement(
+      PreviewArtifact,
+      {
+        preview: {
+          ...manualPreview,
+          recipe: {
+            ...manualPreview.recipe,
+            cwd: "/Users/example/private-project",
+            command: {
+              argv: ["--config", "/Users/example/private-project/vite.config.js"],
+            },
+          },
+        },
+        onStart() {},
+      },
+    ));
+    assert.match(unsafeRequestHtml, /预览信息不完整或无法安全显示/);
+    assert.match(unsafeRequestHtml, /disabled=""/);
+    assert.doesNotMatch(unsafeRequestHtml, /\/Users\/|private-project/);
+
+    const localErrorHtml = renderToStaticMarkup(React.createElement(
+      PreviewArtifact,
+      {
+        preview: manualPreview,
+        error: {
+          code: "PROJECT_WORK_PREVIEW_STALE",
+          message: "stale /Users/example/private-project",
+        },
+        onStart() {},
+      },
+    ));
+    assert.match(localErrorHtml, /预览请求已经变化，请重新核对当前面板后再确认/);
+    assert.doesNotMatch(localErrorHtml, /\/Users\/|private-project/);
+  });
+});
+
+test("manual preview uses the injected API only after an explicit hash-bound action", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  const actionStart = source.indexOf("const startPreview = useCallback");
+  const actionEnd = source.indexOf("const compactContext", actionStart);
+  const implementation = source.slice(actionStart, actionEnd);
+  const executorStart = source.indexOf("const executeAction = useCallback");
+  const executorEnd = source.indexOf("const activeProviderId", executorStart);
+  const executor = source.slice(executorStart, executorEnd);
+
+  assert.notEqual(actionStart, -1);
+  assert.match(implementation, /preview\?\.status !== "requested"/);
+  assert.match(implementation, /preview\.executionPolicyMode !== "manual_review"/);
+  assert.match(implementation, /preview\.confirmationRequired !== true/);
+  assert.match(implementation, /executeAction\("preview-start"/);
+  assert.match(implementation, /api\.startPreview/);
+  assert.match(implementation, /conversationId: snapshot\.id/);
+  assert.match(implementation, /previewId: preview\.id/);
+  assert.match(implementation, /requestHash: preview\.requestHash/);
+  assert.match(implementation, /setPreviewError/);
+  assert.equal((source.match(/api\.startPreview\(/g) ?? []).length, 1);
+  assert.doesNotMatch(implementation, /useEffect|window\.open|location\./);
+  assert.match(executor, /const nextSnapshot = await operation\(\)/);
+  assert.match(executor, /publishSnapshot\(nextSnapshot\)/);
+});
+
 test("composer thinking control exposes only model-supported Chinese levels", async () => {
   await withLiveWorkbench(({ ProjectThinkingLevelControl }) => {
     const availableHtml = renderToStaticMarkup(React.createElement(
@@ -489,6 +720,229 @@ test("message payload controls stay frozen until image serialization and HTTP fi
   });
 });
 
+test("durable ask-user renders text and choice questions without becoming write approval", async () => {
+  await withLiveWorkbench(({
+    ProjectAgentPane,
+    createAskUserAnswerDraft,
+    isAskUserAnswerComplete,
+    serializeAskUserAnswers,
+  }) => {
+    const request = {
+      id: "ask-user-1",
+      status: "pending",
+      source: "model_tool",
+      questions: [{
+        id: "scope",
+        label: "修改范围",
+        prompt: "需要处理哪些部分？",
+        kind: "multiple_choice",
+        required: true,
+        options: [{
+          id: "code",
+          label: "代码",
+          description: "修改实现文件",
+        }, {
+          id: "tests",
+          label: "测试",
+          description: "同步补充测试",
+        }],
+      }, {
+        id: "strategy",
+        prompt: "选择实现策略",
+        kind: "single_choice",
+        required: true,
+        options: [{
+          id: "small",
+          label: "最小改动",
+        }, {
+          id: "refactor",
+          label: "结构调整",
+        }],
+      }, {
+        id: "note",
+        prompt: "补充限制",
+        kind: "text",
+        required: false,
+        options: [],
+      }],
+      answers: [],
+    };
+    const html = renderToStaticMarkup(React.createElement(ProjectAgentPane, {
+      conversation: conversation({
+        status: "awaiting_user",
+        askUserRequests: [request],
+      }),
+      draft: "",
+      onDraftChange: () => {},
+      contextChips: [],
+      onRemoveContext: () => {},
+      selectedCapabilityIds: [],
+      onRemoveCapability: () => {},
+      selectedWorkflowId: null,
+      onRemoveWorkflow: () => {},
+      pendingImage: null,
+      onRemoveImage: () => {},
+      imageInputRef: { current: null },
+      onSelectImage: () => {},
+      supportsImages: false,
+      onSubmit: () => {},
+      onAbort: () => {},
+      onAnswerAskUser: () => {},
+      onCancelAskUser: () => {},
+      onOpenArtifact: () => {},
+      action: null,
+      error: null,
+      modelLabel: "deepseek-v4-flash",
+      thinkingLevelControl: null,
+      contextUsageControl: null,
+      pdfInputRef: { current: null },
+      uploadingPdf: null,
+      onUploadPdf: () => {},
+      onRetryDocument: () => {},
+      retryingDocumentId: null,
+    }));
+
+    assert.match(html, /Agent 等待你的决定/);
+    assert.match(html, /回答只用于明确任务需求，不代表批准任何文件修改/);
+    assert.match(html, /type="checkbox"/);
+    assert.match(html, /type="radio"/);
+    assert.match(html, /aria-label="补充限制"/);
+    assert.match(html, /请先回答 Agent 的问题/);
+    assert.match(html, /回答需求问题不会批准文件写入/);
+    assert.match(html, /<button class="project-agent-primary" type="submit" disabled="">/);
+
+    const initial = createAskUserAnswerDraft(request);
+    assert.equal(isAskUserAnswerComplete(request, initial), false);
+    const completed = {
+      ...initial,
+      scope: ["code", "tests"],
+      strategy: "small",
+      note: "  保持改动克制  ",
+    };
+    assert.equal(isAskUserAnswerComplete(request, completed), true);
+    assert.deepEqual(serializeAskUserAnswers(request, completed), [{
+      questionId: "scope",
+      value: ["code", "tests"],
+    }, {
+      questionId: "strategy",
+      value: "small",
+    }, {
+      questionId: "note",
+      value: "保持改动克制",
+    }]);
+  });
+});
+
+test("running composer keeps steer separate from the durable follow-up queue", async () => {
+  await withLiveWorkbench(({ ProjectAgentPane }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectAgentPane, {
+      conversation: conversation({
+        status: "running",
+        turnStatus: "running",
+        followUpQueue: [{
+          id: "follow-up-1",
+          text: "完成检查后再运行类型检查",
+          status: "queued",
+        }, {
+          id: "follow-up-old",
+          text: "已经处理的旧消息",
+          status: "delivered",
+        }],
+      }),
+      draft: "最后再检查 README",
+      onDraftChange: () => {},
+      contextChips: [],
+      onRemoveContext: () => {},
+      selectedCapabilityIds: [],
+      onRemoveCapability: () => {},
+      selectedWorkflowId: null,
+      onRemoveWorkflow: () => {},
+      pendingImage: null,
+      onRemoveImage: () => {},
+      imageInputRef: { current: null },
+      onSelectImage: () => {},
+      supportsImages: false,
+      onSubmit: () => {},
+      onAbort: () => {},
+      runningMessageMode: "follow_up",
+      onRunningMessageModeChange: () => {},
+      onRemoveFollowUp: () => {},
+      onClearFollowUps: () => {},
+      onOpenArtifact: () => {},
+      action: null,
+      error: null,
+      modelLabel: "deepseek-v4-flash",
+      thinkingLevelControl: null,
+      contextUsageControl: null,
+      pdfInputRef: { current: null },
+      uploadingPdf: null,
+      onUploadPdf: () => {},
+      onRetryDocument: () => {},
+      retryingDocumentId: null,
+    }));
+
+    assert.match(html, /后续队列/);
+    assert.match(html, /1 条等待当前 Agent 完成后处理/);
+    assert.match(html, /完成检查后再运行类型检查/);
+    assert.doesNotMatch(html, /已经处理的旧消息/);
+    assert.match(html, /立即调整/);
+    assert.match(html, /改变当前工作方向/);
+    assert.match(html, /排队后续/);
+    assert.match(html, /当前工作结束后处理/);
+    assert.match(html, /aria-pressed="true"/);
+    assert.match(html, /发送会加入持久后续队列/);
+    assert.match(html, /aria-label="加入后续队列"/);
+    assert.match(html, /停止并清空队列/);
+    assert.match(html, /停止会同时取消尚未处理的后续消息/);
+  });
+});
+
+test("normal-work control mutations publish durable snapshots and refresh queue deletions", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  const submitStart = source.indexOf("const submitMessage = useCallback");
+  const submitEnd = source.indexOf("const selectImage", submitStart);
+  const submitImplementation = source.slice(submitStart, submitEnd);
+  const controlStart = source.indexOf("const removeFollowUp = useCallback");
+  const controlEnd = source.indexOf("const headerTitle", controlStart);
+  const controlImplementation = source.slice(controlStart, controlEnd);
+
+  assert.match(submitImplementation, /runningMessageMode === "follow_up"/);
+  assert.match(submitImplementation, /api\.enqueueFollowUp/);
+  assert.match(submitImplementation, /\.then\(\(result\) => result\.snapshot\)/);
+  assert.match(submitImplementation, /api\.steerConversation/);
+  assert.match(controlImplementation, /api\.removeFollowUp/);
+  assert.match(controlImplementation, /api\.clearFollowUps/);
+  assert.match(controlImplementation, /api\.fetchConversation/);
+  assert.match(controlImplementation, /api\.answerAskUserRequest/);
+  assert.match(controlImplementation, /api\.cancelAskUserRequest/);
+  assert.match(controlImplementation, /尚未处理的 \$\{queuedCount\} 条后续消息会同时取消/);
+  assert.doesNotMatch(controlImplementation, /applyChangeSet|proposalHash/);
+});
+
+test("live workbench prefers incremental EventSource and keeps bounded polling fallback", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  const effectStart = source.indexOf(
+    "const refreshSnapshot = async",
+  );
+  const effectEnd = source.indexOf(
+    "useEffect(() => {\n    const changeSet",
+    effectStart,
+  );
+  const implementation = source.slice(effectStart, effectEnd);
+
+  assert.notEqual(effectStart, -1);
+  assert.notEqual(effectEnd, -1);
+  assert.match(implementation, /api\.subscribeConversation/);
+  assert.match(
+    implementation,
+    /afterSeq: snapshotRef\.current\?\.lastEventSeq \?\? 0/,
+  );
+  assert.match(implementation, /mergeIncrementalConversationSnapshot/);
+  assert.match(implementation, /if \(!unsubscribe && shouldPollConversation\)/);
+  assert.match(implementation, /api\.fetchConversation/);
+  assert.match(implementation, /unsubscribe\?\.\(\)/);
+});
+
 test("safe image metadata is visible without returning image data to the browser", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const html = renderToStaticMarkup(React.createElement(
@@ -527,12 +981,14 @@ test("normal-work keeps context usage beside the composer model and out of the h
 
   const providerIndex = headerImplementation.indexOf("<ProviderMenu");
   const capabilitiesIndex = headerImplementation.indexOf("<ProjectCapabilityMenu");
+  const policyIndex = composerImplementation.indexOf("{executionPolicyControl}");
   const modelIndex = composerImplementation.indexOf("project-composer-model");
   const thinkingIndex = composerImplementation.indexOf("{thinkingLevelControl}");
   const contextIndex = composerImplementation.indexOf("{contextUsageControl}");
   assert.ok(providerIndex >= 0 && providerIndex < capabilitiesIndex);
   assert.doesNotMatch(headerImplementation, /ProjectContextUsageMenu/);
-  assert.ok(modelIndex >= 0 && modelIndex < thinkingIndex);
+  assert.ok(policyIndex >= 0 && policyIndex < modelIndex);
+  assert.ok(modelIndex < thinkingIndex);
   assert.ok(thinkingIndex < contextIndex);
   assert.doesNotMatch(source, />\s*整理上下文\s*</);
 });
@@ -541,6 +997,19 @@ test("composer context menu expands above its trigger", async () => {
   const styles = await readFile(STYLES_URL, "utf8");
   const selectorStart = styles.indexOf(
     ".project-agent-composer .project-context-usage-popover",
+  );
+  const selectorEnd = styles.indexOf("}", selectorStart);
+  const rule = styles.slice(selectorStart, selectorEnd);
+
+  assert.notEqual(selectorStart, -1);
+  assert.match(rule, /top: auto/);
+  assert.match(rule, /bottom: calc\(100% \+ 8px\)/);
+});
+
+test("composer execution policy menu expands above its trigger", async () => {
+  const styles = await readFile(STYLES_URL, "utf8");
+  const selectorStart = styles.indexOf(
+    ".project-agent-composer .project-execution-policy-popover",
   );
   const selectorEnd = styles.indexOf("}", selectorStart);
   const rule = styles.slice(selectorStart, selectorEnd);
@@ -594,6 +1063,41 @@ test("file artifact reads standalone trees from the conversation route", async (
 
   assert.match(implementation, /api\.fetchTree\(\{[\s\S]*conversationId/);
   assert.doesNotMatch(implementation, /fetchTree\(\{ projectId: project\.id/);
+});
+
+test("file artifact uses server paging, explicit search, overlay labels, and safe image URLs", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  const fileArtifactStart = source.indexOf("const PROJECT_FILE_TREE_PAGE_SIZE = 160");
+  const fileArtifactEnd = source.indexOf(
+    "const GIT_EVIDENCE_VISIBLE_PATHS",
+    fileArtifactStart,
+  );
+  const implementation = source.slice(fileArtifactStart, fileArtifactEnd);
+
+  assert.notEqual(fileArtifactStart, -1);
+  assert.match(
+    implementation,
+    /api\.fetchTree\(\{[\s\S]*limit: PROJECT_FILE_TREE_PAGE_SIZE,[\s\S]*cursor:/,
+  );
+  assert.match(
+    implementation,
+    /api\.fetchTree\(\{[\s\S]*query: normalized,[\s\S]*limit: PROJECT_FILE_TREE_PAGE_SIZE/,
+  );
+  assert.match(implementation, /role="search"/);
+  assert.match(implementation, /搜索文件名或路径/);
+  assert.match(implementation, /继续加载搜索结果/);
+  assert.match(implementation, /Agent 新建/);
+  assert.match(implementation, /Agent 已修改/);
+  assert.match(
+    implementation,
+    /api\.imageUrl\(\{ conversationId, path: activePath \}\)/,
+  );
+  assert.match(implementation, /<img[\s\S]*src=\{selectedImageUrl\}/);
+  assert.match(implementation, /onError=\{\(\) => setImageLoadFailed\(true\)\}/);
+  assert.match(
+    implementation,
+    /PROJECT_FILE_IMAGE_PATTERN\.test\(path\)[\s\S]{0,240}return;/,
+  );
 });
 
 test("live project workbench renders an immediate preparation state for a new conversation", async () => {
@@ -660,6 +1164,64 @@ test("a ready change set exposes its exact diff and hash-bound apply control", a
   }, { exposeArtifact: true });
 });
 
+test("a blocked auto-review change stays inspectable without an apply action", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        activeArtifactId: "changes",
+        pendingChangeSet: {
+          id: "change-set-blocked",
+          status: "blocked",
+          blockedReason: "change_set_line_limit",
+          proposalHash: "sha256:blocked-proposal",
+          files: [{
+            id: "file-change-blocked",
+            path: "src/app.js",
+            operation: "modify",
+            additions: 5_001,
+            deletions: 1,
+            actionable: false,
+            selected: true,
+            baseHash: "sha256:before",
+            afterHash: "sha256:after",
+            diff: ["--- a/src/app.js", "+++ b/src/app.js"],
+          }],
+        },
+      }),
+    }));
+
+    assert.match(html, /修改已被替我审批阻止/);
+    assert.match(html, /修改行数超出自动审批范围/);
+    assert.match(html, /只可查看，不能应用/);
+    assert.doesNotMatch(html, /确认应用所选修改/);
+  }, { exposeArtifact: true });
+});
+
+test("a blocked auto-review verification is shown as never executed", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        activeArtifactId: "run_result",
+        verificationRuns: [{
+          id: "verification-blocked",
+          status: "blocked",
+          blockedReason: "verification_isolation_unavailable",
+          command: "node --test",
+          checks: [],
+          logs: [],
+        }],
+      }),
+    }));
+
+    assert.match(html, /验证已阻止/);
+    assert.match(html, /当前没有隔离运行环境，验证命令没有自动执行/);
+    assert.match(html, /未启动本机进程/);
+    assert.doesNotMatch(html, /命令没有产生输出/);
+  }, { exposeArtifact: true });
+});
+
 test("failed and passing verification evidence keeps the saved command retryable", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
@@ -711,7 +1273,7 @@ test("failed and passing verification evidence keeps the saved command retryable
   }, { exposeArtifact: true });
 });
 
-test("pending changes block verification until the exact diff is applied", async () => {
+test("pending changes can be verified inside the isolated workspace before apply", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
       project,
@@ -746,9 +1308,91 @@ test("pending changes block verification until the exact diff is applied", async
       }),
     }));
 
-    assert.match(html, /disabled=""[^>]*>.*先审阅修改/s);
-    assert.match(html, /等待修改确认/);
-    assert.match(html, /验证才会变为可运行/);
+    assert.match(html, />运行验证</);
+    assert.match(html, /在隔离工作区运行/);
+    assert.match(html, /待审阅修改不会提前写入真实项目/);
+    assert.doesNotMatch(html, /先审阅修改|等待修改确认|验证才会变为可运行/);
+  }, { exposeArtifact: true });
+});
+
+test("settled turns expose paged history, unread state, retry, and per-turn evidence", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        unreadCount: 2,
+        latestMessageSeq: 10,
+        lastReadMessageSeq: 7,
+        readState: {
+          latestAssistantMessageSeq: 10,
+          unreadCount: 2,
+        },
+        messages: [{
+          id: "message-user-5",
+          role: "user",
+          kind: "message",
+          content: "检查失败后修复",
+          messageSeq: 9,
+          turnId: "turn-5",
+          turnSeq: 5,
+        }, {
+          id: "message-assistant-5",
+          role: "assistant",
+          kind: "message",
+          content: "已经修复并复测通过。",
+          messageSeq: 10,
+          turnId: "turn-5",
+          turnSeq: 5,
+          attempt: 2,
+          turnEvidence: {
+            providerId: "openai-codex",
+            modelId: "gpt-5.3-codex",
+            thinkingLevel: "high",
+            usage: {
+              totalTokens: 1536,
+              costUsd: 0.0123,
+            },
+          },
+        }],
+      }),
+    }));
+
+    assert.match(html, /加载更早记录/);
+    assert.match(html, /2 条未读/);
+    assert.match(html, /重试上一轮/);
+    assert.match(html, /openai-codex · gpt-5\.3-codex/);
+    assert.match(html, /1,536 tokens/);
+    assert.match(html, /\$0\.0123/);
+    assert.match(html, /第 2 次回答/);
+  });
+});
+
+test("interrupted verification repair waits for an explicit resume action", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        activeArtifactId: "run_result",
+        operations: [{
+          id: "operation-repair-1",
+          type: "verification_repair",
+          status: "interrupted",
+          repairAttemptCount: 1,
+          maxRepairAttempts: 2,
+        }],
+        verificationCommand: {
+          id: "command-test-repair",
+          label: "前端测试",
+          displayCommand: "npm test",
+          resolvedScript: "node --test",
+          cwdLabel: "隔离工作区",
+        },
+      }),
+    }));
+
+    assert.match(html, /修复与复测尚未完成/);
+    assert.match(html, /继续修复并复测/);
+    assert.match(html, /继续会再次调用当前模型/);
   }, { exposeArtifact: true });
 });
 
@@ -804,12 +1448,224 @@ test("settled activity is coalesced and collapsed above the final answer", async
     assert.match(html, /class="project-activity-body" hidden=""/);
     assert.match(html, /已完成/);
     assert.match(html, /2 项 · 查看过程/);
+    assert.match(html, /查看与检索了 1 次/);
     assert.equal((html.match(/思考完成/g) ?? []).length, 1);
     assert.doesNotMatch(html, /agent\.thinking|37 条记录/);
     assert.ok(
       html.indexOf('aria-label="Pi Agent 活动"') < html.indexOf("这是本轮最终答案。"),
       "completed activity should render before the final answer",
     );
+  });
+});
+
+test("activity normalization collapses tool lifecycles into counted public summaries", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      { seq: 2, type: "agent.thinking", status: "active" },
+      {
+        seq: 3,
+        type: "tool.started",
+        toolName: "read",
+        toolCallId: "read-1",
+        path: "src/a.js",
+      },
+      {
+        seq: 4,
+        type: "tool.progress",
+        toolName: "read",
+        toolCallId: "read-1",
+        path: "src/a.js",
+      },
+      {
+        seq: 5,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "read-1",
+        path: "src/a.js",
+        status: "completed",
+      },
+      {
+        seq: 6,
+        type: "tool.started",
+        toolName: "grep",
+        toolCallId: "grep-1",
+      },
+      {
+        seq: 7,
+        type: "tool.completed",
+        toolName: "grep",
+        toolCallId: "grep-1",
+        status: "completed",
+      },
+      {
+        seq: 8,
+        type: "tool.completed",
+        toolName: "read_document",
+        toolCallId: "document-1",
+        status: "completed",
+      },
+      {
+        seq: 9,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "read-failed",
+        path: "src/missing.js",
+        status: "failed",
+      },
+      {
+        seq: 10,
+        type: "plan.updated",
+        status: "completed",
+      },
+      {
+        seq: 11,
+        type: "change_set.ready",
+        status: "clean",
+        data: { stats: { files: 0 } },
+      },
+      { seq: 12, type: "agent.thinking", status: "finished" },
+    ], false);
+
+    assert.equal(normalized.length, 3);
+    assert.equal(normalized[0].type, "activity.research_summary");
+    assert.equal(normalized[0].title, "查看与检索了 3 次");
+    assert.equal(normalized[0].detail, "项目资料 2 次 · 会话资料 1 次");
+    assert.deepEqual(normalized[0].counts, {
+      project: 2,
+      document: 1,
+      retrieval: 0,
+    });
+    assert.equal(normalized[1].toolCallId, "read-failed");
+    assert.equal(normalized[1].status, "failed");
+    assert.equal(normalized[2].type, "agent.thinking");
+    assert.equal(normalized[2].status, "finished");
+  });
+});
+
+test("activity normalization distinguishes prepared and actually run verification commands", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "tool.started",
+        toolName: "request_verification",
+        toolCallId: "request-1",
+      },
+      {
+        seq: 3,
+        type: "tool.completed",
+        toolName: "request_verification",
+        toolCallId: "request-1",
+        status: "completed",
+      },
+      {
+        seq: 4,
+        type: "verification.requested",
+        eventId: "command-1",
+        status: "requested",
+      },
+      {
+        seq: 5,
+        type: "verification.started",
+        eventId: "run-1",
+      },
+      {
+        seq: 6,
+        type: "verification.completed",
+        eventId: "run-1",
+        status: "passed",
+      },
+      {
+        seq: 7,
+        type: "verification.completed",
+        eventId: "run-failed",
+        status: "failed",
+      },
+    ], false);
+
+    assert.equal(normalized.length, 2);
+    assert.equal(normalized[0].type, "activity.command_summary");
+    assert.equal(normalized[0].title, "运行了 1 条验证命令");
+    assert.equal(normalized[0].detail, "已准备 1 条 · 已运行 1 条");
+    assert.equal(normalized[1].type, "verification.completed");
+    assert.equal(normalized[1].status, "failed");
+    assert.doesNotMatch(JSON.stringify(normalized), /request_verification/);
+  });
+});
+
+test("auto-review decisions state whether safe work was allowed or risky work blocked", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        executionPolicy: {
+          mode: "auto_review",
+          revision: 4,
+          policyVersion: 1,
+        },
+        events: [{
+          seq: 1,
+          type: "auto_review.decision",
+          decision: "allow",
+          reasonCode: "safe_bounded_verification",
+        }, {
+          seq: 2,
+          type: "auto_review.decision",
+          decision: "deny",
+          reasonCode: "verification_command_not_auto_safe",
+        }],
+      }),
+    }));
+
+    assert.match(html, /已自动放行安全操作/);
+    assert.match(html, /验证命令已通过安全范围校验/);
+    assert.match(html, /已阻止高风险操作/);
+    assert.match(html, /验证命令不在自动审批的安全范围内/);
+    assert.match(html, /安全修改会自动继续，高风险操作会被阻止/);
+    assert.match(html, /安全修改自动继续/);
+    assert.match(html, /高风险操作会阻止/);
+    assert.match(html, /project-execution-policy-trigger is-auto/);
+    assert.doesNotMatch(html, /完全访问/);
+  });
+});
+
+test("auto-review explains when verification is blocked behind a denied change", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        events: [{
+          seq: 1,
+          type: "auto_review.decision",
+          decision: "deny",
+          reasonCode: "change_set_not_auto_applied",
+        }],
+      }),
+    }));
+
+    assert.match(html, /修改未通过自动审批，后续验证没有运行/);
+  });
+});
+
+test("project stream follows only while the reader remains near the bottom", async () => {
+  await withLiveWorkbench(({ isNearProjectStreamBottom }) => {
+    assert.equal(isNearProjectStreamBottom({
+      scrollHeight: 1_000,
+      clientHeight: 500,
+      scrollTop: 428,
+    }), true);
+    assert.equal(isNearProjectStreamBottom({
+      scrollHeight: 1_000,
+      clientHeight: 500,
+      scrollTop: 427,
+    }), false);
+    assert.equal(isNearProjectStreamBottom({
+      scrollHeight: 500,
+      clientHeight: 500,
+      scrollTop: 0,
+    }), true);
   });
 });
 
@@ -930,6 +1786,7 @@ test("running activity stays expanded while historical thinking deltas are coale
     assert.match(html, /1 项实时进展/);
     assert.match(html, /aria-expanded="true"/);
     assert.doesNotMatch(html, /class="project-activity-body" hidden=""/);
+    assert.match(html, /<details class="is-thinking" open="">/);
     assert.equal((html.match(/正在思考/g) ?? []).length, 1);
     assert.doesNotMatch(html, /agent\.thinking|30 条记录/);
   });
@@ -978,6 +1835,9 @@ test("adding file context only updates removable composer context until submit",
   assert.doesNotMatch(addContextImplementation, /api\.(?:sendMessage|steerConversation)/);
 
   assert.match(source, />\s*加入上下文\s*</);
+  assert.match(source, /role="listbox"/);
+  assert.match(source, /aria-activedescendant=/);
+  assert.doesNotMatch(source, /selectedFile\.lines\.map[\s\S]{0,600}<button/);
   assert.match(source, /aria-label=\{`移除上下文：\$\{context\.label\}`\}/);
   assert.match(source, /<form className="project-agent-composer" onSubmit=\{onSubmit\}>/);
   assert.match(submitImplementation, /api\.sendMessage/);
@@ -992,4 +1852,144 @@ test("adding file context only updates removable composer context until submit",
   );
   assert.match(submitImplementation, /replacePendingImage\(null\)/);
   assert.match(source, /useState\(\s*readLastArtifact\(/);
+});
+
+test("workspace status explains isolation and recovery without exposing runtime details", async () => {
+  await withLiveWorkbench(({ ProjectWorkspaceStatus }) => {
+    const readyHtml = renderToStaticMarkup(React.createElement(ProjectWorkspaceStatus, {
+      workspace: {
+        kind: "sparse_overlay",
+        isolation: "review_overlay",
+        recovery: "apply_journal_v1",
+        status: "ready",
+      },
+    }));
+    assert.match(readyHtml, /修改在隔离副本中准备/);
+    assert.match(readyHtml, /真实项目只会在你确认更改后更新/);
+
+    const recoveringHtml = renderToStaticMarkup(React.createElement(ProjectWorkspaceStatus, {
+      workspace: { status: "recovering" },
+    }));
+    assert.match(recoveringHtml, /正在恢复上次文件操作/);
+    assert.match(recoveringHtml, /完成核对前不会继续写入项目文件/);
+
+    const blockedHtml = renderToStaticMarkup(React.createElement(ProjectWorkspaceStatus, {
+      workspace: { status: "recovery_blocked" },
+    }));
+    assert.match(blockedHtml, /上次文件操作需要检查/);
+    assert.match(blockedHtml, /role="alert"/);
+
+    const combinedHtml = `${readyHtml}${recoveringHtml}${blockedHtml}`;
+    assert.doesNotMatch(
+      combinedHtml,
+      /sparse_overlay|review_overlay|apply_journal_v1|\/Users\//,
+    );
+  });
+});
+
+test("change evidence keeps Git read-only and offers one confirmed apply undo", async () => {
+  await withLiveWorkbench(({ ChangeEvidencePanel }) => {
+    const applyRecord = {
+      id: "apply-1",
+      status: "applied",
+      files: [
+        { id: "file-1", path: "src/App.jsx" },
+        { id: "file-2", path: "src/styles.css" },
+      ],
+      undo: {
+        status: "available",
+        hash: "sha256:undo-1",
+      },
+    };
+    let undoTarget = null;
+    const props = {
+      gitEvidence: {
+        available: true,
+        branch: "codex/runtime",
+        head: "1234567890abcdef",
+        staged: ["src/staged.js"],
+        unstaged: ["src/changed.js"],
+        untracked: ["src/new.js"],
+        truncated: false,
+      },
+      gitStatus: "ready",
+      onRefreshGit: () => {},
+      workspace: { status: "ready" },
+      applyJournal: [applyRecord],
+      onUndoApply: (record) => {
+        undoTarget = record;
+      },
+    };
+    const panel = ChangeEvidencePanel(props);
+    const html = renderToStaticMarkup(panel);
+
+    assert.match(html, /Git 只读状态/);
+    assert.match(html, /codex\/runtime · 12345678/);
+    assert.match(html, /已暂存/);
+    assert.match(html, /src\/staged\.js/);
+    assert.match(html, /未暂存/);
+    assert.match(html, /src\/changed\.js/);
+    assert.match(html, /未跟踪/);
+    assert.match(html, /src\/new\.js/);
+    assert.match(html, /这里只读查看，不会暂存、提交或推送/);
+    assert.match(html, /文件应用记录/);
+    assert.match(html, /已应用并核验/);
+    assert.match(html, /撤销这次应用/);
+    assert.doesNotMatch(html, /sparse_overlay|review_overlay|apply_journal_v1|\/Users\//);
+
+    const undoButton = findElement(
+      panel,
+      (node) => (
+        node.type === "button"
+        && React.Children.toArray(node.props.children).includes("撤销这次应用")
+      ),
+    );
+    assert.ok(undoButton);
+    undoButton.props.onClick();
+    assert.equal(undoTarget, applyRecord);
+  });
+});
+
+test("change evidence loads only for its artifact and binds undo to the durable hash", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  const artifactStart = source.indexOf("function ArtifactPane");
+  const artifactEnd = source.indexOf("export function LiveProjectWorkbench", artifactStart);
+  const artifactImplementation = source.slice(artifactStart, artifactEnd);
+  const undoStart = source.indexOf("const undoAppliedChanges = useCallback");
+  const undoEnd = source.indexOf("const runVerification", undoStart);
+  const undoImplementation = source.slice(undoStart, undoEnd);
+
+  assert.notEqual(artifactStart, -1);
+  assert.match(artifactImplementation, /activeArtifactId !== "changes"/);
+  assert.match(artifactImplementation, /api\.fetchGitEvidence/);
+  assert.match(artifactImplementation, /onRefreshGit=\{loadGitEvidence\}/);
+  assert.match(undoImplementation, /window\.confirm/);
+  assert.match(undoImplementation, /api\.undoApply/);
+  assert.match(undoImplementation, /undoHash: record\.undo\.hash/);
+  assert.match(undoImplementation, /任何外部变化都会阻止撤销/);
+  assert.match(undoImplementation, /不会暂存、提交或推送/);
+  assert.doesNotMatch(undoImplementation, /git\s+(?:add|commit|push)/i);
+});
+
+test("large project files keep one bounded listbox focus surface", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  const fileArtifactStart = source.indexOf("const PROJECT_FILE_VISIBLE_LINE_LIMIT = 400");
+  const fileArtifactEnd = source.indexOf(
+    "const GIT_EVIDENCE_VISIBLE_PATHS",
+    fileArtifactStart,
+  );
+  const fileArtifact = source.slice(fileArtifactStart, fileArtifactEnd);
+
+  assert.notEqual(fileArtifactStart, -1);
+  assert.match(fileArtifact, /\.slice\(0, PROJECT_FILE_VISIBLE_LINE_LIMIT\)/);
+  assert.match(fileArtifact, /role="listbox"/);
+  assert.match(fileArtifact, /tabIndex=\{0\}/);
+  assert.match(fileArtifact, /aria-activedescendant=/);
+  assert.match(fileArtifact, /role="option"/);
+  assert.match(fileArtifact, /visibleFileLines\.map/);
+  assert.doesNotMatch(
+    fileArtifact,
+    /visibleFileLines\.map\([\s\S]{0,500}<button/,
+  );
+  assert.doesNotMatch(fileArtifact, /role="option"[\s\S]{0,160}tabIndex=/);
 });

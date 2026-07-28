@@ -81,6 +81,22 @@ export function mergeFreshConversationSnapshot(current, incoming) {
   return shouldApplyHydration(current, incoming) ? incoming : current;
 }
 
+export function mergeIncrementalConversationSnapshot(current, incoming) {
+  const accepted = mergeFreshConversationSnapshot(current, incoming);
+  if (accepted !== incoming || !current || current.id !== incoming?.id) {
+    return accepted;
+  }
+  const events = new Map(
+    [...(current.events ?? []), ...(incoming.events ?? [])]
+      .filter((event) => Number.isSafeInteger(event?.seq) && event.seq > 0)
+      .map((event) => [event.seq, event]),
+  );
+  return {
+    ...incoming,
+    events: [...events.values()].sort((left, right) => left.seq - right.seq),
+  };
+}
+
 export function upsertLiveProject(state, project) {
   const exists = state.projects.some((item) => item.id === project.id);
   return {

@@ -9,9 +9,14 @@ const MAX_CONTEXT_SIDE_CHARS = 400;
 const MAX_FALLBACK_REFERENCES = 8;
 const MAX_FALLBACK_BLOCK_CHARS = 1_000;
 const MAX_FALLBACK_CONTENT_CHARS = 8_000;
-const MAX_HISTORY_TURNS = 4;
-const MAX_HISTORY_CHARS = 6_000;
+const MAX_HISTORY_TURNS = 8;
+const MAX_HISTORY_CHARS = 9_000;
+// Placeholder-length garbage ("待核验" era turns) must never re-enter context.
+const MIN_HISTORY_ANSWER_CHARS = 10;
 const MAX_PROJECT_CONTEXT_CHARS = 8_000;
+// The whole parsed paper rides along on every turn so the Agent can explain
+// any part of it; references stay the bounded citation anchors.
+const MAX_FULL_TEXT_CHARS = 150_000;
 const OUTPUT_FIELDS = ["paper_id", "answer", "citations"];
 
 export class ReadingChatGeneratorError extends Error {
@@ -243,11 +248,16 @@ function normalizeHistory(recentTurns) {
   for (let index = selected.length - 1; index >= 0; index -= 1) {
     const turn = selected[index];
     const question = compact(turn?.question, MAX_QUESTION_CHARS);
-    const answer = compact(turn?.answer, 3_000);
-    if (!question || !answer) continue;
+    const flattened = compact(turn?.answer, Number.POSITIVE_INFINITY);
+    const answer = flattened.length > 3_000 ? flattened.slice(-3_000) : flattened;
+    if (!question || answer.length < MIN_HISTORY_ANSWER_CHARS) continue;
     const remaining = MAX_HISTORY_CHARS - chars;
     if (remaining <= 0) break;
-    const boundedAnswer = answer.slice(0, Math.max(0, remaining - question.length));
+    // Keep the tail of an over-budget answer: teaching turns end with the
+    // quiz/summary the next ultra-short user input refers back to.
+    const budget = remaining - question.length;
+    if (budget < MIN_HISTORY_ANSWER_CHARS) break;
+    const boundedAnswer = answer.length > budget ? answer.slice(-budget) : answer;
     if (!boundedAnswer) continue;
     chars += question.length + boundedAnswer.length;
     normalized.unshift({ question, answer: boundedAnswer });
@@ -295,6 +305,28 @@ function normalizedReferences(references) {
   }));
 }
 
+// Serialize the whole parsed body in document order so every turn can teach
+// any part of the paper. If a paper somehow exceeds the ceiling, keep the
+// head: the truncated tail is usually references/appendix.
+function fullPaperText(document) {
+  const parts = [];
+  let chars = 0;
+  let truncated = false;
+  for (const block of document.blocks) {
+    const heading = block.path.length > 0 ? block.path.join(" > ") : "";
+    const piece = heading && block.kind === "heading"
+      ? `\n## ${block.source}\n`
+      : `${block.source}\n`;
+    if (chars + piece.length > MAX_FULL_TEXT_CHARS) {
+      truncated = true;
+      break;
+    }
+    parts.push(piece);
+    chars += piece.length;
+  }
+  return { content: parts.join(""), truncated };
+}
+
 function validateOutput(value, paperId, allowedReferenceIds) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw outputError("模型没有返回论文对话对象");
@@ -307,8 +339,10 @@ function validateOutput(value, paperId, allowedReferenceIds) {
   if (value.paper_id !== paperId) throw outputError("模型返回了错误的论文 ID");
   if (typeof value.answer !== "string") throw outputError("answer 必须是字符串");
   const answer = value.answer.trim();
-  if (answer.length < 2 || answer.length > 6_000) {
-    throw outputError("answer 长度不符合论文对话合同");
+  if (answer.length < 10 || answer.length > 6_000) {
+    // Placeholder-only replies ("待核验" etc.) are failures, never cached:
+    // a real teaching answer is always longer than a token or two.
+    throw outputError("answer 过短或过长，不符合论文对话合同");
   }
   if (!Array.isArray(value.citations) || value.citations.length > 8) {
     throw outputError("citations 不符合论文对话合同");
@@ -371,10 +405,15 @@ export function prepareReadingChatMessage({
     projectContextRequested,
   );
   const prompt = promptRegistry.loadPrompt(PROMPT_ID);
+  const paperText = fullPaperText(normalizedDocument);
   const input = {
     paper: normalizedPaper,
     document_revision: normalizedDocument.revision,
     question: normalizedQuestion,
+    paper_full_text: {
+      content: paperText.content,
+      truncated: paperText.truncated,
+    },
     references,
     recent_turns: history,
     ...(normalizedProjectContext ? { project_context: normalizedProjectContext } : {}),

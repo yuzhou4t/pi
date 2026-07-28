@@ -8,12 +8,22 @@ import { CandidateSummaryError, createCandidateSummaryService } from "./candidat
 import { HttpRangeError, parseByteRange } from "./httpRange.js";
 import { createJournalWorkflowService } from "./journal/workflowService.js";
 import { SOURCE_REGISTRY, SOURCE_REGISTRY_VERSION } from "./journal/sourceRegistry.js";
+import { createWeeklyJournalScheduler } from "./journal/weeklyScheduler.js";
 import {
   ProjectWorkError,
   projectWorkError,
   safeProjectWorkError,
 } from "./project-work/errors.js";
 import { createProjectWorkService } from "./project-work/projectWorkService.js";
+import {
+  normalizeProjectWorkRuntimeUrl,
+  probeProjectWorkRuntime,
+  proxyProjectWorkRequest,
+} from "./project-work/runtimeProxy.js";
+import {
+  migrateRuntimeEnvelope,
+  RUNTIME_SCHEMA_VERSION,
+} from "./runtimeSchema.js";
 
 const host = "127.0.0.1";
 const port = Number(process.env.PI_API_PORT ?? process.env.PORT ?? 8787);
@@ -21,9 +31,74 @@ const allowedOrigins = new Set([
   "http://127.0.0.1:4173",
   "http://localhost:4173",
 ]);
+const projectWorkClientRequestIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
+const journalClientRequestIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
+const sha256Pattern = /^sha256:[a-f0-9]{64}$/;
 const candidateSummaries = createCandidateSummaryService();
 const journalWorkflow = createJournalWorkflowService();
-const projectWork = createProjectWorkService();
+const projectWorkRuntimeOnly = process.env.PI_PROJECT_WORK_RUNTIME_ONLY === "1";
+const configuredProjectWorkRuntimeUrl = normalizeProjectWorkRuntimeUrl(
+  process.env.PI_PROJECT_WORK_RUNTIME_URL,
+);
+const projectWork = configuredProjectWorkRuntimeUrl
+  ? null
+  : createProjectWorkService();
+
+export function shutdownApiServer({
+  server,
+  dispose = () => undefined,
+  timeoutMs = 1_750,
+  onExit = () => process.exit(0),
+  unrefTimeout = true,
+}) {
+  let completed = false;
+  let disposed = false;
+  let serverClosed = false;
+  let resolveDone;
+  const done = new Promise((resolve) => {
+    resolveDone = resolve;
+  });
+  const finish = () => {
+    if (completed) return;
+    completed = true;
+    clearTimeout(forceTimer);
+    resolveDone();
+    onExit();
+  };
+  const finishWhenReady = () => {
+    if (disposed && serverClosed) finish();
+  };
+  const forceTimer = setTimeout(() => {
+    try {
+      server.closeAllConnections?.();
+    } finally {
+      finish();
+    }
+  }, timeoutMs);
+  if (unrefTimeout) forceTimer.unref?.();
+
+  try {
+    server.close(() => {
+      serverClosed = true;
+      finishWhenReady();
+    });
+    server.closeIdleConnections?.();
+  } catch {
+    serverClosed = true;
+  }
+  Promise.resolve()
+    .then(dispose)
+    .catch(() => undefined)
+    .finally(() => {
+      disposed = true;
+      finishWhenReady();
+    });
+  return done;
+}
+
+function isJournalClientRequestId(value) {
+  return typeof value === "string" && journalClientRequestIdPattern.test(value);
+}
 
 function publicPaper(paper) {
   if (!paper || typeof paper !== "object") return paper;
@@ -272,11 +347,27 @@ function publicReadingState(readings) {
           id: paper?.chat?.id ?? "current",
           title: paper?.chat?.title ?? null,
           status: paper?.chat?.status ?? "idle",
+          branch_type: paper?.chat?.branch_type ?? "canonical",
+          parent_checkpoint: paper?.chat?.parent_checkpoint
+            && typeof paper.chat.parent_checkpoint === "object"
+            ? {
+                conversation_id:
+                  paper.chat.parent_checkpoint.conversation_id ?? null,
+                turn_id: paper.chat.parent_checkpoint.turn_id ?? null,
+                turn_count: paper.chat.parent_checkpoint.turn_count ?? 0,
+                checkpoint_hash:
+                  paper.chat.parent_checkpoint.checkpoint_hash ?? null,
+                created_at: paper.chat.parent_checkpoint.created_at ?? null,
+              }
+            : null,
+          promotion_status: paper?.chat?.promotion_status ?? "canonical",
+          promoted_at: paper?.chat?.promoted_at ?? null,
           turns: Array.isArray(paper?.chat?.turns)
             ? paper.chat.turns.map((turn) => ({
                 id: turn?.id ?? null,
                 client_request_id: turn?.client_request_id ?? null,
                 question: turn?.question ?? "",
+                round_id: turn?.round_id ?? null,
                 status: turn?.status ?? "failed",
                 reference: turn?.reference && typeof turn.reference === "object"
                   ? {
@@ -310,11 +401,23 @@ function publicReadingState(readings) {
           updated_at: paper?.chat?.updated_at ?? null,
         },
         active_conversation_id: paper?.chat?.id ?? "current",
+        canonical_conversation_id:
+          paper?.canonical_conversation_id ?? paper?.chat?.id ?? "current",
         conversations: [
           {
             id: paper?.chat?.id ?? "current",
             title: paper?.chat?.title ?? null,
             turn_count: Array.isArray(paper?.chat?.turns) ? paper.chat.turns.length : 0,
+            branch_type: paper?.chat?.branch_type ?? "canonical",
+            parent_checkpoint: paper?.chat?.parent_checkpoint
+              && typeof paper.chat.parent_checkpoint === "object"
+              ? { ...paper.chat.parent_checkpoint }
+              : null,
+            promotion_status: paper?.chat?.promotion_status ?? "canonical",
+            promoted_at: paper?.chat?.promoted_at ?? null,
+            canonical: (
+              paper?.canonical_conversation_id ?? paper?.chat?.id ?? "current"
+            ) === (paper?.chat?.id ?? "current"),
             updated_at: paper?.chat?.updated_at ?? null,
             active: true,
           },
@@ -325,6 +428,16 @@ function publicReadingState(readings) {
                 turn_count: Array.isArray(conversation?.turns)
                   ? conversation.turns.length
                   : 0,
+                branch_type: conversation?.branch_type ?? "scratch",
+                parent_checkpoint: conversation?.parent_checkpoint
+                  && typeof conversation.parent_checkpoint === "object"
+                  ? { ...conversation.parent_checkpoint }
+                  : null,
+                promotion_status:
+                  conversation?.promotion_status ?? "not_promoted",
+                promoted_at: conversation?.promoted_at ?? null,
+                canonical:
+                  conversation?.id === paper?.canonical_conversation_id,
                 updated_at: conversation?.updated_at
                   ?? conversation?.created_at
                   ?? null,
@@ -332,6 +445,26 @@ function publicReadingState(readings) {
               }))
             : []),
         ],
+        pinned_conclusions: Array.isArray(paper?.pinned_conclusions)
+          ? paper.pinned_conclusions.map((conclusion) => ({
+              schema_version: conclusion?.schema_version ?? 1,
+              conclusion_id: conclusion?.conclusion_id ?? null,
+              source_conversation_id:
+                conclusion?.source_conversation_id ?? null,
+              source_turn_id: conclusion?.source_turn_id ?? null,
+              source_input_hash: conclusion?.source_input_hash ?? null,
+              content: conclusion?.content ?? "",
+              content_hash: conclusion?.content_hash ?? null,
+              citations: Array.isArray(conclusion?.citations)
+                ? structuredClone(conclusion.citations)
+                : [],
+              confirmed_by: conclusion?.confirmed_by ?? null,
+              status: conclusion?.status ?? "unpinned",
+              pinned_at: conclusion?.pinned_at ?? null,
+              unpinned_at: conclusion?.unpinned_at ?? null,
+              updated_at: conclusion?.updated_at ?? null,
+            }))
+          : [],
         agent_actions: {
           status: paper?.agent_actions?.status ?? "idle",
           proposals: Array.isArray(paper?.agent_actions?.proposals)
@@ -422,8 +555,24 @@ function publicObsidianState(obsidian) {
     proposals: Array.isArray(obsidian.proposals)
       ? obsidian.proposals.map((proposal) => publicObsidianProposal(proposal))
       : [],
-    approval: null,
+    approval: obsidian.approval && typeof obsidian.approval === "object"
+      ? {
+          client_request_id: obsidian.approval.client_request_id ?? null,
+          proposal_hash: obsidian.approval.proposal_hash ?? null,
+          approval_hash: obsidian.approval.approval_hash ?? null,
+          operations: Array.isArray(obsidian.approval.operations)
+            ? obsidian.approval.operations.map((operation) => ({
+                proposal_id: operation.proposal_id ?? null,
+                content_hash: operation.content_hash ?? null,
+                target_version_or_hash: operation.target_version_or_hash ?? null,
+              }))
+            : [],
+          approved_at: obsidian.approval.approved_at ?? null,
+        }
+      : null,
     last_error: publicWorkflowError(obsidian.last_error),
+    committed_at: obsidian.committed_at ?? null,
+    verified_at: obsidian.verified_at ?? null,
     updated_at: obsidian.updated_at ?? null,
   };
 }
@@ -434,8 +583,8 @@ function publicObsidianArtifact(artifact) {
     schema_version: artifact.schema_version ?? 1,
     run_id: artifact.run_id ?? null,
     target_type: "obsidian",
-    write_capability: "preview_only",
-    external_write_performed: false,
+    write_capability: "hash_bound_commit",
+    external_write_performed: artifact.external_write_performed === true,
     status: artifact.status ?? "preview_ready",
     target_directory: artifact.target_directory ?? null,
     source_hash: artifact.source_hash ?? null,
@@ -519,8 +668,25 @@ function publicProjectStateState(projectState) {
     target_hash: projectState.target_hash ?? null,
     content_hash: projectState.content_hash ?? null,
     actionable: Boolean(projectState.actionable),
-    approval: null,
+    approval: projectState.approval && typeof projectState.approval === "object"
+      ? {
+          client_request_id: projectState.approval.client_request_id ?? null,
+          proposal_hash: projectState.approval.proposal_hash ?? null,
+          approval_hash: projectState.approval.approval_hash ?? null,
+          operation: projectState.approval.operation
+            ? {
+                proposal_id: projectState.approval.operation.proposal_id ?? null,
+                content_hash: projectState.approval.operation.content_hash ?? null,
+                target_version_or_hash:
+                  projectState.approval.operation.target_version_or_hash ?? null,
+              }
+            : null,
+          approved_at: projectState.approval.approved_at ?? null,
+        }
+      : null,
     last_error: publicWorkflowError(projectState.last_error),
+    committed_at: projectState.committed_at ?? null,
+    verified_at: projectState.verified_at ?? null,
     updated_at: projectState.updated_at ?? null,
   };
 }
@@ -531,8 +697,8 @@ function publicProjectStateArtifact(artifact) {
     schema_version: artifact.schema_version ?? 1,
     run_id: artifact.run_id ?? null,
     target_type: "project_state",
-    write_capability: "preview_only",
-    external_write_performed: false,
+    write_capability: "hash_bound_commit",
+    external_write_performed: artifact.external_write_performed === true,
     status: artifact.status ?? "preview_ready",
     source_hash: artifact.source_hash ?? null,
     proposal_hash: artifact.proposal_hash ?? null,
@@ -562,6 +728,57 @@ function publicZoteroArtifact(artifact) {
   };
 }
 
+function publicArchiveBatch(batch) {
+  if (!batch || typeof batch !== "object" || Array.isArray(batch)) return null;
+  return {
+    schema_version: batch.schema_version ?? 1,
+    batch_id: batch.batch_id ?? null,
+    client_request_id: batch.client_request_id ?? null,
+    selected_targets: Array.isArray(batch.selected_targets)
+      ? [...batch.selected_targets]
+      : [],
+    status: batch.status ?? null,
+    last_error: publicWorkflowError(batch.last_error),
+    approved_at: batch.approved_at ?? null,
+    completed_at: batch.completed_at ?? null,
+    updated_at: batch.updated_at ?? null,
+  };
+}
+
+function publicJournalEvent(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return null;
+  const safe = {
+    seq: Number.isSafeInteger(event.seq) ? event.seq : null,
+    type: typeof event.type === "string" ? event.type : "journal.event",
+    at: event.at ?? null,
+  };
+  for (const key of [
+    "status",
+    "phase",
+    "paper_id",
+    "batch_id",
+    "proposal_id",
+    "source_id",
+    "ready_count",
+    "failed_count",
+    "attempted_count",
+    "candidate_count",
+    "blocked_count",
+    "selected_count",
+  ]) {
+    const value = event[key];
+    if (
+      typeof value === "string"
+      || typeof value === "number"
+      || typeof value === "boolean"
+    ) {
+      safe[key] = value;
+    }
+  }
+  if (event.error) safe.error = publicWorkflowError(event.error);
+  return safe;
+}
+
 export function publicRun(run) {
   if (!run) return null;
   const guides = run.guides && typeof run.guides === "object"
@@ -588,6 +805,16 @@ export function publicRun(run) {
     : null;
   return {
     ...run,
+    ...migrateRuntimeEnvelope(run, {
+      domain: "journal",
+      pendingReview: [
+        "review_ready",
+        "guide_ready",
+        "draft_ready",
+      ].includes(run.status),
+      recovering: run.archive_batch?.status === "committing"
+        && run.status !== "committing",
+    }),
     candidates: Array.isArray(run.candidates) ? run.candidates.map(publicPaper) : [],
     guides,
     paper_decisions: run.paper_decisions && typeof run.paper_decisions === "object"
@@ -597,6 +824,7 @@ export function publicRun(run) {
     obsidian: publicObsidianState(run.obsidian),
     project_state: publicProjectStateState(run.project_state),
     zotero: publicZoteroState(run.zotero),
+    archive_batch: publicArchiveBatch(run.archive_batch),
   };
 }
 
@@ -620,6 +848,21 @@ function sendJson(response, status, body, origin) {
   response.end(JSON.stringify(body));
 }
 
+function sendProjectWorkImage(response, image, origin) {
+  const body = Buffer.isBuffer(image.bytes)
+    ? image.bytes
+    : Buffer.from(image.bytes);
+  response.writeHead(200, {
+    "content-type": image.mimeType,
+    "content-length": String(body.length),
+    "cache-control": "private, no-store",
+    "content-security-policy": "default-src 'none'; sandbox",
+    "x-content-type-options": "nosniff",
+    ...corsHeaders(origin),
+  });
+  response.end(body);
+}
+
 function sendWorkflowError(response, error, origin, fallback) {
   sendJson(response, Number.isInteger(error?.status) ? error.status : 500, {
     error: {
@@ -637,6 +880,16 @@ function requireProjectWorkMutationOrigin(origin) {
       "项目修改操作只能从本机 Pi Agent 界面发起",
       403,
     );
+  }
+}
+
+function requireJournalMutationOrigin(origin, { allowMissing = false } = {}) {
+  if ((!origin && !allowMissing) || (origin && !allowedOrigins.has(origin))) {
+    const error = new Error("论文工作流写操作只能从本机 Pi Agent 界面发起");
+    error.code = "JOURNAL_ORIGIN_REQUIRED";
+    error.status = 403;
+    error.retryable = false;
+    throw error;
   }
 }
 
@@ -689,6 +942,14 @@ function sendProjectWorkError(response, error, origin) {
 function publicProjectWorkConversationSummary(value) {
   const conversation = value?.conversation ?? value;
   return {
+    ...migrateRuntimeEnvelope(conversation, {
+      domain: "project_work",
+      pendingQuestion: conversation?.status === "awaiting_user",
+      pendingReview: conversation?.status === "awaiting_confirmation",
+      verifying: conversation?.status === "verifying",
+      recovering: conversation?.status === "recovering",
+      stopped: ["aborted", "stopped"].includes(conversation?.status),
+    }),
     id: conversation?.id ?? null,
     projectId: conversation?.projectId ?? null,
     workspaceKind: conversation?.workspaceKind ?? null,
@@ -700,10 +961,48 @@ function publicProjectWorkConversationSummary(value) {
     modelId: conversation?.modelId ?? null,
     thinkingLevel: conversation?.thinkingLevel ?? null,
     pendingChangeFileCount: conversation?.pendingChangeFileCount ?? 0,
+    unreadCount: Number.isSafeInteger(conversation?.unreadCount)
+      ? conversation.unreadCount
+      : 0,
+    latestMessageSeq: Number.isSafeInteger(conversation?.latestMessageSeq)
+      ? conversation.latestMessageSeq
+      : 0,
+    lastReadMessageSeq: Number.isSafeInteger(conversation?.lastReadMessageSeq)
+      ? conversation.lastReadMessageSeq
+      : 0,
     lastEventSeq: conversation?.lastEventSeq ?? 0,
     createdAt: conversation?.createdAt ?? null,
     updatedAt: conversation?.updatedAt ?? null,
   };
+}
+
+function publicProjectWorkConversationState(value) {
+  if (
+    value?.snapshot
+    && typeof value.snapshot === "object"
+    && !Array.isArray(value.snapshot)
+  ) {
+    return {
+      ...value,
+      snapshot: publicProjectWorkConversationState(value.snapshot),
+    };
+  }
+  const conversation = value?.conversation ?? value;
+  if (!conversation || typeof conversation !== "object") return value;
+  const publicConversation = {
+    ...conversation,
+    ...migrateRuntimeEnvelope(conversation, {
+      domain: "project_work",
+      pendingQuestion: conversation.status === "awaiting_user",
+      pendingReview: conversation.status === "awaiting_confirmation",
+      verifying: conversation.status === "verifying",
+      recovering: conversation.status === "recovering",
+      stopped: ["aborted", "stopped", "error"].includes(conversation.status),
+    }),
+  };
+  return value?.conversation
+    ? { ...value, conversation: publicConversation }
+    : publicConversation;
 }
 
 async function sendPdf(request, response, pdf, origin) {
@@ -805,6 +1104,10 @@ export function createApiServer({
   candidateSummaryService = candidateSummaries,
   journalWorkflowService = journalWorkflow,
   projectWorkService = projectWork,
+  projectWorkRuntimeUrl = configuredProjectWorkRuntimeUrl,
+  projectWorkRuntimeHealthProbe = probeProjectWorkRuntime,
+  runtimeOnly = projectWorkRuntimeOnly,
+  allowMissingJournalMutationOrigin = false,
 } = {}) {
   return http.createServer(async (request, response) => {
   const origin = request.headers.origin;
@@ -826,19 +1129,76 @@ export function createApiServer({
   }
 
   const url = new URL(request.url, `http://${request.headers.host || `${host}:${port}`}`);
+  if (
+    !["GET", "HEAD", "OPTIONS"].includes(request.method)
+    && (
+      url.pathname === "/api/v1/journal-runs"
+      || url.pathname.startsWith("/api/v1/journal-runs/")
+    )
+  ) {
+    try {
+      requireJournalMutationOrigin(origin, {
+        allowMissing: allowMissingJournalMutationOrigin,
+      });
+    } catch (error) {
+      sendWorkflowError(
+        response,
+        error,
+        origin,
+        "论文工作流写操作只能从本机 Pi Agent 界面发起",
+      );
+      return;
+    }
+  }
   if (request.method === "GET" && url.pathname === "/api/v1/health") {
+    const runtimeHealth = projectWorkRuntimeUrl
+      ? await projectWorkRuntimeHealthProbe(projectWorkRuntimeUrl)
+      : {
+          reachable: true,
+          runtimeRole: runtimeOnly ? "worker" : "embedded",
+          runtimeSchemaVersion: RUNTIME_SCHEMA_VERSION,
+        };
+    const runtimeAvailable = runtimeHealth.reachable === true;
     sendJson(response, 200, {
-      status: "ok",
+      status: runtimeAvailable ? "ok" : "degraded",
       mode: candidateSummaryService.config.mode,
       default_provider_id: candidateSummaryService.config.defaultProviderId,
-      journal_workflow: "available",
-      project_work: "available",
+      runtime_schema_version: RUNTIME_SCHEMA_VERSION,
+      runtime_role: runtimeOnly
+        ? "worker"
+        : projectWorkRuntimeUrl
+          ? "gateway"
+          : "embedded",
+      journal_workflow: runtimeOnly ? "unavailable" : "available",
+      project_work: runtimeAvailable ? "available" : "recovering",
+      runtime_reachable: runtimeAvailable,
+      runtime_worker_role: runtimeHealth.runtimeRole,
+      runtime_worker_schema_version: runtimeHealth.runtimeSchemaVersion,
       mineru_configured: Boolean(process.env.PI_MINERU_API_TOKEN),
     }, origin);
     return;
   }
 
+  if (runtimeOnly && !url.pathname.startsWith("/api/v1/project-work")) {
+    sendJson(response, 404, {
+      error: {
+        code: "RUNTIME_ROUTE_NOT_FOUND",
+        message: "Pi Runtime 仅提供项目工作接口",
+        retryable: false,
+      },
+    }, origin);
+    return;
+  }
+
   if (url.pathname.startsWith("/api/v1/project-work")) {
+    if (projectWorkRuntimeUrl) {
+      await proxyProjectWorkRequest(
+        request,
+        response,
+        projectWorkRuntimeUrl,
+      );
+      return;
+    }
     try {
       if (request.method === "GET" && url.pathname === "/api/v1/project-work/models") {
         sendJson(response, 200, await projectWorkService.listModels(), origin);
@@ -1007,8 +1367,28 @@ export function createApiServer({
         const tree = await projectWorkService.getProjectTree(projectId, {
           directory: url.searchParams.get("path") ?? "",
           depth: Number(url.searchParams.get("depth") ?? 3),
+          query: url.searchParams.get("query") ?? "",
+          limit: url.searchParams.has("limit")
+            ? Number(url.searchParams.get("limit"))
+            : undefined,
+          cursor: url.searchParams.get("cursor") ?? undefined,
         });
         sendJson(response, 200, tree, origin);
+        return;
+      }
+
+      const projectImageMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/projects\/([^/]+)\/image$/,
+      );
+      if (projectImageMatch && request.method === "GET") {
+        const projectId = decodeProjectWorkSegment(projectImageMatch[1]);
+        sendProjectWorkImage(
+          response,
+          await projectWorkService.readProjectImage(projectId, {
+            filePath: url.searchParams.get("path"),
+          }),
+          origin,
+        );
         return;
       }
 
@@ -1025,6 +1405,23 @@ export function createApiServer({
             : undefined,
         });
         sendJson(response, 200, file, origin);
+        return;
+      }
+
+      const conversationImageMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/image$/,
+      );
+      if (conversationImageMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(
+          conversationImageMatch[1],
+        );
+        sendProjectWorkImage(
+          response,
+          await projectWorkService.readConversationImage(conversationId, {
+            filePath: url.searchParams.get("path"),
+          }),
+          origin,
+        );
         return;
       }
 
@@ -1052,6 +1449,11 @@ export function createApiServer({
         const tree = await projectWorkService.getConversationTree(conversationId, {
           directory: url.searchParams.get("path") ?? "",
           depth: Number(url.searchParams.get("depth") ?? 3),
+          query: url.searchParams.get("query") ?? "",
+          limit: url.searchParams.has("limit")
+            ? Number(url.searchParams.get("limit"))
+            : undefined,
+          cursor: url.searchParams.get("cursor") ?? undefined,
         });
         sendJson(response, 200, tree, origin);
         return;
@@ -1174,12 +1576,398 @@ export function createApiServer({
           afterSeq: Number(url.searchParams.get("after_seq") ?? 0),
           eventLimit: Number(url.searchParams.get("event_limit") ?? 500),
         });
-        sendJson(response, 200, result, origin);
+        sendJson(
+          response,
+          200,
+          publicProjectWorkConversationState(result),
+          origin,
+        );
+        return;
+      }
+
+      const conversationEventsMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/events$/,
+      );
+      if (conversationEventsMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(
+          conversationEventsMatch[1],
+        );
+        const headerAfterSeq = Number(request.headers["last-event-id"]);
+        const queryAfterSeq = Number(url.searchParams.get("after_seq"));
+        const afterSeq = Number.isSafeInteger(headerAfterSeq) && headerAfterSeq >= 0
+          ? headerAfterSeq
+          : Number.isSafeInteger(queryAfterSeq) && queryAfterSeq >= 0
+            ? queryAfterSeq
+            : 0;
+        const wantsStream = String(request.headers.accept ?? "")
+          .includes("text/event-stream");
+        const initialSnapshot = await projectWorkService.getConversation(
+          conversationId,
+          {
+            afterSeq,
+            eventLimit: Number(url.searchParams.get("limit") ?? 500),
+          },
+        );
+        if (!wantsStream) {
+          const publicSnapshot = publicProjectWorkConversationState(
+            initialSnapshot,
+          );
+          sendJson(response, 200, {
+            schema_version: 1,
+            snapshot_watermark:
+              publicSnapshot.conversation?.lastEventSeq ?? afterSeq,
+            conversation: publicSnapshot.conversation,
+            events: publicSnapshot.events,
+            has_more: publicSnapshot.hasMoreEvents,
+            last_seq: publicSnapshot.events?.at(-1)?.seq ?? afterSeq,
+          }, origin);
+          return;
+        }
+        if (typeof projectWorkService.subscribeEvents !== "function") {
+          throw projectWorkError(
+            "PROJECT_WORK_EVENT_STREAM_UNAVAILABLE",
+            "项目工作事件流当前不可用",
+            503,
+            true,
+          );
+        }
+
+        response.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-store",
+          connection: "keep-alive",
+          "x-content-type-options": "nosniff",
+          ...corsHeaders(origin),
+        });
+        response.write("retry: 1500\n\n");
+        let closed = false;
+        let lastSentSeq = afterSeq;
+        let pump = Promise.resolve();
+        const pushSnapshot = async () => {
+          if (closed) return;
+          let hasMore = true;
+          while (hasMore && !closed) {
+            const nextSnapshot = await projectWorkService.getConversation(
+              conversationId,
+              {
+                afterSeq: lastSentSeq,
+                eventLimit: 500,
+              },
+            );
+            const publicSnapshot = publicProjectWorkConversationState(
+              nextSnapshot,
+            );
+            const events = Array.isArray(publicSnapshot.events)
+              ? publicSnapshot.events
+              : [];
+            if (events.length > 0) {
+              lastSentSeq = events.at(-1).seq;
+            } else if (lastSentSeq === 0) {
+              lastSentSeq = publicSnapshot.conversation?.lastEventSeq ?? 0;
+            }
+            response.write(`id: ${lastSentSeq}\n`);
+            response.write("event: snapshot\n");
+            response.write(`data: ${JSON.stringify({
+              schema_version: 1,
+              snapshot_watermark:
+                publicSnapshot.conversation?.lastEventSeq ?? lastSentSeq,
+              conversation: publicSnapshot.conversation,
+              events,
+              has_more: Boolean(publicSnapshot.hasMoreEvents),
+              last_seq: lastSentSeq,
+            })}\n\n`);
+            hasMore = Boolean(publicSnapshot.hasMoreEvents);
+          }
+        };
+        const scheduleSnapshot = () => {
+          pump = pump.then(pushSnapshot).catch((error) => {
+            if (closed) return;
+            response.write("event: stream_error\n");
+            response.write(`data: ${JSON.stringify({
+              code: error?.code ?? "PROJECT_WORK_EVENT_STREAM_FAILED",
+              message: error?.message ?? "项目工作事件流暂时中断",
+            })}\n\n`);
+          });
+        };
+        const unsubscribe = projectWorkService.subscribeEvents(
+          conversationId,
+          scheduleSnapshot,
+        );
+        const heartbeat = setInterval(() => {
+          if (!closed) response.write(": keep-alive\n\n");
+        }, 15_000);
+        const close = () => {
+          if (closed) return;
+          closed = true;
+          clearInterval(heartbeat);
+          unsubscribe();
+        };
+        request.once("close", close);
+        response.once("close", close);
+        scheduleSnapshot();
+        return;
+      }
+
+      const followUpsMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/follow-ups$/,
+      );
+      if (followUpsMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(followUpsMatch[1]);
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          items: await projectWorkService.listFollowUps(conversationId, {
+            includeHistory: url.searchParams.get("include_history") === "true",
+          }),
+        }, origin);
+        return;
+      }
+      if (followUpsMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(followUpsMatch[1]);
+        const payload = await readProjectWorkJson(request);
+        sendJson(
+          response,
+          202,
+          publicProjectWorkConversationState(
+            await projectWorkService.enqueueFollowUp(conversationId, {
+              text: payload.text,
+            }),
+          ),
+          origin,
+        );
+        return;
+      }
+      if (followUpsMatch && request.method === "DELETE") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(followUpsMatch[1]);
+        sendJson(
+          response,
+          200,
+          await projectWorkService.clearFollowUps(conversationId),
+          origin,
+        );
+        return;
+      }
+
+      const followUpMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/follow-ups\/([^/]+)$/,
+      );
+      if (followUpMatch && request.method === "DELETE") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(followUpMatch[1]);
+        const itemId = decodeProjectWorkSegment(followUpMatch[2]);
+        sendJson(
+          response,
+          200,
+          await projectWorkService.removeFollowUp(conversationId, itemId),
+          origin,
+        );
+        return;
+      }
+
+      const askUserRequestsMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/questions$/,
+      );
+      if (askUserRequestsMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(
+          askUserRequestsMatch[1],
+        );
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          requests: await projectWorkService.listAskUserRequests(
+            conversationId,
+            {
+              includeHistory: url.searchParams.get("include_history") === "true",
+            },
+          ),
+        }, origin);
+        return;
+      }
+      if (askUserRequestsMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          askUserRequestsMatch[1],
+        );
+        const payload = await readProjectWorkJson(request);
+        const questions = Array.isArray(payload.questions)
+          ? payload.questions.map((question) => ({
+              id: question?.id,
+              label: question?.label,
+              prompt: question?.prompt,
+              kind: question?.kind,
+              required: question?.required,
+              options: Array.isArray(question?.options)
+                ? question.options.map((option) => ({
+                    id: option?.id,
+                    label: option?.label,
+                    description: option?.description,
+                  }))
+                : [],
+            }))
+          : payload.questions;
+        sendJson(
+          response,
+          201,
+          await projectWorkService.createAskUserRequest(conversationId, {
+            questions,
+          }),
+          origin,
+        );
+        return;
+      }
+
+      const askUserRequestActionMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/questions\/([^/]+)\/(answer|cancel)$/,
+      );
+      if (askUserRequestActionMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          askUserRequestActionMatch[1],
+        );
+        const requestId = decodeProjectWorkSegment(
+          askUserRequestActionMatch[2],
+        );
+        const action = askUserRequestActionMatch[3];
+        const payload = await readProjectWorkJson(request);
+        const result = action === "answer"
+          ? await projectWorkService.answerAskUserRequest(
+              conversationId,
+              requestId,
+              {
+                answers: Array.isArray(payload.answers)
+                  ? payload.answers.map((answer) => ({
+                      questionId: answer?.question_id ?? answer?.questionId,
+                      value: answer?.value,
+                    }))
+                  : payload.answers,
+              },
+            )
+          : await projectWorkService.cancelAskUserRequest(
+              conversationId,
+              requestId,
+            );
+        sendJson(
+          response,
+          200,
+          publicProjectWorkConversationState(result),
+          origin,
+        );
+        return;
+      }
+
+      const conversationTurnsMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/turns$/,
+      );
+      if (conversationTurnsMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(
+          conversationTurnsMatch[1],
+        );
+        const beforeTurnSeq = url.searchParams.has("before_turn_seq")
+          ? Number(url.searchParams.get("before_turn_seq"))
+          : undefined;
+        const limit = url.searchParams.has("limit")
+          ? Number(url.searchParams.get("limit"))
+          : 20;
+        sendJson(
+          response,
+          200,
+          await projectWorkService.getConversationTurns(conversationId, {
+            beforeTurnSeq,
+            limit,
+          }),
+          origin,
+        );
+        return;
+      }
+
+      const conversationReadMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/read$/,
+      );
+      if (conversationReadMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          conversationReadMatch[1],
+        );
+        const payload = await readProjectWorkJson(request);
+        if (
+          payload?.schema_version !== 1
+          || !projectWorkClientRequestIdPattern.test(
+            String(payload?.client_request_id ?? ""),
+          )
+          || Object.keys(payload).some(
+            (key) => ![
+              "schema_version",
+              "client_request_id",
+              "through_message_seq",
+            ].includes(key),
+          )
+          || (
+            payload.through_message_seq !== undefined
+            && (
+              !Number.isSafeInteger(payload.through_message_seq)
+              || payload.through_message_seq < 0
+            )
+          )
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_READ_REQUEST_INVALID",
+            "会话已读请求无效",
+            400,
+          );
+        }
+        sendJson(
+          response,
+          200,
+          publicProjectWorkConversationState(
+            await projectWorkService.markConversationRead(conversationId, {
+              throughMessageSeq: payload.through_message_seq,
+              clientRequestId: payload.client_request_id,
+            }),
+          ),
+          origin,
+        );
+        return;
+      }
+
+      const conversationRetryMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/retry-last-turn$/,
+      );
+      if (conversationRetryMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          conversationRetryMatch[1],
+        );
+        const payload = await readProjectWorkJson(request);
+        if (
+          payload?.schema_version !== 1
+          || !projectWorkClientRequestIdPattern.test(
+            String(payload?.client_request_id ?? ""),
+          )
+          || Object.keys(payload).some(
+            (key) => !["schema_version", "client_request_id"].includes(key),
+          )
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_RETRY_REQUEST_INVALID",
+            "重试上一轮的请求无效",
+            400,
+          );
+        }
+        sendJson(
+          response,
+          202,
+          publicProjectWorkConversationState(
+            await projectWorkService.retryLastTurn(conversationId, {
+              clientRequestId: payload.client_request_id,
+            }),
+          ),
+          origin,
+        );
         return;
       }
 
       const conversationActionMatch = url.pathname.match(
-        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/(messages|steer|abort|compact|configuration)$/,
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/(messages|steer|abort|compact|configuration|execution-policy)$/,
       );
       if (conversationActionMatch && request.method === "POST") {
         requireProjectWorkMutationOrigin(origin);
@@ -1223,6 +2011,14 @@ export function createApiServer({
             modelId: payload.model_id,
             thinkingLevel: payload.thinking_level,
           });
+        } else if (action === "execution-policy") {
+          result = await projectWorkService.configureExecutionPolicy(
+            conversationId,
+            {
+              mode: payload.mode,
+              expectedRevision: payload.expected_revision,
+            },
+          );
         } else {
           result = await projectWorkService.compactConversation(conversationId, {
             instructions: payload.instructions,
@@ -1231,7 +2027,62 @@ export function createApiServer({
         sendJson(
           response,
           action === "messages" || action === "steer" ? 202 : 200,
-          result,
+          publicProjectWorkConversationState(result),
+          origin,
+        );
+        return;
+      }
+
+      const workspaceRecordMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/workspace$/,
+      );
+      if (workspaceRecordMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(workspaceRecordMatch[1]);
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          workspace: await projectWorkService.getWorkspace(conversationId),
+        }, origin);
+        return;
+      }
+
+      const gitEvidenceMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/git-evidence$/,
+      );
+      if (gitEvidenceMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(gitEvidenceMatch[1]);
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          git: await projectWorkService.getGitEvidence(conversationId),
+        }, origin);
+        return;
+      }
+
+      const applyJournalMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/applies$/,
+      );
+      if (applyJournalMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(applyJournalMatch[1]);
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          applies: await projectWorkService.listApplyJournal(conversationId),
+        }, origin);
+        return;
+      }
+
+      const undoApplyMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/applies\/([^/]+)\/undo$/,
+      );
+      if (undoApplyMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(undoApplyMatch[1]);
+        const applyId = decodeProjectWorkSegment(undoApplyMatch[2]);
+        const payload = await readProjectWorkJson(request);
+        sendJson(
+          response,
+          200,
+          await projectWorkService.undoApply(conversationId, applyId, {
+            undoHash: payload.undo_hash ?? payload.undoHash,
+          }),
           origin,
         );
         return;
@@ -1259,7 +2110,58 @@ export function createApiServer({
         sendJson(
           response,
           200,
-          await projectWorkService.getConversation(conversationId),
+          publicProjectWorkConversationState(
+            await projectWorkService.getConversation(conversationId),
+          ),
+          origin,
+        );
+        return;
+      }
+
+      const previewStartMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/previews\/([^/]+)\/start$/,
+      );
+      if (previewStartMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(previewStartMatch[1]);
+        const previewId = decodeProjectWorkSegment(previewStartMatch[2]);
+        const payload = await readProjectWorkJson(request);
+        if (
+          typeof payload?.client_request_id !== "string"
+          || !projectWorkClientRequestIdPattern.test(payload.client_request_id)
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_CLIENT_REQUEST_ID_INVALID",
+            "启动本机预览必须提供稳定的请求标识",
+            400,
+          );
+        }
+        if (
+          payload?.schema_version !== 1
+          || !sha256Pattern.test(String(payload.request_hash ?? ""))
+          || Object.keys(payload).some(
+            (key) => ![
+              "schema_version",
+              "client_request_id",
+              "request_hash",
+            ].includes(key),
+          )
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_PREVIEW_START_REQUEST_INVALID",
+            "本机预览确认请求无效",
+            400,
+          );
+        }
+        sendJson(
+          response,
+          200,
+          publicProjectWorkConversationState(
+            await projectWorkService.startPreview(conversationId, {
+              previewId,
+              requestHash: payload.request_hash,
+            }),
+          ),
           origin,
         );
         return;
@@ -1278,7 +2180,54 @@ export function createApiServer({
         sendJson(
           response,
           200,
-          await projectWorkService.getConversation(conversationId),
+          publicProjectWorkConversationState(
+            await projectWorkService.getConversation(conversationId),
+          ),
+          origin,
+        );
+        return;
+      }
+
+      const verificationRepairResumeMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/verification-repairs\/([^/]+)\/resume$/,
+      );
+      if (
+        verificationRepairResumeMatch
+        && request.method === "POST"
+      ) {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          verificationRepairResumeMatch[1],
+        );
+        const operationId = decodeProjectWorkSegment(
+          verificationRepairResumeMatch[2],
+        );
+        const payload = await readProjectWorkJson(request);
+        if (
+          payload?.schema_version !== 1
+          || !projectWorkClientRequestIdPattern.test(
+            String(payload?.client_request_id ?? ""),
+          )
+          || Object.keys(payload).some(
+            (key) => !["schema_version", "client_request_id"].includes(key),
+          )
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_VERIFICATION_REPAIR_REQUEST_INVALID",
+            "恢复验证修复的请求无效",
+            400,
+          );
+        }
+        await projectWorkService.resumeVerificationRepair(conversationId, {
+          operationId,
+          clientRequestId: payload.client_request_id,
+        });
+        sendJson(
+          response,
+          202,
+          publicProjectWorkConversationState(
+            await projectWorkService.getConversation(conversationId),
+          ),
           origin,
         );
         return;
@@ -1377,6 +2326,14 @@ export function createApiServer({
         throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
       }
       const body = await readJson(request);
+      if (
+        body?.schema_version !== 1
+        || Object.keys(body).some(
+          (key) => !["schema_version", "provider_id", "model_id"].includes(key),
+        )
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "期刊扫描请求版本或字段无效", 400);
+      }
       const run = await journalWorkflowService.startRun({
         trigger: "manual",
         providerId: body?.provider_id,
@@ -1409,14 +2366,157 @@ export function createApiServer({
     return;
   }
 
+  const journalEventsMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9._-]+)\/events$/,
+  );
+  if (request.method === "GET" && journalEventsMatch) {
+    const runId = journalEventsMatch[1];
+    const headerAfterSeq = Number(request.headers["last-event-id"]);
+    const queryAfterSeq = Number(url.searchParams.get("after_seq"));
+    const afterSeq = Number.isSafeInteger(headerAfterSeq) && headerAfterSeq >= 0
+      ? headerAfterSeq
+      : Number.isSafeInteger(queryAfterSeq) && queryAfterSeq >= 0
+        ? queryAfterSeq
+        : 0;
+    const wantsStream = String(request.headers.accept ?? "")
+      .includes("text/event-stream");
+    try {
+      const run = await journalWorkflowService.getRun(runId);
+      if (!run) {
+        sendJson(response, 404, {
+          error: {
+            code: "RUN_NOT_FOUND",
+            message: "运行不存在",
+            retryable: false,
+          },
+        }, origin);
+        return;
+      }
+      if (!wantsStream) {
+        const page = await journalWorkflowService.readEvents(runId, {
+          afterSeq,
+          limit: Number(url.searchParams.get("limit") ?? 500),
+        });
+        const deliveredLastSeq = page.events.at(-1)?.seq ?? afterSeq;
+        sendJson(response, 200, {
+          schema_version: 1,
+          snapshot_watermark: run.snapshot_watermark ?? page.lastSeq,
+          run: publicRun(run),
+          events: page.events.map(publicJournalEvent).filter(Boolean),
+          has_more: page.hasMore,
+          last_seq: deliveredLastSeq,
+        }, origin);
+        return;
+      }
+
+      response.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-store",
+        connection: "keep-alive",
+        "x-content-type-options": "nosniff",
+        ...corsHeaders(origin),
+      });
+      response.write("retry: 1500\n\n");
+      let closed = false;
+      let lastSentSeq = afterSeq;
+      let pump = Promise.resolve();
+      const pushSnapshot = async () => {
+        if (closed) return;
+        let hasMore = true;
+        while (hasMore && !closed) {
+          const [nextRun, page] = await Promise.all([
+            journalWorkflowService.getRun(runId),
+            journalWorkflowService.readEvents(runId, {
+              afterSeq: lastSentSeq,
+              limit: 500,
+            }),
+          ]);
+          const publicEvents = page.events
+            .map(publicJournalEvent)
+            .filter(Boolean);
+          const deliveredLastSeq = page.events.at(-1)?.seq;
+          if (
+            Number.isSafeInteger(deliveredLastSeq)
+            && deliveredLastSeq > lastSentSeq
+          ) {
+            lastSentSeq = deliveredLastSeq;
+          }
+          response.write(`id: ${lastSentSeq}\n`);
+          response.write("event: snapshot\n");
+          response.write(`data: ${JSON.stringify({
+            schema_version: 1,
+            snapshot_watermark:
+              nextRun?.snapshot_watermark ?? page.lastSeq,
+            run: publicRun(nextRun),
+            events: publicEvents,
+            has_more: page.hasMore,
+            last_seq: lastSentSeq,
+          })}\n\n`);
+          hasMore = page.hasMore;
+        }
+      };
+      const scheduleSnapshot = () => {
+        pump = pump.then(pushSnapshot).catch((error) => {
+          if (closed) return;
+          response.write("event: error\n");
+          response.write(`data: ${JSON.stringify({
+            code: error?.code ?? "JOURNAL_EVENT_STREAM_FAILED",
+            message: error?.message ?? "论文运行事件流暂时中断",
+          })}\n\n`);
+        });
+      };
+      const unsubscribe = journalWorkflowService.subscribeEvents(
+        runId,
+        scheduleSnapshot,
+      );
+      const heartbeat = setInterval(() => {
+        if (!closed) response.write(": keep-alive\n\n");
+      }, 15_000);
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        clearInterval(heartbeat);
+        unsubscribe();
+      };
+      request.once("aborted", close);
+      request.once("close", close);
+      response.once("close", close);
+      scheduleSnapshot();
+    } catch (error) {
+      if (!response.headersSent) {
+        sendWorkflowError(
+          response,
+          error,
+          origin,
+          "无法读取论文运行事件",
+        );
+      }
+    }
+    return;
+  }
+
   const journalResumeMatch = url.pathname.match(/^\/api\/v1\/journal-runs\/([a-zA-Z0-9._-]+)\/resume$/);
   if (request.method === "POST" && journalResumeMatch) {
-    const run = await journalWorkflowService.resumeRun(journalResumeMatch[1]);
-    if (!run) {
-      sendJson(response, 404, { error: { code: "RUN_NOT_FOUND", message: "运行不存在", retryable: false } }, origin);
-      return;
+    try {
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (
+        body?.schema_version !== 1
+        || Object.keys(body).some((key) => key !== "schema_version")
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "恢复论文运行请求无效", 400);
+      }
+      const run = await journalWorkflowService.resumeRun(journalResumeMatch[1]);
+      if (!run) {
+        sendJson(response, 404, { error: { code: "RUN_NOT_FOUND", message: "运行不存在", retryable: false } }, origin);
+        return;
+      }
+      sendJson(response, 202, publicRun(run), origin);
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法恢复论文运行");
     }
-    sendJson(response, 202, publicRun(run), origin);
     return;
   }
 
@@ -1456,7 +2556,14 @@ export function createApiServer({
         throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
       }
       const body = await readJson(request);
-      if (body?.schema_version !== 1 || body?.from_step !== "guide") {
+      if (
+        body?.schema_version !== 1
+        || body?.from_step !== "guide"
+        || !isJournalClientRequestId(body.client_request_id)
+        || Object.keys(body).some(
+          (key) => !["schema_version", "from_step", "client_request_id"].includes(key),
+        )
+      ) {
         throw new CandidateSummaryError("INVALID_REQUEST", "重新研读请求无效", 400);
       }
       sendJson(
@@ -1464,6 +2571,7 @@ export function createApiServer({
         200,
         publicRun(await journalWorkflowService.restartReadingFromGuide(
           journalReadingRestartMatch[1],
+          { clientRequestId: body.client_request_id },
         )),
         origin,
       );
@@ -1482,7 +2590,13 @@ export function createApiServer({
         throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
       }
       const body = await readJson(request);
-      if (body?.schema_version !== 1) {
+      if (
+        body?.schema_version !== 1
+        || !isJournalClientRequestId(body.client_request_id)
+        || Object.keys(body).some(
+          (key) => !["schema_version", "client_request_id"].includes(key),
+        )
+      ) {
         throw new CandidateSummaryError("INVALID_REQUEST", "清空研读进度请求无效", 400);
       }
       sendJson(
@@ -1491,6 +2605,7 @@ export function createApiServer({
         publicRun(await journalWorkflowService.resetPaperReading(
           journalReadingResetMatch[1],
           journalReadingResetMatch[2],
+          { clientRequestId: body.client_request_id },
         )),
         origin,
       );
@@ -1561,7 +2676,10 @@ export function createApiServer({
         throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
       }
       const body = await readJson(request);
-      if (body?.schema_version !== 1) {
+      if (
+        body?.schema_version !== 1
+        || !isJournalClientRequestId(body.client_request_id)
+      ) {
         throw new CandidateSummaryError("INVALID_REQUEST", "精读追问请求版本无效", 400);
       }
       sendJson(
@@ -1592,12 +2710,26 @@ export function createApiServer({
   );
   if (request.method === "POST" && journalReadingConversationsMatch) {
     try {
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (
+        body?.schema_version !== 1
+        || !isJournalClientRequestId(body.client_request_id)
+        || Object.keys(body).some(
+          (key) => !["schema_version", "client_request_id"].includes(key),
+        )
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "新建研读会话请求无效", 400);
+      }
       sendJson(
         response,
         201,
         await journalWorkflowService.createReadingConversation(
           journalReadingConversationsMatch[1],
           journalReadingConversationsMatch[2],
+          { clientRequestId: body.client_request_id },
         ),
         origin,
       );
@@ -1635,6 +2767,45 @@ export function createApiServer({
     return;
   }
 
+  const journalReadingConversationPromoteMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/papers\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,119})\/reading\/conversations\/([a-zA-Z0-9][a-zA-Z0-9._:-]{0,159})\/promote$/,
+  );
+  if (request.method === "POST" && journalReadingConversationPromoteMatch) {
+    try {
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (
+        body?.schema_version !== 1
+        || !isJournalClientRequestId(body.client_request_id)
+        || typeof body.confirmed_by !== "string"
+        || Object.keys(body).some(
+          (key) => !["schema_version", "client_request_id", "confirmed_by"].includes(key),
+        )
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "提升研读分支请求无效", 400);
+      }
+      sendJson(
+        response,
+        200,
+        await journalWorkflowService.promoteReadingConversation(
+          journalReadingConversationPromoteMatch[1],
+          journalReadingConversationPromoteMatch[2],
+          journalReadingConversationPromoteMatch[3],
+          {
+            clientRequestId: body.client_request_id,
+            confirmedBy: body.confirmed_by,
+          },
+        ),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法提升研读分支");
+    }
+    return;
+  }
+
   const journalReadingChatMatch = url.pathname.match(
     /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/papers\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,119})\/reading\/chat\/messages$/,
   );
@@ -1649,6 +2820,7 @@ export function createApiServer({
         "client_request_id",
         "text",
         "reference",
+        "round_id",
         "include_project_context",
         "provider_id",
         "model_id",
@@ -1661,8 +2833,7 @@ export function createApiServer({
         "end_offset",
       ]);
       if (
-        typeof body?.client_request_id !== "string"
-        || !body.client_request_id.trim()
+        !isJournalClientRequestId(body?.client_request_id)
       ) {
         throw new CandidateSummaryError(
           "READING_CHAT_CLIENT_REQUEST_ID_REQUIRED",
@@ -1673,6 +2844,13 @@ export function createApiServer({
       if (
         body?.schema_version !== 1
         || Object.keys(body).some((key) => !allowedKeys.has(key))
+        || (
+          body.round_id != null
+          && (
+            typeof body.round_id !== "string"
+            || !/^[a-z][a-z0-9-]{0,79}$/.test(body.round_id)
+          )
+        )
         || (
           body.include_project_context != null
           && typeof body.include_project_context !== "boolean"
@@ -1697,6 +2875,7 @@ export function createApiServer({
           {
             text: body.text,
             reference: body.reference ?? null,
+            ...(body.round_id ? { roundId: body.round_id } : {}),
             clientRequestId: body.client_request_id ?? null,
             includeProjectContext: body.include_project_context === true,
             providerId: body.provider_id,
@@ -1707,6 +2886,84 @@ export function createApiServer({
       );
     } catch (error) {
       sendWorkflowError(response, error, origin, "无法完成当前论文对话");
+    }
+    return;
+  }
+
+  const journalReadingConclusionPinMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/papers\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,119})\/reading\/chat\/turns\/([a-zA-Z0-9][a-zA-Z0-9._:-]{0,159})\/pin$/,
+  );
+  if (request.method === "POST" && journalReadingConclusionPinMatch) {
+    try {
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (
+        body?.schema_version !== 1
+        || !isJournalClientRequestId(body.client_request_id)
+        || typeof body.confirmed_by !== "string"
+        || Object.keys(body).some(
+          (key) => !["schema_version", "client_request_id", "confirmed_by"].includes(key),
+        )
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "固定论文结论请求无效", 400);
+      }
+      sendJson(
+        response,
+        201,
+        await journalWorkflowService.pinReadingConclusion(
+          journalReadingConclusionPinMatch[1],
+          journalReadingConclusionPinMatch[2],
+          journalReadingConclusionPinMatch[3],
+          {
+            clientRequestId: body.client_request_id,
+            confirmedBy: body.confirmed_by,
+          },
+        ),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法固定论文结论");
+    }
+    return;
+  }
+
+  const journalReadingConclusionUnpinMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/papers\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,119})\/reading\/pinned-conclusions\/([a-zA-Z0-9][a-zA-Z0-9._:-]{0,159})\/unpin$/,
+  );
+  if (request.method === "POST" && journalReadingConclusionUnpinMatch) {
+    try {
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (
+        body?.schema_version !== 1
+        || !isJournalClientRequestId(body.client_request_id)
+        || typeof body.confirmed_by !== "string"
+        || Object.keys(body).some(
+          (key) => !["schema_version", "client_request_id", "confirmed_by"].includes(key),
+        )
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "取消固定论文结论请求无效", 400);
+      }
+      sendJson(
+        response,
+        200,
+        await journalWorkflowService.unpinReadingConclusion(
+          journalReadingConclusionUnpinMatch[1],
+          journalReadingConclusionUnpinMatch[2],
+          journalReadingConclusionUnpinMatch[3],
+          {
+            clientRequestId: body.client_request_id,
+            confirmedBy: body.confirmed_by,
+          },
+        ),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法取消固定论文结论");
     }
     return;
   }
@@ -1722,8 +2979,7 @@ export function createApiServer({
       const body = await readJson(request);
       if (
         body?.schema_version !== 1
-        || typeof body.client_request_id !== "string"
-        || !body.client_request_id.trim()
+        || !isJournalClientRequestId(body.client_request_id)
         || Object.keys(body).some(
           (key) => !["schema_version", "client_request_id"].includes(key),
         )
@@ -1790,8 +3046,7 @@ export function createApiServer({
         : new Set(["schema_version", "client_request_id"]);
       if (
         body?.schema_version !== 1
-        || typeof body.client_request_id !== "string"
-        || !body.client_request_id.trim()
+        || !isJournalClientRequestId(body.client_request_id)
         || Object.keys(body).some((key) => !allowedKeys.has(key))
         || (
           action === "commit"
@@ -2004,28 +3259,63 @@ export function createApiServer({
     /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/zotero\/commit$/,
   );
   if (request.method === "POST" && journalZoteroCommitMatch) {
+    sendJson(response, 410, {
+      error: {
+        code: "ZOTERO_COMMIT_DEPRECATED",
+        message: "旧版 Zotero 单独确认入口已停用，请通过联合归档预览确认写入",
+        retryable: false,
+      },
+    }, origin);
+    return;
+  }
+
+  const journalArchiveCommitMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/archive\/commit$/,
+  );
+  if (request.method === "POST" && journalArchiveCommitMatch) {
     try {
       if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
         throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
       }
       const body = await readJson(request);
-      if (body?.schema_version !== 1) {
-        throw new CandidateSummaryError("INVALID_REQUEST", "Zotero 确认请求版本无效", 400);
+      if (
+        body?.schema_version !== 1
+        || !isJournalClientRequestId(body.client_request_id)
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "联合归档确认请求版本无效", 400);
       }
       sendJson(
         response,
         202,
-        publicRun(await journalWorkflowService.startZoteroCommit(
-          journalZoteroCommitMatch[1],
+        publicRun(await journalWorkflowService.startArchiveCommit(
+          journalArchiveCommitMatch[1],
           {
-            proposalHash: body.proposal_hash,
-            operations: body.operations,
+            clientRequestId: body.client_request_id,
+            obsidian: body.obsidian
+              ? {
+                  proposalHash: body.obsidian.proposal_hash,
+                  operations: body.obsidian.operations,
+                }
+              : null,
+            zotero: body.zotero
+              ? {
+                  proposalHash: body.zotero.proposal_hash,
+                  operations: body.zotero.operations,
+                }
+              : null,
+            projectState: body.project_state
+              ? {
+                  proposalHash: body.project_state.proposal_hash,
+                  operation: body.project_state.operation,
+                }
+              : null,
+            simulateObsidianFailure: body.simulate_obsidian_failure === true,
           },
         )),
         origin,
       );
     } catch (error) {
-      sendWorkflowError(response, error, origin, "无法确认 Zotero 写入");
+      sendWorkflowError(response, error, origin, "无法确认联合归档写入");
     }
     return;
   }
@@ -2094,6 +3384,40 @@ export function createApiServer({
       );
     } catch (error) {
       sendWorkflowError(response, error, origin, "无法读取论文正文");
+    }
+    return;
+  }
+
+  const journalDocumentRetryMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/papers\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,119})\/document\/retry$/,
+  );
+  if (request.method === "POST" && journalDocumentRetryMatch) {
+    try {
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (
+        body?.schema_version !== 1
+        || !isJournalClientRequestId(body.client_request_id)
+        || Object.keys(body).some(
+          (key) => !["schema_version", "client_request_id"].includes(key),
+        )
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "逐篇重试请求无效", 400);
+      }
+      sendJson(
+        response,
+        202,
+        publicRun(await journalWorkflowService.retryPaperDocument(
+          journalDocumentRetryMatch[1],
+          journalDocumentRetryMatch[2],
+          { clientRequestId: body.client_request_id },
+        )),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法重试该篇候选全文");
     }
     return;
   }
@@ -2250,13 +3574,30 @@ const isMainModule = process.argv[1]
 
 if (isMainModule) {
   const server = createApiServer();
+  let shuttingDown = false;
+  const weeklyScheduler = (
+    !projectWorkRuntimeOnly
+    && process.env.PI_JOURNAL_SCHEDULER_ENABLED !== "0"
+  )
+    ? createWeeklyJournalScheduler({
+        workflowService: journalWorkflow,
+        dataDir: path.resolve(process.env.PI_DATA_DIR || ".pi-agent"),
+      })
+    : null;
   server.listen(port, host, () => {
     console.log(`Pi Agent local API listening on http://${host}:${port} (${candidateSummaries.config.mode})`);
+    weeklyScheduler?.start().catch((error) => {
+      console.warn(`Pi Agent weekly scheduler could not start: ${error.message}`);
+    });
   });
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.on(signal, () => {
-      Promise.resolve(projectWork.dispose()).catch(() => undefined).finally(() => {
-        server.close(() => process.exit(0));
+      if (shuttingDown) return;
+      shuttingDown = true;
+      weeklyScheduler?.dispose();
+      void shutdownApiServer({
+        server,
+        dispose: () => projectWork?.dispose?.(),
       });
     });
   }

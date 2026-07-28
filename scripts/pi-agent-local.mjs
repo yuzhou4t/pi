@@ -14,6 +14,8 @@ export const WEB_PORT = Number.isInteger(configuredWebPort)
 export const WEB_URL = `http://${WEB_HOST}:${WEB_PORT}/`;
 export const API_PORT_START = 47_880;
 export const API_PORT_END = 47_919;
+export const RUNTIME_PORT_START = 47_920;
+export const RUNTIME_PORT_END = 47_959;
 
 const projectRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -31,6 +33,12 @@ export function isPiAgentHealth(health) {
   return health?.status === "ok"
     && health?.journal_workflow === "available"
     && health?.project_work === "available";
+}
+
+export function isPiRuntimeHealth(health) {
+  return health?.status === "ok"
+    && health?.project_work === "available"
+    && health?.runtime_role === "worker";
 }
 
 export async function isPortAvailable(port, host = WEB_HOST) {
@@ -159,8 +167,12 @@ async function run() {
     );
   }
 
-  const apiPort = await chooseApiPort();
+  const runtimePort = await chooseApiPort({
+    start: RUNTIME_PORT_START,
+    end: RUNTIME_PORT_END,
+  });
   let apiProcess = null;
+  let runtimeProcess = null;
   let webProcess = null;
   let stopping = false;
   let stopSignal = null;
@@ -183,31 +195,73 @@ async function run() {
     await Promise.allSettled([
       stopChildGroup(webProcess),
       stopChildGroup(apiProcess),
+      stopChildGroup(runtimeProcess),
     ]);
     console.log("Pi Agent 已关闭，端口已经释放。");
   };
 
   try {
-    console.log(`正在启动 Pi Agent API（内部端口 ${apiPort}）…`);
-    apiProcess = startChild(
+    console.log(`正在启动 Pi Runtime（内部端口 ${runtimePort}）…`);
+    runtimeProcess = startChild(
       [
-        "--watch",
         "--env-file-if-exists=.env.local",
         "server/index.js",
       ],
-      { PI_API_PORT: String(apiPort) },
+      {
+        PI_API_PORT: String(runtimePort),
+        PI_PROJECT_WORK_RUNTIME_ONLY: "1",
+      },
     );
     await waitUntil(
-      "Pi Agent API",
-      async () => isPiAgentHealth(
+      "Pi Runtime",
+      async () => isPiRuntimeHealth(
         await fetchWithTimeout(
-          `http://${WEB_HOST}:${apiPort}/api/v1/health`,
+          `http://${WEB_HOST}:${runtimePort}/api/v1/health`,
           "json",
         ),
       ),
-      apiProcess,
+      runtimeProcess,
       () => Boolean(stopSignal),
     );
+
+    const apiPort = await chooseApiPort();
+    console.log(`正在启动 Pi Agent API（内部端口 ${apiPort}）…`);
+    const startApi = async () => {
+      apiProcess = startChild(
+        [
+          "--env-file-if-exists=.env.local",
+          "server/index.js",
+        ],
+        {
+          PI_API_PORT: String(apiPort),
+          PI_PROJECT_WORK_RUNTIME_URL: `http://${WEB_HOST}:${runtimePort}`,
+        },
+      );
+      await waitUntil(
+        "Pi Agent API",
+        async () => isPiAgentHealth(
+          await fetchWithTimeout(
+            `http://${WEB_HOST}:${apiPort}/api/v1/health`,
+            "json",
+          ),
+        ),
+        apiProcess,
+        () => Boolean(stopSignal),
+      );
+    };
+    await startApi();
+
+    const superviseApi = async () => {
+      while (!stopping && !stopSignal) {
+        const watchedProcess = apiProcess;
+        const [code, signal] = await once(watchedProcess, "exit");
+        if (stopping || stopSignal || watchedProcess !== apiProcess) return;
+        console.warn(
+          `Pi Agent API 已退出（${signal ?? `退出码 ${code}`}），正在连接保留中的 Pi Runtime 并重启 API…`,
+        );
+        await startApi();
+      }
+    };
 
     console.log(`正在启动 Pi Agent 网页（固定端口 ${WEB_PORT}）…`);
     webProcess = startChild(
@@ -234,9 +288,10 @@ async function run() {
 
     const result = await Promise.race([
       stopRequested,
-      once(apiProcess, "exit").then(([code, signal]) => ({
+      superviseApi(),
+      once(runtimeProcess, "exit").then(([code, signal]) => ({
         kind: "child",
-        name: "API",
+        name: "Pi Runtime",
         code,
         signal,
       })),

@@ -535,7 +535,7 @@ export function createZoteroArchivalService({
       ) {
         throw archivalError(
           "ZOTERO_READING_NOT_READY",
-          "进入精读的论文必须完成四个阶段后才能生成 Zotero 预览",
+          "进入精读的论文必须补齐归档所需的四类证据后才能生成 Zotero 预览",
         );
       }
     }
@@ -1407,6 +1407,7 @@ export function createZoteroArchivalService({
     getTargets,
     resumeCommit,
     startCommit,
+    validateCommit: validateApproval,
     waitForCommit,
   });
 }

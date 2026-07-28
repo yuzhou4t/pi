@@ -72,7 +72,7 @@ test("an explicit selection is derived from one canonical block with UTF-16 offs
   assert.equal(providerRequest.input.references[0].block_id, document().blocks[3].block_id);
   assert.equal(generated.references[0].start_offset, start);
   assert.equal(generated.result.citations[0].reference_id, "reference-1");
-  assert.equal(generated.prompt_version, "reading-chat.v2");
+  assert.equal(generated.prompt_version, "reading-chat.v4");
   assert.match(generated.input_hash, /^sha256:[a-f0-9]{64}$/);
 });
 
@@ -109,30 +109,54 @@ test("no explicit selection uses bounded paper context with trusted block refere
     )),
     true,
   );
-  assert.equal(JSON.stringify(providerRequest.input).length < 15_000, true);
+  // Every turn carries the whole parsed paper so the Agent can teach any part.
+  const fullText = providerRequest.input.paper_full_text;
+  assert.equal(fullText.truncated, false);
+  assert.equal(
+    document().blocks.every((block) => {
+      const source = block.kind === "table" && typeof block.markdown === "string"
+        ? block.markdown.trim()
+        : (block.text ?? block.markdown ?? "").trim();
+      return !source || fullText.content.includes(source);
+    }),
+    true,
+  );
   assert.equal(generated.result.citations.length, 2);
 });
 
-test("recent conversation input keeps only four answered and bounded turns", () => {
+test("recent conversation input keeps bounded turns, drops placeholders, and preserves answer tails", () => {
   const prepared = prepareReadingChatMessage({
     paper,
     document: document(),
     question: "继续解释。",
-    recentTurns: Array.from({ length: 7 }, (_, index) => ({
-      question: `问题 ${index + 1}${"问".repeat(700)}`,
-      answer: `回答 ${index + 1}${"答".repeat(2_000)}`,
-    })),
+    recentTurns: [
+      ...Array.from({ length: 9 }, (_, index) => ({
+        question: `问题 ${index + 1}${"问".repeat(700)}`,
+        answer: `回答 ${index + 1}${"答".repeat(2_000)}`,
+      })),
+      { question: "c", answer: "待核验" },
+      {
+        question: "带我读方法章",
+        answer: `${"讲".repeat(4_000)}选择题：C. 多代理框架协作完成`,
+      },
+    ],
     providerId: "deepseek",
     modelId: "deepseek-v4-flash",
   });
 
-  assert.equal(prepared.recentTurns.length <= 4, true);
-  assert.match(prepared.recentTurns.at(-1).question, /^问题 7/);
+  assert.equal(prepared.recentTurns.length <= 8, true);
+  // Placeholder-only turns never re-enter context.
+  assert.equal(
+    prepared.recentTurns.some((turn) => turn.answer === "待核验"),
+    false,
+  );
+  // Over-budget answers keep their tail, where the quiz lives.
+  assert.match(prepared.recentTurns.at(-1).answer, /多代理框架协作完成$/);
   assert.equal(
     prepared.recentTurns.reduce(
       (sum, turn) => sum + turn.question.length + turn.answer.length,
       0,
-    ) <= 6_000,
+    ) <= 9_000,
     true,
   );
 });

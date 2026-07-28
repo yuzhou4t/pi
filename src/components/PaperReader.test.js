@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
-function renderBlock(PaperReaderFullBlock, block, { resolved }) {
+const STYLES_URL = new URL("../styles.css", import.meta.url);
+
+function renderBlock(PaperReaderFullBlock, block, { resolved, active = true }) {
   return renderToStaticMarkup(React.createElement(PaperReaderFullBlock, {
     block,
     section: null,
-    active: true,
+    active,
     activeRef: null,
     onActivate() {},
     language: "bilingual",
@@ -83,5 +86,68 @@ test("ready passthrough blocks do not show a false untranslated warning", async 
       renderBlock(PaperReaderFullBlock, missing, { resolved: false }),
       /本段尚未翻译/,
     );
+    assert.match(
+      renderBlock(PaperReaderFullBlock, translated, { resolved: true, active: true }),
+      /tabindex="0"/,
+    );
+    assert.doesNotMatch(
+      renderBlock(PaperReaderFullBlock, translated, { resolved: true, active: false }),
+      /tabindex=|role="button"|aria-label=/,
+    );
   });
+});
+
+test("1440 desktop full text keeps every stable anchor with one focusable paragraph", async () => {
+  await withPaperReader(({ PaperReaderFullBlock }) => {
+    const blocks = Array.from({ length: 240 }, (_, index) => ({
+      id: `block-${String(index + 1).padStart(3, "0")}`,
+      kind: "paragraph",
+      text: `Paragraph ${index + 1} keeps **source ${index + 1}** available for selection.`,
+    }));
+    const activeId = "block-120";
+    const html = renderToStaticMarkup(React.createElement(
+      "div",
+      {
+        className: "paper-reader-full",
+        style: { width: 820, maxWidth: "100%" },
+      },
+      blocks.map((block) => React.createElement(PaperReaderFullBlock, {
+        block,
+        section: null,
+        active: block.id === activeId,
+        activeRef: null,
+        onActivate() {},
+        language: "original",
+        translationResolved: true,
+        key: block.id,
+      })),
+    ));
+
+    assert.equal((html.match(/data-reader-block-id=/g) ?? []).length, blocks.length);
+    assert.equal((html.match(/tabindex="0"/g) ?? []).length, 1);
+    assert.equal((html.match(/role="button"/g) ?? []).length, 1);
+    assert.doesNotMatch(html, /tabindex="-1"/);
+    assert.match(html, new RegExp(`id="${activeId}"[^>]*data-reader-block-id="${activeId}"`));
+    assert.match(html, /data-source-start=/);
+    assert.match(html, /data-source-end=/);
+    assert.match(html, /Paragraph 1 keeps/);
+    assert.match(html, /Paragraph 240 keeps/);
+  });
+
+  const styles = await readFile(STYLES_URL, "utf8");
+  const virtualizationStart = styles.indexOf(
+    ".paper-reader-full > .paper-reader-full-heading,",
+  );
+  const virtualizationEnd = styles.indexOf(
+    ".paper-reader-full-heading.is-active {",
+    virtualizationStart,
+  );
+  const virtualization = styles.slice(virtualizationStart, virtualizationEnd);
+
+  assert.notEqual(virtualizationStart, -1);
+  assert.match(virtualization, /content-visibility:\s*auto/);
+  assert.match(virtualization, /contain:\s*layout paint style/);
+  assert.match(virtualization, /contain-intrinsic-block-size:\s*auto 132px/);
+  assert.match(virtualization, /\.paper-reader-full-block\.is-active[\s\S]*content-visibility:\s*visible/);
+  assert.doesNotMatch(virtualization, /display:\s*none|visibility:\s*hidden/);
 });

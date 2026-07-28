@@ -1,7 +1,7 @@
 # V1 项目工作会话真实纵向切片
 
-> 状态：2026-07-25 已确认
-> 阶段：前端合同已由真实本地文件、Pi SDK 会话、受控写回与验证服务承接
+> 状态：2026-07-27 可靠性升级已实现
+> 阶段：前端合同已由持久 Pi Runtime、隔离审阅层、受控运行和可恢复写回承接
 
 ## 1. 目标
 
@@ -51,17 +51,19 @@ V1 不再预置固定任务。用户既可直接新建独立对话，也可先�
 - 桌面首次打开时右栏关闭，中栏使用除左栏外的全部可用宽度；用户打开或关闭右栏时，中栏对话内容和滚动位置不得重置。
 - 用户显式发送后，Pi 可通过结构化工具公开计划、文件活动与验证建议；任务标题来自真实会话，不再由固定 fixture 推进。
 - 活动卡可跳到“查看文件”“查看更改”“打开预览”“查看测试”，但跳转不改变消息或执行状态。
-- 页面加载、项目绑定、会话切换、模型切换和工件切换均不能触发模型；只有显式发送才启动 Pi turn。运行中可显式 steer 或 abort，空闲时可显式 compact。
+- 页面加载、项目绑定、会话切换、模型切换和工件切换均不能触发模型；只有显式发送才启动 Pi turn。运行中可区分即时 steer 与后续消息 queue，可删除或清空未处理 queue；空闲时可显式 compact、retry-last-turn。
+- Pi 可用 durable `ask_user` 暂停并等待单选、多选或文本决策。回答只恢复 Agent 推理，不批准验证、预览或文件写回。
+- 历史消息有稳定 `messageSeq / turnSeq`，按 turn 游标分页；会话保存单调已读水位。最终回答附带本轮 provider、model、thinking、token/cache、费用和上下文证据。
 - 文件或代码选区以可移除的上下文标签进入 Composer，不自动发送。
 
 ### 右栏：当前工件
 
 右栏默认关闭，通过一个明确按钮一键打开或关闭；打开后一次只展示一个工件，并保留桌面拖拽、折叠和沉浸查看能力：
 
-1. **文件**：服务端按需读取的紧凑文件树与只读文本/代码查看，包含安全相对路径和行号；二进制内容不进入 Agent 上下文。
+1. **文件**：服务端分页、搜索并合并审阅层新文件的紧凑文件树；文本/代码按 400 行窗口读取，允许安全图片预览。`.DS_Store`、凭据、内部 worktree、危险符号链接和越界路径始终过滤；二进制内容不进入 Agent 上下文。
 2. **更改**：逐文件 unified diff、增删统计、创建/修改/删除状态、文件选择、`baseHash` 与 `afterHash`。
-3. **预览**：只接受服务端登记的 loopback URL；当前切片不自动启动开发服务器，没有登记地址时展示真实空态。
-4. **运行**：展示命令、状态、耗时、退出码、检查项和可展开的有界日志；不提供自由终端。
+3. **预览**：只接受服务端登记的 Vite、静态站点或 Uvicorn recipe。手动模式展示 recipe、相对 cwd、参数摘要和请求 hash，明确确认后由 supervisor 启动 owned loopback process；没有登记地址时展示真实空态。
+4. **运行**：展示每次 attempt 的命令、状态、耗时、退出码、检查项和可展开的有界日志；不提供自由终端。验证针对隔离审阅层中的修改运行，真实项目在最终 ChangeSet 确认前保持不变。
 
 ## 4. 状态合同
 
@@ -73,9 +75,11 @@ ArtifactKind = file | changes | preview | run_result | existing_paper_artifacts
 ProjectWorkPhase = ready | planned | working | review | applied | completed
 ```
 
+- 公共可靠性生命周期固定为 `idle / running / awaiting_user / awaiting_review / verifying / recovering / stopped`。业务 phase 不被它替代；预览、压缩、验证或结算失败作为独立 `ConversationOperation` 记录，不能抹掉已经成功的回答。
 - `Conversation` 保存作用域、工作区类型、状态、Pi provider/model、消息、计划、待确认 ChangeSet 与验证记录。绑定项目使用 `workspaceKind: bound_project`；独立对话使用 `projectId: null` 与 `workspaceKind: scratch`。
-- `ConversationEvent` 使用单调递增的 `seq` 记录计划、活动、批准和结果，恢复后不得倒序或重复。
+- `ConversationEvent` 使用单调递增的 `seq` 记录计划、活动、批准和结果；snapshot 保存 watermark，SSE 重连只请求 `afterSeq`，恢复后不得倒序或重复。
 - `ChangeSet` 保存逐文件操作、diff、选择状态、`baseHash`、`afterHash` 和确认状态。
+- `WorkspaceRecord` 保存隔离方式、状态、恢复能力和安全标签；`ApplyJournal` 保存逐文件 transition、备份、读回结果和一次性 undo hash。
 - 项目工作会话拥有独立的服务端 JSON 状态、单调 JSONL 事件流和 Pi JSONL 会话树；浏览器只保存当前工作类型、项目、会话与最后工件偏好。
 - 永久删除只清理该会话拥有的服务端状态、事件、Pi JSONL 会话、审阅层、未应用 ChangeSet 和验证历史；不触碰项目根目录、其他会话、已确认写回的文件或 Git 历史。删除接口同时校验项目归属和 busy 状态，公共响应不得泄露绝对路径。
 
@@ -87,7 +91,8 @@ ProjectWorkPhase = ready | planned | working | review | applied | completed
 - 用户可逐文件选择或取消，确认按钮明确写为“确认应用所选修改”。
 - 确认前展示目标文件、操作类型、完整 diff、目标版本、`baseHash` 与 `afterHash`。
 - 未选择文件时不能确认；取消后仍停留在 `review`，不会出现成功结果。
-- “应用”会在服务端再次重算 change-set，并核对 change-set hash、逐文件 base/after hash、真实项目当前内容和稀疏审阅层内容；确认后原子写回所选文件并读回核验。它不会 stage、commit 或 push。
+- “应用”会在服务端再次重算 change-set，并核对 change-set hash、逐文件 base/after hash、真实项目当前内容和稀疏审阅层内容；确认后按项目串行执行持久 apply journal、原子写回和读回核验。进程中断后只会确定恢复或进入人工检查，不猜测成功。
+- 已成功应用的一组文件可获得一次性 hash-bound undo；撤销前重新核对当前文件，任何外部变化都会阻止覆盖。它不会 stage、commit 或 push。
 - 一次确认后保留未应用的审阅内容；最终摘要必须能回到 Diff、预览和运行证据。
 
 ## 6. 桌面端合同
@@ -102,17 +107,19 @@ ProjectWorkPhase = ready | planned | working | review | applied | completed
 本切片仍不实现：
 
 - Monaco 等代码编辑器；
-- Git stage、commit、push、分支或 worktree；
-- 自动启动开发服务器；
+- Git stage、commit、push 或自动创建分支；
+- 自由选择命令、安装依赖、watcher、inline code 或隐式网络；
 - 多 Agent、远程机器、插件市场或依赖安装；
 - 放宽现有 Codex subscription adapter 的只读、无工具隔离。
 
 ## 8. 真实运行边界
 
-- 项目工作使用独立的 `@earendil-works/pi-coding-agent` SDK 宿主，保留 Pi 的持久会话、事件、steer、abort、compact、retry 与 compaction；不把完整 CLI 或 Bash 工具暴露给浏览器。
-- Pi 只获得服务端实现的 contained `read/edit/write/grep/find/ls`、`update_plan` 和 `request_verification`。工具先 canonicalize 相对路径并拒绝符号链接、过滤目录和越界访问。
+- 日常启动器把项目工作 Runtime 从公共 HTTP API 拆开监管。浏览器断开或 API 重启不会结束正在运行的 Pi session；只有关闭 launcher 才受控停止 Runtime。
+- 项目工作使用独立的 `@earendil-works/pi-coding-agent` SDK 宿主，保留 Pi 的持久会话树、事件、steer、follow-up、abort、compact、retry 与 compaction；不把完整 CLI 或 Bash 工具暴露给浏览器。
+- Pi 只获得服务端实现的 contained `read/edit/write/grep/find/ls`、`update_plan`、`ask_user`、`request_verification` 和注册式 preview request。工具先 canonicalize 相对路径并拒绝符号链接、过滤目录和越界访问。
 - Agent 读取真实项目的安全实时视图，修改只进入会话级稀疏审阅层；`.git`、`.env*`、`node_modules`、缓存和 Pi Agent 自身数据始终不可访问。不同会话可以独立探索，但同一真实项目的最终写回按项目串行。
 - 独立对话复用同一组 contained tools，但 `projectRoot` 指向会话私有 scratch 根；它不读取用户项目规则或文件。确认写入按会话串行，只能更新该 scratch 根，删除会话时一并清理。
-- 验证不是自由终端。Pi 只能建议 allowlist 中的 Node/package-manager 检查，用户在右栏看到命令与解析后的 package script 后显式点击；只有此时才从已确认的真实项目物化一次性副本，并保留独立 attempt。
+- 验证不是自由终端。Pi 只能建议 allowlist argv、现有 package scripts 和已安装依赖；用户在右栏看到最终命令与解析后的项目脚本后显式点击。服务端从当前隔离视图和审阅修改物化一次性副本，并保留独立 attempt。
+- 在同一已确认 command binding 内，失败日志可经过脱敏后回灌给 Pi，最多进行两次修复与复测；任何新命令、`ask_user`、预览或写回都不会被这次确认顺带批准。服务重启把未完成修复标为 interrupted，只有明确恢复才会再次调用模型。
 - 验证进程仍继承当前 macOS 用户权限，不等同于容器或 OS 安全沙箱；界面明确显示这一点。依赖没有安装在确认版本快照中时，验证会如实失败，不会静默改到真实项目或自动安装。
-- 自动登记和启动本地预览服务、图片预览、Monaco、PTY、Git/worktree、多 Agent 与远程机器仍是后续能力。
+- Monaco、PTY、Git stage/commit/push、完整 clean-Git conversation worktree、多 Agent 与远程机器仍不是当前能力。绑定项目在可恢复 worktree 隔离完成前保持手动审阅，不开放旧版自动应用。

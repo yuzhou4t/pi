@@ -1,5 +1,4 @@
 import { buildCandidateBatch } from "./classicFallback.js";
-import { fetchDblpSource } from "./dblpAdapter.js";
 import {
   buildSourceScan,
   deduplicatePapers,
@@ -7,17 +6,29 @@ import {
   normalizePaper,
 } from "./monitorCore.js";
 import { enrichPapersWithOpenAlex } from "./openAlexEnricher.js";
+import { fetchRegisteredSource } from "./sourceDispatcher.js";
 import { SOURCE_REGISTRY } from "./sourceRegistry.js";
 
 const MAX_PAPERS_PER_SOURCE = 80;
 const MAX_ENRICHMENT_PAPERS = 40;
 const WEEK_WINDOW_MS = 8 * 24 * 60 * 60 * 1000;
 
-export function publicationDiscovery(publishedAt, observedAt) {
+export function publicationDiscovery(
+  publishedAt,
+  observedAt,
+  publicationDatePrecision,
+) {
+  const inferredPrecision = publicationDatePrecision
+    || (/^\d{4}-\d{2}-\d{2}(?:[T\s].*)?$/.test(String(publishedAt ?? ""))
+      ? "day"
+      : "unknown");
   const published = Date.parse(publishedAt);
   const observed = Date.parse(observedAt);
   const age = observed - published;
-  const publishedThisWeek = Number.isFinite(age) && age >= -24 * 60 * 60 * 1000 && age <= WEEK_WINDOW_MS;
+  const publishedThisWeek = inferredPrecision === "day"
+    && Number.isFinite(age)
+    && age >= -24 * 60 * 60 * 1000
+    && age <= WEEK_WINDOW_MS;
   return {
     published_this_week: publishedThisWeek,
     display_label: publishedThisWeek ? "本周新论文" : "本周补发现 · 非本周新论文",
@@ -26,9 +37,142 @@ export function publicationDiscovery(publishedAt, observedAt) {
 
 function errorRecord(error) {
   return {
-    code: typeof error?.message === "string" ? error.message.slice(0, 160) : "SOURCE_SCAN_FAILED",
-    retryable: error?.name === "AbortError" || /^DBLP_HTTP_(429|5\d\d)$/.test(error?.message ?? ""),
+    code: typeof error?.code === "string"
+      ? error.code
+      : typeof error?.message === "string"
+        ? error.message.slice(0, 160)
+        : "SOURCE_SCAN_FAILED",
+    retryable: Boolean(
+      error?.retryable
+      || error?.name === "AbortError"
+      || /^(?:DBLP|CROSSREF)_HTTP_(429|5\d\d)$/.test(error?.message ?? ""),
+    ),
+    ...(Array.isArray(error?.attempts) ? { attempts: structuredClone(error.attempts) } : {}),
   };
+}
+
+function committedSourceScans(sourceScans) {
+  return sourceScans.map((scan) => scan.status === "success"
+    ? {
+        ...scan,
+        cursor_after: structuredClone(scan.next_cursor),
+        cursor_committed: true,
+        cursor_commit_status: "committed",
+      }
+    : {
+        ...scan,
+        cursor_commit_status: "not_applicable",
+      });
+}
+
+async function readTransaction(runStore, runId) {
+  try {
+    return await runStore.readArtifact(
+      runId,
+      "inputs/source-scan-transaction.json",
+    );
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function candidateBatchFromTransaction(transaction, candidates) {
+  return {
+    mode: transaction.candidate_mode,
+    fallback_reason: transaction.fallback_reason ?? null,
+    candidates,
+  };
+}
+
+async function finalizeTransaction({
+  runId,
+  runStore,
+  sourceStateStore,
+  transaction,
+  sourceScans,
+  summary,
+  candidates,
+}) {
+  const commit = await sourceStateStore.commitScanTransaction({
+    transactionId: transaction.transaction_id,
+    expectedRevision: transaction.expected_source_state_revision,
+    sourceScans,
+    observedAt: transaction.observed_at,
+  });
+  const committedScans = committedSourceScans(sourceScans);
+  await runStore.writeArtifact(runId, "inputs/source-scans.json", committedScans);
+  await runStore.writeArtifact(runId, "inputs/source-scan-transaction.json", {
+    ...transaction,
+    status: "committed",
+    committed_source_state_revision: commit.revision,
+    committed_at: transaction.committed_at ?? new Date().toISOString(),
+  });
+  if (transaction.status !== "committed") {
+    await runStore.appendEvent(runId, {
+      type: "source_scan_completed",
+      at: transaction.observed_at,
+      source_state_revision: commit.revision,
+      ...summary,
+    });
+  }
+  return {
+    sourceScans: committedScans,
+    summary,
+    candidateBatch: candidateBatchFromTransaction(transaction, candidates),
+    cursor_commit_pending: false,
+  };
+}
+
+function stagedTransactionResult(transaction, sourceScans, summary, candidates) {
+  return {
+    sourceScans,
+    summary,
+    candidateBatch: candidateBatchFromTransaction(transaction, candidates),
+    cursor_commit_pending: true,
+  };
+}
+
+export async function commitJournalSourceScan({
+  runId,
+  runStore,
+  sourceStateStore,
+  requiredArtifacts = [],
+} = {}) {
+  if (!runId || !runStore || !sourceStateStore) {
+    throw new Error("runId, runStore, and sourceStateStore are required");
+  }
+  const transaction = await readTransaction(runStore, runId);
+  if (
+    transaction?.schema_version !== 1
+    || transaction.transaction_id !== `source-scan:${runId}`
+    || !["staged", "committed"].includes(transaction.status)
+  ) {
+    throw new Error("SOURCE_SCAN_TRANSACTION_NOT_READY");
+  }
+  const [sourceScans, summary, candidates] = await Promise.all([
+    runStore.readArtifact(runId, "inputs/source-scans.json"),
+    runStore.readArtifact(runId, "inputs/scan-summary.json"),
+    runStore.readArtifact(runId, "inputs/ranking-pool.json"),
+    ...requiredArtifacts.map((artifact) => runStore.readArtifact(runId, artifact)),
+  ]);
+  if (transaction.status === "committed") {
+    return {
+      sourceScans,
+      summary,
+      candidateBatch: candidateBatchFromTransaction(transaction, candidates),
+      cursor_commit_pending: false,
+    };
+  }
+  return finalizeTransaction({
+    runId,
+    runStore,
+    sourceStateStore,
+    transaction,
+    sourceScans,
+    summary,
+    candidates,
+  });
 }
 
 async function mapWithConcurrency(items, concurrency, task) {
@@ -51,20 +195,59 @@ export async function scanJournalSources({
   runStore,
   sourceStateStore,
   sources = SOURCE_REGISTRY,
-  fetchSource = fetchDblpSource,
+  fetchSource = fetchRegisteredSource,
   fetchImpl = globalThis.fetch,
   observedAt = new Date().toISOString(),
   maxPapersPerSource = MAX_PAPERS_PER_SOURCE,
   concurrency = 1,
-  sourceDelayMs = fetchSource === fetchDblpSource ? 1500 : 0,
+  sourceDelayMs = 0,
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   openAlexMailto = "",
+  deferCursorCommit = false,
 } = {}) {
   if (!runId || !runStore || !sourceStateStore) {
     throw new Error("runId, runStore, and sourceStateStore are required");
   }
-  let sourceState = await sourceStateStore.load();
-  const stateBeforeScan = sourceState;
+  const transactionId = `source-scan:${runId}`;
+  const existingTransaction = await readTransaction(runStore, runId);
+  if (
+    existingTransaction?.schema_version === 1
+    && existingTransaction.transaction_id === transactionId
+    && ["staged", "committed"].includes(existingTransaction.status)
+  ) {
+    const [persistedScans, summary, candidates] = await Promise.all([
+      runStore.readArtifact(runId, "inputs/source-scans.json"),
+      runStore.readArtifact(runId, "inputs/scan-summary.json"),
+      runStore.readArtifact(runId, "inputs/ranking-pool.json"),
+    ]);
+    if (existingTransaction.status === "committed") return {
+      sourceScans: persistedScans,
+      summary,
+      candidateBatch: candidateBatchFromTransaction(
+        existingTransaction,
+        candidates,
+      ),
+      cursor_commit_pending: false,
+    };
+    if (deferCursorCommit) {
+      return stagedTransactionResult(
+        existingTransaction,
+        persistedScans,
+        summary,
+        candidates,
+      );
+    }
+    return finalizeTransaction({
+      runId,
+      runStore,
+      sourceStateStore,
+      transaction: existingTransaction,
+      sourceScans: persistedScans,
+      summary,
+      candidates,
+    });
+  }
+  const stateBeforeScan = await sourceStateStore.load();
 
   async function recordSourceProgress(scan) {
     await runStore.updateRun(runId, (current) => {
@@ -117,6 +300,7 @@ export async function scanJournalSources({
         fetched_at: fetched.fetched_at,
         index_url: fetched.index_url,
         target_urls: fetched.target_urls,
+        dispatch: fetched.dispatch ?? null,
         papers: classified,
       };
       await runStore.writeArtifact(runId, `sources/${source.source_id}.json`, artifact);
@@ -130,9 +314,12 @@ export async function scanJournalSources({
           status: "success",
           cursorBefore,
           nextCursor,
-          outputPersisted: true,
+          outputPersisted: false,
           papers: classified,
         }),
+        output_persisted: true,
+        cursor_commit_status: "staged",
+        dispatch: fetched.dispatch ?? null,
         fetched_record_count: normalizedAll.length,
       };
       await recordSourceProgress(scan);
@@ -148,6 +335,7 @@ export async function scanJournalSources({
         papers: [],
         error: failure,
       });
+      scan.cursor_commit_status = "not_applicable";
       await recordSourceProgress(scan);
       return scan;
     } finally {
@@ -156,25 +344,9 @@ export async function scanJournalSources({
       }
     }
   });
-  for (const scan of sourceScans) {
-    sourceState = scan.status === "success" && scan.cursor_committed
-      ? sourceStateStore.applySuccessfulScan(sourceState, {
-          sourceId: scan.source_id,
-          papers: scan.papers,
-          cursorAfter: scan.cursor_after,
-          observedAt,
-        })
-      : sourceStateStore.applyFailedScan(sourceState, {
-          sourceId: scan.source_id,
-          error: scan.error?.code ?? "SOURCE_SCAN_FAILED",
-          observedAt,
-        });
-  }
-  await sourceStateStore.save(sourceState);
-
   const newRecords = deduplicatePapers(
     sourceScans
-      .filter((scan) => scan.status === "success" && scan.cursor_committed)
+      .filter((scan) => scan.status === "success" && scan.output_persisted)
       .flatMap((scan) => scan.papers.filter((paper) => paper.is_new)),
   );
   const likelyRelevant = filterTopicCandidates(newRecords);
@@ -189,7 +361,11 @@ export async function scanJournalSources({
   });
   const topicCandidates = filterTopicCandidates(enriched.map((paper) => ({
     ...paper,
-    ...publicationDiscovery(paper.published_at, observedAt),
+    ...publicationDiscovery(
+      paper.published_at,
+      observedAt,
+      paper.publication_date_precision,
+    ),
   })));
   const recentTopicCandidates = topicCandidates.filter((paper) => paper.published_this_week);
   const candidateBatch = buildCandidateBatch({
@@ -217,15 +393,36 @@ export async function scanJournalSources({
   await runStore.writeArtifact(runId, "inputs/source-scans.json", sourceScans);
   await runStore.writeArtifact(runId, "inputs/scan-summary.json", summary);
   await runStore.writeArtifact(runId, "inputs/ranking-pool.json", candidateBatch.candidates);
-  await runStore.appendEvent(runId, {
-    type: "source_scan_completed",
-    at: observedAt,
-    ...summary,
-  });
-
-  return {
+  const transaction = {
+    schema_version: 1,
+    transaction_id: transactionId,
+    run_id: runId,
+    status: "staged",
+    observed_at: observedAt,
+    expected_source_state_revision: stateBeforeScan.revision,
+    candidate_mode: candidateBatch.mode,
+    fallback_reason: candidateBatch.fallback_reason,
+  };
+  await runStore.writeArtifact(
+    runId,
+    "inputs/source-scan-transaction.json",
+    transaction,
+  );
+  if (deferCursorCommit) {
+    return stagedTransactionResult(
+      transaction,
+      sourceScans,
+      summary,
+      candidateBatch.candidates,
+    );
+  }
+  return finalizeTransaction({
+    runId,
+    runStore,
+    sourceStateStore,
+    transaction,
     sourceScans,
     summary,
-    candidateBatch,
-  };
+    candidates: candidateBatch.candidates,
+  });
 }

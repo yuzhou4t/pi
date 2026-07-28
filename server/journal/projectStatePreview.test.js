@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -165,7 +167,7 @@ test("creates a deterministic exact append preview without writing the project-s
   const first = await context.service.createPreview(context.runId);
   const proposal = first.proposal;
   assert.equal(first.status, "preview_ready");
-  assert.equal(first.write_capability, "preview_only");
+  assert.equal(first.write_capability, "hash_bound_commit");
   assert.equal(first.external_write_performed, false);
   assert.equal(first.run_status, "draft_ready");
   assert.equal(context.calls.length, 1);
@@ -229,6 +231,96 @@ test("creates a deterministic exact append preview without writing the project-s
   assert.equal(second.proposal.proposal_id, proposal.proposal_id);
   assert.equal(second.proposal.diff.after_hash, proposal.diff.after_hash);
   assert.equal(await readFile(context.targetPath, "utf8"), context.stateContent);
+});
+
+test("commits the exact project-state append once and verifies it on read-back", async () => {
+  const context = await setup();
+  await chmod(context.targetPath, 0o640);
+  const preview = await context.service.createPreview(context.runId);
+  const proposal = preview.proposal;
+  const approval = {
+    clientRequestId: "project-state-approval-1",
+    proposalHash: preview.proposal_hash,
+    operation: {
+      proposal_id: proposal.proposal_id,
+      content_hash: proposal.content_hash,
+      target_version_or_hash: proposal.target_version_or_hash,
+    },
+  };
+
+  const committed = await context.service.commit(context.runId, approval);
+  const expected = `${context.stateContent}${proposal.diff.append_text}`;
+  assert.equal(await readFile(context.targetPath, "utf8"), expected);
+  assert.equal(committed.project_state.status, "completed");
+  assert.ok(committed.project_state.verified_at);
+  assert.equal((await stat(context.targetPath)).mode & 0o777, 0o640);
+
+  const idempotent = await context.service.commit(context.runId, {
+    ...approval,
+    clientRequestId: "project-state-approval-2",
+  });
+  assert.equal(idempotent.project_state.status, "completed");
+  assert.equal(await readFile(context.targetPath, "utf8"), expected);
+});
+
+test("refuses a project-state commit after the target changes", async () => {
+  const context = await setup();
+  const preview = await context.service.createPreview(context.runId);
+  const proposal = preview.proposal;
+  const changed = `${context.stateContent}\n## 用户修改\n\n保留我。\n`;
+  await writeFile(context.targetPath, changed, "utf8");
+
+  await assert.rejects(
+    context.service.commit(context.runId, {
+      clientRequestId: "project-state-stale-1",
+      proposalHash: preview.proposal_hash,
+      operation: {
+        proposal_id: proposal.proposal_id,
+        content_hash: proposal.content_hash,
+        target_version_or_hash: proposal.target_version_or_hash,
+      },
+    }),
+    (error) => error.code === "PROJECT_STATE_PREVIEW_STALE",
+  );
+  assert.equal(await readFile(context.targetPath, "utf8"), changed);
+});
+
+test("refuses a tampered project-state preview artifact before writing", async () => {
+  const context = await setup();
+  const preview = await context.service.createPreview(context.runId);
+  const proposal = preview.proposal;
+  const tamperedMarkdown = `${proposal.markdown}\n篡改内容\n`;
+  const tamperedAppend = `${proposal.diff.append_text}\n篡改内容\n`;
+  await context.runStore.writeArtifact(context.runId, preview.artifact_path, {
+    ...preview,
+    proposal: {
+      ...proposal,
+      markdown: tamperedMarkdown,
+      content_hash: __test.sha256(tamperedMarkdown),
+      diff: {
+        ...proposal.diff,
+        append_text: tamperedAppend,
+        after_hash: __test.sha256(`${context.stateContent}${tamperedAppend}`),
+      },
+    },
+  });
+
+  await assert.rejects(
+    context.service.commit(context.runId, {
+      clientRequestId: "project-state-tampered-artifact",
+      proposalHash: preview.proposal_hash,
+      operation: {
+        proposal_id: proposal.proposal_id,
+        content_hash: proposal.content_hash,
+        target_version_or_hash: proposal.target_version_or_hash,
+      },
+    }),
+    (error) => error.code === "PROJECT_STATE_PREVIEW_STALE",
+  );
+  assert.equal(
+    await readFile(context.targetPath, "utf8"),
+    context.stateContent,
+  );
 });
 
 test("requires draft_ready, an authoritative read decision, and all four completed stages", async () => {

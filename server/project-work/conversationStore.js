@@ -1,9 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { projectWorkError } from "./errors.js";
 
 const CONVERSATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/;
+export const CONVERSATION_RECORD_SCHEMA_VERSION = 1;
 
 function assertConversationId(conversationId) {
   if (
@@ -37,6 +47,7 @@ export function createConversationStore({ storageRoot } = {}) {
   const conversationsRoot = path.resolve(storageRoot, "conversations");
   const queues = new Map();
   const eventSequences = new Map();
+  const eventListeners = new Map();
 
   function directory(conversationId) {
     const id = assertConversationId(conversationId);
@@ -82,20 +93,57 @@ export function createConversationStore({ storageRoot } = {}) {
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
-    await writeJsonAtomic(target, state);
-    return structuredClone(state);
+    const next = {
+      ...state,
+      schemaVersion: CONVERSATION_RECORD_SCHEMA_VERSION,
+    };
+    await writeJsonAtomic(target, next);
+    return structuredClone(next);
   }
 
   async function get(conversationId) {
     const id = assertConversationId(conversationId);
     try {
-      return JSON.parse(await readFile(statePath(id), "utf8"));
+      const target = statePath(id);
+      const value = JSON.parse(await readFile(target, "utf8"));
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new SyntaxError("conversation record must be an object");
+      }
+      const version = value.schemaVersion;
+      if (
+        version !== undefined
+        && version !== 0
+        && version !== CONVERSATION_RECORD_SCHEMA_VERSION
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_DATA_VERSION_UNSUPPORTED",
+          "工作会话数据版本高于当前应用，无法安全读取",
+          409,
+        );
+      }
+      if (version === undefined || version === 0) {
+        const migrated = {
+          ...value,
+          schemaVersion: CONVERSATION_RECORD_SCHEMA_VERSION,
+        };
+        await writeJsonAtomic(target, migrated);
+        return migrated;
+      }
+      return value;
     } catch (error) {
       if (error?.code === "ENOENT") {
         throw projectWorkError(
           "PROJECT_WORK_CONVERSATION_NOT_FOUND",
           "工作会话不存在",
           404,
+        );
+      }
+      if (error instanceof SyntaxError) {
+        throw projectWorkError(
+          "PROJECT_WORK_CONVERSATION_RECORD_CORRUPT",
+          "工作会话记录损坏，需要恢复后继续",
+          500,
+          true,
         );
       }
       throw error;
@@ -123,7 +171,7 @@ export function createConversationStore({ storageRoot } = {}) {
     });
   }
 
-  async function parseEvents(conversationId) {
+  async function parseEvents(conversationId, { repairTail = false } = {}) {
     let content;
     try {
       content = await readFile(eventsPath(conversationId), "utf8");
@@ -131,16 +179,66 @@ export function createConversationStore({ storageRoot } = {}) {
       if (error?.code === "ENOENT") return [];
       throw error;
     }
-    return content
-      .split(/\r\n|\n|\r/)
-      .filter(Boolean)
-      .map((line) => JSON.parse(line));
+    const eventFilePath = eventsPath(conversationId);
+    const lastNewlineIndex = Math.max(
+      content.lastIndexOf("\n"),
+      content.lastIndexOf("\r"),
+    );
+    const hasTerminatingNewline = /[\r\n]$/.test(content);
+    const committedContent = hasTerminatingNewline
+      ? content
+      : lastNewlineIndex >= 0
+        ? content.slice(0, lastNewlineIndex + 1)
+        : "";
+    const tail = hasTerminatingNewline
+      ? ""
+      : content.slice(lastNewlineIndex + 1);
+    let derivedSequence = 0;
+    const events = [];
+    const parseLine = (line) => {
+      try {
+        const event = JSON.parse(line);
+        const persistedSequence = Number.isSafeInteger(event?.seq)
+          && event.seq > derivedSequence
+          ? event.seq
+          : null;
+        derivedSequence = persistedSequence ?? derivedSequence + 1;
+        events.push({
+          ...event,
+          seq: derivedSequence,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (const line of committedContent.split(/\r\n|\n|\r/).filter(Boolean)) {
+      if (!parseLine(line)) {
+        throw projectWorkError(
+          "PROJECT_WORK_EVENT_LOG_CORRUPT",
+          "工作会话事件记录损坏，需要恢复后继续",
+          500,
+          true,
+        );
+      }
+    }
+    if (tail) {
+      if (parseLine(tail)) {
+        if (repairTail) await appendFile(eventFilePath, "\n", "utf8");
+      } else if (repairTail) {
+        await truncate(
+          eventFilePath,
+          Buffer.byteLength(committedContent, "utf8"),
+        );
+      }
+    }
+    return events;
   }
 
   async function currentSequence(conversationId) {
     const id = assertConversationId(conversationId);
     if (eventSequences.has(id)) return eventSequences.get(id);
-    const events = await parseEvents(id);
+    const events = await parseEvents(id, { repairTail: true });
     const sequence = events.at(-1)?.seq ?? 0;
     eventSequences.set(id, sequence);
     return sequence;
@@ -148,7 +246,7 @@ export function createConversationStore({ storageRoot } = {}) {
 
   function appendEvent(conversationId, event) {
     return withLock(conversationId, async () => {
-      await get(conversationId);
+      const currentState = await get(conversationId);
       const id = assertConversationId(conversationId);
       const seq = (await currentSequence(id)) + 1;
       const normalized = {
@@ -164,23 +262,57 @@ export function createConversationStore({ storageRoot } = {}) {
         encoding: "utf8",
         mode: 0o600,
       });
+      await writeJsonAtomic(statePath(id), {
+        ...currentState,
+        lastEventSeq: seq,
+        updatedAt: normalized.at ?? currentState.updatedAt,
+      });
       eventSequences.set(id, seq);
+      for (const listener of eventListeners.get(id) ?? []) {
+        try {
+          Promise.resolve(listener(structuredClone(normalized)))
+            .catch(() => undefined);
+        } catch {
+          // A disconnected subscriber must not make the durable append fail.
+        }
+      }
       return normalized;
     });
   }
 
-  async function readEvents(conversationId, { afterSeq = 0, limit = 500 } = {}) {
+  function subscribe(conversationId, listener) {
+    const id = assertConversationId(conversationId);
+    if (typeof listener !== "function") {
+      throw new TypeError("conversation event listener must be a function");
+    }
+    const listeners = eventListeners.get(id) ?? new Set();
+    listeners.add(listener);
+    eventListeners.set(id, listeners);
+    return () => {
+      const current = eventListeners.get(id);
+      if (!current) return;
+      current.delete(listener);
+      if (current.size === 0) eventListeners.delete(id);
+    };
+  }
+
+  function readEvents(conversationId, { afterSeq = 0, limit = 500 } = {}) {
     const normalizedAfter = Number.isInteger(afterSeq) && afterSeq >= 0 ? afterSeq : 0;
     const normalizedLimit = Number.isInteger(limit)
       ? Math.min(Math.max(limit, 1), 1_000)
       : 500;
-    const events = (await parseEvents(conversationId))
-      .filter((event) => event.seq > normalizedAfter);
-    return {
-      events: events.slice(0, normalizedLimit),
-      hasMore: events.length > normalizedLimit,
-      lastSeq: await currentSequence(conversationId),
-    };
+    return withLock(conversationId, async () => {
+      const id = assertConversationId(conversationId);
+      const allEvents = await parseEvents(id, { repairTail: true });
+      const sequence = allEvents.at(-1)?.seq ?? 0;
+      eventSequences.set(id, sequence);
+      const events = allEvents.filter((event) => event.seq > normalizedAfter);
+      return {
+        events: events.slice(0, normalizedLimit),
+        hasMore: events.length > normalizedLimit,
+        lastSeq: sequence,
+      };
+    });
   }
 
   async function list(projectId) {
@@ -217,6 +349,7 @@ export function createConversationStore({ storageRoot } = {}) {
       await get(id);
       await rm(directory(id), { recursive: true, force: false });
       eventSequences.delete(id);
+      eventListeners.delete(id);
     });
   }
 
@@ -228,6 +361,7 @@ export function createConversationStore({ storageRoot } = {}) {
     list,
     readEvents,
     remove,
+    subscribe,
     update,
   });
 }

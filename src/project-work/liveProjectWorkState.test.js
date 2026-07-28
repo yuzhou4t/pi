@@ -8,6 +8,7 @@ import {
   isProjectWorkConversationBusy,
   isProjectWorkConversationDeleteBlocked,
   mergeFreshConversationSnapshot,
+  mergeIncrementalConversationSnapshot,
   removeLiveConversation,
   replaceProjectConversationSlice,
   renameLiveConversation,
@@ -466,6 +467,55 @@ test("a late idle snapshot cannot roll back a newer manual rename", () => {
   };
 
   assert.equal(mergeFreshConversationSnapshot(renamed, lateIdle), renamed);
+});
+
+test("incremental event snapshots keep prior history and deduplicate replays", () => {
+  const current = {
+    id: "conversation-old",
+    projectId: "project-1",
+    title: "检查登录页",
+    status: "running",
+    lastEventSeq: 4,
+    updatedAt: "2026-07-25T14:00:00.000Z",
+    events: [{
+      seq: 3,
+      type: "tool.completed",
+    }, {
+      seq: 4,
+      type: "message.delta",
+      detail: "旧片段",
+    }],
+  };
+  const incoming = {
+    ...current,
+    status: "awaiting_user",
+    lastEventSeq: 6,
+    updatedAt: "2026-07-25T14:00:01.000Z",
+    events: [{
+      seq: 4,
+      type: "message.delta",
+      detail: "重放片段",
+    }, {
+      seq: 5,
+      type: "message.completed",
+    }, {
+      seq: 6,
+      type: "ask_user.requested",
+    }],
+  };
+
+  const merged = mergeIncrementalConversationSnapshot(current, incoming);
+  assert.equal(merged.status, "awaiting_user");
+  assert.deepEqual(merged.events.map((event) => event.seq), [3, 4, 5, 6]);
+  assert.equal(merged.events[1].detail, "重放片段");
+
+  const stale = {
+    ...incoming,
+    lastEventSeq: 2,
+    updatedAt: "2026-07-25T13:59:59.000Z",
+    events: [{ seq: 2, type: "stale" }],
+  };
+  assert.equal(mergeIncrementalConversationSnapshot(merged, stale), merged);
 });
 
 test("only a live busy status blocks conversation deletion", () => {

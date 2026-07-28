@@ -69,6 +69,14 @@ function ConversationList({
             <strong>{conversation.title}</strong>
             <small>{deletingConversation ? "正在删除…" : conversation.subtitle}</small>
           </span>
+          {conversation.unreadCount > 0 ? (
+            <b
+              className="project-conversation-unread-badge"
+              aria-label={`${conversation.unreadCount} 条未读消息`}
+            >
+              {conversation.unreadCount > 99 ? "99+" : conversation.unreadCount}
+            </b>
+          ) : null}
         </button>
         {hasConversationActions && !deletingConversation ? (
           <>

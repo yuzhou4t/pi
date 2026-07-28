@@ -22,6 +22,23 @@ function incrementalId(prefix = "test") {
   return () => `${prefix}-${++sequence}`;
 }
 
+async function enableRecoverableWorkspaceForTest(storageRoot, conversationId) {
+  const statePath = path.join(
+    storageRoot,
+    "conversations",
+    conversationId,
+    "conversation.json",
+  );
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.workspace = {
+    ...state.workspace,
+    recoverableIsolation: true,
+    automaticApplyAllowed: true,
+    revision: (state.workspace?.revision ?? 1) + 1,
+  };
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+}
+
 function modelCatalog() {
   return {
     defaultProviderId: "deepseek",
@@ -37,9 +54,51 @@ function modelCatalog() {
   };
 }
 
+function createFakePreviewSupervisor({ startError = null } = {}) {
+  const active = new Set();
+  const starts = [];
+  const stops = [];
+  return {
+    starts,
+    stops,
+    async start(input) {
+      starts.push(structuredClone(input));
+      if (startError) throw startError;
+      active.add(input.key);
+      return {
+        status: "ready",
+        url: `http://127.0.0.1:48080${input.request.route}`,
+        title: input.request.title,
+        runtime: input.request.runtime,
+        cwd: input.request.cwd,
+        app: input.request.app,
+        route: input.request.route,
+        startedAt: "2026-07-27T02:00:00.000Z",
+        openedAt: "2026-07-27T02:00:01.000Z",
+      };
+    },
+    has(key) {
+      return active.has(key);
+    },
+    async stop(key) {
+      stops.push(key);
+      return active.delete(key);
+    },
+    async dispose() {
+      active.clear();
+    },
+  };
+}
+
 function createFakeSessionFactory({
   changedContent = "export const version = 2;\n",
   additionalChanges = [],
+  verificationRequest = {
+    file: "node",
+    args: ["--test"],
+    checks: ["项目测试应通过"],
+  },
+  previewRequest = null,
 } = {}) {
   const sessions = [];
   const factory = async (options) => {
@@ -48,6 +107,7 @@ function createFakeSessionFactory({
       options,
       prompts: [],
       aborts: 0,
+      activeToolCalls: [],
     };
     const host = {
       subscribe(listener) {
@@ -92,17 +152,184 @@ function createFakeSessionFactory({
             "utf8",
           );
         }
-        await options.onVerificationRequest({
-          file: "node",
-          args: ["--test"],
-          checks: ["项目测试应通过"],
-        });
+        if (verificationRequest) {
+          await options.onVerificationRequest(verificationRequest);
+        }
+        if (previewRequest) {
+          await options.onPreviewRequest(previewRequest);
+        }
         subscriber?.({ type: "agent_settled" });
+      },
+      setActiveToolsByName(names) {
+        record.activeToolCalls.push([...names]);
+        return [...names];
       },
       async steer() {},
       async abort() {
         record.aborts += 1;
       },
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createVerificationRepairSessionFactory({
+  command = {
+    file: "node",
+    args: ["--test"],
+    checks: ["项目测试应通过"],
+  },
+  repairMode = "pass",
+} = {}) {
+  const sessions = [];
+  const factory = async (options) => {
+    let subscriber = null;
+    const record = {
+      activeToolCalls: [],
+      prompts: [],
+      repairCalls: [],
+    };
+    const ensureBaseFile = async (filePath) => {
+      const basePath = path.join(options.baseRoot, filePath);
+      try {
+        await access(basePath);
+      } catch {
+        await mkdir(path.dirname(basePath), { recursive: true });
+        await writeFile(
+          basePath,
+          await readFile(path.join(options.projectRoot, filePath)),
+        );
+      }
+    };
+    const emitAssistantTurn = (text) => {
+      subscriber?.({ type: "agent_start" });
+      subscriber?.({ type: "turn_start" });
+      subscriber?.({
+        type: "message_start",
+        message: { role: "assistant" },
+      });
+      subscriber?.({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text }],
+          stopReason: "stop",
+        },
+      });
+      subscriber?.({ type: "turn_end" });
+      subscriber?.({ type: "agent_end", willRetry: false });
+      subscriber?.({ type: "agent_settled" });
+    };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt(prompt) {
+        record.prompts.push(prompt);
+        await ensureBaseFile("app.js");
+        await writeFile(
+          path.join(options.workspaceRoot, "app.js"),
+          "export const verificationState = \"broken\";\n",
+          "utf8",
+        );
+        await options.onVerificationRequest(command);
+        emitAssistantTurn("初步修改已完成，等待验证。");
+      },
+      async repairVerification(payload) {
+        record.repairCalls.push(structuredClone(payload));
+        if (repairMode === "pass") {
+          await writeFile(
+            path.join(options.workspaceRoot, "app.js"),
+            "export const verificationState = \"fixed\";\n",
+            "utf8",
+          );
+        } else if (repairMode === "change_binding") {
+          await ensureBaseFile("package.json");
+          const packageJson = JSON.parse(
+            await readFile(path.join(options.projectRoot, "package.json"), "utf8"),
+          );
+          packageJson.scripts.verify = "node --test changed";
+          await writeFile(
+            path.join(options.workspaceRoot, "package.json"),
+            `${JSON.stringify(packageJson, null, 2)}\n`,
+            "utf8",
+          );
+        }
+        emitAssistantTurn(`第 ${payload.repairAttempt} 次验证修复已完成。`);
+      },
+      setActiveToolsByName(names) {
+        record.activeToolCalls.push([...names]);
+        return [...names];
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createAskUserSessionFactory() {
+  const sessions = [];
+  const factory = async (options) => {
+    let subscriber = null;
+    let turn = 0;
+    const record = {
+      outcomes: [],
+      prompts: [],
+    };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt(prompt) {
+        record.prompts.push(prompt);
+        turn += 1;
+        const outcome = await options.onAskUserRequest({
+          questions: [{
+            id: `scope-${turn}`,
+            prompt: "选择本轮实现范围",
+            kind: "single_choice",
+            options: [{
+              id: "backend",
+              label: "后端",
+            }, {
+              id: "frontend",
+              label: "前端",
+            }],
+          }],
+        });
+        record.outcomes.push(outcome);
+        subscriber?.({ type: "agent_settled" });
+      },
+      setActiveToolsByName(names) {
+        return [...names];
+      },
+      async steer() {},
+      async abort() {},
       async compact() {},
       async setModel() {},
       dispose() {},
@@ -152,6 +379,104 @@ function createBlockingSessionFactory() {
       async setModel() {},
       dispose() {},
     };
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createFollowUpSessionFactory() {
+  const sessions = [];
+  const factory = async () => {
+    let subscriber = null;
+    let releasePrompt;
+    const record = {
+      prompts: [],
+      followUps: [],
+      steering: [],
+      clearCalls: 0,
+      emit(event) {
+        subscriber?.(event);
+      },
+      deliver(text) {
+        const index = record.followUps.indexOf(text);
+        if (index >= 0) record.followUps.splice(index, 1);
+        record.emit({
+          type: "queue_update",
+          steering: [...record.steering],
+          followUp: [...record.followUps],
+        });
+        record.emit({
+          type: "message_start",
+          message: {
+            role: "user",
+            content: [{ type: "text", text }],
+          },
+        });
+      },
+      release() {
+        releasePrompt?.();
+      },
+    };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      prompt(prompt) {
+        record.prompts.push(prompt);
+        record.emit({ type: "agent_start" });
+        return new Promise((resolve) => {
+          releasePrompt = resolve;
+        });
+      },
+      async steer(text) {
+        record.steering.push(text);
+      },
+      async followUp(text) {
+        record.followUps.push(text);
+        record.emit({
+          type: "queue_update",
+          steering: [...record.steering],
+          followUp: [...record.followUps],
+        });
+      },
+      async replaceFollowUps(messages) {
+        record.followUps = [...messages];
+        record.emit({
+          type: "queue_update",
+          steering: [...record.steering],
+          followUp: [...record.followUps],
+        });
+      },
+      clearQueue() {
+        record.clearCalls += 1;
+        const cleared = {
+          steering: [...record.steering],
+          followUp: [...record.followUps],
+        };
+        record.steering = [];
+        record.followUps = [];
+        record.emit({
+          type: "queue_update",
+          steering: [],
+          followUp: [],
+        });
+        return cleared;
+      },
+      async abort() {
+        record.release();
+      },
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
     sessions.push(record);
     return host;
   };
@@ -372,6 +697,93 @@ function createContextSessionFactory() {
   return factory;
 }
 
+function createTurnControlSessionFactory({ retryError = null } = {}) {
+  const sessions = [];
+  const factory = async () => {
+    let subscriber = null;
+    let answerSequence = 0;
+    const record = {
+      prompts: [],
+      retries: 0,
+      contextUsage: {
+        tokens: 1_000,
+        contextWindow: 10_000,
+        percent: 10,
+      },
+    };
+    async function emitAnswer(prefix) {
+      answerSequence += 1;
+      const message = {
+        role: "assistant",
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+        content: [{
+          type: "text",
+          text: `${prefix}-${answerSequence}`,
+        }],
+        usage: {
+          input: 100 * answerSequence,
+          output: 20 * answerSequence,
+          cacheRead: 5,
+          cacheWrite: 0,
+          totalTokens: (120 * answerSequence) + 5,
+          cost: {
+            total: 0.001 * answerSequence,
+          },
+        },
+        stopReason: "stop",
+      };
+      record.contextUsage = {
+        tokens: 1_000 + (answerSequence * 100),
+        contextWindow: 10_000,
+        percent: 10 + answerSequence,
+      };
+      subscriber?.({ type: "agent_start" });
+      subscriber?.({ type: "turn_start" });
+      subscriber?.({ type: "message_start", message });
+      subscriber?.({ type: "message_end", message });
+      subscriber?.({ type: "turn_end", message, toolResults: [] });
+      subscriber?.({ type: "agent_end", messages: [message], willRetry: false });
+      subscriber?.({ type: "agent_settled" });
+    }
+    const host = {
+      getContextUsage() {
+        return structuredClone(record.contextUsage);
+      },
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt(prompt) {
+        record.prompts.push(prompt);
+        await emitAnswer("回答");
+      },
+      async retryLastTurn() {
+        record.retries += 1;
+        if (retryError) throw retryError;
+        await emitAnswer("重试回答");
+      },
+      setActiveToolsByName(names) {
+        return [...names];
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
 function createThinkingLevelSessionFactory() {
   const sessions = [];
   const catalog = {
@@ -540,13 +952,25 @@ test("thinking strength is model-aware, persisted, and applied to each Pi turn",
     && event.data.thinkingLevel === "high"
   )));
 
-  await assert.rejects(
-    service.configureConversation(conversation.id, {
-      providerId: "openai-codex",
-      modelId: "gpt-5.3-codex",
-      thinkingLevel: "max",
-    }),
+  const configurationError = await eventually(
+    async () => {
+      try {
+        await service.configureConversation(conversation.id, {
+          providerId: "openai-codex",
+          modelId: "gpt-5.3-codex",
+          thinkingLevel: "max",
+        });
+        return null;
+      } catch (error) {
+        return error;
+      }
+    },
     (error) => error?.code === "PROJECT_WORK_THINKING_LEVEL_UNSUPPORTED",
+    "configuration did not become available after the turn settled",
+  );
+  assert.equal(
+    configurationError.code,
+    "PROJECT_WORK_THINKING_LEVEL_UNSUPPORTED",
   );
 
   const fixed = await service.createConversation(project.id, {
@@ -611,6 +1035,7 @@ test("context usage stays read-only until a turn and compaction persists only sa
     estimatedTokensAfter: null,
     willRetry: false,
     completedAt: null,
+    resumeStatus: null,
   });
 
   await service.sendMessage(conversation.id, { text: "检查当前上下文" });
@@ -676,6 +1101,313 @@ test("context usage stays read-only until a turn and compaction persists only sa
   assert.equal(remeasured.conversation.contextUsage.percent, 14);
 });
 
+test("turn history paginates durably and final answers carry unread and usage evidence", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-turn-history-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionFactory = createTurnControlSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    idFactory: incrementalId("turn-history"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "第一轮" });
+  const first = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.messages.length === 2
+    ),
+    "first turn did not settle",
+  );
+  const firstAssistant = first.conversation.messages.at(-1);
+  assert.equal(first.conversation.unreadCount, 1);
+  assert.equal(first.conversation.readState.latestAssistantMessageSeq, 2);
+  assert.deepEqual(firstAssistant.turnEvidence, {
+    schemaVersion: 1,
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+    thinkingLevel: "medium",
+    usage: {
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 5,
+      cacheWriteTokens: 0,
+      totalTokens: 125,
+      costUsd: 0.001,
+    },
+    contextUsage: {
+      tokens: 1_100,
+      contextWindow: 10_000,
+      percent: 11,
+      status: "estimated",
+      updatedAt: firstAssistant.turnEvidence.contextUsage.updatedAt,
+    },
+    capturedAt: firstAssistant.turnEvidence.capturedAt,
+  });
+
+  const markedFirst = await service.markConversationRead(conversation.id, {
+    clientRequestId: "read:first-turn",
+  });
+  assert.equal(markedFirst.conversation.unreadCount, 0);
+  assert.equal(markedFirst.conversation.readState.lastReadMessageSeq, 2);
+  const replayedRead = await service.markConversationRead(conversation.id, {
+    clientRequestId: "read:first-turn",
+  });
+  assert.equal(replayedRead.conversation.readState.lastReadMessageSeq, 2);
+  await assert.rejects(
+    () => service.markConversationRead(conversation.id, {
+      clientRequestId: "read:first-turn",
+      throughMessageSeq: 0,
+    }),
+    (error) => error.code === "PROJECT_WORK_CLIENT_REQUEST_CONFLICT",
+  );
+
+  await service.sendMessage(conversation.id, { text: "第二轮" });
+  const second = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.messages.length === 4
+    ),
+    "second turn did not settle",
+  );
+  assert.equal(second.conversation.unreadCount, 1);
+  assert.deepEqual(
+    second.conversation.messages.map((message) => message.messageSeq),
+    [1, 2, 3, 4],
+  );
+
+  const newestPage = await service.getConversationTurns(conversation.id, {
+    limit: 1,
+  });
+  assert.equal(newestPage.turns.length, 1);
+  assert.equal(newestPage.turns[0].turnSeq, 2);
+  assert.equal(newestPage.turns[0].assistantAttemptCount, 1);
+  assert.equal(newestPage.hasMore, true);
+  assert.equal(newestPage.nextBeforeTurnSeq, 2);
+  const olderPage = await service.getConversationTurns(conversation.id, {
+    beforeTurnSeq: newestPage.nextBeforeTurnSeq,
+    limit: 1,
+  });
+  assert.equal(olderPage.turns[0].turnSeq, 1);
+  assert.equal(olderPage.hasMore, false);
+
+  await service.markConversationRead(conversation.id, {
+    clientRequestId: "read:second-turn",
+  });
+  await service.retryLastTurn(conversation.id, {
+    clientRequestId: "retry:second-turn",
+  });
+  await service.retryLastTurn(conversation.id, {
+    clientRequestId: "retry:second-turn",
+  });
+  const retried = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.operations.some(
+        (operation) => (
+          operation.type === "retry_last_turn"
+          && operation.status === "completed"
+        ),
+      )
+    ),
+    "retry-last-turn operation did not complete",
+  );
+  assert.equal(retried.conversation.status, "idle");
+  assert.equal(sessionFactory.sessions[0].retries, 1);
+  assert.equal(retried.conversation.unreadCount, 1);
+  assert.equal(
+    retried.conversation.messages.filter(
+      (message) => message.role === "assistant",
+    ).length,
+    3,
+  );
+  const retriedPage = await service.getConversationTurns(conversation.id, {
+    limit: 1,
+  });
+  assert.equal(retriedPage.turns[0].turnSeq, 2);
+  assert.equal(retriedPage.turns[0].assistantAttemptCount, 2);
+  assert.match(
+    retriedPage.turns[0].messages.at(-1).text,
+    /^重试回答-/,
+  );
+  assert.equal(retriedPage.turns[0].turnEvidence.usage.costUsd, 0.003);
+});
+
+test("conversation snapshots keep only the latest twenty turns while older pages remain complete", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-turn-window-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createTurnControlSessionFactory(),
+    idFactory: incrementalId("turn-window"),
+  });
+  t.after(() => service.dispose());
+  const conversation = await service.createStandaloneConversation();
+  const statePath = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+    "conversation.json",
+  );
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.messages = Array.from({ length: 30 }, (_, index) => {
+    const turnSeq = index + 1;
+    const turnId = `turn-${turnSeq}`;
+    return [{
+      id: `message-${turnSeq}-user`,
+      messageSeq: (index * 2) + 1,
+      turnId,
+      turnSeq,
+      role: "user",
+      text: `问题 ${turnSeq}`,
+      status: "accepted",
+      createdAt: `2026-07-27T00:${String(index).padStart(2, "0")}:00.000Z`,
+    }, {
+      id: `message-${turnSeq}-assistant`,
+      messageSeq: (index * 2) + 2,
+      turnId,
+      turnSeq,
+      attempt: 1,
+      role: "assistant",
+      text: `回答 ${turnSeq}`,
+      status: "completed",
+      isFinal: true,
+      createdAt: `2026-07-27T00:${String(index).padStart(2, "0")}:01.000Z`,
+    }];
+  }).flat();
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const snapshot = await service.getConversation(conversation.id);
+  assert.equal(snapshot.conversation.messages.length, 40);
+  assert.equal(snapshot.conversation.messages[0].turnSeq, 11);
+  assert.equal(snapshot.conversation.hasMoreTurns, true);
+  assert.equal(snapshot.conversation.nextBeforeTurnSeq, 11);
+  assert.equal(snapshot.conversation.latestMessageSeq, 60);
+
+  const older = await service.getConversationTurns(conversation.id, {
+    beforeTurnSeq: snapshot.conversation.nextBeforeTurnSeq,
+    limit: 20,
+  });
+  assert.deepEqual(
+    older.turns.map((turn) => turn.turnSeq),
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  );
+  assert.equal(older.hasMore, false);
+});
+
+test("retry operation failure preserves the last successful answer and conversation state", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-turn-retry-fail-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionFactory = createTurnControlSessionFactory({
+    retryError: new Error("provider retry failed"),
+  });
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    idFactory: incrementalId("turn-retry-fail"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "保留这次回答" });
+  const answered = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "initial answer did not settle",
+  );
+  const originalAnswer = answered.conversation.messages.at(-1);
+  await service.markConversationRead(conversation.id);
+
+  await service.retryLastTurn(conversation.id);
+  const failed = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.operations.some(
+      (operation) => (
+        operation.type === "retry_last_turn"
+        && operation.status === "failed"
+      ),
+    ),
+    "retry failure was not persisted",
+  );
+  assert.equal(failed.conversation.status, "idle");
+  assert.equal(failed.conversation.lastError, null);
+  assert.equal(failed.conversation.unreadCount, 0);
+  assert.equal(failed.conversation.messages.length, 2);
+  assert.equal(failed.conversation.messages.at(-1).id, originalAnswer.id);
+  assert.equal(failed.conversation.messages.at(-1).text, originalAnswer.text);
+  const failedOperation = failed.conversation.operations.find(
+    (operation) => operation.type === "retry_last_turn",
+  );
+  assert.equal(failedOperation.status, "failed");
+  assert.equal(failedOperation.error.code, "PROJECT_WORK_FAILED");
+  assert.equal(failedOperation.error.message, "项目工作操作失败");
+});
+
+test("a running retry operation recovers as interrupted without replacing its durable answer", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-turn-retry-recover-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const sessionFactory = createTurnControlSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    idFactory: incrementalId("turn-retry-recover"),
+  });
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "先生成持久回答" });
+  const answered = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "answer did not settle before recovery fixture",
+  );
+  const originalAnswer = answered.conversation.messages.at(-1);
+  await service.dispose();
+
+  const statePath = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+    "conversation.json",
+  );
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.status = "running";
+  state.operations = [{
+    id: "operation-recover",
+    type: "retry_last_turn",
+    status: "running",
+    turnId: originalAnswer.turnId,
+    targetAssistantMessageId: originalAnswer.id,
+    resultAssistantMessageId: null,
+    resumeStatus: "idle",
+    startedAt: "2026-07-27T00:00:00.000Z",
+    completedAt: null,
+    error: null,
+  }];
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const recoveredService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createTurnControlSessionFactory(),
+    idFactory: incrementalId("turn-retry-recovered"),
+  });
+  t.after(() => recoveredService.dispose());
+  const recovered = await recoveredService.getConversation(conversation.id);
+  assert.equal(recovered.conversation.status, "idle");
+  assert.equal(recovered.conversation.lastError, null);
+  assert.equal(recovered.conversation.messages.at(-1).id, originalAnswer.id);
+  assert.equal(recovered.conversation.messages.at(-1).text, originalAnswer.text);
+  assert.equal(recovered.conversation.operations[0].status, "interrupted");
+  assert.equal(
+    recovered.conversation.operations[0].error.code,
+    "PROJECT_WORK_OPERATION_INTERRUPTED",
+  );
+});
+
 test("automatic compaction failure records a safe terminal state", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-auto-compaction-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
@@ -738,6 +1470,333 @@ test("automatic compaction failure records a safe terminal state", async (t) => 
   );
 });
 
+test("manual compaction failure stays operation-scoped and restores conversation status", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-manual-compaction-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionFactory = async () => {
+    let subscriber = null;
+    return {
+      get autoCompactionEnabled() {
+        return true;
+      },
+      getContextUsage() {
+        return {
+          tokens: 20_000,
+          contextWindow: 100_000,
+          percent: 20,
+        };
+      },
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async compact() {
+        subscriber?.({ type: "compaction_start", reason: "manual" });
+        throw new Error("private failure at /Users/private/project");
+      },
+      async steer() {},
+      async abort() {},
+      async setModel() {},
+      dispose() {},
+    };
+  };
+  sessionFactory.listModels = async () => modelCatalog();
+  sessionFactory.dispose = async () => {};
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    idFactory: incrementalId("manual-compaction"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  await assert.rejects(
+    service.compactConversation(conversation.id),
+    /private failure/,
+  );
+  const failed = await service.getConversation(conversation.id);
+
+  assert.equal(failed.conversation.status, "idle");
+  assert.equal(failed.conversation.lastError, null);
+  assert.equal(failed.conversation.compaction.status, "failed");
+  assert.equal(failed.conversation.compaction.resumeStatus, "idle");
+  assert.equal(
+    failed.events.some((event) => event.type === "error"),
+    false,
+  );
+  assert.ok(
+    failed.events.some((event) => event.type === "compaction.failed"),
+  );
+  assert.doesNotMatch(JSON.stringify(failed), /Users\/private\/project/);
+});
+
+test("follow-up queue is durable, independently editable, and stop clears pending items", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-follow-ups-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionFactory = createFollowUpSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    idFactory: incrementalId("follow-up"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "先检查项目" });
+  const first = await service.enqueueFollowUp(conversation.id, {
+    text: "完成后补充测试",
+  });
+  const second = await service.enqueueFollowUp(conversation.id, {
+    text: "最后总结风险",
+  });
+
+  assert.deepEqual(
+    (await service.listFollowUps(conversation.id)).map((item) => item.text),
+    ["完成后补充测试", "最后总结风险"],
+  );
+  assert.deepEqual(
+    sessionFactory.sessions[0].followUps,
+    ["完成后补充测试", "最后总结风险"],
+  );
+
+  sessionFactory.sessions[0].deliver(first.item.text);
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.followUpQueue.some(
+      (item) => item.id === first.item.id && item.status === "delivered",
+    ),
+    "delivered follow-up was not persisted",
+  );
+
+  const removed = await service.removeFollowUp(
+    conversation.id,
+    second.item.id,
+  );
+  assert.equal(removed.cancelled[0].status, "cancelled");
+  assert.deepEqual(sessionFactory.sessions[0].followUps, []);
+
+  await service.enqueueFollowUp(conversation.id, {
+    text: "停止时应清理",
+  });
+  await service.abortConversation(conversation.id);
+  const stopped = await service.getConversation(conversation.id);
+  assert.equal(
+    stopped.conversation.followUpQueue.find(
+      (item) => item.text === "停止时应清理",
+    ).status,
+    "cancelled",
+  );
+  assert.ok(sessionFactory.sessions[0].clearCalls > 0);
+  assert.equal(
+    stopped.events.some((event) => (
+      event.type === "message.queued"
+      && event.data.text === "完成后补充测试"
+    )),
+    false,
+  );
+});
+
+test("queued follow-ups survive a service restart even when the active turn cannot resume", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-follow-up-restore-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const firstFactory = createFollowUpSessionFactory();
+  const firstService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: firstFactory,
+    idFactory: incrementalId("follow-up-restore-first"),
+  });
+  const conversation = await firstService.createStandaloneConversation();
+  await firstService.sendMessage(conversation.id, { text: "执行长任务" });
+  const queued = await firstService.enqueueFollowUp(conversation.id, {
+    text: "服务恢复后仍需可见",
+  });
+  await firstService.dispose();
+
+  const secondService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory(),
+    idFactory: incrementalId("follow-up-restore-second"),
+  });
+  t.after(() => secondService.dispose());
+  const restored = await secondService.getConversation(conversation.id);
+  assert.notEqual(restored.conversation.status, "running");
+  assert.equal(
+    restored.conversation.followUpQueue.find(
+      (item) => item.id === queued.item.id,
+    ).status,
+    "queued",
+  );
+  assert.deepEqual(
+    (await secondService.listFollowUps(conversation.id)).map(
+      (item) => item.text,
+    ),
+    ["服务恢复后仍需可见"],
+  );
+  const removed = await secondService.removeFollowUp(
+    conversation.id,
+    queued.item.id,
+  );
+  assert.equal(removed.cancelled[0].status, "cancelled");
+});
+
+test("project-owned ask-user state persists across service restart without impersonating a model tool", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-ask-user-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const firstService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory(),
+    idFactory: incrementalId("ask-user-first"),
+  });
+  const conversation = await firstService.createStandaloneConversation();
+  const created = await firstService.createAskUserRequest(conversation.id, {
+    questions: [{
+      id: "scope",
+      label: "范围",
+      prompt: "这次需要检查哪些部分？",
+      kind: "multiple_choice",
+      options: [{
+        id: "backend",
+        label: "后端",
+      }, {
+        id: "frontend",
+        label: "前端",
+      }],
+    }, {
+      id: "note",
+      label: "补充",
+      prompt: "还有什么约束？",
+      kind: "text",
+      required: false,
+    }],
+  });
+  assert.equal(created.request.source, "project_api");
+  assert.equal(created.snapshot.conversation.status, "awaiting_user");
+  await assert.rejects(
+    firstService.sendMessage(conversation.id, { text: "绕过问题继续" }),
+    (error) => error.code === "PROJECT_WORK_CONVERSATION_BUSY",
+  );
+  await firstService.dispose();
+
+  const secondService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory(),
+    idFactory: incrementalId("ask-user-second"),
+  });
+  t.after(() => secondService.dispose());
+  const restored = await secondService.getConversation(conversation.id);
+  assert.equal(restored.conversation.status, "awaiting_user");
+  assert.equal(restored.conversation.askUserRequests[0].status, "pending");
+  assert.equal(restored.conversation.askUserRequests[0].source, "project_api");
+
+  const answered = await secondService.answerAskUserRequest(
+    conversation.id,
+    created.request.id,
+    {
+      answers: [{
+        questionId: "scope",
+        value: ["backend"],
+      }],
+    },
+  );
+  assert.equal(answered.request.status, "answered");
+  assert.equal(answered.snapshot.conversation.status, "idle");
+  assert.deepEqual(answered.request.answers, [{
+    questionId: "scope",
+    value: ["backend"],
+  }]);
+
+  const secondRequest = await secondService.createAskUserRequest(
+    conversation.id,
+    {
+      questions: [{
+        id: "continue",
+        prompt: "是否继续？",
+        kind: "single_choice",
+        options: [{
+          id: "yes",
+          label: "继续",
+        }, {
+          id: "no",
+          label: "停止",
+        }],
+      }],
+    },
+  );
+  const cancelled = await secondService.cancelAskUserRequest(
+    conversation.id,
+    secondRequest.request.id,
+  );
+  assert.equal(cancelled.request.status, "cancelled");
+  assert.equal(cancelled.snapshot.conversation.status, "idle");
+});
+
+test("agent ask_user pauses durably and resumes with answered or cancelled input", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-agent-ask-user-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionFactory = createAskUserSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    idFactory: incrementalId("agent-ask-user"),
+  });
+  t.after(() => service.dispose());
+  const conversation = await service.createStandaloneConversation();
+
+  await service.sendMessage(conversation.id, { text: "先确认范围" });
+  const awaitingAnswer = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "awaiting_user"
+      && snapshot.conversation.askUserRequests.some(
+        (request) => request.status === "pending",
+      )
+    ),
+    "agent question did not become durable",
+  );
+  const firstRequest = awaitingAnswer.conversation.askUserRequests.find(
+    (request) => request.status === "pending",
+  );
+  assert.equal(firstRequest.source, "agent_tool");
+  await service.answerAskUserRequest(conversation.id, firstRequest.id, {
+    answers: [{
+      questionId: "scope-1",
+      value: "backend",
+    }],
+  });
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "answered agent question did not resume",
+  );
+  assert.deepEqual(sessionFactory.sessions[0].outcomes[0].answers, [{
+    questionId: "scope-1",
+    value: "backend",
+  }]);
+
+  await service.sendMessage(conversation.id, { text: "再确认一次" });
+  const awaitingCancel = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.askUserRequests.some(
+      (request) => request.status === "pending",
+    ),
+    "second agent question did not become durable",
+  );
+  const secondRequest = awaitingCancel.conversation.askUserRequests.find(
+    (request) => request.status === "pending",
+  );
+  await service.cancelAskUserRequest(conversation.id, secondRequest.id);
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "cancelled agent question did not resume",
+  );
+  assert.equal(sessionFactory.sessions[0].outcomes[1].status, "cancelled");
+});
+
 test("restoring an interrupted automatic compaction terminates its running state", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-compaction-restore-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
@@ -770,6 +1829,7 @@ test("restoring an interrupted automatic compaction terminates its running state
       estimatedTokensAfter: 22_000,
       willRetry: false,
       completedAt: null,
+      resumeStatus: null,
     },
   }, null, 2)}\n`);
 
@@ -783,6 +1843,7 @@ test("restoring an interrupted automatic compaction terminates its running state
     estimatedTokensAfter: 22_000,
     willRetry: false,
     completedAt: interruptedAt.toISOString(),
+    resumeStatus: null,
   });
   assert.equal(restored.conversation.lastError.code, "PROJECT_WORK_SESSION_INTERRUPTED");
 });
@@ -835,6 +1896,104 @@ test("thinking deltas persist only one lifecycle pair per agent run", async (t) 
   assert.equal(completedEvents.length, 2);
   assert.ok(thinkingEvents[1].seq < completedEvents[0].seq);
   assert.ok(thinkingEvents[3].seq < completedEvents[1].seq);
+});
+
+test("a new turn clears the previous plan until it publishes its own", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-turn-plan-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  let releaseSecondPlan;
+  let promptCount = 0;
+  const sessionFactory = async (options) => {
+    let subscriber = null;
+    return {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt() {
+        promptCount += 1;
+        if (promptCount === 2) {
+          await new Promise((resolve) => {
+            releaseSecondPlan = resolve;
+          });
+        }
+        await options.onPlan({
+          explanation: promptCount === 1 ? "上一轮计划" : "当前轮计划",
+          steps: [{
+            id: promptCount === 1 ? "previous" : "current",
+            text: promptCount === 1 ? "上一轮步骤" : "当前轮步骤",
+            status: "completed",
+          }],
+        });
+        subscriber?.({ type: "agent_settled" });
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+  };
+  sessionFactory.listModels = async () => modelCatalog();
+  sessionFactory.dispose = async () => {};
+
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    idFactory: incrementalId("turn-plan"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "第一轮" });
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.plan?.steps?.[0]?.id === "previous"
+    ),
+    "first turn plan did not settle",
+  );
+
+  const admitted = await eventually(
+    async () => {
+      try {
+        return await service.sendMessage(conversation.id, {
+          text: "第二轮",
+          clientRequestId: "turn-plan-second",
+        });
+      } catch (error) {
+        if (error?.code === "PROJECT_WORK_CONVERSATION_BUSY") return null;
+        throw error;
+      }
+    },
+    Boolean,
+    "second turn was not admitted after the first turn settled",
+  );
+  assert.equal(admitted.conversation.status, "running");
+  assert.equal(admitted.conversation.plan, null);
+  assert.equal(
+    (await service.getConversation(conversation.id)).conversation.plan,
+    null,
+  );
+
+  await eventually(
+    async () => releaseSecondPlan,
+    (release) => typeof release === "function",
+    "second turn did not start",
+  );
+  releaseSecondPlan();
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.plan?.steps?.[0]?.id === "current"
+    ),
+    "second turn plan did not settle",
+  );
+  assert.equal(settled.conversation.plan.explanation, "当前轮计划");
 });
 
 test("create-mode picking accepts no name and public project data never leaks its path", async (t) => {
@@ -1062,6 +2221,10 @@ test("conversation file reads prefer overlay content and can open overlay-only f
   const storageRoot = path.join(temporaryRoot, "private-state");
   await mkdir(projectRoot);
   await writeFile(path.join(projectRoot, "app.js"), "export const source = 'live';\n");
+  const pngHeader = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ]);
+  await writeFile(path.join(projectRoot, "preview.png"), pngHeader);
   const service = createProjectWorkService({
     storageRoot,
     sessionFactory: createFakeSessionFactory(),
@@ -1087,6 +2250,7 @@ test("conversation file reads prefer overlay content and can open overlay-only f
     path.join(overlayRoot, "src", "generated.js"),
     "export const generated = true;\n",
   );
+  await writeFile(path.join(overlayRoot, "src", "generated.png"), pngHeader);
 
   const modified = await service.readConversationFile(conversation.id, {
     filePath: "app.js",
@@ -1097,12 +2261,38 @@ test("conversation file reads prefer overlay content and can open overlay-only f
   const live = await service.readProjectFile(project.id, {
     filePath: "app.js",
   });
+  const rootTree = await service.getConversationTree(conversation.id, {
+    limit: 20,
+  });
+  const nestedTree = await service.getConversationTree(conversation.id, {
+    directory: "src",
+    query: "generated",
+    limit: 20,
+  });
+  const image = await service.readConversationImage(conversation.id, {
+    filePath: "src/generated.png",
+  });
 
   assert.match(modified.content, /source = 'overlay'/);
   assert.match(created.content, /generated = true/);
   assert.notEqual(modified.hash, live.hash);
+  assert.equal(
+    rootTree.entries.find((entry) => entry.path === "app.js")?.overlay,
+    "modified",
+  );
+  assert.deepEqual(
+    nestedTree.entries.map((entry) => [entry.path, entry.overlay]),
+    [
+      ["src/generated.js", "created"],
+      ["src/generated.png", "created"],
+    ],
+  );
+  assert.equal(image.mimeType, "image/png");
+  assert.equal(image.bytes.equals(pngHeader), true);
   assert.equal(JSON.stringify({ modified, created }).includes(projectRoot), false);
   assert.equal(JSON.stringify({ modified, created }).includes(storageRoot), false);
+  assert.equal(JSON.stringify({ rootTree, nestedTree, image }).includes(projectRoot), false);
+  assert.equal(JSON.stringify({ rootTree, nestedTree, image }).includes(storageRoot), false);
 });
 
 test("a replaced bound root is rejected before a live-overlay conversation starts", async (t) => {
@@ -1391,7 +2581,13 @@ test("real project-work chain binds context and changes, applies by hash, and pr
   );
   const settled = await eventually(
     () => service.getConversation(conversation.id),
-    (snapshot) => snapshot.conversation.status === "awaiting_confirmation",
+    (snapshot) => (
+      snapshot.conversation.status === "awaiting_confirmation"
+      && snapshot.events.some((event) => (
+        event.type === "agent.status"
+        && event.data.status === "awaiting_confirmation"
+      ))
+    ),
     "agent_settled did not produce a reviewable change set",
   );
 
@@ -1483,6 +2679,9 @@ test("real project-work chain binds context and changes, applies by hash, and pr
   assert.match(passed.output, /<workspace>/);
   assert.equal(failed.status, "failed");
   assert.equal(failed.exitCode, 1);
+  const afterFailedVerification = await service.getConversation(conversation.id);
+  assert.equal(afterFailedVerification.conversation.status, "applied");
+  assert.equal(afterFailedVerification.conversation.lastError, null);
   assert.equal(runnerCalls.length, 2);
   const canonicalStorageRoot = await realpath(storageRoot);
   assert.equal(
@@ -1501,7 +2700,1241 @@ test("real project-work chain binds context and changes, applies by hash, and pr
   );
 });
 
-test("partial apply keeps unselected files reviewable and blocks verification", async (t) => {
+test("a confirmed failed verification is repaired once and rerun against the same isolated command", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-verification-repair-pass-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(
+    path.join(projectRoot, "app.js"),
+    "export const verificationState = \"original\";\n",
+    "utf8",
+  );
+  const sessionFactory = createVerificationRepairSessionFactory();
+  const runnerCalls = [];
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async (request) => {
+      runnerCalls.push(structuredClone(request));
+      const content = await readFile(path.join(request.cwd, "app.js"), "utf8");
+      const passed = content.includes("\"fixed\"");
+      return {
+        exitCode: passed ? 0 : 1,
+        durationMs: 4,
+        stdout: passed ? "verification passed" : "",
+        stderr: passed ? "" : `verification failed in ${request.cwd}/app.js`,
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+      };
+    },
+    idFactory: incrementalId("repair-pass"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, {
+    text: "修复实现并准备验证",
+  });
+  const pending = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "awaiting_confirmation"
+      && snapshot.conversation.verifications.some(
+        (verification) => verification.status === "requested",
+      )
+    ),
+    "manual verification request was not ready",
+  );
+  const request = pending.conversation.verifications.find(
+    (verification) => verification.status === "requested",
+  );
+
+  assert.equal(runnerCalls.length, 0);
+  assert.equal(
+    await readFile(path.join(projectRoot, "app.js"), "utf8"),
+    "export const verificationState = \"original\";\n",
+  );
+  const completed = await service.runVerification(conversation.id, {
+    requestId: request.id,
+  });
+
+  assert.equal(completed.status, "passed");
+  assert.equal(completed.repairAttempt, 1);
+  assert.equal(runnerCalls.length, 2);
+  assert.equal(sessionFactory.sessions[0].repairCalls.length, 1);
+  const [repairPayload] = sessionFactory.sessions[0].repairCalls;
+  assert.equal(repairPayload.commandBindingHash, request.bindingHash);
+  assert.equal(repairPayload.repairAttempt, 1);
+  assert.equal(repairPayload.maxRepairAttempts, 2);
+  assert.equal(repairPayload.failure.output.includes(storageRoot), false);
+  assert.match(repairPayload.failure.output, /<workspace>/);
+  assert.ok(sessionFactory.sessions[0].activeToolCalls.some((names) => (
+    names.join(",") === "read,edit,write,grep,find,ls,update_plan"
+  )));
+
+  const settled = await service.getConversation(conversation.id);
+  const operation = settled.conversation.operations.find(
+    (item) => item.type === "verification_repair",
+  );
+  assert.equal(operation.status, "completed");
+  assert.equal(operation.phase, "completed");
+  assert.equal(operation.repairAttemptCount, 1);
+  assert.equal(operation.validationAttemptIds.length, 2);
+  assert.equal(settled.conversation.status, "awaiting_confirmation");
+  assert.equal(settled.conversation.activeChangeSet.status, "ready");
+  assert.ok(settled.conversation.messages.some(
+    (message) => message.text === "初步修改已完成，等待验证。",
+  ));
+  assert.ok(settled.conversation.messages.some((message) => (
+    message.verificationRepairOperationId === operation.id
+    && message.repairAttempt === 1
+  )));
+  assert.equal(
+    await readFile(path.join(projectRoot, "app.js"), "utf8"),
+    "export const verificationState = \"original\";\n",
+  );
+});
+
+test("verification repair stops after two failed repair attempts", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-verification-repair-limit-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await writeFile(
+    path.join(projectRoot, "app.js"),
+    "export const verificationState = \"original\";\n",
+    "utf8",
+  );
+  const sessionFactory = createVerificationRepairSessionFactory({
+    repairMode: "fail",
+  });
+  let runnerCalls = 0;
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async () => {
+      runnerCalls += 1;
+      return {
+        exitCode: 1,
+        durationMs: 3,
+        stdout: "",
+        stderr: "the assertion still fails",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+      };
+    },
+    idFactory: incrementalId("repair-limit"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, { text: "修复并验证" });
+  const pending = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "awaiting_confirmation",
+    "change set was not ready",
+  );
+  const request = pending.conversation.verifications.find(
+    (verification) => verification.status === "requested",
+  );
+  const completed = await service.runVerification(conversation.id, {
+    requestId: request.id,
+  });
+
+  assert.equal(completed.status, "failed");
+  assert.equal(completed.repairAttempt, 2);
+  assert.equal(runnerCalls, 3);
+  assert.equal(sessionFactory.sessions[0].repairCalls.length, 2);
+  const settled = await service.getConversation(conversation.id);
+  const operation = settled.conversation.operations.find(
+    (item) => item.type === "verification_repair",
+  );
+  assert.equal(operation.status, "failed");
+  assert.equal(operation.repairAttemptCount, 2);
+  assert.equal(operation.maxRepairAttempts, 2);
+  assert.equal(operation.validationAttemptIds.length, 3);
+  assert.equal(
+    operation.error.code,
+    "PROJECT_WORK_VERIFICATION_REPAIR_LIMIT",
+  );
+  assert.equal(settled.conversation.status, "awaiting_confirmation");
+  assert.equal(settled.conversation.lastError, null);
+});
+
+test("verification repair blocks when a package script changes the confirmed command binding", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-verification-repair-binding-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await Promise.all([
+    writeFile(
+      path.join(projectRoot, "app.js"),
+      "export const verificationState = \"original\";\n",
+      "utf8",
+    ),
+    writeFile(
+      path.join(projectRoot, "package.json"),
+      `${JSON.stringify({
+        scripts: {
+          verify: "node --test",
+        },
+      }, null, 2)}\n`,
+      "utf8",
+    ),
+  ]);
+  const sessionFactory = createVerificationRepairSessionFactory({
+    command: {
+      file: "npm",
+      args: ["run", "verify"],
+      checks: ["项目测试应通过"],
+    },
+    repairMode: "change_binding",
+  });
+  let runnerCalls = 0;
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async () => {
+      runnerCalls += 1;
+      return {
+        exitCode: 1,
+        durationMs: 3,
+        stdout: "",
+        stderr: "initial verification failed",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+      };
+    },
+    idFactory: incrementalId("repair-binding"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, { text: "修复并验证脚本" });
+  const pending = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "awaiting_confirmation",
+    "change set was not ready",
+  );
+  const request = pending.conversation.verifications.find(
+    (verification) => verification.status === "requested",
+  );
+  const completed = await service.runVerification(conversation.id, {
+    requestId: request.id,
+  });
+
+  assert.equal(
+    completed.errorCode,
+    "PROJECT_WORK_VERIFICATION_BINDING_CHANGED",
+  );
+  assert.equal(runnerCalls, 1);
+  assert.equal(sessionFactory.sessions[0].repairCalls.length, 1);
+  const settled = await service.getConversation(conversation.id);
+  const operation = settled.conversation.operations.find(
+    (item) => item.type === "verification_repair",
+  );
+  assert.equal(operation.status, "failed");
+  assert.equal(
+    operation.error.code,
+    "PROJECT_WORK_VERIFICATION_BINDING_CHANGED",
+  );
+  assert.equal(settled.conversation.status, "awaiting_confirmation");
+  assert.deepEqual(
+    JSON.parse(await readFile(path.join(projectRoot, "package.json"), "utf8")),
+    {
+      scripts: {
+        verify: "node --test",
+      },
+    },
+  );
+});
+
+test("restart interrupts verification repair without a paid repeat and explicit resume reverifies first", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-verification-repair-restart-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(
+    path.join(projectRoot, "app.js"),
+    "export const verificationState = \"original\";\n",
+    "utf8",
+  );
+  const firstFactory = createVerificationRepairSessionFactory();
+  const firstService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: firstFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async (request) => {
+      const content = await readFile(path.join(request.cwd, "app.js"), "utf8");
+      return {
+        exitCode: content.includes("\"fixed\"") ? 0 : 1,
+        durationMs: 2,
+        stdout: "",
+        stderr: content.includes("\"fixed\"") ? "" : "failed",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+      };
+    },
+    idFactory: incrementalId("repair-restart-first"),
+  });
+  const selection = await firstService.pickProjectRoot({ mode: "existing" });
+  const project = await firstService.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await firstService.createConversation(project.id);
+  await firstService.sendMessage(conversation.id, { text: "修复并验证" });
+  const pending = await eventually(
+    () => firstService.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "awaiting_confirmation",
+    "change set was not ready",
+  );
+  const request = pending.conversation.verifications.find(
+    (verification) => verification.status === "requested",
+  );
+  await firstService.runVerification(conversation.id, {
+    requestId: request.id,
+  });
+  await firstService.dispose();
+
+  const statePath = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+    "conversation.json",
+  );
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  const operation = state.operations.find(
+    (item) => item.type === "verification_repair",
+  );
+  const initialFailure = state.verifications.find(
+    (verification) => (
+      verification.status === "failed"
+      && !verification.repairOperationId
+    ),
+  );
+  const passedRepair = state.verifications.find(
+    (verification) => (
+      verification.status === "passed"
+      && verification.repairOperationId === operation.id
+    ),
+  );
+  state.status = "verifying";
+  Object.assign(operation, {
+    status: "running",
+    phase: "verifying",
+    repairAttemptCount: 1,
+    lastFailedAttemptId: initialFailure.id,
+    completedAt: null,
+    error: null,
+  });
+  state.verifications.push({
+    ...passedRepair,
+    id: "verification-run-crash",
+    status: "running",
+    exitCode: null,
+    durationMs: null,
+    output: "",
+    resumeStatus: "awaiting_confirmation",
+    completedAt: null,
+  });
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const resumedFactory = createVerificationRepairSessionFactory();
+  let resumedRunnerCalls = 0;
+  const resumedService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: resumedFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async (request) => {
+      resumedRunnerCalls += 1;
+      const content = await readFile(path.join(request.cwd, "app.js"), "utf8");
+      return {
+        exitCode: content.includes("\"fixed\"") ? 0 : 1,
+        durationMs: 2,
+        stdout: "reverified",
+        stderr: "",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+      };
+    },
+    idFactory: incrementalId("repair-restart-resumed"),
+  });
+  t.after(() => resumedService.dispose());
+
+  const recovered = await resumedService.getConversation(conversation.id);
+  const interrupted = recovered.conversation.operations.find(
+    (item) => item.id === operation.id,
+  );
+  assert.equal(interrupted.status, "interrupted");
+  assert.equal(
+    interrupted.error.code,
+    "PROJECT_WORK_VERIFICATION_REPAIR_INTERRUPTED",
+  );
+  assert.equal(resumedFactory.sessions.length, 0);
+  assert.equal(resumedRunnerCalls, 0);
+
+  const completed = await resumedService.resumeVerificationRepair(
+    conversation.id,
+    {
+      operationId: operation.id,
+      clientRequestId: "repair:resume-once",
+    },
+  );
+  assert.equal(completed.status, "passed");
+  await resumedService.resumeVerificationRepair(conversation.id, {
+    operationId: operation.id,
+    clientRequestId: "repair:resume-once",
+  });
+  assert.equal(resumedFactory.sessions.length, 1);
+  assert.equal(resumedFactory.sessions[0].repairCalls.length, 0);
+  assert.equal(resumedRunnerCalls, 1);
+  const finalSnapshot = await resumedService.getConversation(conversation.id);
+  const completedOperation = finalSnapshot.conversation.operations.find(
+    (item) => item.id === operation.id,
+  );
+  assert.equal(completedOperation.status, "completed");
+  assert.equal(completedOperation.repairAttemptCount, 1);
+});
+
+test("apply journal exposes one hash-bound undo and blocks stale external changes", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-apply-undo-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "export const version = 1;\n");
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({ verificationRequest: null }),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("apply-undo"),
+  });
+  t.after(() => service.dispose());
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+
+  async function prepareAndApply(message) {
+    await service.sendMessage(conversation.id, { text: message });
+    const settled = await eventually(
+      () => service.getConversation(conversation.id),
+      (snapshot) => snapshot.conversation.activeChangeSet?.status === "ready",
+      "change set did not become reviewable",
+    );
+    const changeSet = settled.conversation.activeChangeSet;
+    await service.applyChangeSet(conversation.id, {
+      changeSetId: changeSet.id,
+      changeSetHash: changeSet.hash,
+      files: changeSet.files.map((file) => ({
+        fileId: file.id,
+        baseHash: file.baseHash,
+        afterHash: file.afterHash,
+      })),
+    });
+    return (await service.listApplyJournal(conversation.id)).at(-1);
+  }
+
+  const firstJournal = await prepareAndApply("升级版本");
+  assert.equal(firstJournal.status, "applied");
+  assert.equal(firstJournal.undo.status, "available");
+  assert.equal(JSON.stringify(firstJournal).includes(projectRoot), false);
+  const undone = await service.undoApply(conversation.id, firstJournal.id, {
+    undoHash: firstJournal.undo.hash,
+  });
+  assert.equal(
+    await readFile(path.join(projectRoot, "app.js"), "utf8"),
+    "export const version = 1;\n",
+  );
+  assert.equal(undone.conversation.applyJournal[0].status, "undone");
+  assert.equal(undone.conversation.applyJournal[0].undo.status, "used");
+  await assert.rejects(
+    service.undoApply(conversation.id, firstJournal.id, {
+      undoHash: firstJournal.undo.hash,
+    }),
+    (error) => error.code === "PROJECT_WORK_UNDO_UNAVAILABLE",
+  );
+
+  const secondJournal = await prepareAndApply("再次升级版本");
+  await writeFile(
+    path.join(projectRoot, "app.js"),
+    "export const version = 3;\n",
+  );
+  await assert.rejects(
+    service.undoApply(conversation.id, secondJournal.id, {
+      undoHash: secondJournal.undo.hash,
+    }),
+    (error) => error.code === "PROJECT_WORK_CHANGE_STALE",
+  );
+  assert.equal(
+    await readFile(path.join(projectRoot, "app.js"), "utf8"),
+    "export const version = 3;\n",
+  );
+  const journals = await service.listApplyJournal(conversation.id);
+  assert.equal(journals.at(-1).undo.status, "blocked");
+});
+
+test("a prepared apply journal rolls back deterministically after service restart", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-apply-recovery-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await Promise.all([
+    writeFile(path.join(projectRoot, "app.js"), "export const version = 1;\n"),
+    writeFile(path.join(projectRoot, "other.js"), "export const other = 1;\n"),
+  ]);
+  const firstService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({
+      verificationRequest: null,
+      additionalChanges: [{
+        path: "other.js",
+        content: "export const other = 2;\n",
+      }],
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("apply-recovery-first"),
+  });
+  const selection = await firstService.pickProjectRoot({ mode: "existing" });
+  const project = await firstService.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await firstService.createConversation(project.id);
+  await firstService.sendMessage(conversation.id, { text: "准备可恢复修改" });
+  const ready = await eventually(
+    () => firstService.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.activeChangeSet?.status === "ready",
+    "recovery change did not become reviewable",
+  );
+  const changeSet = ready.conversation.activeChangeSet;
+  await firstService.applyChangeSet(conversation.id, {
+    changeSetId: changeSet.id,
+    changeSetHash: changeSet.hash,
+    files: changeSet.files.map((file) => ({
+      fileId: file.id,
+      baseHash: file.baseHash,
+      afterHash: file.afterHash,
+    })),
+  });
+  await firstService.dispose();
+
+  const conversationRoot = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+  );
+  const statePath = path.join(conversationRoot, "conversation.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  const interruptedJournal = state.applyJournal[0];
+  assert.equal(interruptedJournal.files.length, 2);
+  interruptedJournal.status = "prepared";
+  interruptedJournal.appliedAt = null;
+  interruptedJournal.finalizedAt = null;
+  interruptedJournal.undo.status = "unavailable";
+  state.status = "awaiting_confirmation";
+  state.activeChangeSet = {
+    ...interruptedJournal.changeSet,
+    status: "ready",
+  };
+  await Promise.all([
+    writeFile(
+      path.join(conversationRoot, "base", "app.js"),
+      "export const version = 2;\n",
+    ),
+    writeFile(
+      path.join(conversationRoot, "workspace", "app.js"),
+      "export const version = 2;\n",
+    ),
+    writeFile(
+      path.join(projectRoot, "other.js"),
+      "export const other = 1;\n",
+    ),
+    writeFile(
+      path.join(conversationRoot, "base", "other.js"),
+      "export const other = 1;\n",
+    ),
+    writeFile(
+      path.join(conversationRoot, "workspace", "other.js"),
+      "export const other = 2;\n",
+    ),
+    writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8"),
+  ]);
+
+  const secondService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({ verificationRequest: null }),
+    idFactory: incrementalId("apply-recovery-second"),
+  });
+  t.after(() => secondService.dispose());
+  const recovered = await secondService.getConversation(conversation.id);
+
+  assert.equal(
+    await readFile(path.join(projectRoot, "app.js"), "utf8"),
+    "export const version = 1;\n",
+  );
+  assert.equal(
+    await readFile(path.join(conversationRoot, "base", "app.js"), "utf8"),
+    "export const version = 1;\n",
+  );
+  assert.equal(
+    await readFile(path.join(projectRoot, "other.js"), "utf8"),
+    "export const other = 1;\n",
+  );
+  assert.equal(
+    await readFile(path.join(conversationRoot, "base", "other.js"), "utf8"),
+    "export const other = 1;\n",
+  );
+  assert.equal(recovered.conversation.workspace.status, "ready");
+  assert.equal(recovered.conversation.applyJournal[0].status, "rolled_back");
+  assert.equal(recovered.conversation.activeChangeSet.status, "ready");
+});
+
+test("execution policy defaults to manual review and configures with revision CAS", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-execution-policy-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createFakeSessionFactory(),
+    idFactory: incrementalId("execution-policy"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  assert.deepEqual(conversation.executionPolicy, {
+    mode: "manual_review",
+    revision: 1,
+    policyVersion: 1,
+  });
+
+  const configured = await service.configureExecutionPolicy(conversation.id, {
+    mode: "auto_review",
+    expectedRevision: 1,
+  });
+  assert.deepEqual(configured.conversation.executionPolicy, {
+    mode: "auto_review",
+    revision: 2,
+    policyVersion: 1,
+  });
+  assert.deepEqual(
+    (await service.listStandaloneConversations())[0].executionPolicy,
+    configured.conversation.executionPolicy,
+  );
+  await assert.rejects(
+    service.configureExecutionPolicy(conversation.id, {
+      mode: "manual_review",
+      expectedRevision: 1,
+    }),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_EXECUTION_POLICY_STALE");
+      assert.equal(error.status, 409);
+      return true;
+    },
+  );
+  assert.ok(configured.events.some((event) => (
+    event.type === "execution_policy.changed"
+    && event.data.mode === "auto_review"
+    && event.data.revision === 2
+  )));
+});
+
+test("bound-project auto review fails closed to manual while workspace isolation is limited", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-auto-review-pending-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await writeFile(
+    path.join(projectRoot, "app.js"),
+    "export const version = 1;\n",
+    "utf8",
+  );
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createFakeSessionFactory({ verificationRequest: null }),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("auto-review-pending"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, { text: "先准备修改，不要应用" });
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.activeChangeSet?.status === "ready"
+      && snapshot.conversation.status === "awaiting_confirmation"
+    ),
+    "manual change did not reach review",
+  );
+
+  const configured = await service.configureExecutionPolicy(conversation.id, {
+    mode: "auto_review",
+    expectedRevision: 1,
+  });
+  assert.equal(
+    configured.conversation.executionPolicy.mode,
+    "manual_review",
+  );
+  assert.equal(
+    configured.conversation.workspace.automaticApplyAllowed,
+    false,
+  );
+  assert.ok(configured.events.some((event) => (
+    event.type === "execution_policy.downgraded"
+    && event.data.reasonCode === "workspace_isolation_unavailable"
+  )));
+  assert.equal(
+    await readFile(path.join(projectRoot, "app.js"), "utf8"),
+    "export const version = 1;\n",
+  );
+});
+
+test("auto review applies a safe change but blocks verification without an isolated runner", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-auto-review-safe-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await writeFile(
+    path.join(projectRoot, "app.js"),
+    "export const version = 1;\n",
+    "utf8",
+  );
+  const runnerCalls = [];
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createFakeSessionFactory(),
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async (command) => {
+      runnerCalls.push(command);
+      return {
+        exitCode: 0,
+        durationMs: 5,
+        stdout: "safe verification passed",
+        stderr: "",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+      };
+    },
+    idFactory: incrementalId("auto-review-safe"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await enableRecoverableWorkspaceForTest(
+    path.join(temporaryRoot, "private-state"),
+    conversation.id,
+  );
+  await service.configureExecutionPolicy(conversation.id, {
+    mode: "auto_review",
+    expectedRevision: 1,
+  });
+  await service.sendMessage(conversation.id, {
+    text: "修改并验证",
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "applied"
+      &&
+      snapshot.conversation.activeChangeSet?.status === "applied"
+      && snapshot.conversation.verifications.some(
+        (verification) => verification.status === "blocked",
+      )
+    ),
+    "auto review did not apply the safe turn and block its command",
+  );
+
+  assert.equal(
+    await readFile(path.join(projectRoot, "app.js"), "utf8"),
+    "export const version = 2;\n",
+  );
+  assert.equal(settled.conversation.activeChangeSet.status, "applied");
+  assert.equal(runnerCalls.length, 0);
+  const blocked = settled.conversation.verifications.find(
+    (verification) => verification.status === "blocked",
+  );
+  assert.ok(blocked.turnId);
+  assert.equal(blocked.executionPolicyRevision, 2);
+  assert.equal(blocked.blockedReason, "verification_isolation_unavailable");
+  assert.deepEqual(
+    settled.events
+      .filter((event) => event.type === "auto_review.decision")
+      .map((event) => ({
+        actionType: event.data.actionType,
+        decision: event.data.decision,
+      })),
+    [
+      { actionType: "change_set", decision: "allow" },
+      { actionType: "verification", decision: "deny" },
+    ],
+  );
+});
+
+test("auto review starts and opens a current-turn controlled preview after applying safe changes", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-auto-preview-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await writeFile(
+    path.join(projectRoot, "app.js"),
+    "export const version = 1;\n",
+    "utf8",
+  );
+  const sessionFactory = createFakeSessionFactory({
+    verificationRequest: null,
+    previewRequest: {
+      runtime: "vite",
+      cwd: ".",
+      route: "/reader/",
+      title: "读者端",
+    },
+  });
+  const previewSupervisor = createFakePreviewSupervisor();
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    previewSupervisor,
+    idFactory: incrementalId("auto-preview"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await enableRecoverableWorkspaceForTest(
+    path.join(temporaryRoot, "private-state"),
+    conversation.id,
+  );
+  await service.configureExecutionPolicy(conversation.id, {
+    mode: "auto_review",
+    expectedRevision: 1,
+  });
+  await service.sendMessage(conversation.id, {
+    text: "应用修改后启动并打开读者端预览",
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "applied"
+      && snapshot.conversation.preview?.status === "ready"
+    ),
+    "controlled preview did not open after safe settlement",
+  );
+
+  assert.equal(previewSupervisor.starts.length, 1);
+  assert.equal(previewSupervisor.starts[0].key, conversation.id);
+  assert.equal(previewSupervisor.starts[0].projectRoot, await realpath(projectRoot));
+  assert.deepEqual(previewSupervisor.starts[0].request, {
+    id: previewSupervisor.starts[0].request.id,
+    runtime: "vite",
+    cwd: ".",
+    app: null,
+    route: "/reader/",
+    title: "读者端",
+    requestHash: previewSupervisor.starts[0].request.requestHash,
+    turnId: previewSupervisor.starts[0].request.turnId,
+    workflowId: null,
+    executionPolicyMode: "auto_review",
+    executionPolicyRevision: 2,
+    status: "requested",
+    blockedReason: null,
+    createdAt: previewSupervisor.starts[0].request.createdAt,
+    completedAt: null,
+  });
+  assert.equal(settled.conversation.preview.url, "http://127.0.0.1:48080/reader/");
+  assert.match(settled.conversation.preview.requestHash, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(settled.conversation.preview.confirmationRequired, false);
+  assert.deepEqual(settled.conversation.preview.recipe, {
+    runtime: "vite",
+    cwd: ".",
+    app: null,
+    route: "/reader/",
+    command: {
+      executable: "node_modules/.bin/vite",
+      argv: [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "<assigned-loopback-port>",
+        "--strictPort",
+      ],
+    },
+  });
+  assert.doesNotMatch(
+    JSON.stringify(settled.conversation.preview),
+    new RegExp(temporaryRoot.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+  );
+  assert.equal("cwd" in settled.conversation.preview, false);
+  assert.equal("app" in settled.conversation.preview, false);
+  assert.ok(sessionFactory.sessions[0].activeToolCalls.some(
+    (names) => names.includes("request_preview"),
+  ));
+  assert.ok(settled.events.some((event) => event.type === "preview.opened"));
+  assert.ok(settled.events.some((event) => (
+    event.type === "auto_review.decision"
+    && event.data.actionType === "preview"
+    && event.data.decision === "allow"
+  )));
+});
+
+test("manual review persists a static preview and starts it only with the exact preview id and request hash", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-manual-preview-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await writeFile(
+    path.join(projectRoot, "app.js"),
+    "export const version = 1;\n",
+    "utf8",
+  );
+  const sessionFactory = createFakeSessionFactory({
+    verificationRequest: null,
+    previewRequest: {
+      runtime: "static",
+      cwd: ".",
+      route: "/",
+      title: "静态页面",
+    },
+  });
+  const previewSupervisor = createFakePreviewSupervisor();
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    previewSupervisor,
+    idFactory: incrementalId("manual-preview"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, {
+    text: "准备修改并登记静态预览",
+  });
+  const pending = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "awaiting_confirmation"
+      && snapshot.conversation.preview?.status === "requested"
+    ),
+    "manual preview was not persisted for confirmation",
+  );
+
+  assert.equal(previewSupervisor.starts.length, 0);
+  assert.ok(sessionFactory.sessions[0].activeToolCalls.some(
+    (names) => names.includes("request_preview"),
+  ));
+  assert.equal(pending.conversation.preview.executionPolicyMode, "manual_review");
+  assert.equal(pending.conversation.preview.confirmationRequired, true);
+  assert.match(pending.conversation.preview.requestHash, /^sha256:[a-f0-9]{64}$/);
+  assert.deepEqual(pending.conversation.preview.recipe, {
+    runtime: "static",
+    cwd: ".",
+    app: null,
+    route: "/",
+    command: {
+      executable: "pi-agent-bundled-static-server",
+      argv: [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "<assigned-loopback-port>",
+      ],
+    },
+  });
+
+  await service.dispose();
+  const restoredService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({ verificationRequest: null }),
+    previewSupervisor,
+    idFactory: incrementalId("manual-preview-restored"),
+  });
+  t.after(() => restoredService.dispose());
+  const restored = await restoredService.getConversation(conversation.id);
+  assert.equal(restored.conversation.preview.status, "requested");
+  assert.equal(
+    restored.conversation.preview.requestHash,
+    pending.conversation.preview.requestHash,
+  );
+
+  await assert.rejects(
+    restoredService.startPreview(conversation.id, {
+      previewId: pending.conversation.preview.id,
+      requestHash: `sha256:${"f".repeat(64)}`,
+    }),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_PREVIEW_STALE");
+      assert.equal(error.status, 409);
+      return true;
+    },
+  );
+  assert.equal(previewSupervisor.starts.length, 0);
+
+  const started = await restoredService.startPreview(conversation.id, {
+    previewId: pending.conversation.preview.id,
+    requestHash: pending.conversation.preview.requestHash,
+  });
+  assert.equal(previewSupervisor.starts.length, 1);
+  assert.equal(previewSupervisor.starts[0].request.runtime, "static");
+  assert.equal(previewSupervisor.starts[0].request.app, null);
+  assert.equal(previewSupervisor.starts[0].request.status, "starting");
+  assert.equal(started.conversation.preview.status, "ready");
+  assert.equal(started.conversation.preview.confirmationRequired, false);
+  assert.ok(started.conversation.preview.confirmedAt);
+  assert.equal(started.conversation.preview.url, "http://127.0.0.1:48080/");
+  assert.ok(started.events.some((event) => (
+    event.type === "preview.confirmed"
+    && event.data.requestHash === pending.conversation.preview.requestHash
+  )));
+
+  await assert.rejects(
+    restoredService.startPreview(conversation.id, {
+      previewId: pending.conversation.preview.id,
+      requestHash: pending.conversation.preview.requestHash,
+    }),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_PREVIEW_NOT_FOUND");
+      return true;
+    },
+  );
+});
+
+test("auto review blocks a preview when the same turn's changes are denied", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-blocked-preview-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "original\n", "utf8");
+  const previewSupervisor = createFakePreviewSupervisor();
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createFakeSessionFactory({
+      changedContent: `${"changed\n".repeat(5_001)}`,
+      verificationRequest: null,
+      previewRequest: {
+        runtime: "python_uvicorn",
+        cwd: "backend",
+        app: "app.main:app",
+        route: "/reader/",
+      },
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    previewSupervisor,
+    idFactory: incrementalId("blocked-preview"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await enableRecoverableWorkspaceForTest(
+    path.join(temporaryRoot, "private-state"),
+    conversation.id,
+  );
+  await service.configureExecutionPolicy(conversation.id, {
+    mode: "auto_review",
+    expectedRevision: 1,
+  });
+  await service.sendMessage(conversation.id, {
+    text: "修改后打开预览",
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.preview?.status === "blocked"
+    ),
+    "preview did not remain blocked after an unsafe change",
+  );
+
+  assert.equal(previewSupervisor.starts.length, 0);
+  assert.equal(
+    settled.conversation.preview.error.code,
+    "PROJECT_WORK_PREVIEW_BLOCKED",
+  );
+  assert.ok(settled.events.some((event) => (
+    event.type === "auto_review.decision"
+    && event.data.actionType === "preview"
+    && event.data.reasonCode === "change_set_not_auto_applied"
+  )));
+});
+
+test("auto review makes an out-of-policy change inspectable but permanently non-actionable", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-auto-review-blocked-change-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "original\n", "utf8");
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createFakeSessionFactory({
+      changedContent: `${"changed\n".repeat(5_001)}`,
+      verificationRequest: null,
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("auto-review-blocked-change"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await enableRecoverableWorkspaceForTest(
+    path.join(temporaryRoot, "private-state"),
+    conversation.id,
+  );
+  await service.configureExecutionPolicy(conversation.id, {
+    mode: "auto_review",
+    expectedRevision: 1,
+  });
+  await service.sendMessage(conversation.id, { text: "准备超大修改" });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.activeChangeSet?.status === "blocked"
+    ),
+    "out-of-policy change was not blocked",
+  );
+
+  const blocked = settled.conversation.activeChangeSet;
+  assert.equal(blocked.blockedReason, "change_set_line_limit");
+  assert.equal(blocked.overlayCleared, true);
+  assert.equal(blocked.files.every((file) => file.actionable === false), true);
+  assert.equal(await readFile(path.join(projectRoot, "app.js"), "utf8"), "original\n");
+  await assert.rejects(
+    service.applyChangeSet(conversation.id, {
+      changeSetId: blocked.id,
+      changeSetHash: blocked.hash,
+      files: blocked.files.map((file) => ({
+        fileId: file.id,
+        baseHash: file.baseHash,
+        afterHash: file.afterHash,
+      })),
+    }),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_CHANGE_SET_BLOCKED");
+      return true;
+    },
+  );
+});
+
+test("auto review denies an unsafe verification without starting the runner", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-auto-review-deny-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await Promise.all([
+    writeFile(path.join(projectRoot, "app.js"), "export const version = 1;\n"),
+    writeFile(path.join(projectRoot, "package.json"), JSON.stringify({
+      scripts: { dev: "vite --host 127.0.0.1" },
+    })),
+  ]);
+  let runnerCalls = 0;
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createFakeSessionFactory({
+      verificationRequest: {
+        file: "npm",
+        args: ["run", "dev"],
+        checks: ["启动长期服务"],
+      },
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async () => {
+      runnerCalls += 1;
+      throw new Error("unsafe verification must not run");
+    },
+    idFactory: incrementalId("auto-review-deny"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await enableRecoverableWorkspaceForTest(
+    path.join(temporaryRoot, "private-state"),
+    conversation.id,
+  );
+  await service.configureExecutionPolicy(conversation.id, {
+    mode: "auto_review",
+    expectedRevision: 1,
+  });
+  await service.sendMessage(conversation.id, {
+    text: "修改后启动开发服务",
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "applied"
+      && snapshot.conversation.verifications.some(
+        (verification) => verification.status === "blocked",
+      )
+    ),
+    "unsafe auto verification was not blocked",
+  );
+
+  assert.equal(runnerCalls, 0);
+  const blocked = settled.conversation.verifications.find(
+    (verification) => verification.status === "blocked",
+  );
+  assert.equal(blocked.blockedReason, "verification_command_not_auto_safe");
+  assert.ok(settled.events.some((event) => (
+    event.type === "auto_review.decision"
+    && event.data.actionType === "verification"
+    && event.data.decision === "deny"
+  )));
+});
+
+test("partial apply keeps unselected files reviewable and verifies the pending overlay privately", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-project-partial-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const projectRoot = path.join(temporaryRoot, "project");
@@ -1509,6 +3942,7 @@ test("partial apply keeps unselected files reviewable and blocks verification", 
   await writeFile(path.join(projectRoot, "app.js"), "app v1\n", "utf8");
   await writeFile(path.join(projectRoot, "other.js"), "other v1\n", "utf8");
 
+  const verificationObserved = [];
   const service = createProjectWorkService({
     storageRoot: path.join(temporaryRoot, "private-state"),
     sessionFactory: createFakeSessionFactory({
@@ -1519,6 +3953,20 @@ test("partial apply keeps unselected files reviewable and blocks verification", 
       }],
     }),
     picker: async () => ({ rootPath: projectRoot }),
+    runner: async (command) => {
+      verificationObserved.push(
+        await readFile(path.join(command.cwd, "other.js"), "utf8"),
+      );
+      return {
+        exitCode: 0,
+        durationMs: 3,
+        stdout: "overlay verified",
+        stderr: "",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+      };
+    },
     idFactory: incrementalId("partial"),
   });
   t.after(() => service.dispose());
@@ -1564,12 +4012,14 @@ test("partial apply keeps unselected files reviewable and blocks verification", 
   const verification = afterPartial.conversation.verifications.find(
     (item) => item.status === "requested",
   );
-  await assert.rejects(
-    service.runVerification(conversation.id, { requestId: verification.id }),
-    (error) => {
-      assert.equal(error.code, "PROJECT_WORK_CHANGES_NOT_APPLIED");
-      return true;
-    },
+  const verified = await service.runVerification(conversation.id, {
+    requestId: verification.id,
+  });
+  assert.equal(verified.status, "passed");
+  assert.deepEqual(verificationObserved, ["other v2\n"]);
+  assert.equal(
+    await readFile(path.join(projectRoot, "other.js"), "utf8"),
+    "other v1\n",
   );
 
   const remaining = afterPartial.conversation.activeChangeSet;
@@ -2351,6 +4801,7 @@ test("one-turn screenshot review passes a bounded image to Pi without persisting
       && snapshot.conversation.messages.some(
         (message) => message.role === "assistant",
       )
+      && sessions[0]?.activeToolCalls.at(-1)?.includes("edit")
     ),
     "image turn did not settle",
   );

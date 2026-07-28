@@ -29,7 +29,7 @@ const STATUS_LABELS = {
   review_ready: "本周待审阅",
   preparing_guides: "正在准备导读",
   guide_ready: "导读待决定",
-  reading: "分阶段精读",
+  reading: "论文研读",
   draft_ready: "阅读成果待归档",
   awaiting_approval: "等待写入确认",
   committing: "正在写入",
@@ -49,7 +49,7 @@ const JOURNAL_PHASE_LABELS = {
   candidate_review: "候选已准备，等待审阅",
   guide_generation: "生成五分钟导读",
   guide_review: "导读已准备，等待决定",
-  close_reading: "对照原文完成四阶段精读",
+  close_reading: "在原文中完成论文研读",
   write_preview: "阅读成果已准备，等待归档预览",
   archive_preview: "阅读成果已准备，等待归档预览",
   zotero_preview: "核对 Zotero 精确预览",
@@ -69,7 +69,7 @@ const WORKFLOW_STEPS = [
 const TARGET_META = {
   zotero: {
     label: "Zotero",
-    description: "题录、PDF 与五分钟导读",
+    description: "题录、原始论文与五分钟导读",
     icon: BookmarkSimple,
   },
   obsidian: {
@@ -299,13 +299,17 @@ function ProposalExactDetails({ proposal }) {
   );
 }
 
-function ObsidianPreviewSection({ obsidianUiState }) {
+function ObsidianPreviewSection({
+  obsidianUiState,
+  onToggleProposal,
+  readOnly = false,
+}) {
   if (!obsidianUiState || obsidianUiState.status === "not_required") return null;
   if (obsidianUiState.status === "loading") {
     return (
       <div className="workflow-demo-notice" role="status">
         <CircleNotch className="spin" size={18} weight="bold" aria-hidden="true" />
-        <div><strong>正在读取 Obsidian 精确预览</strong><p>只读取 Run 中保存的预览，不会写入笔记文件。</p></div>
+        <div><strong>正在读取 Obsidian 精确预览</strong><p>加载完成后可与其他归档项一起核对和确认。</p></div>
       </div>
     );
   }
@@ -324,15 +328,34 @@ function ObsidianPreviewSection({ obsidianUiState }) {
       <header>
         <span><NotePencil size={19} aria-hidden="true" /></span>
         <div>
-          <h3 id="obsidian-preview-title">Obsidian · 仅预览</h3>
-          <p>完整精读 Markdown、目标文件与内容哈希；当前不会提交写入。</p>
+          <h3 id="obsidian-preview-title">Obsidian 精读笔记</h3>
+          <p>完整笔记正文、目标文件与内容哈希；只有本次精确预览获批后才会写入。</p>
         </div>
       </header>
-      {preview.proposals.map((proposal) => (
-        <article className={`workflow-proposal${proposal.actionable ? "" : " is-blocked"}`} key={proposal.id}>
-          <span className="workflow-checkbox" aria-hidden="true">
-            {proposal.actionable ? <FileText size={13} weight="bold" /> : <WarningCircle size={13} weight="fill" />}
-          </span>
+      {preview.proposals.map((proposal) => {
+        const proposalId = proposal.proposalId ?? proposal.id;
+        const inputId = `obsidian-proposal-${proposalId}`;
+        return (
+        <article className={`workflow-proposal${proposal.selected ? " is-selected" : ""}${proposal.actionable ? "" : " is-blocked"}`} key={proposalId}>
+          <input
+            id={inputId}
+            type="checkbox"
+            checked={Boolean(proposal.selected)}
+            disabled={readOnly || proposal.actionable === false}
+            onChange={() => onToggleProposal?.(proposalId)}
+          />
+          <label className="workflow-proposal-check" htmlFor={inputId}>
+            <span className="workflow-checkbox">
+              {proposal.actionable
+                ? proposal.selected
+                  ? <Check size={13} weight="bold" aria-hidden="true" />
+                  : null
+                : <WarningCircle size={13} weight="fill" aria-hidden="true" />}
+            </span>
+            <span className="sr-only">{proposal.selected
+              ? "取消这篇 Obsidian 笔记"
+              : "选择这篇 Obsidian 笔记"}</span>
+          </label>
           <div className="workflow-proposal-copy">
             <div className="workflow-proposal-main">
               <strong>{proposal.title}</strong>
@@ -350,7 +373,7 @@ function ObsidianPreviewSection({ obsidianUiState }) {
               </span>
             ) : null}
             <details className="workflow-proposal-exact">
-              <summary>查看将写入的完整 Markdown</summary>
+              <summary>查看将写入的完整笔记</summary>
               <div>
                 <section>
                   <h4>精读笔记全文</h4>
@@ -367,18 +390,23 @@ function ObsidianPreviewSection({ obsidianUiState }) {
             </details>
           </div>
         </article>
-      ))}
+        );
+      })}
     </section>
   );
 }
 
-function ProjectStatePreviewSection({ projectStateUiState }) {
+function ProjectStatePreviewSection({
+  projectStateUiState,
+  onToggleProposal,
+  readOnly = false,
+}) {
   if (!projectStateUiState || projectStateUiState.status === "not_required") return null;
   if (projectStateUiState.status === "loading") {
     return (
       <div className="workflow-demo-notice" role="status">
         <CircleNotch className="spin" size={18} weight="bold" aria-hidden="true" />
-        <div><strong>正在读取项目状态精确预览</strong><p>只读取 Run 中保存的追加预览，不会改动项目文件。</p></div>
+        <div><strong>正在读取项目状态精确预览</strong><p>加载完成后可与其他归档项一起核对和确认。</p></div>
       </div>
     );
   }
@@ -406,16 +434,33 @@ function ProjectStatePreviewSection({ projectStateUiState }) {
       <header>
         <span><FolderOpen size={19} aria-hidden="true" /></span>
         <div>
-          <h3 id="project-state-preview-title">项目状态 · 仅预览</h3>
-          <p>只准备精确追加内容；当前不会改动项目状态文件。</p>
+          <h3 id="project-state-preview-title">项目状态更新</h3>
+          <p>只追加下面展示的内容；写入前会重新核验文件版本和预览哈希。</p>
         </div>
       </header>
       <article className={`workflow-proposal${proposal.actionable === false ? " is-blocked" : ""}`}>
-        <span className="workflow-checkbox" aria-hidden="true">
-          {proposal.actionable === false
-            ? <WarningCircle size={13} weight="fill" />
-            : <FileText size={13} weight="bold" />}
-        </span>
+        <input
+          id={`project-state-proposal-${proposalId}`}
+          type="checkbox"
+          checked={Boolean(proposal.selected)}
+          disabled={readOnly || proposal.actionable === false}
+          onChange={() => onToggleProposal?.(proposalId)}
+        />
+        <label
+          className="workflow-proposal-check"
+          htmlFor={`project-state-proposal-${proposalId}`}
+        >
+          <span className="workflow-checkbox">
+            {proposal.actionable === false
+              ? <WarningCircle size={13} weight="fill" aria-hidden="true" />
+              : proposal.selected
+                ? <Check size={13} weight="bold" aria-hidden="true" />
+                : null}
+          </span>
+          <span className="sr-only">{proposal.selected
+            ? "取消项目状态更新"
+            : "选择项目状态更新"}</span>
+        </label>
         <div className="workflow-proposal-copy">
           <div className="workflow-proposal-main">
             <strong>{proposal.title ?? proposal.targetDetails?.sourcePath ?? "项目状态更新建议"}</strong>
@@ -433,7 +478,7 @@ function ProjectStatePreviewSection({ projectStateUiState }) {
             </span>
           ) : null}
           <details className="workflow-proposal-exact">
-            <summary>查看将追加的完整 Markdown</summary>
+            <summary>查看将追加的完整内容</summary>
             <div>
               <section>
                 <h4>拟追加内容</h4>
@@ -614,6 +659,7 @@ function CandidateReview({
   onOpenPaper,
   onStartJournalRun,
   onResumeJournalRun,
+  onRetryPaperDocument,
   readOnly = false,
   readOnlyQuiet = false,
 }) {
@@ -621,6 +667,10 @@ function CandidateReview({
   const displayedPaperIds = new Set(papers.map((paper) => paper.id));
   const selectedCount = selectedPaperIds.filter((paperId) => displayedPaperIds.has(paperId)).length;
   const [expandedEvidenceId, setExpandedEvidenceId] = useState(null);
+  const [documentRetryState, setDocumentRetryState] = useState({
+    paperId: null,
+    errors: {},
+  });
   const unavailableGuideCount = papers.filter((paper) => (
     paper.isDemo === false
       ? !run?.selectablePaperIds?.includes(paper.id)
@@ -629,8 +679,11 @@ function CandidateReview({
   const liveRun = journalRunState?.run;
   const liveScanStarted = Boolean(liveRun) || ["starting", "running", "ready", "failed", "error"].includes(journalRunState?.status);
   const hasLiveCandidates = Boolean(liveRun?.candidates?.length);
+  const hasFixtureCandidates = run?.source === "fixture"
+    && papers.some((paper) => paper.isDemo !== false);
   const scanInProgress = ["starting", "running"].includes(journalRunState?.status);
-  const scanSummary = liveRun?.scanSummary ?? (liveScanStarted ? null : workflowFixture.scanSummary);
+  const scanSummary = liveRun?.scanSummary
+    ?? (liveScanStarted || !hasFixtureCandidates ? null : workflowFixture.scanSummary);
   const sourceProgress = liveRun?.sourceProgress;
   const successfulSourceCount = liveRun?.scanSummary?.successful_source_count
     ?? sourceProgress?.successful_source_ids?.length;
@@ -658,9 +711,13 @@ function CandidateReview({
   const summarySourceLabel = hasLiveCandidates
     ? `候选说明 · 真实运行${liveRun?.ranking?.source === "model" ? "模型排序" : "确定性回退排序"}`
     : ["error", "failed"].includes(journalRunState?.status)
-      ? "真实扫描未完成，当前仍显示内置候选"
+      ? "真实扫描未完成，没有可供审阅的候选"
     : liveScanStarted
-      ? "当前仍显示内置候选，真实候选准备完成后会自动替换"
+      ? scanInProgress
+        ? "真实候选正在准备"
+        : "本轮没有可供审阅的候选"
+      : !hasFixtureCandidates
+        ? "尚未开始真实扫描"
       : candidateSummaryState?.status === "loading"
         ? "候选说明 · 正在检查本地模型服务"
         : candidateSummaryState?.status === "fallback"
@@ -675,12 +732,42 @@ function CandidateReview({
     setExpandedEvidenceId((current) => current === paperId ? null : paperId);
   };
 
+  const retryPaperDocument = async (paperId) => {
+    if (!onRetryPaperDocument || documentRetryState.paperId) return;
+    setDocumentRetryState((current) => ({
+      paperId,
+      errors: { ...current.errors, [paperId]: null },
+    }));
+    try {
+      await onRetryPaperDocument(paperId);
+      setDocumentRetryState({ paperId: null, errors: {} });
+    } catch {
+      setDocumentRetryState((current) => ({
+        paperId: null,
+        errors: {
+          ...current.errors,
+          [paperId]: "全文准备仍未完成，请稍后再试。",
+        },
+      }));
+    }
+  };
+
   return (
     <section className="workflow-stage workflow-review-stage" aria-labelledby="review-title">
       <div className="workflow-stage-scroll-area">
         <header className="workflow-stage-heading">
           <div>
-            <span className="workflow-stage-label">{hasLiveCandidates ? "真实扫描结果" : scanInProgress ? "本周扫描进行中" : "本周扫描完成"}</span>
+            <span className="workflow-stage-label">
+              {hasLiveCandidates
+                ? "真实扫描结果"
+                : scanInProgress
+                  ? "本周扫描进行中"
+                  : liveScanStarted
+                    ? "本周扫描未产生候选"
+                    : hasFixtureCandidates
+                      ? "本周扫描完成"
+                      : "等待开始本周扫描"}
+            </span>
             <h2 id="review-title">选择本周要读的论文</h2>
             {scanSummary ? (
               <p className="workflow-scan-summary">
@@ -705,7 +792,7 @@ function CandidateReview({
             ) : null}
             <div className="workflow-scan-model-row">
               <p className="workflow-scan-source" role="status">{summarySourceLabel}</p>
-              {!readOnly && !liveScanStarted ? (
+              {!readOnly && !liveScanStarted && hasFixtureCandidates ? (
                 <button
                   className="workflow-evidence-toggle workflow-model-refresh"
                   type="button"
@@ -729,6 +816,22 @@ function CandidateReview({
             </button>
           ) : null}
         </header>
+
+        {papers.length === 0 ? (
+          <div className="workflow-empty-candidates" role="status">
+            <FileText size={22} aria-hidden="true" />
+            <div>
+              <strong>当前没有可供审阅的真实候选</strong>
+              <p>
+                {scanInProgress
+                  ? "扫描与筛选仍在进行，完成后会在这里显示结果。"
+                  : journalRunState?.error
+                    ? "本次真实扫描没有完成。修复连接后重新扫描，不会改用示例论文。"
+                    : "运行本周扫描后，候选论文会在这里出现。"}
+              </p>
+            </div>
+          </div>
+        ) : null}
 
         {guideFailure ? (
           <div className="workflow-guide-failure" role="alert">
@@ -817,7 +920,27 @@ function CandidateReview({
                         打开全文
                       </button>
                     ) : null}
+                    {!readOnly && mineru.tone === "failed" && onRetryPaperDocument ? (
+                      <button
+                        className="workflow-evidence-toggle"
+                        type="button"
+                        disabled={Boolean(documentRetryState.paperId)}
+                        onClick={() => retryPaperDocument(paper.id)}
+                      >
+                        {documentRetryState.paperId === paper.id
+                          ? <CircleNotch className="spin" size={13} weight="bold" aria-hidden="true" />
+                          : null}
+                        {documentRetryState.paperId === paper.id
+                          ? "正在重试"
+                          : "重试全文准备"}
+                      </button>
+                    ) : null}
                   </div>
+                  {documentRetryState.errors[paper.id] ? (
+                    <p className="workflow-unavailable-note is-error" role="alert">
+                      {documentRetryState.errors[paper.id]}
+                    </p>
+                  ) : null}
                   {evidenceExpanded ? (
                     <div className="workflow-candidate-evidence" id={`${paper.id}-evidence`}>
                       <div>
@@ -1106,20 +1229,11 @@ function ReadingStage({
       <PaperTabs papers={selectedPapers} activePaperId={activePaper?.id} onSetActivePaper={onSetActivePaper} />
       <header className="workflow-stage-heading workflow-paper-heading">
         <div>
-          <span className="workflow-stage-label">分阶段精读 · {stageIndex + 1}/{readingStages.length}</span>
+          <span className="workflow-stage-label">研读整理</span>
           <h2 id="reading-title">{activePaper?.title}</h2>
           <p>本阶段只聚焦所需的章节与证据片段。</p>
         </div>
       </header>
-
-      <nav className="workflow-reading-stepper" aria-label="精读阶段">
-        {readingStages.map((item, index) => (
-          <span className={index < stageIndex ? "is-complete" : index === stageIndex ? "is-active" : ""} key={item.id} aria-current={index === stageIndex ? "step" : undefined}>
-            <i>{index < stageIndex ? <Check size={12} weight="bold" aria-hidden="true" /> : index + 1}</i>
-            {item.label}
-          </span>
-        ))}
-      </nav>
 
       <article className="workflow-reading-document">
         <header>
@@ -1147,7 +1261,7 @@ function ReadingStage({
 
       <footer className="workflow-stage-actions">
         <button className="workflow-secondary-action" type="button" onClick={onPreviousStage} disabled={stageIndex === 0}>
-          <ArrowLeft size={15} weight="bold" aria-hidden="true" />上一步
+          <ArrowLeft size={15} weight="bold" aria-hidden="true" />上一项
         </button>
         {isLastStage && nextIncompletePaper ? (
           <button className="workflow-primary-action" type="button" onClick={() => onSetActivePaper?.(nextIncompletePaper.id)}>
@@ -1159,7 +1273,7 @@ function ReadingStage({
           </button>
         ) : (
           <button className="workflow-primary-action" type="button" onClick={onNextStage}>
-            下一步：{readingStages[stageIndex + 1]?.label} <ArrowRight size={15} weight="bold" aria-hidden="true" />
+            继续整理 <ArrowRight size={15} weight="bold" aria-hidden="true" />
           </button>
         )}
       </footer>
@@ -1221,12 +1335,12 @@ function LiveReadingStage({
       {!readOnly && onRestartFromGuide ? (
         <footer className="workflow-reading-restart">
           <span>
-            想换一篇论文重新研读？
-            <small>返回本周推荐文章，保留候选、正文和五分钟导读，只重置本轮阅读进度。</small>
+            想清除本轮未完成的阅读，再从导读开始？
+            <small>候选、正文和五分钟导读会保留；研读结论、位置、追问与未写入提案会清除。</small>
           </span>
           <button type="button" onClick={onRestartFromGuide}>
             <ArrowLeft size={15} weight="bold" aria-hidden="true" />
-            返回本周文章
+            从导读重新开始
           </button>
         </footer>
       ) : null}
@@ -1278,8 +1392,8 @@ export function RestartReadingDialog({ pending, error, onCancel, onConfirm }) {
         <header>
           <span><BookOpen size={20} aria-hidden="true" /></span>
           <div>
-            <h2 id="restart-reading-title">返回本周推荐文章？</h2>
-            <p>这会回到本周推荐文章列表，可重新选择要研读的论文。</p>
+            <h2 id="restart-reading-title">从导读重新开始？</h2>
+            <p>这是一次重置操作。完成后会回到本周推荐文章列表。</p>
           </div>
         </header>
         <div className="restart-reading-scope">
@@ -1300,7 +1414,7 @@ export function RestartReadingDialog({ pending, error, onCancel, onConfirm }) {
           <button type="button" disabled={pending} onClick={onCancel}>取消</button>
           <button className="is-primary" type="button" disabled={pending} onClick={onConfirm}>
             {pending ? <CircleNotch className="spin" size={15} aria-hidden="true" /> : null}
-            {pending ? "正在返回…" : "确认返回"}
+            {pending ? "正在重新开始…" : "确认重新开始"}
           </button>
         </footer>
       </section>
@@ -1335,7 +1449,7 @@ function ArchiveReadyStage({
             <CheckCircle size={15} weight="fill" aria-hidden="true" />
             {paper.shortTitle ?? paper.title}
             <small>
-              {run?.guideChoices?.[paper.id] === "read" ? "四阶段精读已完成" : "保留五分钟导读"}
+              {run?.guideChoices?.[paper.id] === "read" ? "研读成果已准备" : "保留五分钟导读"}
             </small>
           </span>
         ))}
@@ -1346,7 +1460,7 @@ function ArchiveReadyStage({
             <NotePencil size={18} aria-hidden="true" />
             <span>
               <strong id="archive-obsidian-target-title">Obsidian 精读笔记</strong>
-              <small>每篇精读论文生成一份完整 Markdown；目标目录只由本地配置决定。</small>
+              <small>每篇精读论文生成一份完整笔记；目标目录只由本地配置决定。</small>
             </span>
           </div>
           <span className="workflow-zotero-target-status">
@@ -1385,7 +1499,7 @@ function ArchiveReadyStage({
           <BookmarkSimple size={18} aria-hidden="true" />
           <span>
             <strong id="archive-zotero-target-title">Zotero collection</strong>
-            <small>题录、原版 PDF 和五分钟导读将进入这里。</small>
+            <small>题录、原始论文和五分钟导读将进入这里。</small>
           </span>
         </div>
         <ZoteroRecoveryTarget
@@ -1396,7 +1510,7 @@ function ArchiveReadyStage({
         {zoteroUiState?.error ? <p role="alert">{zoteroUiState.error}</p> : null}
       </section>
       <footer className="workflow-stage-actions">
-        <p>下一步会逐篇展示题录、PDF、导读和目标位置。</p>
+        <p>下一步会逐篇展示题录、原始论文、导读和目标位置。</p>
         <button
           className="workflow-primary-action"
           type="button"
@@ -1480,22 +1594,49 @@ function ApprovalStage({
   zoteroUiState,
   obsidianUiState,
   projectStateUiState,
+  onToggleObsidianProposal,
+  onToggleProjectStateProposal,
   onSelectZoteroTarget,
   onRetryZoteroTargets,
   readOnly = false,
 }) {
   const [simulateObsidianFailure, setSimulateObsidianFailure] = useState(false);
   const displayedProposals = proposals.filter((proposal) => (proposal.paperIds ?? []).length > 0);
-  const actionableProposals = displayedProposals.filter((proposal) => proposal.actionable !== false);
+  const actionableProposals = displayedProposals.filter((proposal) => (
+    proposal.actionable !== false
+    && ["draft", "failed"].includes(proposal.status)
+  ));
   const manualOnly = displayedProposals.length > 0 && actionableProposals.length === 0;
   const duplicateOnly = manualOnly && displayedProposals.every((proposal) => (
     proposal.status === "blocked" || proposal.writeMode === "manual_update_required"
   ));
-  const selectedCount = actionableProposals.filter((proposal) => proposal.selected).length;
-  const obsidianCommitBlocked = run?.source === "live" && readingPapers.length > 0;
-  const targetPath = [...new Set(actionableProposals.map(
-    (proposal) => TARGET_META[proposal.target]?.label ?? proposal.target,
-  ))].join(" → ");
+  const selectedZoteroCount = actionableProposals.filter((proposal) => proposal.selected).length;
+  const actionableObsidianProposals = (obsidianUiState?.preview?.proposals ?? [])
+    .filter((proposal) => proposal.actionable !== false);
+  const selectedObsidianCount = actionableObsidianProposals
+    .filter((proposal) => proposal.selected !== false).length;
+  const projectStateProposal = projectStateUiState?.preview?.proposal
+    ?? projectStateUiState?.preview?.proposals?.[0]
+    ?? null;
+  const selectedProjectStateCount = projectStateProposal?.actionable !== false
+    && projectStateProposal
+    && projectStateProposal.selected !== false
+    ? 1
+    : 0;
+  const selectedCount = selectedZoteroCount + selectedObsidianCount + selectedProjectStateCount;
+  const actionableCount = actionableProposals.length
+    + actionableObsidianProposals.length
+    + (
+      projectStateProposal?.actionable !== false && projectStateProposal
+        ? 1
+        : 0
+    );
+  const hasArchiveWrites = selectedCount > 0;
+  const targetPath = [
+    selectedObsidianCount > 0 ? "Obsidian" : null,
+    selectedZoteroCount > 0 ? "Zotero" : null,
+    selectedProjectStateCount > 0 ? "项目状态" : null,
+  ].filter(Boolean).join(" → ");
 
   return (
     <section className="workflow-stage workflow-approval-stage" aria-labelledby="approval-title">
@@ -1503,53 +1644,55 @@ function ApprovalStage({
         <div>
           <span className="workflow-stage-label">{readOnly
             ? "归档预览 · 历史回看"
-            : obsidianCommitBlocked
-            ? "归档精确预览 · 尚未写入"
-            : manualOnly
+            : manualOnly && !hasArchiveWrites
               ? duplicateOnly ? "Zotero 已有匹配条目" : "自动写入已停止"
               : "内联确认 · 最后一步"}</span>
           <h2 id="approval-title">{readOnly
             ? "查看当时核对过的确切内容"
-            : manualOnly ? "当前没有可安全自动写入的论文" : "检查准备写入的确切内容"}</h2>
+            : manualOnly && !hasArchiveWrites
+              ? "当前没有可安全自动写入的内容"
+              : "检查准备写入的确切内容"}</h2>
           <p>{readOnly
             ? "这是只读快照；提案选择、重新生成、提交与重试都不会在回看时开放。"
-            : obsidianCommitBlocked
-            ? "Obsidian、项目状态与 Zotero 的目标和内容都已展开供核对；前两项当前仅支持预览，因此本轮不会单独提交 Zotero。"
-            : manualOnly
+            : manualOnly && !hasArchiveWrites
             ? duplicateOnly
               ? "下面保留完整预览供你核对；Pi Agent 不会移动或修改现有条目。"
               : "下面保留失败原因和精确预览；请先人工检查，再重新读取 Zotero 状态。"
             : "可逐项取消，最后只确认一次。预览内容改变后，本次批准会失效。"}</p>
         </div>
-        {!readOnly ? <span className="workflow-selected-count">已选 {selectedCount}/{actionableProposals.length}</span> : null}
+        {!readOnly ? <span className="workflow-selected-count">待写入 {selectedCount}/{actionableCount}</span> : null}
       </header>
 
-      <div className={`workflow-demo-notice${!readOnly && (manualOnly || obsidianCommitBlocked) ? " is-error" : ""}`} role="note">
+      <div className={`workflow-demo-notice${!readOnly && manualOnly && !hasArchiveWrites ? " is-error" : ""}`} role="note">
         {readOnly
           ? <ShieldCheck size={18} weight="fill" aria-hidden="true" />
-          : obsidianCommitBlocked || manualOnly
+          : manualOnly && !hasArchiveWrites
           ? <WarningCircle size={18} weight="fill" aria-hidden="true" />
           : <Info size={18} weight="fill" aria-hidden="true" />}
         <div>
           <strong>{readOnly
             ? "回看不会改变真实 Run"
-            : obsidianCommitBlocked
-            ? "当前只完成精确预览"
-            : manualOnly ? "需要人工检查后再继续" : "确认后才会写入"}</strong>
+            : manualOnly && !hasArchiveWrites ? "需要人工检查后再继续" : "确认后才会写入"}</strong>
           <p>{readOnly
             ? "你可以展开完整内容核对，但这里的所有写操作都已锁定。"
-            : obsidianCommitBlocked
-            ? "联合写入与写后核验尚未接入；确认按钮保持关闭，Zotero、Obsidian 与项目状态都不会发生变化。"
-            : manualOnly
+            : manualOnly && !hasArchiveWrites
             ? duplicateOnly
-              ? "当前版本不会自动更新已有条目的 PDF、导读或 collection，也不会把浏览行为视为写入授权。"
+              ? "当前版本不会自动更新已有条目的原始论文、导读或 collection，也不会把浏览行为视为写入授权。"
               : "不可安全重试的失败不会自动再次提交；重新检查只生成新预览，仍需再次确认。"
             : `只写入下面已勾选的项，按 ${targetPath || "所选目标"} 顺序提交；任一步失败可单独重试，不影响已成功项。`}</p>
         </div>
       </div>
 
-      <ObsidianPreviewSection obsidianUiState={obsidianUiState} />
-      <ProjectStatePreviewSection projectStateUiState={projectStateUiState} />
+      <ObsidianPreviewSection
+        obsidianUiState={obsidianUiState}
+        onToggleProposal={onToggleObsidianProposal}
+        readOnly={readOnly}
+      />
+      <ProjectStatePreviewSection
+        projectStateUiState={projectStateUiState}
+        onToggleProposal={onToggleProjectStateProposal}
+        readOnly={readOnly}
+      />
 
       <div className="workflow-proposal-groups">
         {Object.entries(TARGET_META).map(([target, meta]) => {
@@ -1566,9 +1709,10 @@ function ApprovalStage({
                 const proposalId = proposal.id ?? proposal.proposal_id;
                 const inputId = `proposal-${proposalId}`;
                 const blocked = proposal.actionable === false;
+                const alreadyCommitted = proposal.status === "committed";
                 return (
                 <article className={`workflow-proposal${proposal.selected ? " is-selected" : ""}${blocked ? " is-blocked" : ""}`} key={proposalId}>
-                  <input id={inputId} type="checkbox" checked={Boolean(proposal.selected)} disabled={readOnly || blocked} onChange={() => onToggleProposal?.(proposalId)} />
+                  <input id={inputId} type="checkbox" checked={Boolean(proposal.selected)} disabled={readOnly || blocked || alreadyCommitted} onChange={() => onToggleProposal?.(proposalId)} />
                   <label className="workflow-proposal-check" htmlFor={inputId}>
                     <span className="workflow-checkbox">{proposal.selected ? <Check size={13} weight="bold" aria-hidden="true" /> : null}</span>
                     <span className="sr-only">{blocked ? "此项需要手工处理" : proposal.selected ? "取消这篇论文" : "选择这篇论文"}</span>
@@ -1583,6 +1727,12 @@ function ApprovalStage({
                       <span className="workflow-proposal-manual">
                         <WarningCircle size={15} aria-hidden="true" />
                         需在 Zotero 手工处理；本轮不会自动改动现有条目。
+                      </span>
+                    ) : null}
+                    {alreadyCommitted ? (
+                      <span className="workflow-proposal-manual">
+                        <CheckCircle size={15} aria-hidden="true" />
+                        已写入并读回核验；本次恢复不会重复执行。
                       </span>
                     ) : null}
                     <ProposalExactDetails proposal={proposal} />
@@ -1611,7 +1761,7 @@ function ApprovalStage({
 
       <ReadingLinks papers={readingPapers} onOpenPaper={onOpenPaper} />
 
-      {!readOnly && actionableProposals.some((proposal) => proposal.target === "obsidian") ? (
+      {!readOnly && selectedObsidianCount > 0 ? (
         <label className="workflow-failure-toggle">
           <input type="checkbox" checked={simulateObsidianFailure} onChange={(event) => setSimulateObsidianFailure(event.target.checked)} />
           <span><WarningCircle size={16} aria-hidden="true" /><strong>模拟 Obsidian 写入失败</strong><small>用于验证失败后只重试失败项，不会重复创建 Zotero 条目。</small></span>
@@ -1630,32 +1780,28 @@ function ApprovalStage({
           <p><ShieldCheck size={16} aria-hidden="true" />正在回看预览阶段；当前 Run 与所有外部目标保持不变。</p>
         ) : (
           <>
-            <p><ShieldCheck size={16} aria-hidden="true" />{obsidianCommitBlocked
-              ? "这是审阅界面，不是写入授权；三处目标都保持不变。"
-              : manualOnly
+            <p><ShieldCheck size={16} aria-hidden="true" />{manualOnly && !hasArchiveWrites
                 ? "没有可提交的自动写入项；现有 Zotero 数据保持不变。"
-                : "本次批准只绑定当前所选提案及其预览哈希。"}</p>
+                : `本次批准只绑定当前 ${selectedCount} 项内容及其预览哈希；写后逐项读回核验。`}</p>
             <button
               className="workflow-primary-action"
               type="button"
-              disabled={obsidianCommitBlocked || (manualOnly
+              disabled={manualOnly && !hasArchiveWrites
                 ? (
                     zoteroUiState?.targetStatus !== "ready"
                     || !zoteroUiState?.selectedTargetId
                     || zoteroUiState?.proposalPending
                   )
-                : selectedCount === 0 || zoteroUiState?.commitPending)}
-              onClick={manualOnly
+                : !hasArchiveWrites || zoteroUiState?.commitPending}
+              onClick={manualOnly && !hasArchiveWrites
                 ? onRegeneratePreview
                 : () => onCommit?.({ simulateObsidianFailure })}
             >
-              {obsidianCommitBlocked
-                ? "等待接入联合写入"
-                : manualOnly && zoteroUiState?.proposalPending
+              {manualOnly && !hasArchiveWrites && zoteroUiState?.proposalPending
                 ? <><CircleNotch className="spin" size={15} weight="bold" aria-hidden="true" />正在重新检查</>
                 : zoteroUiState?.commitPending
                 ? <><CircleNotch className="spin" size={15} weight="bold" aria-hidden="true" />正在提交确认</>
-                : manualOnly
+                : manualOnly && !hasArchiveWrites
                   ? <>重新检查并生成新预览</>
                   : <><Check size={15} weight="bold" aria-hidden="true" />确认写入所选内容</>}
             </button>
@@ -1838,7 +1984,7 @@ function ReadingReadyStage({ proposals, readingPapers, onOpenPaper }) {
       <WarningCircle size={36} weight="fill" aria-hidden="true" />
       <span className="workflow-stage-label">旧版运行状态</span>
       <h2 id="reading-ready-title">这轮使用了旧的“先归档、后精读”顺序</h2>
-      <p>当前版本不会把 Zotero 归档视为精读已经开始或完成。下面只保留历史结果和原文入口；请新建一轮，按“导读决定 → 四阶段精读 → 统一预览”继续。</p>
+      <p>当前版本不会把 Zotero 归档视为研读已经开始或完成。下面只保留历史结果和原文入口；请新建一轮，按“导读决定 → 论文研读 → 统一预览”继续。</p>
       <ResultList proposals={proposals} />
       <ReadingLinks papers={readingPapers} onOpenPaper={onOpenPaper} />
     </section>
@@ -1875,6 +2021,7 @@ export function WorkflowWorkspace({
   onStartJournalRun,
   onRestoreJournalRuns,
   onResumeJournalRun,
+  onRetryPaperDocument,
   onRestartFromGuide,
   onTogglePaper,
   onPrepareGuides,
@@ -1887,6 +2034,8 @@ export function WorkflowWorkspace({
   zoteroUiState,
   obsidianUiState,
   projectStateUiState,
+  onToggleObsidianProposal,
+  onToggleProjectStateProposal,
   onSelectZoteroTarget,
   onRetryZoteroTargets,
   onGeneratePreview,
@@ -1934,7 +2083,8 @@ export function WorkflowWorkspace({
     && run?.source === "live"
     && ["reading", "draft_ready"].includes(status),
   );
-  const papers = suppliedPapers ?? workflowFixture.papers ?? [];
+  const papers = suppliedPapers
+    ?? (run?.source === "fixture" ? workflowFixture.papers ?? [] : []);
   const reviewPapers = papers.slice(0, 5);
   const selectedPaperIds = run?.selectedPaperIds ?? run?.selected_ids ?? [];
   const selectedPapers = papers.filter((paper) => selectedPaperIds.includes(paper.id));
@@ -1957,7 +2107,8 @@ export function WorkflowWorkspace({
     }
     onOpenPaper?.(paperId, null, readerTarget?.purpose ?? "document");
   };
-  const proposals = run?.proposals ?? workflowFixture.proposals ?? [];
+  const proposals = run?.proposals
+    ?? (run?.source === "fixture" ? workflowFixture.proposals ?? [] : []);
   const availableStepIds = getAvailableStepIds({
     run,
     status,
@@ -2021,7 +2172,7 @@ export function WorkflowWorkspace({
         : JOURNAL_PHASE_LABELS[journalRunState?.run?.phase];
 
   let content = null;
-  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onResumeJournalRun={onResumeJournalRun} />;
+  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onResumeJournalRun={onResumeJournalRun} onRetryPaperDocument={onRetryPaperDocument} />;
   if (status === "preparing_guides") {
     content = <PreparingGuides run={run} selectedPapers={selectedPapers} journalRunState={journalRunState} />;
   }
@@ -2069,15 +2220,28 @@ export function WorkflowWorkspace({
       />
     );
   }
-  if (status === "awaiting_approval") content = <ApprovalStage run={run} proposals={proposals} readingPapers={readingPapers} onOpenPaper={onOpenPaper} onToggleProposal={onToggleProposal} onCommit={onCommit} onRegeneratePreview={onGeneratePreview} zoteroUiState={zoteroUiState} obsidianUiState={obsidianUiState} projectStateUiState={projectStateUiState} onSelectZoteroTarget={onSelectZoteroTarget} onRetryZoteroTargets={onRetryZoteroTargets} />;
-  if (status === "manual_action_required") content = <ApprovalStage run={run} proposals={proposals} readingPapers={readingPapers} onOpenPaper={onOpenPaper} onToggleProposal={onToggleProposal} onCommit={onCommit} onRegeneratePreview={onGeneratePreview} zoteroUiState={zoteroUiState} obsidianUiState={obsidianUiState} projectStateUiState={projectStateUiState} onSelectZoteroTarget={onSelectZoteroTarget} onRetryZoteroTargets={onRetryZoteroTargets} />;
+  if (status === "awaiting_approval") content = <ApprovalStage run={run} proposals={proposals} readingPapers={readingPapers} onOpenPaper={onOpenPaper} onToggleProposal={onToggleProposal} onCommit={onCommit} onRegeneratePreview={onGeneratePreview} zoteroUiState={zoteroUiState} obsidianUiState={obsidianUiState} projectStateUiState={projectStateUiState} onToggleObsidianProposal={onToggleObsidianProposal} onToggleProjectStateProposal={onToggleProjectStateProposal} onSelectZoteroTarget={onSelectZoteroTarget} onRetryZoteroTargets={onRetryZoteroTargets} />;
+  if (status === "manual_action_required") content = <ApprovalStage run={run} proposals={proposals} readingPapers={readingPapers} onOpenPaper={onOpenPaper} onToggleProposal={onToggleProposal} onCommit={onCommit} onRegeneratePreview={onGeneratePreview} zoteroUiState={zoteroUiState} obsidianUiState={obsidianUiState} projectStateUiState={projectStateUiState} onToggleObsidianProposal={onToggleObsidianProposal} onToggleProjectStateProposal={onToggleProjectStateProposal} onSelectZoteroTarget={onSelectZoteroTarget} onRetryZoteroTargets={onRetryZoteroTargets} />;
   if (status === "committing") content = <CommittingStage run={run} proposals={proposals} recoveryError={journalRunState?.status === "error" ? journalRunState.error : null} onResume={onResumeJournalRun} />;
-  if (status === "partial") content = <PartialStage proposals={proposals} readingPapers={readingPapers} onOpenPaper={onOpenPaper} onRetryFailed={onRetryFailed} onRegeneratePreview={onGeneratePreview} zoteroUiState={zoteroUiState} onSelectZoteroTarget={onSelectZoteroTarget} onRetryZoteroTargets={onRetryZoteroTargets} />;
+  if (status === "partial") {
+    const archiveBatch = journalRunState?.run?.archiveBatch;
+    const localArchivePending = Boolean(
+      archiveBatch
+      && archiveBatch.status !== "completed"
+      && (
+        Boolean(obsidianUiState?.preview)
+        || Boolean(projectStateUiState?.preview)
+      )
+    );
+    content = localArchivePending
+      ? <ApprovalStage run={run} proposals={proposals} readingPapers={readingPapers} onOpenPaper={onOpenPaper} onToggleProposal={onToggleProposal} onCommit={onRetryFailed} onRegeneratePreview={onGeneratePreview} zoteroUiState={zoteroUiState} obsidianUiState={obsidianUiState} projectStateUiState={projectStateUiState} onToggleObsidianProposal={onToggleObsidianProposal} onToggleProjectStateProposal={onToggleProjectStateProposal} onSelectZoteroTarget={onSelectZoteroTarget} onRetryZoteroTargets={onRetryZoteroTargets} />
+      : <PartialStage proposals={proposals} readingPapers={readingPapers} onOpenPaper={onOpenPaper} onRetryFailed={onRetryFailed} onRegeneratePreview={onGeneratePreview} zoteroUiState={zoteroUiState} onSelectZoteroTarget={onSelectZoteroTarget} onRetryZoteroTargets={onRetryZoteroTargets} />;
+  }
   if (status === "reading_ready") content = <ReadingReadyStage proposals={proposals} readingPapers={readingPapers} onOpenPaper={onOpenPaper} />;
   if (status === "completed") content = <CompletedStage proposals={proposals} onReset={onReset} />;
   if (status === "completed_no_write") content = <CompletedNoWriteStage onReset={onReset} />;
   if (viewingHistory && viewedStep.id === "review") {
-    content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onTogglePaper={onTogglePaper} journalRunState={journalRunState} onOpenPaper={onOpenPaper} readOnly readOnlyQuiet={pinnedLanding} />;
+    content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onTogglePaper={onTogglePaper} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onRetryPaperDocument={onRetryPaperDocument} readOnly readOnlyQuiet={pinnedLanding} />;
   }
   if (viewingHistory && viewedStep.id === "guide") {
     content = (
@@ -2184,7 +2348,7 @@ export function WorkflowWorkspace({
           </span>
           <div>
             {viewedStep.id === "guide" && canRestartFromGuide ? (
-              <button type="button" onClick={openRestartDialog}>从这里重新开始</button>
+              <button type="button" onClick={openRestartDialog}>从导读重新开始</button>
             ) : null}
             <button type="button" onClick={() => viewStep(currentStep.id)}>
               {pinnedLanding ? "查看精读进度" : "返回当前步骤"}

@@ -1,5 +1,15 @@
-import { createHash } from "node:crypto";
-import { lstat, readFile, realpath, stat } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  chmod,
+  link,
+  lstat,
+  readFile,
+  realpath,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { READING_STAGE_ORDER } from "./readingGenerator.js";
 import {
@@ -72,6 +82,7 @@ function assertPaperId(paperId) {
 }
 
 function assertCitation(citation) {
+  const excerpt = citation?.excerpt ?? citation?.quote;
   if (
     !citation
     || typeof citation !== "object"
@@ -81,7 +92,7 @@ function assertCitation(citation) {
     || citation.path.some((part) => !compactLine(part))
     || !Number.isInteger(citation.ordinal)
     || citation.ordinal < 1
-    || !compactLine(citation.excerpt)
+    || !compactLine(excerpt)
     || !compactLine(citation.support)
   ) {
     throw previewError(
@@ -89,6 +100,47 @@ function assertCitation(citation) {
       "精读引用缺少可核验的段落锚点或原文信息",
     );
   }
+}
+
+function canonicalPinnedConclusions(reading) {
+  const canonicalConversationId = reading.canonical_conversation_id
+    ?? reading.active_conversation_id
+    ?? reading.chat?.id
+    ?? "current";
+  const conclusions = Array.isArray(reading.pinned_conclusions)
+    ? reading.pinned_conclusions.filter((conclusion) => (
+        conclusion?.status === "pinned"
+        && conclusion.source_conversation_id === canonicalConversationId
+      ))
+    : [];
+  conclusions.forEach((conclusion) => {
+    if (
+      !compactLine(conclusion.conclusion_id)
+      || !compactLine(conclusion.source_turn_id)
+      || !markdownText(conclusion.content)
+      || !HASH_PATTERN.test(conclusion.content_hash)
+      || conclusion.content_hash !== sha256(conclusion.content)
+      || !compactLine(conclusion.confirmed_by)
+      || !Array.isArray(conclusion.citations)
+      || conclusion.citations.length < 1
+      || (
+        conclusion.coverage_stages != null
+        && (
+          !Array.isArray(conclusion.coverage_stages)
+          || conclusion.coverage_stages.some(
+            (stage) => !READING_STAGE_ORDER.includes(stage),
+          )
+        )
+      )
+    ) {
+      throw previewError(
+        "OBSIDIAN_READING_INVALID",
+        "已确认结论缺少来源、内容哈希、确认人或可核验引用",
+      );
+    }
+    conclusion.citations.forEach(assertCitation);
+  });
+  return conclusions;
 }
 
 function assertStage(stageId, stage) {
@@ -171,7 +223,7 @@ function assertReading(run, paperId, reading) {
   ) {
     throw previewError(
       "OBSIDIAN_READING_NOT_READY",
-      "四阶段精读尚未完整完成，不能生成 Obsidian 写入预览",
+      "归档所需的阅读证据尚未齐全，不能生成 Obsidian 写入预览",
     );
   }
   for (const stageId of READING_STAGE_ORDER) {
@@ -189,7 +241,7 @@ function citationMarkdown(citations, headingLevel = 3) {
       `${index + 1}. \`${citation.block_id}\``,
       `   - 位置：${citation.path.length > 0 ? citation.path.map(compactLine).join(" › ") : "未提供章节路径"}`,
       `   - 段落序号：${citation.ordinal}`,
-      `   - 原文摘录：${compactLine(citation.excerpt)}`,
+      `   - 原文摘录：${compactLine(citation.excerpt ?? citation.quote)}`,
       `   - 支持关系：${compactLine(citation.support)}`,
     ]),
   ];
@@ -238,18 +290,54 @@ function workflowMarkdown(run, paper, reading) {
     "",
   ];
 
-  READING_STAGE_ORDER.forEach((stageId, index) => {
-    const stage = reading.stages[stageId];
+  const pinnedConclusions = canonicalPinnedConclusions(reading);
+  const pinnedCoverage = new Set(
+    pinnedConclusions.flatMap((conclusion) => conclusion.coverage_stages ?? []),
+  );
+  if (pinnedConclusions.length > 0) {
     lines.push(
-      `## ${index + 1}. ${STAGE_LABELS[stageId]}`,
+      "## 已确认结论",
+      "",
+      "> 以下结论由用户在正式研读会话中固定；它们优先进入归档，固定操作本身不构成任何外部写入批准。",
+      "",
+    );
+    pinnedConclusions.forEach((conclusion, index) => {
+      lines.push(
+        `### 结论 ${index + 1}`,
+        "",
+        markdownText(conclusion.content),
+        "",
+        `- 确认人：${compactLine(conclusion.confirmed_by)}`,
+        `- 来源会话：\`${compactLine(conclusion.source_conversation_id)}\``,
+        `- 来源 Turn：\`${compactLine(conclusion.source_turn_id)}\``,
+        "",
+        ...citationMarkdown(conclusion.citations, 4),
+        "",
+      );
+    });
+    lines.push(
+      "## 四镜头覆盖补充",
+      "",
+      "> 以下阶段结果只用于补足已确认结论尚未覆盖的归档镜头。",
+      "",
+    );
+  }
+
+  READING_STAGE_ORDER.forEach((stageId, index) => {
+    if (pinnedCoverage.has(stageId)) return;
+    const stage = reading.stages[stageId];
+    const heading = pinnedConclusions.length > 0 ? "###" : "##";
+    const detailHeadingLevel = pinnedConclusions.length > 0 ? 4 : 3;
+    lines.push(
+      `${heading} ${index + 1}. ${STAGE_LABELS[stageId]}`,
       "",
       ...(stageId === "project-relation"
         ? ["> 本节是待用户确认的项目关系判断，不会自动写入项目状态。", ""]
         : []),
       markdownText(stage.result.answer),
       "",
-      ...citationMarkdown(stage.result.evidence),
-      ...openQuestionsMarkdown(stage.result.open_questions),
+      ...citationMarkdown(stage.result.evidence, detailHeadingLevel),
+      ...openQuestionsMarkdown(stage.result.open_questions, detailHeadingLevel),
       "",
     );
   });
@@ -336,6 +424,7 @@ async function inspectTarget(targetPath, targetDirectory, fileName) {
     kind,
     byte_length: targetStat.size,
     modified_at_ms: targetStat.mtimeMs,
+    mode: targetStat.mode & 0o777,
     current_content_hash: currentContentHash,
   };
   return {
@@ -377,8 +466,25 @@ function relevantRunHash(run) {
         status: reading.status ?? null,
         document_revision: reading.document_revision ?? null,
         current_stage: reading.current_stage ?? null,
+        canonical_conversation_id: reading.canonical_conversation_id ?? null,
         stages: reading.stages ?? null,
         questions: reading.questions ?? null,
+        pinned_conclusions: (reading.pinned_conclusions ?? [])
+          .map((conclusion) => ({
+            conclusion_id: conclusion.conclusion_id ?? null,
+            source_conversation_id:
+              conclusion.source_conversation_id ?? null,
+            source_turn_id: conclusion.source_turn_id ?? null,
+            content_hash: conclusion.content_hash ?? null,
+            citations: conclusion.citations ?? [],
+            coverage_stages: conclusion.coverage_stages ?? [],
+            confirmed_by: conclusion.confirmed_by ?? null,
+            status: conclusion.status ?? null,
+            updated_at: conclusion.updated_at ?? null,
+          }))
+          .sort((left, right) => (
+            String(left.conclusion_id).localeCompare(String(right.conclusion_id))
+          )),
         agent_actions: {
           status: reading.agent_actions?.status ?? null,
           proposals: (reading.agent_actions?.proposals ?? [])
@@ -416,6 +522,102 @@ function proposalCore(proposal) {
   };
 }
 
+function proposalIntegrityCore(proposal) {
+  return {
+    ...proposalCore(proposal),
+    decision: proposal.decision,
+    target_details: proposal.target_details,
+    target_hash: proposal.target_hash,
+    markdown: proposal.markdown,
+    diff: proposal.diff,
+  };
+}
+
+function assertProposalIntegrity(proposal) {
+  const expectedId = `obsidian-preview-${sha256({
+    run_id: proposal.run_id,
+    paper_id: proposal.paper_id,
+    target_locator: proposal.target_locator,
+    content_hash: proposal.content_hash,
+    target_hash: proposal.target_hash,
+  }).slice(7, 23)}`;
+  const baseValid = (
+    proposal.proposal_id === expectedId
+    && proposal.content_hash === sha256(proposal.markdown)
+    && proposal.target_hash === proposal.target_version_or_hash
+  );
+  const diffValid = proposal.write_mode === "create_only"
+    ? (
+        proposal.diff?.mode === "create"
+        && proposal.diff.before === null
+        && proposal.diff.after === proposal.markdown
+      )
+    : proposal.write_mode === "managed_update"
+      ? (
+          proposal.diff?.mode === "replace_managed_workflow"
+          && proposal.diff.before_hash
+            === proposal.target_details?.current_content_hash
+          && proposal.diff.after_hash === proposal.content_hash
+          && proposal.diff.after === proposal.markdown
+        )
+      : proposal.write_mode === "manual_update_required"
+        && proposal.diff?.mode === "blocked_existing"
+        && proposal.diff.before_hash
+          === proposal.target_details?.current_content_hash
+        && proposal.diff.after_hash
+          === proposal.target_details?.current_content_hash;
+  if (!baseValid || !diffValid) {
+    throw previewError(
+      "OBSIDIAN_PREVIEW_CORRUPT",
+      "Obsidian 精确预览缺失或损坏，请重新生成",
+      409,
+      true,
+    );
+  }
+}
+
+function safeCommitError(error) {
+  return {
+    code: compactLine(error?.code, "OBSIDIAN_WRITE_FAILED"),
+    message: compactLine(error?.message, "Obsidian 笔记写入失败"),
+    retryable: error?.retryable !== false,
+  };
+}
+
+async function atomicWriteTarget(targetPath, markdown, expectedTargetHash) {
+  const temporaryPath = `${targetPath}.${randomUUID()}.tmp`;
+  await writeFile(temporaryPath, markdown, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  try {
+    const current = await inspectTarget(
+      targetPath,
+      path.dirname(targetPath),
+      path.basename(targetPath),
+    );
+    if (current.target_hash !== expectedTargetHash) {
+      throw previewError(
+        "OBSIDIAN_PREVIEW_STALE",
+        "Obsidian 目标在确认前发生变化，未执行写入",
+        409,
+        true,
+      );
+    }
+    if (current.exists) {
+      await chmod(temporaryPath, current.mode);
+      await rename(temporaryPath, targetPath);
+    } else {
+      await link(temporaryPath, targetPath);
+      await unlink(temporaryPath);
+    }
+  } catch (error) {
+    await unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
+}
+
 export function createObsidianPreviewService({
   runStore,
   getPaperReading,
@@ -429,6 +631,16 @@ export function createObsidianPreviewService({
     throw new Error("obsidianNoteDir is required");
   }
   const configuredDirectory = path.resolve(obsidianNoteDir);
+  const targetQueues = new Map();
+
+  function withTargetLock(targetPath, operation) {
+    const previous = targetQueues.get(targetPath) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    targetQueues.set(targetPath, current);
+    return current.finally(() => {
+      if (targetQueues.get(targetPath) === current) targetQueues.delete(targetPath);
+    });
+  }
 
   async function targetDirectory() {
     let directoryStat;
@@ -602,7 +814,7 @@ export function createObsidianPreviewService({
       });
     }
 
-    const proposalHash = sha256(proposals.map(proposalCore));
+    const proposalHash = sha256(proposals.map(proposalIntegrityCore));
     const generatedAt = now().toISOString();
     const status = proposals.every((proposal) => proposal.actionable)
       ? "preview_ready"
@@ -613,7 +825,7 @@ export function createObsidianPreviewService({
       schema_version: 1,
       run_id: runId,
       target_type: "obsidian",
-      write_capability: "preview_only",
+      write_capability: "hash_bound_commit",
       external_write_performed: false,
       status,
       configured_directory: configuredDirectory,
@@ -680,11 +892,25 @@ export function createObsidianPreviewService({
       );
     }
     const artifact = await runStore.readArtifact(runId, artifactPath);
+    let artifactIntegrityValid = false;
+    try {
+      artifactIntegrityValid = (
+        Array.isArray(artifact?.proposals)
+        && artifact.proposals.every((proposal) => {
+          assertProposalIntegrity(proposal);
+          return true;
+        })
+        && sha256(artifact.proposals.map(proposalIntegrityCore)) === proposalHash
+      );
+    } catch {
+      artifactIntegrityValid = false;
+    }
     if (
       !artifact
       || artifact.run_id !== runId
       || artifact.proposal_hash !== proposalHash
       || artifact.source_hash !== relevantRunHash(run)
+      || !artifactIntegrityValid
     ) {
       throw previewError(
         "OBSIDIAN_PREVIEW_STALE",
@@ -694,9 +920,257 @@ export function createObsidianPreviewService({
     return artifact;
   }
 
+  async function validateCommit(runId, {
+    proposalHash,
+    operations,
+  } = {}) {
+    const artifact = await getPreview(runId);
+    const run = await runStore.getRun(runId);
+    if (artifact.proposal_hash !== proposalHash) {
+      throw previewError(
+        "OBSIDIAN_PREVIEW_STALE",
+        "Obsidian 预览内容已变化，请重新检查后确认",
+        409,
+        true,
+      );
+    }
+    if (!Array.isArray(operations) || operations.length === 0) {
+      throw previewError(
+        "OBSIDIAN_APPROVAL_EMPTY",
+        "至少选择一篇 Obsidian 笔记写入",
+        400,
+      );
+    }
+    const selected = [];
+    const seen = new Set();
+    for (const binding of operations) {
+      const proposal = artifact.proposals.find(
+        (candidate) => candidate.proposal_id === binding?.proposal_id,
+      );
+      if (
+        !proposal
+        || seen.has(proposal.proposal_id)
+        || proposal.actionable !== true
+        || !["create_only", "managed_update"].includes(proposal.write_mode)
+        || binding.content_hash !== proposal.content_hash
+        || binding.target_version_or_hash !== proposal.target_version_or_hash
+      ) {
+        throw previewError(
+          "OBSIDIAN_APPROVAL_INVALID",
+          "Obsidian 确认内容与当前预览不一致",
+          409,
+          true,
+        );
+      }
+      seen.add(proposal.proposal_id);
+      const current = await inspectTarget(
+        proposal.target_locator,
+        artifact.target_directory,
+        proposal.target_details.file_name,
+      );
+      const paper = run?.candidates?.find(
+        (candidate) => candidate.paper_id === proposal.paper_id,
+      );
+      if (
+        current.current_content_hash === proposal.content_hash
+        && paper
+        && parseManagedNote(current.current_content, paper)?.status === "managed"
+      ) {
+        selected.push({ ...proposal, already_committed: true });
+        continue;
+      }
+      if (current.target_hash !== proposal.target_version_or_hash) {
+        throw previewError(
+          "OBSIDIAN_PREVIEW_STALE",
+          "Obsidian 目标在预览后发生变化，请重新生成预览",
+          409,
+          true,
+        );
+      }
+      selected.push({ ...proposal, already_committed: false });
+    }
+    return { artifact, selected };
+  }
+
+  async function commit(runId, {
+    clientRequestId,
+    proposalHash,
+    operations,
+  } = {}) {
+    if (typeof clientRequestId !== "string" || !clientRequestId.trim()) {
+      throw previewError(
+        "OBSIDIAN_APPROVAL_REQUEST_INVALID",
+        "Obsidian 确认请求标识无效",
+        400,
+      );
+    }
+    const { artifact, selected } = await validateCommit(runId, {
+      proposalHash,
+      operations,
+    });
+    const approvedAt = now().toISOString();
+    const approval = {
+      schema_version: 1,
+      run_id: runId,
+      client_request_id: clientRequestId.trim(),
+      proposal_hash: proposalHash,
+      operations: selected.map((proposal) => ({
+        proposal_id: proposal.proposal_id,
+        content_hash: proposal.content_hash,
+        target_version_or_hash: proposal.target_version_or_hash,
+      })),
+      approved_at: approvedAt,
+    };
+    approval.approval_hash = sha256(approval);
+    const approvalPath =
+      `obsidian/approvals/${approval.approval_hash.slice(7)}.json`;
+    await runStore.writeArtifact(runId, approvalPath, approval);
+    await runStore.updateRun(runId, (current) => ({
+      obsidian: {
+        ...current.obsidian,
+        status: "committing",
+        approval: {
+          ...approval,
+          artifact_path: approvalPath,
+        },
+        last_error: null,
+        proposals: (current.obsidian?.proposals ?? []).map((proposal) => (
+          selected.some((item) => item.proposal_id === proposal.proposal_id)
+            ? { ...proposal, selected: true, status: "committing" }
+            : proposal
+        )),
+        updated_at: approvedAt,
+      },
+    }));
+
+    for (const proposal of selected) {
+      const startedAt = now().toISOString();
+      const ledgerPath = `writes/obsidian/${proposal.proposal_id}.json`;
+      try {
+        await runStore.writeArtifact(runId, ledgerPath, {
+          schema_version: 1,
+          run_id: runId,
+          proposal_id: proposal.proposal_id,
+          approval_hash: approval.approval_hash,
+          status: "committing",
+          started_at: startedAt,
+        });
+        await withTargetLock(proposal.target_locator, async () => {
+          if (!proposal.already_committed) {
+            await atomicWriteTarget(
+              proposal.target_locator,
+              proposal.markdown,
+              proposal.target_version_or_hash,
+            );
+          }
+          const verified = await inspectTarget(
+            proposal.target_locator,
+            artifact.target_directory,
+            proposal.target_details.file_name,
+          );
+          const paper = (await runStore.getRun(runId))?.candidates?.find(
+            (candidate) => candidate.paper_id === proposal.paper_id,
+          );
+          if (
+            verified.current_content_hash !== proposal.content_hash
+            || !paper
+            || parseManagedNote(verified.current_content, paper)?.status !== "managed"
+          ) {
+            throw previewError(
+              "OBSIDIAN_WRITE_VERIFICATION_FAILED",
+              "Obsidian 笔记写入后的读回核验失败",
+              500,
+              true,
+            );
+          }
+        });
+        const completedAt = now().toISOString();
+        await runStore.writeArtifact(runId, ledgerPath, {
+          schema_version: 1,
+          run_id: runId,
+          proposal_id: proposal.proposal_id,
+          approval_hash: approval.approval_hash,
+          status: "committed",
+          started_at: startedAt,
+          completed_at: completedAt,
+          verified: true,
+        });
+        await runStore.updateRun(runId, (current) => ({
+          obsidian: {
+            ...current.obsidian,
+            proposals: (current.obsidian?.proposals ?? []).map((item) => (
+              item.proposal_id === proposal.proposal_id
+                ? {
+                    ...item,
+                    selected: true,
+                    status: "committed",
+                    committed_at: completedAt,
+                    verified_at: completedAt,
+                    last_error: null,
+                  }
+                : item
+            )),
+            updated_at: completedAt,
+          },
+        }));
+      } catch (error) {
+        const failedAt = now().toISOString();
+        const lastError = safeCommitError(error);
+        await runStore.writeArtifact(runId, ledgerPath, {
+          schema_version: 1,
+          run_id: runId,
+          proposal_id: proposal.proposal_id,
+          approval_hash: approval.approval_hash,
+          status: "failed",
+          started_at: startedAt,
+          completed_at: failedAt,
+          verified: false,
+          error: lastError,
+        }).catch(() => undefined);
+        await runStore.updateRun(runId, (current) => ({
+          obsidian: {
+            ...current.obsidian,
+            proposals: (current.obsidian?.proposals ?? []).map((item) => (
+              item.proposal_id === proposal.proposal_id
+                ? { ...item, selected: true, status: "failed", last_error: lastError }
+                : item
+            )),
+            last_error: lastError,
+            updated_at: failedAt,
+          },
+        }));
+      }
+    }
+    const finishedAt = now().toISOString();
+    const updated = await runStore.updateRun(runId, (current) => {
+      const selectedStates = (current.obsidian?.proposals ?? []).filter(
+        (proposal) => proposal.selected === true,
+      );
+      const failed = selectedStates.filter((proposal) => proposal.status === "failed");
+      const committed = selectedStates.filter((proposal) => proposal.status === "committed");
+      return {
+        obsidian: {
+          ...current.obsidian,
+          status: failed.length > 0
+            ? committed.length > 0 ? "partial" : "failed"
+            : "completed",
+          updated_at: finishedAt,
+        },
+      };
+    });
+    await runStore.appendEvent(runId, {
+      type: "obsidian_commit_completed",
+      proposal_hash: proposalHash,
+      at: finishedAt,
+    });
+    return updated;
+  }
+
   return {
+    commit,
     createPreview,
     getPreview,
+    validateCommit,
   };
 }
 
