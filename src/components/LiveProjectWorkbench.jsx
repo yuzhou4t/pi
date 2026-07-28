@@ -40,8 +40,12 @@ import {
   X,
 } from "@phosphor-icons/react";
 import {
+  MAX_PROJECT_WORK_TEXT_ATTACHMENTS,
+  MAX_PROJECT_WORK_TEXT_ATTACHMENT_TOTAL_BYTES,
+  projectWorkDroppedFileKind,
   projectWorkApi,
   validateProjectWorkImageFile,
+  validateProjectWorkTextAttachmentFile,
 } from "../api/projectWork.js";
 import {
   mergeFreshConversationSnapshot,
@@ -2059,6 +2063,9 @@ export function ProjectAgentPane({
   onRemoveWorkflow,
   pendingImage,
   onRemoveImage,
+  pendingAttachments = [],
+  onRemoveAttachment,
+  onDropFiles,
   imageInputRef,
   onSelectImage,
   supportsImages,
@@ -2098,7 +2105,9 @@ export function ProjectAgentPane({
   );
   const autoReview = conversation.executionPolicy?.mode === "auto_review";
   const streamRef = useRef(null);
+  const dragDepthRef = useRef(0);
   const followLatestRef = useRef(true);
+  const [dropActive, setDropActive] = useState(false);
   const previousConversationIdRef = useRef(conversation.id);
   const previousRunningRef = useRef(running);
   const userMessageCount = conversation.messages.filter(
@@ -2116,6 +2125,7 @@ export function ProjectAgentPane({
     && !pendingImage;
   const turnSelectionDeferred = running && Boolean(
     pendingImage
+    || pendingAttachments.length > 0
     || selectedWorkflow
     || selectedCapabilities.length > 0,
   );
@@ -2207,9 +2217,47 @@ export function ProjectAgentPane({
     conversation.messages,
     running,
   );
+  const handleDragEnter = useCallback((event) => {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setDropActive(true);
+  }, []);
+  const handleDragOver = useCallback((event) => {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+  }, []);
+  const handleDragLeave = useCallback((event) => {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return;
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDropActive(false);
+  }, []);
+  const handleDrop = useCallback((event) => {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return;
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setDropActive(false);
+    const files = Array.from(event.dataTransfer?.files ?? []);
+    if (files.length > 0) onDropFiles?.(files);
+  }, [onDropFiles]);
 
   return (
-    <div className="project-agent">
+    <div
+      className={`project-agent${dropActive ? " is-file-drop-active" : ""}`}
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {dropActive ? (
+        <div className="project-file-drop-overlay" role="status">
+          <UploadSimple size={20} weight="bold" aria-hidden="true" />
+          <strong>释放以添加到当前会话</strong>
+          <span>PDF 会解析；图片和文本文件仅随消息发送</span>
+        </div>
+      ) : null}
       <div
         className="project-agent-stream"
         onScroll={handleStreamScroll}
@@ -2278,7 +2326,14 @@ export function ProjectAgentPane({
             const messageImages = Array.isArray(message.images)
               ? message.images
               : [];
-            if (!text && messageImages.length === 0) return null;
+            const messageAttachments = Array.isArray(message.attachments)
+              ? message.attachments
+              : [];
+            if (
+              !text
+              && messageImages.length === 0
+              && messageAttachments.length === 0
+            ) return null;
             return (
               <Fragment key={message.id}>
                 {settledWithAnswer && index === lastAssistantMessageIndex
@@ -2290,7 +2345,7 @@ export function ProjectAgentPane({
                   <small>{message.role === "user" ? "你" : "Pi Agent"}</small>
                   {message.role === "assistant" ? (
                     <ProjectAgentMarkdown>{text}</ProjectAgentMarkdown>
-                  ) : messageImages.length > 0 ? (
+                  ) : messageImages.length > 0 || messageAttachments.length > 0 ? (
                     <div className="project-agent-user-message-content">
                       {text ? (
                         <div className="project-agent-plain-text">{text}</div>
@@ -2300,6 +2355,15 @@ export function ProjectAgentPane({
                           <span key={image.id ?? `${message.id}-image-${imageIndex}`}>
                             <ImageSquare size={13} aria-hidden="true" />
                             图片 · {image.fileName || "图片"}
+                          </span>
+                        ))}
+                        {messageAttachments.map((attachment, attachmentIndex) => (
+                          <span
+                            key={attachment.contentHash
+                              ?? `${message.id}-attachment-${attachmentIndex}`}
+                          >
+                            <FileCode size={13} aria-hidden="true" />
+                            文件 · {attachment.fileName || "文本附件"}
                           </span>
                         ))}
                       </div>
@@ -2409,6 +2473,27 @@ export function ProjectAgentPane({
             ) : null}
           </>
         ) : null}
+        {pendingAttachments.length > 0 ? (
+          <div className="project-pending-attachments" aria-label="当前消息的临时文件">
+            {pendingAttachments.map((attachment) => (
+              <span key={attachment.id}>
+                <FileCode size={13} aria-hidden="true" />
+                <span>
+                  <strong>{attachment.file.name}</strong>
+                  <small>仅随当前消息发送</small>
+                </span>
+                <button
+                  type="button"
+                  disabled={turnPayloadLocked}
+                  onClick={() => onRemoveAttachment?.(attachment.id)}
+                  aria-label={`移除文件：${attachment.file.name}`}
+                >
+                  <X size={12} weight="bold" aria-hidden="true" />
+                </button>
+              </span>
+            ))}
+          </div>
+        ) : null}
         {selectedWorkflow || selectedCapabilities.length > 0 ? (
           <div className="project-turn-chips" aria-label="当前消息使用的能力">
             {selectedWorkflow ? (
@@ -2473,7 +2558,7 @@ export function ProjectAgentPane({
               ? "当前模型不能看图，请切换支持图片的模型"
               : workflowImageMissing
                 ? "截图验收需要先添加一张图片"
-                : "当前 Agent 完成后再发送所选能力或图片"}
+                : "当前 Agent 完成后再发送所选能力、图片或文件"}
           </small>
         ) : null}
         {running ? (
@@ -2533,7 +2618,7 @@ export function ProjectAgentPane({
                 onClick={() => onOpenArtifact("files")}
               >
                 <Paperclip size={13} aria-hidden="true" />
-                添加文件
+                添加项目文件
               </button>
               <button
                 className="project-composer-tool project-composer-attachment"
@@ -2547,7 +2632,7 @@ export function ProjectAgentPane({
                 ) : (
                   <UploadSimple size={13} aria-hidden="true" />
                 )}
-                添加资料
+                上传 PDF 资料
               </button>
               <button
                 className="project-composer-tool project-composer-attachment"
@@ -2598,7 +2683,7 @@ export function ProjectAgentPane({
                   ? "发送会加入持久后续队列"
                   : running
                     ? "发送会立即调整当前 Agent 的方向"
-                    : "只有显式发送才开始工作"}
+                    : "只有显式发送才开始工作 · 可拖入 PDF、图片或文本文件"}
               {" · Enter 发送 · Shift+Enter 换行"}
             </small>
           </div>
@@ -4136,6 +4221,7 @@ export function LiveProjectWorkbench({
   const [selectedWorkflowId, setSelectedWorkflowId] = useState(null);
   const [runningMessageMode, setRunningMessageMode] = useState("steer");
   const [pendingImage, setPendingImage] = useState(null);
+  const [pendingAttachments, setPendingAttachments] = useState([]);
   const [modelCatalog, setModelCatalog] = useState({
     providers: [],
     defaultThinkingLevel: null,
@@ -4228,6 +4314,7 @@ export function LiveProjectWorkbench({
     setSelectedWorkflowId(null);
     setRunningMessageMode("steer");
     replacePendingImage(null);
+    setPendingAttachments([]);
     setActiveArtifactId(readLastArtifact(
       conversation?.id,
       conversation?.activeArtifactId ?? "files",
@@ -4525,6 +4612,7 @@ export function LiveProjectWorkbench({
       running
       && (
         pendingImage
+        || pendingAttachments.length > 0
         || selectedWorkflowId
         || selectedCapabilityIds.length > 0
       )
@@ -4560,6 +4648,7 @@ export function LiveProjectWorkbench({
             text,
             contexts: contextChips,
             images: pendingImage ? [pendingImage.file] : [],
+            attachments: pendingAttachments.map((attachment) => attachment.file),
             capabilities: selectedCapabilityIds,
             workflowId: selectedWorkflowId,
             providerId: providerId || snapshot.providerId,
@@ -4576,6 +4665,7 @@ export function LiveProjectWorkbench({
         setSelectedCapabilityIds([]);
         setSelectedWorkflowId(null);
         replacePendingImage(null);
+        setPendingAttachments([]);
       }
     });
   }, [
@@ -4585,6 +4675,7 @@ export function LiveProjectWorkbench({
     draft,
     executeAction,
     modelId,
+    pendingAttachments,
     pendingImage,
     providerId,
     replacePendingImage,
@@ -4610,6 +4701,38 @@ export function LiveProjectWorkbench({
       errorRef.current?.(error);
     }
   }, [action, replacePendingImage]);
+
+  const addPendingAttachments = useCallback((files) => {
+    if (action || isConversationRunning(snapshot)) {
+      throw new TypeError("请等待当前 Agent 完成后再添加消息文件");
+    }
+    const additions = files.map((file) => {
+      validateProjectWorkTextAttachmentFile(file);
+      return {
+        id: `${file.name}:${file.size}:${file.lastModified ?? 0}`,
+        file,
+      };
+    });
+    const next = [...pendingAttachments];
+    for (const attachment of additions) {
+      if (!next.some((item) => item.id === attachment.id)) {
+        next.push(attachment);
+      }
+    }
+    if (next.length > MAX_PROJECT_WORK_TEXT_ATTACHMENTS) {
+      throw new TypeError(
+        `每条消息最多添加 ${MAX_PROJECT_WORK_TEXT_ATTACHMENTS} 个文本或代码文件`,
+      );
+    }
+    if (
+      next.reduce((total, attachment) => total + attachment.file.size, 0)
+      > MAX_PROJECT_WORK_TEXT_ATTACHMENT_TOTAL_BYTES
+    ) {
+      throw new TypeError("当前消息的文本附件总大小不能超过 120 KB");
+    }
+    setPendingAttachments(next);
+    setActionError(null);
+  }, [action, pendingAttachments, snapshot]);
 
   const openArtifact = useCallback((artifactId, path = "") => {
     if (!ARTIFACTS.some((artifact) => artifact.id === artifactId)) return;
@@ -4661,6 +4784,53 @@ export function LiveProjectWorkbench({
     snapshot?.id,
     uploadingPdf,
   ]);
+
+  const dropFiles = useCallback(async (files) => {
+    const grouped = {
+      pdf: [],
+      image: [],
+      text: [],
+      unsupported: [],
+    };
+    files.forEach((file) => {
+      grouped[projectWorkDroppedFileKind(file)].push(file);
+    });
+    const errors = [];
+
+    if (grouped.unsupported.length > 0) {
+      errors.push(new TypeError(
+        `暂不支持 ${grouped.unsupported.map((file) => file.name).join("、")}；可拖入 PDF、图片、文本或代码文件`,
+      ));
+    }
+    if (grouped.image.length > 1) {
+      errors.push(new TypeError("每条消息最多添加一张图片"));
+    } else if (grouped.image.length === 1) {
+      if (isConversationRunning(snapshot)) {
+        errors.push(new TypeError("请等待当前 Agent 完成后再添加图片"));
+      } else {
+        try {
+          validateProjectWorkImageFile(grouped.image[0]);
+          selectImage(grouped.image[0]);
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    }
+    if (grouped.text.length > 0) {
+      try {
+        addPendingAttachments(grouped.text);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    for (const file of grouped.pdf) {
+      await uploadPdf(file);
+    }
+    if (errors.length > 0) {
+      setActionError(errors[0]);
+      errorRef.current?.(errors[0]);
+    }
+  }, [addPendingAttachments, selectImage, snapshot, uploadPdf]);
 
   const retryDocument = useCallback((documentId) => {
     if (!documentId || typeof api.retryPdf !== "function") return;
@@ -5193,6 +5363,16 @@ export function LiveProjectWorkbench({
           onRemoveImage={() => {
             if (!turnPayloadLocked) replacePendingImage(null);
           }}
+          pendingAttachments={pendingAttachments}
+          onRemoveAttachment={(attachmentId) => {
+            if (turnPayloadLocked) return;
+            setPendingAttachments(
+              (current) => current.filter(
+                (attachment) => attachment.id !== attachmentId,
+              ),
+            );
+          }}
+          onDropFiles={dropFiles}
           imageInputRef={imageInputRef}
           onSelectImage={selectImage}
           supportsImages={supportsImages}

@@ -43,6 +43,10 @@ import { createProjectPreviewSupervisor } from "./previewSupervisor.js";
 import { resolveProjectWorkTurn } from "./projectWorkWorkflows.js";
 import { createMacOSProjectPicker } from "./macosProjectPicker.js";
 import { normalizeProjectWorkImages } from "./projectWorkImages.js";
+import {
+  normalizeProjectWorkTextAttachments,
+  projectWorkTextAttachmentPrompt,
+} from "./projectWorkAttachments.js";
 import { createProjectRegistry, publicProject } from "./projectRegistry.js";
 import { createSkillPackageService } from "./skillPackageService.js";
 import { normalizeTurnUsage } from "./turnEvidence.js";
@@ -386,6 +390,16 @@ function publicConversationMessage(message) {
           byteLength: Number.isSafeInteger(image?.byteLength)
             ? image.byteLength
             : 0,
+        }))
+      : [],
+    attachments: Array.isArray(message.attachments)
+      ? message.attachments.map((attachment) => ({
+          fileName: compactText(attachment?.fileName, 180, "文件"),
+          mimeType: compactText(attachment?.mimeType, 120),
+          byteLength: Number.isSafeInteger(attachment?.byteLength)
+            ? attachment.byteLength
+            : 0,
+          contentHash: compactText(attachment?.contentHash, 80),
         }))
       : [],
     status: message.status,
@@ -786,6 +800,7 @@ function messageRequestFingerprint({
   text,
   context,
   images,
+  attachments,
   capabilities,
   workflowId,
   providerId,
@@ -800,6 +815,14 @@ function messageRequestFingerprint({
       .update(String(image?.data ?? ""))
       .digest("hex"),
   }));
+  const attachmentSignatures = attachments.map((attachment) => ({
+    fileName: attachment?.fileName ?? attachment?.file_name ?? null,
+    mimeType: attachment?.mimeType ?? attachment?.mime_type ?? null,
+    byteLength: attachment?.byteLength ?? attachment?.byte_length ?? null,
+    sha256: createHash("sha256")
+      .update(String(attachment?.text ?? ""))
+      .digest("hex"),
+  }));
   const payload = {
     text,
     context: context.map((item) => ({
@@ -809,6 +832,7 @@ function messageRequestFingerprint({
       endLine: item?.endLine ?? null,
     })),
     images: imageSignatures,
+    attachments: attachmentSignatures,
     capabilities: [...capabilities],
     workflowId: workflowId ?? null,
     providerId: providerId ?? null,
@@ -4789,6 +4813,7 @@ export function createProjectWorkService({
     text,
     context = [],
     images = [],
+    attachments = [],
     capabilities = [],
     workflowId,
     providerId,
@@ -4810,10 +4835,12 @@ export function createProjectWorkService({
     const messageContext = Array.isArray(context) ? context : [];
     const requestedCapabilities = Array.isArray(capabilities) ? capabilities : [];
     const requestedImages = Array.isArray(images) ? images : [];
+    const requestedAttachments = Array.isArray(attachments) ? attachments : [];
     const requestFingerprint = messageRequestFingerprint({
       text: messageText,
       context: messageContext,
       images: requestedImages,
+      attachments: requestedAttachments,
       capabilities: requestedCapabilities,
       workflowId,
       providerId,
@@ -4844,9 +4871,15 @@ export function createProjectWorkService({
       hasImages: Array.isArray(images) && images.length > 0,
     });
     const normalizedImages = await normalizeProjectWorkImages(images);
+    const normalizedAttachments = normalizeProjectWorkTextAttachments(
+      requestedAttachments,
+    );
     const promptContext = await buildPromptContext(
       conversationId,
       messageContext,
+    );
+    const attachmentContext = projectWorkTextAttachmentPrompt(
+      normalizedAttachments,
     );
     const createdAt = timestamp();
     const proposedMessageId = `message-${idFactory()}`;
@@ -4961,6 +4994,7 @@ export function createProjectWorkService({
           role: "user",
           text: messageText,
           images: normalizedImages.map(({ metadata }) => metadata),
+          attachments: normalizedAttachments.map(({ metadata }) => metadata),
           status: "accepted",
           ...turnSettings,
           clientRequestId: requestId,
@@ -5144,7 +5178,7 @@ export function createProjectWorkService({
     }
     const completion = Promise.resolve()
       .then(() => runtime.host.prompt(
-        `${messageText}${promptContext}`,
+        `${messageText}${promptContext}${attachmentContext}`,
         {
           turnGuidance: [
             turn.guidance,

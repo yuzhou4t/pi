@@ -7,6 +7,11 @@ export const PROJECT_WORK_IMAGE_TYPES = new Set([
   "image/png",
   "image/webp",
 ]);
+export const MAX_PROJECT_WORK_TEXT_ATTACHMENTS = 5;
+export const MAX_PROJECT_WORK_TEXT_ATTACHMENT_BYTES = 120 * 1024;
+export const MAX_PROJECT_WORK_TEXT_ATTACHMENT_TOTAL_BYTES = 120 * 1024;
+const PROJECT_WORK_TEXT_ATTACHMENT_PATTERN = /\.(?:bash|c|cfg|cjs|conf|cpp|cs|css|csv|fish|go|gql|graphql|h|hpp|htm|html|ini|java|js|json|jsonl|jsx|kt|kts|less|log|md|mdx|mjs|php|py|rb|rs|scss|sh|sql|swift|toml|ts|tsv|tsx|txt|xml|ya?ml|zsh)$/i;
+const PROJECT_WORK_SENSITIVE_ATTACHMENT_PATTERN = /^(?:\.env(?:\..+)?|credentials?(?:\.[^.]+)?|secrets?(?:\.[^.]+)?|id_(?:dsa|ecdsa|ed25519|rsa)|.+\.(?:key|p12|pem|pfx))$/i;
 
 function pick(value, snakeKey, camelKey, fallback = null) {
   if (!value || typeof value !== "object") return fallback;
@@ -55,6 +60,68 @@ export function validateProjectWorkImageFile(file) {
     throw new TypeError("图片不能超过 5 MB");
   }
   return file;
+}
+
+export function projectWorkDroppedFileKind(file) {
+  const name = typeof file?.name === "string" ? file.name : "";
+  const type = typeof file?.type === "string" ? file.type.toLowerCase() : "";
+  if (PROJECT_WORK_SENSITIVE_ATTACHMENT_PATTERN.test(name)) {
+    return "unsupported";
+  }
+  if (type === "application/pdf" || name.toLowerCase().endsWith(".pdf")) {
+    return "pdf";
+  }
+  if (PROJECT_WORK_IMAGE_TYPES.has(type)) return "image";
+  if (
+    type.startsWith("text/")
+    || [
+      "application/graphql",
+      "application/json",
+      "application/sql",
+      "application/xml",
+      "application/x-httpd-php",
+      "application/x-sh",
+      "application/yaml",
+    ].includes(type)
+    || PROJECT_WORK_TEXT_ATTACHMENT_PATTERN.test(name)
+  ) {
+    return "text";
+  }
+  return "unsupported";
+}
+
+export function validateProjectWorkTextAttachmentFile(file) {
+  if (
+    !file
+    || typeof file.name !== "string"
+    || !file.name.trim()
+    || !Number.isSafeInteger(file.size)
+    || file.size < 1
+    || projectWorkDroppedFileKind(file) !== "text"
+  ) {
+    throw new TypeError("请选择文本、代码、Markdown、JSON 或表格文件");
+  }
+  if (file.size > MAX_PROJECT_WORK_TEXT_ATTACHMENT_BYTES) {
+    throw new TypeError(`文件 ${file.name} 不能超过 120 KB`);
+  }
+  return file;
+}
+
+export async function serializeProjectWorkTextAttachment(file) {
+  validateProjectWorkTextAttachmentFile(file);
+  if (typeof file.text !== "function") {
+    throw new TypeError("当前环境无法读取所选文件");
+  }
+  const text = await file.text();
+  if (!text || text.includes("\0")) {
+    throw new TypeError(`文件 ${file.name} 不是可读取的文本文件`);
+  }
+  return {
+    file_name: file.name,
+    mime_type: file.type || "text/plain",
+    byte_length: file.size,
+    text,
+  };
 }
 
 export async function serializeProjectWorkImage(file) {
@@ -363,6 +430,14 @@ function mapMessage(raw) {
       fileName: pick(image, "file_name", "fileName", "图片"),
       mimeType: pick(image, "mime_type", "mimeType"),
       byteLength: Number(pick(image, "byte_length", "byteLength", 0)) || 0,
+    })),
+    attachments: asArray(raw.attachments).map((attachment) => ({
+      fileName: pick(attachment, "file_name", "fileName", "文件"),
+      mimeType: pick(attachment, "mime_type", "mimeType"),
+      byteLength: Number(
+        pick(attachment, "byte_length", "byteLength", 0),
+      ) || 0,
+      contentHash: pick(attachment, "content_hash", "contentHash"),
     })),
     workflowId: pick(raw, "workflow_id", "workflowId"),
     capabilities: asArray(raw.capabilities).filter(
@@ -1994,6 +2069,7 @@ export async function sendProjectWorkMessage({
   text,
   contexts = [],
   images = [],
+  attachments = [],
   capabilities = [],
   workflowId,
   providerId,
@@ -2009,7 +2085,26 @@ export async function sendProjectWorkMessage({
   if (!Array.isArray(images) || images.length > 1) {
     throw new TypeError("每条消息最多添加一张图片");
   }
+  if (
+    !Array.isArray(attachments)
+    || attachments.length > MAX_PROJECT_WORK_TEXT_ATTACHMENTS
+  ) {
+    throw new TypeError(
+      `每条消息最多添加 ${MAX_PROJECT_WORK_TEXT_ATTACHMENTS} 个文本或代码文件`,
+    );
+  }
   const serializedImages = await Promise.all(images.map(serializeProjectWorkImage));
+  const serializedAttachments = await Promise.all(
+    attachments.map(serializeProjectWorkTextAttachment),
+  );
+  if (
+    serializedAttachments.reduce(
+      (total, attachment) => total + attachment.byte_length,
+      0,
+    ) > MAX_PROJECT_WORK_TEXT_ATTACHMENT_TOTAL_BYTES
+  ) {
+    throw new TypeError("当前消息的文本附件总大小不能超过 120 KB");
+  }
   const payload = await requestJson(
     `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/messages`,
     {
@@ -2019,6 +2114,7 @@ export async function sendProjectWorkMessage({
         client_request_id: requestId,
         text: text.trim(),
         images: serializedImages,
+        attachments: serializedAttachments,
         capabilities: asArray(capabilities).filter(
           (capability) => typeof capability === "string" && capability,
         ),

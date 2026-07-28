@@ -1284,6 +1284,12 @@ test("project-work message routes accept bounded images and forward one-turn set
         byte_length: 225_000,
         data: largeBoundedData,
       }],
+      attachments: [{
+        file_name: "检查说明.md",
+        mime_type: "text/markdown",
+        byte_length: 18,
+        text: "# 检查\n按钮。",
+      }],
       contexts: [{
         path: "src/App.jsx",
         content_hash: "sha256:source",
@@ -1317,6 +1323,12 @@ test("project-work message routes accept bounded images and forward one-turn set
         mime_type: "image/png",
         byte_length: 225_000,
         data: largeBoundedData,
+      }],
+      attachments: [{
+        file_name: "检查说明.md",
+        mime_type: "text/markdown",
+        byte_length: 18,
+        text: "# 检查\n按钮。",
       }],
       clientRequestId: "project-message:image-route",
     },

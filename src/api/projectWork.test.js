@@ -36,7 +36,9 @@ import {
   retryProjectWorkPdf,
   sendProjectWorkMessage,
   saveProjectWorkProviderApiKey,
+  projectWorkDroppedFileKind,
   serializeProjectWorkImage,
+  serializeProjectWorkTextAttachment,
   setProjectWorkSkillEnabled,
   startProjectWorkPreview,
   subscribeProjectWorkConversation,
@@ -1480,6 +1482,11 @@ test("thinking level maps in conversation messages and uses snake-case mutation 
       "界面.png",
       { type: "image/png" },
     )],
+    attachments: [new File(
+      ["# Review\nCheck the current route."],
+      "review.md",
+      { type: "text/markdown" },
+    )],
     providerId: "openai-codex",
     modelId: "gpt-5.3-codex",
     thinkingLevel: "high",
@@ -1509,6 +1516,12 @@ test("thinking level maps in conversation messages and uses snake-case mutation 
     byte_length: 4,
     data: "iVBORw==",
   }]);
+  assert.deepEqual(messagePayload.attachments, [{
+    file_name: "review.md",
+    mime_type: "text/markdown",
+    byte_length: 33,
+    text: "# Review\nCheck the current route.",
+  }]);
 });
 
 test("project-work image serialization keeps only bounded image data", async () => {
@@ -1529,6 +1542,41 @@ test("project-work image serialization keeps only bounded image data", async () 
     })),
     /PNG、JPEG 或 WebP/,
   );
+});
+
+test("project-work dropped files route PDF, image, and temporary text safely", async () => {
+  const markdown = new File(["# Notes"], "notes.md", { type: "text/markdown" });
+  assert.equal(projectWorkDroppedFileKind(markdown), "text");
+  assert.equal(
+    projectWorkDroppedFileKind(new File(["pdf"], "paper.pdf", {
+      type: "application/pdf",
+    })),
+    "pdf",
+  );
+  assert.equal(
+    projectWorkDroppedFileKind(new File(["png"], "screen.png", {
+      type: "image/png",
+    })),
+    "image",
+  );
+  assert.equal(
+    projectWorkDroppedFileKind(new File(["zip"], "archive.zip", {
+      type: "application/zip",
+    })),
+    "unsupported",
+  );
+  assert.equal(
+    projectWorkDroppedFileKind(new File(["TOKEN=secret"], ".env.local", {
+      type: "text/plain",
+    })),
+    "unsupported",
+  );
+  assert.deepEqual(await serializeProjectWorkTextAttachment(markdown), {
+    file_name: "notes.md",
+    mime_type: "text/markdown",
+    byte_length: 7,
+    text: "# Notes",
+  });
 });
 
 test("standalone conversations use global list and create routes", async () => {

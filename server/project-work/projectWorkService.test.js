@@ -5225,6 +5225,11 @@ test("one-turn screenshot review passes a bounded image to Pi without persisting
       byteLength: bytes.length,
       data: bytes.toString("base64"),
     }],
+    attachments: [{
+      fileName: "验收说明.md",
+      mimeType: "text/markdown",
+      text: "# 重点\n检查按钮遮挡。",
+    }],
   });
   const settled = await eventually(
     () => service.getConversation(conversation.id),
@@ -5239,9 +5244,9 @@ test("one-turn screenshot review passes a bounded image to Pi without persisting
   );
 
   assert.equal(sessions.length, 1);
-  assert.equal(
+  assert.match(
     sessions[0].prompts[0].prompt,
-    "检查这张设置页截图",
+    /^检查这张设置页截图[\s\S]*验收说明\.md[\s\S]*检查按钮遮挡/,
   );
   assert.match(
     sessions[0].prompts[0].promptOptions.turnGuidance,
@@ -5265,6 +5270,14 @@ test("one-turn screenshot review passes a bounded image to Pi without persisting
     mimeType: "image/png",
     byteLength: bytes.length,
   }]);
+  assert.equal(userMessage.attachments.length, 1);
+  assert.equal(userMessage.attachments[0].fileName, "验收说明.md");
+  assert.equal(userMessage.attachments[0].mimeType, "text/markdown");
+  assert.match(userMessage.attachments[0].contentHash, /^sha256:[a-f0-9]{64}$/);
+  assert.doesNotMatch(
+    JSON.stringify(settled.conversation),
+    /检查按钮遮挡/,
+  );
   assert.doesNotMatch(
     JSON.stringify(settled.conversation),
     new RegExp(bytes.toString("base64")),

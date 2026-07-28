@@ -126,9 +126,10 @@ test("live project workbench renders the honest empty states without starting wo
     assert.match(emptyConversationHtml, /修改先审阅/);
     assert.match(emptyConversationHtml, /命令显式运行/);
     assert.match(emptyConversationHtml, /只有显式发送才开始工作/);
-    assert.match(emptyConversationHtml, /添加文件/);
-    assert.match(emptyConversationHtml, /添加资料/);
-    assert.doesNotMatch(emptyConversationHtml, /MinerU Cloud|上传 PDF/);
+    assert.match(emptyConversationHtml, /添加项目文件/);
+    assert.match(emptyConversationHtml, /上传 PDF 资料/);
+    assert.match(emptyConversationHtml, /可拖入 PDF、图片或文本文件/);
+    assert.doesNotMatch(emptyConversationHtml, /MinerU Cloud/);
     assert.doesNotMatch(emptyConversationHtml, /aria-label="项目工件"/);
     assert.doesNotMatch(emptyConversationHtml, /Zotero|Obsidian|阅读镜头/);
   });
@@ -674,6 +675,12 @@ test("message payload controls stay frozen until image serialization and HTTP fi
         previewUrl: "",
       },
       onRemoveImage: () => {},
+      pendingAttachments: [{
+        id: "attachment-1",
+        file: { name: "检查说明.md", size: 20 },
+      }],
+      onRemoveAttachment: () => {},
+      onDropFiles: () => {},
       imageInputRef: { current: null },
       onSelectImage: () => {},
       supportsImages: true,
@@ -708,6 +715,10 @@ test("message payload controls stay frozen until image serialization and HTTP fi
     assert.match(
       html,
       /<button type="button" disabled="" aria-label="移除图片：设置页\.png"/,
+    );
+    assert.match(
+      html,
+      /<button type="button" disabled="" aria-label="移除文件：检查说明\.md"/,
     );
     assert.match(
       html,

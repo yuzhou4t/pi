@@ -2211,6 +2211,7 @@ export function createApiServer({
             workflowId: payload.workflow_id,
             capabilities: payload.capabilities,
             images: payload.images,
+            attachments: payload.attachments,
             clientRequestId: payload.client_request_id,
           });
         } else if (action === "steer") {
