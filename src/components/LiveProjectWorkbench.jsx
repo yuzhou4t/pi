@@ -1212,19 +1212,9 @@ export function ActivityTimeline({
   );
 }
 
-function EmptyConversationPane({ project, preparing = false, standalone = false }) {
+function EmptyConversationPane({ project, preparing = false }) {
   return (
     <div className="project-agent">
-      <header className="project-agent-header">
-        <div>
-          <span>{standalone ? "Pi Agent" : "项目 Agent"}</span>
-          <strong>{preparing ? "正在创建" : "尚未开始"}</strong>
-        </div>
-        <span className="project-agent-status is-ready">
-          <span aria-hidden="true" />
-          {preparing ? "创建会话" : "等待会话"}
-        </span>
-      </header>
       <div className="project-agent-stream">
         <section className="project-agent-welcome">
           {preparing
@@ -2073,9 +2063,6 @@ export function ProjectAgentPane({
   onSelectImage,
   supportsImages,
   onSubmit,
-  onAbort,
-  onRetryLastTurn,
-  retryingLastTurn = false,
   onLoadEarlier,
   loadingEarlier = false,
   canLoadEarlier = false,
@@ -2093,7 +2080,6 @@ export function ProjectAgentPane({
   thinkingLevelControl,
   contextUsageControl,
   transparentMode = false,
-  onTransparentModeChange,
   pdfInputRef,
   uploadingPdf,
   onUploadPdf,
@@ -2121,8 +2107,6 @@ export function ProjectAgentPane({
   const previousUserMessageCountRef = useRef(userMessageCount);
   const turnPayloadLocked = action === "message" || action === "follow-up";
   const awaitingUser = Boolean(pendingAskUserRequest);
-  const status = activeStatus(conversation);
-  const statusLabel = STATUS_LABELS[status] ?? status;
   const selectedWorkflow = projectWorkWorkflow(selectedWorkflowId);
   const selectedCapabilities = selectedCapabilityIds
     .map(projectWorkCapability)
@@ -2159,9 +2143,6 @@ export function ProjectAgentPane({
     -1,
   );
   const settledWithAnswer = !workActive && lastAssistantMessageIndex >= 0;
-  const canRetryLastTurn = settledWithAnswer
-    && !awaitingUser
-    && typeof onRetryLastTurn === "function";
   const latestEventSeq = conversation.events.at(-1)?.seq
     ?? conversation.lastEventSeq
     ?? 0;
@@ -2229,69 +2210,6 @@ export function ProjectAgentPane({
 
   return (
     <div className="project-agent">
-      <header className="project-agent-header">
-        <div>
-          <span>{standalone ? "Pi Agent" : "项目 Agent"}</span>
-          <strong>{statusLabel}</strong>
-        </div>
-        <div className="live-project-session-actions">
-          <button
-            className={`header-meta-pill project-insight-toggle${transparentMode ? " is-active" : ""}`}
-            type="button"
-            aria-pressed={transparentMode}
-            title={transparentMode
-              ? "关闭后恢复精简的默认过程"
-              : "显示 Harness、模型轮次、工具与用量详情"}
-            onClick={() => onTransparentModeChange?.(!transparentMode)}
-          >
-            <Gauge size={13} weight={transparentMode ? "fill" : "regular"} aria-hidden="true" />
-            {transparentMode ? "透明模式 · 开" : "透明模式"}
-          </button>
-          {running ? (
-            <button
-              className="header-meta-pill"
-              type="button"
-              onClick={onAbort}
-              disabled={Boolean(action)}
-              aria-label={queuedFollowUps.length > 0
-                ? `停止 Agent 并取消 ${queuedFollowUps.length} 条后续消息`
-                : "停止 Agent"}
-              title={queuedFollowUps.length > 0
-                ? "停止会同时取消尚未处理的后续消息"
-                : "停止当前 Agent"}
-            >
-              <StopCircle size={13} aria-hidden="true" />
-              {queuedFollowUps.length > 0 ? "停止并清空队列" : "停止"}
-            </button>
-          ) : null}
-          {!running && canRetryLastTurn ? (
-            <button
-              className="header-meta-pill"
-              type="button"
-              onClick={onRetryLastTurn}
-              disabled={Boolean(action) || retryingLastTurn}
-              title="重新执行上一轮，会再次调用当前模型"
-            >
-              <ArrowClockwise
-                className={retryingLastTurn ? "spin" : undefined}
-                size={13}
-                aria-hidden="true"
-              />
-              {retryingLastTurn ? "正在重试" : "重试上一轮"}
-            </button>
-          ) : null}
-          {conversation.unreadCount > 0 ? (
-            <span className="project-agent-unread" role="status">
-              {conversation.unreadCount} 条未读
-            </span>
-          ) : null}
-          <span className={`project-agent-status is-${statusClass(conversation)}`}>
-            <span aria-hidden="true" />
-            {statusLabel}
-          </span>
-        </div>
-      </header>
-
       <div
         className="project-agent-stream"
         onScroll={handleStreamScroll}
@@ -4893,6 +4811,21 @@ export function LiveProjectWorkbench({
     (message) => message.role === "assistant" && Boolean(messageText(message.content)),
   ) === true;
   const conversationRunning = snapshot ? isConversationRunning(snapshot) : false;
+  const headerStatus = activeStatus(snapshot);
+  const headerStatusLabel = STATUS_LABELS[headerStatus] ?? headerStatus;
+  const queuedHeaderFollowUps = (snapshot?.followUpQueue ?? []).filter(
+    (item) => item.status === "queued",
+  );
+  const awaitingHeaderAnswer = (snapshot?.askUserRequests ?? []).some(
+    (request) => request.status === "pending",
+  );
+  const canRetryFromHeader = Boolean(
+    snapshot
+    && !conversationRunning
+    && action !== "message"
+    && hasAssistantReply
+    && !awaitingHeaderAnswer,
+  );
 
   useEffect(() => {
     if (!conversationRunning) setRunningMessageMode("steer");
@@ -5039,6 +4972,16 @@ export function LiveProjectWorkbench({
     snapshot?.executionPolicy,
     snapshot?.id,
   ]);
+  const titleStatusLabel = snapshot
+    ? headerStatusLabel
+    : preparingConversation
+      ? "正在创建"
+      : "尚未开始";
+  const titleStatusClass = snapshot
+    ? statusClass(snapshot)
+    : preparingConversation
+      ? "executing"
+      : "ready";
   const headerTitle = (
     <div className="workflow-title-block">
       <button
@@ -5051,9 +4994,15 @@ export function LiveProjectWorkbench({
         <SidebarSimple size={18} weight="regular" />
       </button>
       <div>
-        <span className="workflow-kicker">
-          {standalone ? "独立对话" : project?.name ?? snapshot?.rootLabel ?? "正常工作"}
-        </span>
+        <div className="live-project-title-meta">
+          <span className="workflow-kicker">
+            {standalone ? "独立对话" : project?.name ?? snapshot?.rootLabel ?? "正常工作"}
+          </span>
+          <span className={`live-project-title-status is-${titleStatusClass}`}>
+            <span aria-hidden="true" />
+            {titleStatusLabel}
+          </span>
+        </div>
         <h1>{snapshot?.title ?? "项目工作"}</h1>
       </div>
     </div>
@@ -5114,6 +5063,60 @@ export function LiveProjectWorkbench({
         onOpenSkills={onOpenSkills}
         installedSkillCount={installedSkillCount}
       />
+      {snapshot ? (
+        <>
+          <button
+            className={`header-meta-pill project-insight-toggle${transparentMode ? " is-active" : ""}`}
+            type="button"
+            aria-pressed={transparentMode}
+            title={transparentMode
+              ? "关闭后恢复精简的默认过程"
+              : "显示 Harness、模型轮次、工具与用量详情"}
+            onClick={() => setTransparentMode(!transparentMode)}
+          >
+            <Gauge size={13} weight={transparentMode ? "fill" : "regular"} aria-hidden="true" />
+            {transparentMode ? "透明模式 · 开" : "透明模式"}
+          </button>
+          {conversationRunning ? (
+            <button
+              className="header-meta-pill"
+              type="button"
+              onClick={abortConversation}
+              disabled={Boolean(action)}
+              aria-label={queuedHeaderFollowUps.length > 0
+                ? `停止 Agent 并取消 ${queuedHeaderFollowUps.length} 条后续消息`
+                : "停止 Agent"}
+              title={queuedHeaderFollowUps.length > 0
+                ? "停止会同时取消尚未处理的后续消息"
+                : "停止当前 Agent"}
+            >
+              <StopCircle size={13} aria-hidden="true" />
+              {queuedHeaderFollowUps.length > 0 ? "停止并清空队列" : "停止"}
+            </button>
+          ) : null}
+          {canRetryFromHeader ? (
+            <button
+              className="header-meta-pill"
+              type="button"
+              onClick={retryLastTurn}
+              disabled={Boolean(action) || action === "retry-last-turn"}
+              title="重新执行上一轮，会再次调用当前模型"
+            >
+              <ArrowClockwise
+                className={action === "retry-last-turn" ? "spin" : undefined}
+                size={13}
+                aria-hidden="true"
+              />
+              {action === "retry-last-turn" ? "正在重试" : "重试上一轮"}
+            </button>
+          ) : null}
+          {snapshot.unreadCount > 0 ? (
+            <span className="project-agent-unread" role="status">
+              {snapshot.unreadCount} 条未读
+            </span>
+          ) : null}
+        </>
+      ) : null}
     </>
   );
   const agentConversation = useMemo(() => (
@@ -5142,7 +5145,6 @@ export function LiveProjectWorkbench({
           <EmptyConversationPane
             project={project}
             preparing={preparingConversation}
-            standalone={!project}
           />
         )}
         artifact={null}
@@ -5195,9 +5197,6 @@ export function LiveProjectWorkbench({
           onSelectImage={selectImage}
           supportsImages={supportsImages}
           onSubmit={submitMessage}
-          onAbort={abortConversation}
-          onRetryLastTurn={retryLastTurn}
-          retryingLastTurn={action === "retry-last-turn"}
           onLoadEarlier={loadEarlierTurns}
           loadingEarlier={loadingEarlier}
           canLoadEarlier={Boolean(historyCursor)}
@@ -5260,7 +5259,6 @@ export function LiveProjectWorkbench({
             />
           )}
           transparentMode={transparentMode}
-          onTransparentModeChange={setTransparentMode}
           pdfInputRef={pdfInputRef}
           uploadingPdf={uploadingPdf}
           onUploadPdf={uploadPdf}

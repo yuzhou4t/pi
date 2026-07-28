@@ -113,7 +113,7 @@ test("live project workbench renders the honest empty states without starting wo
     ));
 
     assert.match(noConversationHtml, /新建会话后开始/);
-    assert.match(noConversationHtml, /等待会话/);
+    assert.match(noConversationHtml, /尚未开始/);
     assert.match(noConversationHtml, /新建会话后可打开项目工件/);
 
     const emptyConversationHtml = renderToStaticMarkup(React.createElement(
@@ -863,21 +863,22 @@ test("ask-user explains that auto review independently applies only safe changes
 });
 
 test("running composer keeps steer separate from the durable follow-up queue", async () => {
-  await withLiveWorkbench(({ ProjectAgentPane }) => {
+  await withLiveWorkbench(({ LiveProjectWorkbench, ProjectAgentPane }) => {
+    const runningConversation = conversation({
+      status: "running",
+      turnStatus: "running",
+      followUpQueue: [{
+        id: "follow-up-1",
+        text: "完成检查后再运行类型检查",
+        status: "queued",
+      }, {
+        id: "follow-up-old",
+        text: "已经处理的旧消息",
+        status: "delivered",
+      }],
+    });
     const html = renderToStaticMarkup(React.createElement(ProjectAgentPane, {
-      conversation: conversation({
-        status: "running",
-        turnStatus: "running",
-        followUpQueue: [{
-          id: "follow-up-1",
-          text: "完成检查后再运行类型检查",
-          status: "queued",
-        }, {
-          id: "follow-up-old",
-          text: "已经处理的旧消息",
-          status: "delivered",
-        }],
-      }),
+      conversation: runningConversation,
       draft: "最后再检查 README",
       onDraftChange: () => {},
       contextChips: [],
@@ -921,8 +922,13 @@ test("running composer keeps steer separate from the durable follow-up queue", a
     assert.match(html, /aria-pressed="true"/);
     assert.match(html, /发送会加入持久后续队列/);
     assert.match(html, /aria-label="加入后续队列"/);
-    assert.match(html, /停止并清空队列/);
-    assert.match(html, /停止会同时取消尚未处理的后续消息/);
+
+    const workbenchHtml = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      { project, conversation: runningConversation },
+    ));
+    assert.match(workbenchHtml, /停止并清空队列/);
+    assert.match(workbenchHtml, /停止会同时取消尚未处理的后续消息/);
   });
 });
 
@@ -1145,7 +1151,7 @@ test("live project workbench renders an immediate preparation state for a new co
     ));
 
     assert.match(html, /正在准备新工作会话/);
-    assert.match(html, /创建会话/);
+    assert.match(html, /正在创建/);
     assert.doesNotMatch(html, /还没有会话/);
   });
 });
@@ -1393,6 +1399,15 @@ test("settled turns expose paged history, unread state, retry, and per-turn evid
     assert.match(html, /加载更早记录/);
     assert.match(html, /2 条未读/);
     assert.match(html, /重试上一轮/);
+    assert.doesNotMatch(html, /class="project-agent-header"/);
+    assert.ok(
+      html.indexOf("透明模式") < html.indexOf('class="project-agent-stream"'),
+      "transparent mode should live in the shared top bar",
+    );
+    assert.ok(
+      html.indexOf("重试上一轮") < html.indexOf('class="project-agent-stream"'),
+      "retry should live in the shared top bar",
+    );
     assert.match(html, /openai-codex · gpt-5\.3-codex/);
     assert.match(html, /1,536 tokens/);
     assert.match(html, /\$0\.0123/);
