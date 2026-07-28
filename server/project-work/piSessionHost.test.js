@@ -13,6 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  createPublicHarnessSnapshot,
   createProjectWorkTurnGuidanceExtension,
   createPiSessionFactory,
   createProjectWorkTools,
@@ -98,6 +99,173 @@ test("project-work model catalog derives image support from Pi model input modal
     models.find((model) => model.id === "text-model").supportsImages,
     false,
   );
+  assert.equal(
+    models.find((model) => model.id === "vision-model").billingKind,
+    "unknown",
+  );
+});
+
+test("project-work model catalog exposes only safe rate-card metadata", async () => {
+  const factory = createPiSessionFactory({
+    modelRuntime: {
+      async getAvailable() {
+        return [{
+          id: "gpt-5.6-sol",
+          name: "GPT-5.6 Sol",
+          provider: "openai-codex",
+          baseUrl: "https://must-not-appear.example",
+          headers: { authorization: "must-not-appear" },
+          input: ["text", "image"],
+          reasoning: true,
+          contextWindow: 272_000,
+          cost: {
+            input: 5,
+            output: 30,
+            cacheRead: 0.5,
+            cacheWrite: 6.25,
+            tiers: [{
+              inputTokensAbove: 272_000,
+              input: 10,
+              output: 45,
+              cacheRead: 1,
+              cacheWrite: 12.5,
+            }],
+          },
+        }];
+      },
+      getProvider() {
+        return { name: "GPT · ChatGPT 订阅" };
+      },
+    },
+  });
+
+  const catalog = await factory.listModels();
+  const model = catalog.providers[0].models[0];
+  assert.equal(model.billingKind, "chatgpt_subscription");
+  assert.deepEqual(model.pricing, {
+    currency: "USD",
+    unit: "per_million_tokens",
+    source: "pi_model_catalog",
+    version: "0.82.0",
+    input: 5,
+    output: 30,
+    cacheRead: 0.5,
+    cacheWrite: 6.25,
+    tiers: [{
+      inputTokensAbove: 272_000,
+      input: 10,
+      output: 45,
+      cacheRead: 1,
+      cacheWrite: 12.5,
+    }],
+  });
+  assert.doesNotMatch(JSON.stringify(catalog), /must-not-appear/);
+});
+
+test("project-work provider connections save through Pi without returning API keys", async () => {
+  const stored = new Map([["deepseek", "api_key"]]);
+  const receivedKeys = [];
+  const runtime = {
+    getProviders() {
+      return [{
+        id: "deepseek",
+        name: "DeepSeek",
+        auth: {
+          apiKey: {
+            name: "DeepSeek API Key",
+            login() {},
+          },
+        },
+      }, {
+        id: "openai-codex",
+        name: "GPT · ChatGPT 订阅",
+        auth: {
+          oauth: {
+            name: "ChatGPT 登录",
+            login() {},
+          },
+        },
+      }];
+    },
+    getProvider(providerId) {
+      return this.getProviders().find((provider) => provider.id === providerId);
+    },
+    async listCredentials() {
+      return [...stored].map(([providerId, type]) => ({ providerId, type }));
+    },
+    async getAvailable() {
+      return stored.has("deepseek")
+        ? [{ provider: "deepseek", id: "deepseek-v4-pro" }]
+        : [];
+    },
+    async checkAuth(providerId) {
+      return stored.has(providerId)
+        ? { type: stored.get(providerId), source: "credential_store" }
+        : undefined;
+    },
+    async login(providerId, type, callbacks) {
+      assert.equal(providerId, "deepseek");
+      assert.equal(type, "api_key");
+      receivedKeys.push(await callbacks.prompt());
+      stored.set(providerId, type);
+    },
+    async logout(providerId) {
+      stored.delete(providerId);
+    },
+  };
+  const factory = createPiSessionFactory({ modelRuntime: runtime });
+
+  const initial = await factory.listProviderConnections();
+  assert.equal(initial.providers.find((item) => item.id === "deepseek").stored, true);
+  assert.equal(
+    initial.providers.find((item) => item.id === "openai-codex").apiKeySupported,
+    false,
+  );
+  assert.doesNotMatch(JSON.stringify(initial), /secret-api-key/);
+
+  const saved = await factory.saveProviderApiKey({
+    providerId: "deepseek",
+    apiKey: "secret-api-key",
+  });
+  assert.deepEqual(receivedKeys, ["secret-api-key"]);
+  assert.doesNotMatch(JSON.stringify(saved), /secret-api-key/);
+  assert.equal(saved.providers[0].configured, true);
+
+  const removed = await factory.removeProviderCredential("deepseek");
+  assert.equal(removed.providers.find((item) => item.id === "deepseek").stored, false);
+  assert.doesNotMatch(JSON.stringify(removed), /secret-api-key/);
+});
+
+test("project-work provider connection failures never relay provider secret text", async () => {
+  const factory = createPiSessionFactory({
+    modelRuntime: {
+      getProviders() {
+        return [{
+          id: "deepseek",
+          name: "DeepSeek",
+          auth: { apiKey: { login() {} } },
+        }];
+      },
+      getProvider() {
+        return this.getProviders()[0];
+      },
+      async login() {
+        throw new Error("upstream rejected secret-api-key");
+      },
+    },
+  });
+
+  await assert.rejects(
+    factory.saveProviderApiKey({
+      providerId: "deepseek",
+      apiKey: "secret-api-key",
+    }),
+    (error) => {
+      assert.match(error.message, /未能保存/);
+      assert.doesNotMatch(error.message, /secret-api-key/);
+      return true;
+    },
+  );
 });
 
 test("project-work session host forwards image attachments to Pi steer", async () => {
@@ -181,6 +349,46 @@ test("project-work turn guidance modifies only the current system prompt", async
     await beforeAgentStart({ systemPrompt: "Base prompt" }),
     undefined,
   );
+});
+
+test("public harness snapshots expose structure without paths or private reasoning", () => {
+  const snapshot = createPublicHarnessSnapshot({
+    model: {
+      provider: "openai-codex",
+      id: "gpt-5.3-codex",
+    },
+    thinkingLevel: "high",
+    activeTools: ["read", "grep", "read", "unknown-tool"],
+    enabledSkillPaths: [
+      "/private/skills/pi/SKILL.md",
+      "/private/skills/html-report/SKILL.md",
+    ],
+    workspaceKind: "bound_project",
+    workspaceSnapshot: {
+      truncated: true,
+      includedFiles: 42,
+    },
+    agentsFiles: [
+      { path: "/private/project/AGENTS.md", content: "secret project rule" },
+    ],
+  });
+
+  assert.equal(snapshot.runtime, "@earendil-works/pi-coding-agent");
+  assert.equal(snapshot.providerId, "openai-codex");
+  assert.equal(snapshot.modelId, "gpt-5.3-codex");
+  assert.equal(snapshot.thinkingLevel, "high");
+  assert.deepEqual(snapshot.activeTools, ["read", "grep"]);
+  assert.deepEqual(snapshot.skills, ["pi", "html-report"]);
+  assert.deepEqual(snapshot.context, {
+    workspace: "bound_project",
+    snapshot: "bounded",
+    projectRules: 1,
+    conversationDocuments: "on_demand",
+  });
+  assert.equal(snapshot.disclosure.privateReasoning, false);
+  assert.match(snapshot.prompt.policyHash, /^sha256:[a-f0-9]{64}$/);
+  const serialized = JSON.stringify(snapshot);
+  assert.doesNotMatch(serialized, /\/private\/|secret project rule/);
 });
 
 test("project-work thinking levels follow each Pi model's runtime capability map", () => {

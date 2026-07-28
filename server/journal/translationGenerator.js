@@ -197,6 +197,8 @@ export async function translatePaperBatch({
       provider_id: providerId ?? null,
       model_id: modelId ?? null,
       reasoning_effort: reasoningEffort ?? null,
+      operation_id: null,
+      upstream_request_id: null,
       usage: null,
     };
   }
@@ -223,6 +225,8 @@ export async function translatePaperBatch({
     provider_id: generated.provider_id ?? providerId,
     model_id: generated.model_id ?? modelId,
     reasoning_effort: generated.reasoning_effort ?? reasoningEffort ?? null,
+    operation_id: generated.operation_id ?? null,
+    upstream_request_id: generated.upstream_request_id ?? null,
     usage: generated.usage ?? null,
   };
 }

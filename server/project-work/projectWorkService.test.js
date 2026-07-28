@@ -15,7 +15,10 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
-import { createProjectWorkService } from "./projectWorkService.js";
+import {
+  aggregateProjectWorkUsage,
+  createProjectWorkService,
+} from "./projectWorkService.js";
 
 function incrementalId(prefix = "test") {
   let sequence = 0;
@@ -53,6 +56,212 @@ function modelCatalog() {
     }],
   };
 }
+
+test("project-work usage aggregates durable model calls without double counting projections", () => {
+  const usage = aggregateProjectWorkUsage({
+    period: "30d",
+    now: new Date("2026-07-28T12:00:00.000Z"),
+    catalog: {
+      providers: [{
+        id: "openai-codex",
+        name: "GPT · ChatGPT 订阅",
+        models: [{
+          id: "gpt-5.6-sol",
+          name: "GPT-5.6 Sol",
+          billingKind: "chatgpt_subscription",
+          pricing: {
+            currency: "USD",
+            unit: "per_million_tokens",
+            input: 5,
+            output: 30,
+            cacheRead: 0.5,
+            cacheWrite: 6.25,
+            tiers: [],
+          },
+        }],
+      }, {
+        id: "deepseek",
+        name: "DeepSeek",
+        models: [{
+          id: "deepseek-v4-flash",
+          name: "DeepSeek V4 Flash",
+          billingKind: "api",
+          pricing: null,
+        }],
+      }],
+    },
+    conversations: [{
+      id: "conversation-bound",
+      projectId: "project-1",
+      messages: [{
+        id: "assistant-tool",
+        role: "assistant",
+        turnId: "turn-1",
+        text: "工具调用",
+        turnEvidence: {
+          providerId: "openai-codex",
+          modelId: "gpt-5.6-sol",
+          capturedAt: "2026-07-28T09:00:00.000Z",
+          usage: {
+            inputTokens: 10,
+            outputTokens: 2,
+            cacheReadTokens: 3,
+            cacheWriteTokens: 0,
+            totalTokens: 15,
+            costUsd: 0.001,
+          },
+        },
+      }, {
+        id: "assistant-tool",
+        role: "assistant",
+        turnId: "turn-1",
+        text: "同一消息的重复投影",
+        turnEvidence: {
+          providerId: "openai-codex",
+          modelId: "gpt-5.6-sol",
+          capturedAt: "2026-07-28T09:00:00.000Z",
+          usage: {
+            inputTokens: 999,
+            outputTokens: 999,
+            totalTokens: 1998,
+            costUsd: 10,
+          },
+        },
+      }, {
+        id: "assistant-final",
+        role: "assistant",
+        turnId: "turn-1",
+        text: "最终回答",
+        turnEvidence: {
+          providerId: "openai-codex",
+          modelId: "gpt-5.6-sol",
+          capturedAt: "2026-07-28T09:01:00.000Z",
+          usage: {
+            inputTokens: 20,
+            outputTokens: 4,
+            totalTokens: 24,
+            costUsd: 0.002,
+          },
+        },
+      }, {
+        id: "legacy-answer",
+        role: "assistant",
+        turnId: "turn-legacy",
+        text: "旧回复",
+        createdAt: "2026-07-28T09:02:00.000Z",
+      }, {
+        id: "old-answer",
+        role: "assistant",
+        turnId: "turn-old",
+        text: "范围外回复",
+        turnEvidence: {
+          providerId: "openai-codex",
+          modelId: "gpt-5.6-sol",
+          capturedAt: "2026-06-01T09:00:00.000Z",
+          usage: {
+            inputTokens: 100,
+            outputTokens: 20,
+            totalTokens: 120,
+            costUsd: 1,
+          },
+        },
+      }],
+    }, {
+      id: "conversation-standalone",
+      projectId: null,
+      messages: [{
+        id: "assistant-tool",
+        role: "assistant",
+        turnId: "turn-2",
+        text: "独立会话中的同名消息",
+        turnEvidence: {
+          providerId: "deepseek",
+          modelId: "deepseek-v4-flash",
+          capturedAt: "2026-07-28T10:00:00.000Z",
+          usage: {
+            inputTokens: 30,
+            outputTokens: 5,
+            cacheReadTokens: 2,
+            cacheWriteTokens: 1,
+            totalTokens: 38,
+            costUsd: 0.003,
+          },
+        },
+      }, {
+        id: "assistant-final",
+        role: "assistant",
+        turnId: "turn-2",
+        text: "费用未知的最终回复",
+        turnEvidence: {
+          providerId: "deepseek",
+          modelId: "deepseek-v4-flash",
+          capturedAt: "2026-07-28T10:01:00.000Z",
+          usage: {
+            inputTokens: 40,
+            outputTokens: 6,
+            totalTokens: 46,
+          },
+        },
+      }],
+    }],
+  });
+
+  assert.equal(usage.scope, "retained_conversations");
+  assert.equal(usage.costSemantics, "api_equivalent_estimate");
+  assert.deepEqual(usage.totals, {
+    calls: 4,
+    tasks: 2,
+    conversations: 2,
+    inputTokens: 100,
+    outputTokens: 17,
+    cacheReadTokens: 5,
+    cacheWriteTokens: 1,
+    totalTokens: 123,
+    apiEquivalentCostUsd: 0.006,
+    pricedCallCount: 3,
+    unpricedCallCount: 1,
+  });
+  assert.equal(usage.coverage.legacyMessagesWithoutUsage, 1);
+  assert.deepEqual(usage.coverage.excludedKinds, [
+    "compaction",
+    "branch_summary",
+    "tool_summary",
+  ]);
+  assert.equal(usage.models.length, 2);
+  assert.deepEqual(
+    usage.models.map((model) => ({
+      key: `${model.providerId}/${model.modelId}`,
+      calls: model.calls,
+      tasks: model.tasks,
+      cost: model.apiEquivalentCostUsd,
+      unpriced: model.unpricedCallCount,
+    })),
+    [{
+      key: "deepseek/deepseek-v4-flash",
+      calls: 2,
+      tasks: 1,
+      cost: 0.003,
+      unpriced: 1,
+    }, {
+      key: "openai-codex/gpt-5.6-sol",
+      calls: 2,
+      tasks: 1,
+      cost: 0.003,
+      unpriced: 0,
+    }],
+  );
+  assert.equal(usage.models[1].billingKind, "chatgpt_subscription");
+  assert.equal(usage.models[1].currentPricing.input, 5);
+  assert.equal(usage.quota.available, false);
+  assert.doesNotMatch(JSON.stringify(usage), /最终回答|project-1/);
+});
+
+test("project-work usage rejects unknown time ranges", () => {
+  assert.throws(
+    () => aggregateProjectWorkUsage({ period: "quarter" }),
+    (error) => error?.code === "PROJECT_WORK_USAGE_PERIOD_INVALID",
+  );
+});
 
 function createFakePreviewSupervisor({ startError = null } = {}) {
   const active = new Set();
@@ -1047,6 +1256,14 @@ test("thinking strength is model-aware, persisted, and applied to each Pi turn",
     event.type === "turn.started"
     && event.data.thinkingLevel === "high"
   )));
+  const harnessSnapshot = settled.events.find(
+    (event) => event.type === "harness.snapshot",
+  );
+  assert.equal(harnessSnapshot.data.providerId, "openai-codex");
+  assert.equal(harnessSnapshot.data.modelId, "gpt-5.3-codex");
+  assert.equal(harnessSnapshot.data.thinkingLevel, "high");
+  assert.equal(harnessSnapshot.data.disclosure.privateReasoning, false);
+  assert.ok(Array.isArray(harnessSnapshot.data.activeTools));
 
   const configurationError = await eventually(
     async () => {

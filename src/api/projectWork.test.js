@@ -12,8 +12,12 @@ import {
   fetchProjectWorkFile,
   fetchProjectWorkGitEvidence,
   fetchProjectWorkModels,
+  fetchProjectWorkProviderConnections,
+  fetchProjectWorkSkillCatalog,
   fetchProjectWorkTree,
   fetchProjectWorkConversationTurns,
+  fetchModelUsage,
+  fetchProjectWorkUsage,
   fetchProjectWorkWorkspace,
   listProjectWorkAskUserRequests,
   listProjectWorkApplyJournal,
@@ -21,19 +25,26 @@ import {
   listStandaloneProjectWorkConversations,
   markProjectWorkConversationRead,
   mapProjectWorkConversation,
+  mapProjectWorkUsage,
   projectWorkImageUrl,
   removeProjectWorkFollowUp,
   removeProjectWorkPdf,
+  removeProjectWorkProviderCredential,
   renameProjectWorkConversation,
   resumeProjectWorkVerificationRepair,
   retryProjectWorkLastTurn,
   retryProjectWorkPdf,
   sendProjectWorkMessage,
+  saveProjectWorkProviderApiKey,
   serializeProjectWorkImage,
+  setProjectWorkSkillEnabled,
   startProjectWorkPreview,
   subscribeProjectWorkConversation,
   undoProjectWorkApply,
   uploadProjectWorkPdf,
+  fetchInstalledProjectWorkSkills,
+  inspectProjectWorkSkillPackage,
+  installProjectWorkSkillPackage,
 } from "./projectWork.js";
 
 function jsonResponse(body, status = 200) {
@@ -42,6 +53,170 @@ function jsonResponse(body, status = 200) {
     headers: { "content-type": "application/json" },
   });
 }
+
+test("provider credential API sends the key only in the save request", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, options });
+    return jsonResponse({
+      providers: [{
+        id: "deepseek",
+        name: "DeepSeek",
+        api_key_supported: true,
+        api_key_label: "DeepSeek API Key",
+        configured: options.method !== "DELETE",
+        configured_type: options.method !== "DELETE" ? "api_key" : null,
+        configured_source: options.method !== "DELETE" ? "credential_store" : null,
+        stored: options.method !== "DELETE",
+        available_model_count: options.method !== "DELETE" ? 2 : 0,
+      }],
+    });
+  };
+
+  const initial = await fetchProjectWorkProviderConnections({ fetchImpl });
+  assert.equal(initial[0].apiKeySupported, true);
+  assert.equal(initial[0].availableModelCount, 2);
+
+  const saved = await saveProjectWorkProviderApiKey({
+    providerId: "deepseek/provider",
+    apiKey: "secret-api-key",
+    fetchImpl,
+  });
+  assert.equal(
+    calls[1].url,
+    "/api/v1/project-work/provider-connections/deepseek%2Fprovider",
+  );
+  assert.equal(calls[1].options.method, "PUT");
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    schema_version: 1,
+    api_key: "secret-api-key",
+  });
+  assert.doesNotMatch(JSON.stringify(saved), /secret-api-key/);
+
+  const removed = await removeProjectWorkProviderCredential({
+    providerId: "deepseek/provider",
+    fetchImpl,
+  });
+  assert.equal(calls[2].options.method, "DELETE");
+  assert.equal(removed[0].stored, false);
+  assert.doesNotMatch(JSON.stringify(removed), /secret-api-key/);
+});
+
+test("Skill catalog API preserves the inspect, confirm, and enable boundaries", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, options });
+    if (String(url).includes("/skill-previews")) {
+      return jsonResponse({
+        preview_id: "skill-preview-1",
+        preview_hash: `sha256:${"a".repeat(64)}`,
+        name: "@scope/demo-skill",
+        version: "1.2.3",
+        source: "npm:@scope/demo-skill@1.2.3",
+        integrity: "sha512-integrity",
+        skill_files: ["skills/demo/SKILL.md"],
+        skill_count: 1,
+        archive_file_count: 2,
+        archive_bytes: 2048,
+        default_enabled: false,
+        expires_at: "2026-07-28T08:10:00.000Z",
+      });
+    }
+    if (String(url).endsWith("/skills/installed")) {
+      return jsonResponse({
+        revision: 2,
+        packages: [{
+          name: "@scope/demo-skill",
+          version: "1.2.3",
+          enabled: false,
+          skill_count: 1,
+          skill_files: ["skills/demo/SKILL.md"],
+        }],
+      });
+    }
+    if (options.method === "POST") {
+      return jsonResponse({
+        name: "@scope/demo-skill",
+        version: "1.2.3",
+        enabled: false,
+        skill_count: 1,
+      });
+    }
+    if (options.method === "PATCH") {
+      return jsonResponse({
+        name: "@scope/demo-skill",
+        version: "1.2.3",
+        enabled: true,
+        skill_count: 1,
+      });
+    }
+    return jsonResponse({
+      source: "pi.dev",
+      query: "paper reader",
+      sort: "recent",
+      packages: [{
+        name: "@scope/demo-skill",
+        version: "1.2.3",
+        description: "Demo",
+        types: ["skill"],
+        install_supported: true,
+        installed: false,
+        enabled: false,
+      }],
+    });
+  };
+
+  const catalog = await fetchProjectWorkSkillCatalog({
+    query: "paper reader",
+    sort: "recent",
+    fetchImpl,
+  });
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/skills?query=paper+reader&sort=recent",
+  );
+  assert.equal(catalog.packages[0].installSupported, true);
+
+  const preview = await inspectProjectWorkSkillPackage({
+    name: "@scope/demo-skill",
+    version: "1.2.3",
+    fetchImpl,
+  });
+  assert.equal(preview.defaultEnabled, false);
+  assert.deepEqual(preview.skillFiles, ["skills/demo/SKILL.md"]);
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    schema_version: 1,
+    name: "@scope/demo-skill",
+    version: "1.2.3",
+  });
+
+  const installed = await installProjectWorkSkillPackage({
+    previewId: preview.previewId,
+    previewHash: preview.previewHash,
+    fetchImpl,
+  });
+  assert.equal(installed.enabled, false);
+  assert.deepEqual(JSON.parse(calls[2].options.body), {
+    schema_version: 1,
+    preview_id: "skill-preview-1",
+    preview_hash: `sha256:${"a".repeat(64)}`,
+  });
+
+  const local = await fetchInstalledProjectWorkSkills({ fetchImpl });
+  assert.equal(local.revision, 2);
+  assert.equal(local.packages[0].enabled, false);
+
+  const enabled = await setProjectWorkSkillEnabled({
+    name: "@scope/demo-skill",
+    enabled: true,
+    fetchImpl,
+  });
+  assert.equal(
+    calls[4].url,
+    "/api/v1/project-work/skills/%40scope%2Fdemo-skill",
+  );
+  assert.equal(enabled.enabled, true);
+});
 
 test("conversation mapping preserves a ready, hash-bound change set", () => {
   const mapped = mapProjectWorkConversation({
@@ -1047,6 +1222,18 @@ test("project-work model catalog keeps the real context window metadata", async 
           supports_images: true,
           thinking_levels: ["low", "medium", "high"],
           default_thinking_level: "medium",
+          billing_kind: "api",
+          pricing: {
+            currency: "USD",
+            unit: "per_million_tokens",
+            source: "pi_model_catalog",
+            version: "0.82.0",
+            input: 0.5,
+            output: 2,
+            cache_read: 0.05,
+            cache_write: 0.6,
+            tiers: [],
+          },
         }],
       }],
       default_provider_id: "deepseek",
@@ -1066,8 +1253,171 @@ test("project-work model catalog keeps the real context window metadata", async 
     "high",
   ]);
   assert.equal(catalog.providers[0].models[0].defaultThinkingLevel, "medium");
+  assert.equal(catalog.providers[0].models[0].billingKind, "api");
+  assert.equal(catalog.providers[0].models[0].pricing.cacheRead, 0.05);
   assert.equal(catalog.defaultThinkingLevel, "medium");
   assert.equal(catalog.capabilities.web_search.available, false);
+});
+
+test("project-work usage maps safe aggregates and requests the selected period", async () => {
+  const calls = [];
+  const payload = {
+    scope: "retained_conversations",
+    workflow_scope: "project_work",
+    cost_semantics: "api_equivalent_estimate",
+    period: "7d",
+    period_start: "2026-07-22T00:00:00.000Z",
+    period_end: "2026-07-28T12:00:00.000Z",
+    quota: {
+      available: false,
+      detail: "账户剩余额度不可获取",
+    },
+    totals: {
+      calls: 3,
+      tasks: 2,
+      conversations: 1,
+      input_tokens: 100,
+      output_tokens: 20,
+      cache_read_tokens: 30,
+      cache_write_tokens: 0,
+      total_tokens: 150,
+      api_equivalent_cost_usd: 0.25,
+      priced_call_count: 2,
+      unpriced_call_count: 1,
+    },
+    coverage: {
+      conversations_scanned: 2,
+      legacy_messages_without_usage: 1,
+      undated_assistant_messages: 0,
+      included_kinds: ["assistant_model_response"],
+      excluded_kinds: ["compaction"],
+    },
+    models: [{
+      provider_id: "openai-codex",
+      provider_name: "GPT · ChatGPT 订阅",
+      model_id: "gpt-5.6-sol",
+      model_name: "GPT-5.6 Sol",
+      billing_kind: "chatgpt_subscription",
+      calls: 3,
+      tasks: 2,
+      conversations: 1,
+      input_tokens: 100,
+      output_tokens: 20,
+      cache_read_tokens: 30,
+      cache_write_tokens: 0,
+      total_tokens: 150,
+      api_equivalent_cost_usd: 0.25,
+      priced_call_count: 2,
+      unpriced_call_count: 1,
+      current_pricing: {
+        currency: "USD",
+        unit: "per_million_tokens",
+        input: 5,
+        output: 30,
+        cache_read: 0.5,
+        cache_write: 6.25,
+        tiers: [{
+          input_tokens_above: 272_000,
+          input: 10,
+          output: 45,
+          cache_read: 1,
+          cache_write: 12.5,
+        }],
+      },
+    }],
+  };
+  const fetchImpl = async (url) => {
+    calls.push(url);
+    return jsonResponse(payload);
+  };
+
+  const usage = await fetchProjectWorkUsage({ period: "7d", fetchImpl });
+  assert.equal(calls[0], "/api/v1/project-work/usage?period=7d");
+  assert.equal(usage.totals.totalTokens, 150);
+  assert.equal(usage.totals.apiEquivalentCostUsd, 0.25);
+  assert.equal(usage.models[0].billingKind, "chatgpt_subscription");
+  assert.equal(usage.models[0].currentPricing.tiers[0].inputTokensAbove, 272_000);
+  assert.equal(usage.quota.available, false);
+  assert.deepEqual(usage.coverage.excludedKinds, ["compaction"]);
+  assert.deepEqual(mapProjectWorkUsage(null).models, []);
+
+  await assert.rejects(
+    fetchProjectWorkUsage({ period: "quarter", fetchImpl }),
+    /时间范围无效/,
+  );
+});
+
+test("unified model usage requests the selected workflow and maps paper coverage", async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(url);
+    return jsonResponse({
+      scope: "local_model_usage",
+      workflow_scope: "paper_reading",
+      period: "all",
+      totals: {
+        calls: 97,
+        tasks: 6,
+        total_tokens: 660_108,
+        api_equivalent_cost_usd: 0.07809,
+        priced_call_count: 63,
+        unpriced_call_count: 34,
+        historical_backfilled_call_count: 63,
+      },
+      coverage: {
+        historical_lower_bound: true,
+        historical_backfilled_call_count: 63,
+        historical_test_call_count: 4,
+        legacy_translation_artifacts_without_usage: 2,
+        access_issues: [{
+          workflow_scope: "project_work",
+          code: "PROJECT_USAGE_UNAVAILABLE",
+          message: "正常工作用量暂时无法读取",
+        }],
+      },
+      models: [{
+        workflow_scope: "paper_reading",
+        provider_id: "deepseek",
+        provider_name: "DeepSeek API",
+        model_id: "deepseek-v4-pro",
+        model_name: "DeepSeek V4 Pro",
+        billing_kind: "api",
+        calls: 62,
+        total_tokens: 241_690,
+        historical_backfilled_call_count: 62,
+        step_breakdown: [
+          { step: "paper_agent", calls: 58 },
+          { step: "candidate_summaries", calls: 4 },
+        ],
+      }],
+    });
+  };
+
+  const usage = await fetchModelUsage({
+    period: "all",
+    workflow: "paper_reading",
+    fetchImpl,
+  });
+
+  assert.equal(
+    calls[0],
+    "/api/v1/model-usage?period=all&workflow=paper_reading",
+  );
+  assert.equal(usage.workflowScope, "paper_reading");
+  assert.equal(usage.coverage.historicalLowerBound, true);
+  assert.equal(usage.coverage.historicalTestCallCount, 4);
+  assert.equal(usage.coverage.legacyTranslationArtifactsWithoutUsage, 2);
+  assert.equal(usage.coverage.accessIssues[0].workflowScope, "project_work");
+  assert.equal(usage.models[0].workflowScope, "paper_reading");
+  assert.deepEqual(usage.models[0].stepBreakdown, [
+    { step: "paper_agent", calls: 58 },
+    { step: "candidate_summaries", calls: 4 },
+  ]);
+
+  await assert.rejects(
+    fetchModelUsage({ workflow: "invalid", fetchImpl }),
+    /工作类型无效/,
+  );
 });
 
 test("thinking level maps in conversation messages and uses snake-case mutation payloads", async () => {

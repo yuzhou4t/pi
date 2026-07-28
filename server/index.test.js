@@ -472,6 +472,42 @@ async function startTestServer(
   };
 }
 
+function modelUsageReport(workflowScope, {
+  totalTokens,
+  apiEquivalentCostUsd,
+} = {}) {
+  const paperReading = workflowScope === "paper_reading";
+  return {
+    workflowScope,
+    periodStart: "2026-06-28T00:00:00.000Z",
+    periodEnd: "2026-07-28T00:00:00.000Z",
+    totals: {
+      calls: 1,
+      tasks: 1,
+      conversations: 1,
+      inputTokens: totalTokens - 5,
+      outputTokens: 5,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens,
+      apiEquivalentCostUsd,
+      pricedCallCount: 1,
+      unpricedCallCount: 0,
+      historicalBackfilledCallCount: paperReading ? 1 : 0,
+    },
+    coverage: {
+      includedKinds: [paperReading ? "paper_agent" : "assistant_model_response"],
+      excludedKinds: [],
+      historicalLowerBound: paperReading,
+    },
+    models: [{
+      providerId: paperReading ? "deepseek" : "openai-codex",
+      modelId: paperReading ? "deepseek-v4-pro" : "gpt-5.6-sol",
+      totalTokens,
+    }],
+  };
+}
+
 test("gateway health exposes worker reachability and recovery state", async (t) => {
   let reachable = false;
   const server = await startTestServer(
@@ -514,6 +550,326 @@ test("gateway health exposes worker reachability and recovery state", async (t) 
   assert.equal(available.runtime_reachable, true);
   assert.equal(available.runtime_worker_role, "worker");
   assert.equal(available.runtime_worker_schema_version, 1);
+});
+
+test("model usage all merges normal work and paper reading", async (t) => {
+  const calls = [];
+  const projectWorkService = {
+    async getUsage(options) {
+      calls.push({ workflow: "project_work", options });
+      return modelUsageReport("project_work", {
+        totalTokens: 15,
+        apiEquivalentCostUsd: 0.125,
+      });
+    },
+  };
+  const journalWorkflowService = {
+    async getUsage(options) {
+      calls.push({ workflow: "paper_reading", options });
+      return modelUsageReport("paper_reading", {
+        totalTokens: 25,
+        apiEquivalentCostUsd: 0.25,
+      });
+    },
+  };
+  const server = await startTestServer(
+    journalWorkflowService,
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+
+  const response = await fetch(
+    `${server.baseUrl}/api/v1/model-usage?period=7d&workflow=all`,
+  );
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.status, "ready");
+  assert.equal(body.workflowScope, "all");
+  assert.equal(body.period, "7d");
+  assert.equal(body.totals.calls, 2);
+  assert.equal(body.totals.tasks, 2);
+  assert.equal(body.totals.totalTokens, 40);
+  assert.equal(body.totals.apiEquivalentCostUsd, 0.375);
+  assert.deepEqual(
+    body.workflows.map((item) => item.workflowScope),
+    ["project_work", "paper_reading"],
+  );
+  assert.deepEqual(
+    body.models.map((item) => item.workflowScope),
+    ["project_work", "paper_reading"],
+  );
+  assert.deepEqual(calls, [
+    { workflow: "project_work", options: { period: "7d" } },
+    { workflow: "paper_reading", options: { period: "7d" } },
+  ]);
+});
+
+test("model usage workflow filter calls only the selected workflow", async (t) => {
+  const calls = [];
+  const projectWorkService = {
+    async getUsage(options) {
+      calls.push({ workflow: "project_work", options });
+      return modelUsageReport("project_work", {
+        totalTokens: 15,
+        apiEquivalentCostUsd: 0.125,
+      });
+    },
+  };
+  const journalWorkflowService = {
+    async getUsage(options) {
+      calls.push({ workflow: "paper_reading", options });
+      return modelUsageReport("paper_reading", {
+        totalTokens: 25,
+        apiEquivalentCostUsd: 0.25,
+      });
+    },
+  };
+  const server = await startTestServer(
+    journalWorkflowService,
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+
+  const projectResponse = await fetch(
+    `${server.baseUrl}/api/v1/model-usage?period=today&workflow=project_work`,
+  );
+  assert.equal(projectResponse.status, 200);
+  const projectBody = await projectResponse.json();
+  assert.equal(projectBody.status, "ready");
+  assert.equal(projectBody.workflowScope, "project_work");
+  assert.equal(projectBody.totals.totalTokens, 15);
+  assert.deepEqual(
+    projectBody.models.map((item) => item.workflowScope),
+    ["project_work"],
+  );
+
+  const paperResponse = await fetch(
+    `${server.baseUrl}/api/v1/model-usage?period=all&workflow=paper_reading`,
+  );
+  assert.equal(paperResponse.status, 200);
+  const paperBody = await paperResponse.json();
+  assert.equal(paperBody.status, "ready");
+  assert.equal(paperBody.workflowScope, "paper_reading");
+  assert.equal(paperBody.totals.totalTokens, 25);
+  assert.deepEqual(
+    paperBody.models.map((item) => item.workflowScope),
+    ["paper_reading"],
+  );
+
+  assert.deepEqual(calls, [
+    { workflow: "project_work", options: { period: "today" } },
+    { workflow: "paper_reading", options: { period: "all" } },
+  ]);
+});
+
+test("model usage returns partial data when one workflow is unavailable", async (t) => {
+  const projectWorkService = {
+    async getUsage() {
+      throw new Error("project usage unavailable");
+    },
+  };
+  const journalWorkflowService = {
+    async getUsage() {
+      return modelUsageReport("paper_reading", {
+        totalTokens: 25,
+        apiEquivalentCostUsd: 0.25,
+      });
+    },
+  };
+  const server = await startTestServer(
+    journalWorkflowService,
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+
+  const response = await fetch(
+    `${server.baseUrl}/api/v1/model-usage?period=30d&workflow=all`,
+  );
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.status, "partial");
+  assert.equal(body.totals.calls, 1);
+  assert.equal(body.totals.totalTokens, 25);
+  assert.deepEqual(
+    body.workflows.map((item) => item.workflowScope),
+    ["paper_reading"],
+  );
+  assert.deepEqual(body.coverage.accessIssues, [{
+    workflowScope: "project_work",
+    code: "PROJECT_WORK_USAGE_UNAVAILABLE",
+    message: "正常工作用量暂时无法读取",
+  }]);
+});
+
+test("settings routes preserve provider-secret and Skill review boundaries", async (t) => {
+  const calls = [];
+  const projectWorkService = {
+    async listProviderConnections() {
+      calls.push({ action: "listProviders" });
+      return {
+        schemaVersion: 1,
+        providers: [{
+          id: "deepseek",
+          name: "DeepSeek",
+          apiKeySupported: true,
+          configured: true,
+          stored: true,
+          availableModelCount: 2,
+        }],
+      };
+    },
+    async saveProviderApiKey(payload) {
+      calls.push({ action: "saveProvider", ...payload });
+      return this.listProviderConnections();
+    },
+    async removeProviderCredential(providerId) {
+      calls.push({ action: "removeProvider", providerId });
+      return {
+        schemaVersion: 1,
+        providers: [{
+          id: providerId,
+          name: "DeepSeek",
+          apiKeySupported: true,
+          configured: false,
+          stored: false,
+          availableModelCount: 0,
+        }],
+      };
+    },
+    async listSkillCatalog(options) {
+      calls.push({ action: "listSkills", options });
+      return {
+        schemaVersion: 1,
+        source: "pi.dev",
+        packages: [{
+          name: "demo-skill",
+          version: "1.2.3",
+          types: ["skill"],
+          installSupported: true,
+        }],
+      };
+    },
+    async listInstalledSkills() {
+      calls.push({ action: "listInstalled" });
+      return { schemaVersion: 1, revision: 0, packages: [] };
+    },
+    async inspectSkillPackage(payload) {
+      calls.push({ action: "inspectSkill", ...payload });
+      return {
+        schemaVersion: 1,
+        previewId: "skill-preview-1",
+        previewHash: `sha256:${"a".repeat(64)}`,
+        name: payload.name,
+        version: payload.version,
+        defaultEnabled: false,
+      };
+    },
+    async installSkillPackage(payload) {
+      calls.push({ action: "installSkill", ...payload });
+      return {
+        name: "demo-skill",
+        version: "1.2.3",
+        enabled: false,
+      };
+    },
+    async setSkillPackageEnabled(payload) {
+      calls.push({ action: "enableSkill", ...payload });
+      return {
+        name: payload.name,
+        version: "1.2.3",
+        enabled: payload.enabled,
+      };
+    },
+  };
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+  const mutationHeaders = {
+    origin: "http://127.0.0.1:4173",
+    "content-type": "application/json",
+  };
+
+  const saved = await fetch(
+    `${server.baseUrl}/api/v1/project-work/provider-connections/deepseek`,
+    {
+      method: "PUT",
+      headers: mutationHeaders,
+      body: JSON.stringify({ api_key: "secret-api-key" }),
+    },
+  );
+  assert.equal(saved.status, 200);
+  assert.doesNotMatch(await saved.text(), /secret-api-key/);
+
+  const removed = await fetch(
+    `${server.baseUrl}/api/v1/project-work/provider-connections/deepseek`,
+    { method: "DELETE", headers: mutationHeaders },
+  );
+  assert.equal(removed.status, 200);
+
+  const catalog = await fetch(
+    `${server.baseUrl}/api/v1/project-work/skills?query=demo&sort=recent`,
+  );
+  assert.equal(catalog.status, 200);
+  assert.equal((await catalog.json()).source, "pi.dev");
+
+  const preview = await fetch(
+    `${server.baseUrl}/api/v1/project-work/skill-previews`,
+    {
+      method: "POST",
+      headers: mutationHeaders,
+      body: JSON.stringify({ name: "demo-skill", version: "1.2.3" }),
+    },
+  );
+  const previewPayload = await preview.json();
+  assert.equal(previewPayload.defaultEnabled, false);
+
+  const installed = await fetch(
+    `${server.baseUrl}/api/v1/project-work/skills`,
+    {
+      method: "POST",
+      headers: mutationHeaders,
+      body: JSON.stringify({
+        preview_id: previewPayload.previewId,
+        preview_hash: previewPayload.previewHash,
+      }),
+    },
+  );
+  assert.equal(installed.status, 201);
+  assert.equal((await installed.json()).enabled, false);
+
+  const enabled = await fetch(
+    `${server.baseUrl}/api/v1/project-work/skills/demo-skill`,
+    {
+      method: "PATCH",
+      headers: mutationHeaders,
+      body: JSON.stringify({ enabled: true }),
+    },
+  );
+  assert.equal(enabled.status, 200);
+  assert.equal((await enabled.json()).enabled, true);
+
+  assert.deepEqual(
+    calls.find((call) => call.action === "saveProvider"),
+    {
+      action: "saveProvider",
+      providerId: "deepseek",
+      apiKey: "secret-api-key",
+    },
+  );
+  assert.deepEqual(
+    calls.find((call) => call.action === "listSkills").options,
+    { query: "demo", sort: "recent" },
+  );
+  assert.equal(
+    calls.find((call) => call.action === "installSkill").previewHash,
+    `sha256:${"a".repeat(64)}`,
+  );
 });
 
 test("project-work PDF routes use raw bytes and conversation-owned retry/remove actions", async (t) => {

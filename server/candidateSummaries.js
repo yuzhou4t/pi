@@ -332,6 +332,7 @@ export function createCandidateSummaryService({
   codexRunner = runCodexSubscription,
   codexProbe = probeCodexSubscription,
   deepseekRunner = runDeepSeek,
+  usageRecorder = null,
 } = {}) {
   // Live is the production default. Fixtures are available only when the
   // launcher or a test opts in explicitly with PI_MODEL_MODE=fixture.
@@ -475,6 +476,31 @@ export function createCandidateSummaryService({
       providerResult = await callProvider(input);
     } catch (error) {
       throw providerError(error);
+    }
+    if (
+      typeof usageRecorder === "function"
+      && providerResult.operationId
+      && providerResult.usage
+    ) {
+      try {
+        providerResult = {
+          ...providerResult,
+          usage: await usageRecorder({
+            providerId: input.provider_id,
+            modelId: input.model_id,
+            operationId: providerResult.operationId,
+            upstreamRequestId: providerResult.upstreamRequestId ?? null,
+            usage: providerResult.usage,
+            step: "candidate_summaries",
+            runId: input.run_id,
+            inputHash: `sha256:${inputHash}`,
+          }),
+        };
+      } catch (error) {
+        console.warn(
+          `Pi Agent candidate usage capture failed (${error?.code || "unknown"})`,
+        );
+      }
     }
     let parsed;
     try {

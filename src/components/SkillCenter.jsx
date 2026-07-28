@@ -1,33 +1,282 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  ArrowSquareOut,
   Check,
   CheckCircle,
   DownloadSimple,
+  FileText,
   MagnifyingGlass,
   Package,
   ShieldCheck,
   SpinnerGap,
+  WarningCircle,
   X,
 } from "@phosphor-icons/react";
+import { projectWorkApi } from "../api/projectWork.js";
 
-export function SkillCenter({ catalog, skillState, installingId, onInstall, onToggle, onClose }) {
+const PI_SKILL_CATALOG_URL = "https://pi.dev/packages?type=skill";
+const REVIEWED_SKILL_CANDIDATES = [
+  "@counterposition/skill-pi",
+  "@firstpick/pi-skill-html-report",
+];
+
+export function installedSkillRow(skill) {
+  return {
+    ...skill,
+    installed: true,
+    installSupported: true,
+    kind: "package",
+  };
+}
+
+function formatDownloads(value) {
+  const count = Number(value) || 0;
+  if (count >= 100_000) return `${(count / 1_000).toFixed(0)}K/月`;
+  if (count >= 10_000) return `${(count / 1_000).toFixed(1)}K/月`;
+  return `${count.toLocaleString("zh-CN")}/月`;
+}
+
+function packageStateLine(skill) {
+  if (skill.kind === "workflow") return "内置流程，仅在当前一轮选择后使用";
+  if (!skill.installSupported) return skill.unsupportedReason;
+  if (!skill.installed) return "来自 Pi 官方目录，安装前会先检查包内容";
+  return skill.enabled
+    ? "已安装并启用；下一次 Agent 运行会加载"
+    : "已安装，当前停用";
+}
+
+function SkillInstallReview({ preview, status, error, onConfirm, onCancel }) {
+  if (!preview) return null;
+  return (
+    <div
+      className="skill-review-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        event.stopPropagation();
+        if (event.target === event.currentTarget) onCancel();
+      }}
+    >
+      <section
+        className="skill-install-review"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="skill-install-review-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header>
+          <div>
+            <span className="eyebrow">安装预览</span>
+            <h3 id="skill-install-review-title">{preview.name}</h3>
+            <p>{preview.version} · {preview.skillCount} 个 Skill</p>
+          </div>
+          <button className="icon-button" type="button" aria-label="关闭安装预览" onClick={onCancel}>
+            <X size={17} aria-hidden="true" />
+          </button>
+        </header>
+
+        <div className="skill-review-safe">
+          <ShieldCheck size={18} weight="fill" aria-hidden="true" />
+          <div>
+            <strong>已通过纯 Skill 静态检查</strong>
+            <span>不含 Extension、安装脚本或运行时依赖；安装后默认停用。</span>
+          </div>
+        </div>
+
+        <dl className="skill-review-facts">
+          <div><dt>来源</dt><dd>{preview.source}</dd></div>
+          <div><dt>归档</dt><dd>{preview.archiveFileCount} 个文件 · {(preview.archiveBytes / 1024).toFixed(1)} KB</dd></div>
+          <div><dt>完整性</dt><dd>{preview.integrity?.split("-")[0] || "已校验"}</dd></div>
+        </dl>
+
+        <div className="skill-review-files">
+          <strong>将安装的 Skill</strong>
+          {preview.skillFiles.map((file) => (
+            <span key={file}><FileText size={14} aria-hidden="true" />{file}</span>
+          ))}
+        </div>
+
+        {error ? <div className="skill-action-error" role="alert">{error}</div> : null}
+
+        <footer>
+          <button type="button" onClick={onCancel} disabled={status === "installing"}>取消</button>
+          <button
+            className="primary-action"
+            type="button"
+            onClick={onConfirm}
+            disabled={status === "installing"}
+          >
+            {status === "installing"
+              ? <SpinnerGap className="spin" size={15} aria-hidden="true" />
+              : <DownloadSimple size={15} aria-hidden="true" />}
+            {status === "installing" ? "正在安装" : "确认安装"}
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+export function SkillCenter({
+  onStateChange,
+  onClose,
+}) {
   const [query, setQuery] = useState("");
-  const [view, setView] = useState("all");
+  const [view, setView] = useState("installed");
+  const [catalogState, setCatalogState] = useState({
+    status: "idle",
+    packages: [],
+    error: null,
+  });
+  const [installedState, setInstalledState] = useState({
+    status: "loading",
+    packages: [],
+    error: null,
+  });
+  const [action, setAction] = useState({
+    id: null,
+    status: "idle",
+    preview: null,
+    error: null,
+  });
 
+  const loadInstalled = useCallback(async (signal) => {
+    try {
+      const result = await projectWorkApi.listInstalledSkills({ signal });
+      if (signal?.aborted) return;
+      setInstalledState({ status: "ready", packages: result.packages, error: null });
+      onStateChange?.({
+        installedCount: result.packages.length,
+        enabledCount: result.packages.filter((item) => item.enabled).length,
+      });
+    } catch (error) {
+      if (signal?.aborted) return;
+      setInstalledState({ status: "error", packages: [], error: error.message });
+    }
+  }, [onStateChange]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadInstalled(controller.signal);
+    return () => controller.abort();
+  }, [loadInstalled]);
+
+  useEffect(() => {
+    if (view !== "candidates") return undefined;
+    const controller = new AbortController();
+    setCatalogState((current) => ({
+      status: current.packages.length ? "refreshing" : "loading",
+      packages: current.packages,
+      error: null,
+    }));
+    Promise.all(REVIEWED_SKILL_CANDIDATES.map((name) => (
+      projectWorkApi.listSkillCatalog({
+        query: name,
+        sort: "downloads",
+        signal: controller.signal,
+      })
+    ))).then((results) => {
+        if (controller.signal.aborted) return;
+        const packages = REVIEWED_SKILL_CANDIDATES.flatMap((name) => {
+          const match = results
+            .flatMap((result) => result.packages)
+            .find((item) => item.name === name);
+          return match ? [match] : [];
+        });
+        setCatalogState({
+          status: "ready",
+          packages,
+          error: null,
+        });
+      }).catch((error) => {
+        if (controller.signal.aborted) return;
+        setCatalogState((current) => ({
+          status: "error",
+          packages: current.packages,
+          error: error.message,
+        }));
+      });
+    return () => {
+      controller.abort();
+    };
+  }, [view]);
+
+  const installedByName = useMemo(
+    () => new Map(installedState.packages.map((item) => [item.name, item])),
+    [installedState.packages],
+  );
   const visibleSkills = useMemo(() => {
     const normalized = query.trim().toLowerCase();
-    return catalog.filter((skill) => {
-      const state = skillState[skill.id];
-      const installed = skill.kind === "workflow" || state?.installed;
-      const matchesSearch = `${skill.name} ${skill.description} ${skill.category}`.toLowerCase().includes(normalized);
-      const matchesView = view === "all" || (view === "installed" ? installed : !installed);
-      return matchesSearch && matchesView;
-    });
-  }, [catalog, query, skillState, view]);
+    if (view === "installed") {
+      return installedState.packages
+        .filter((skill) => (
+          !normalized
+          || `${skill.name} ${skill.source}`.toLowerCase().includes(normalized)
+        ))
+        .map(installedSkillRow);
+    }
+    return catalogState.packages
+      .filter((skill) => (
+        !normalized
+        || `${skill.name} ${skill.description}`.toLowerCase().includes(normalized)
+      ))
+      .map((skill) => ({
+        ...skill,
+        ...installedByName.get(skill.name),
+        kind: "package",
+      }));
+  }, [
+    catalogState.packages,
+    installedByName,
+    installedState.packages,
+    query,
+    view,
+  ]);
 
-  const installedCount = catalog.filter((skill) => (
-    skill.kind === "workflow" || skillState[skill.id]?.installed
-  )).length;
+  const inspect = async (skill) => {
+    if (!skill.installSupported || action.status !== "idle") return;
+    setAction({ id: skill.id, status: "inspecting", preview: null, error: null });
+    try {
+      const preview = await projectWorkApi.inspectSkillPackage({
+        name: skill.name,
+        version: skill.version,
+      });
+      setAction({ id: skill.id, status: "review", preview, error: null });
+    } catch (error) {
+      setAction({ id: skill.id, status: "idle", preview: null, error: error.message });
+    }
+  };
+
+  const install = async () => {
+    if (!action.preview) return;
+    setAction((current) => ({ ...current, status: "installing", error: null }));
+    try {
+      await projectWorkApi.installSkillPackage({
+        previewId: action.preview.previewId,
+        previewHash: action.preview.previewHash,
+      });
+      setAction({ id: null, status: "idle", preview: null, error: null });
+      await loadInstalled();
+    } catch (error) {
+      setAction((current) => ({ ...current, status: "review", error: error.message }));
+    }
+  };
+
+  const toggle = async (skill) => {
+    if (action.status !== "idle") return;
+    setAction({ id: skill.id, status: "toggling", preview: null, error: null });
+    try {
+      await projectWorkApi.setSkillEnabled({
+        name: skill.name,
+        enabled: !skill.enabled,
+      });
+      setAction({ id: null, status: "idle", preview: null, error: null });
+      await loadInstalled();
+    } catch (error) {
+      setAction({ id: skill.id, status: "idle", preview: null, error: error.message });
+    }
+  };
+
+  const installedCount = installedState.packages.length;
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
@@ -36,93 +285,141 @@ export function SkillCenter({ catalog, skillState, installingId, onInstall, onTo
           <div className="skill-dialog-title">
             <span className="skill-dialog-icon"><Package size={20} weight="regular" aria-hidden="true" /></span>
             <div>
-              <span className="eyebrow">按需扩展，不堆功能</span>
+              <span className="eyebrow">Pi Package Catalog</span>
               <h2 id="skill-center-title">技能中心</h2>
-              <p>下载能力包，再决定是否为当前 Agent 启用。</p>
+              <p>只显示本机安装项和已经确认的候选。</p>
             </div>
           </div>
-          <button className="icon-button" type="button" aria-label="关闭 Skill 中心" onClick={onClose}>
-            <X size={19} aria-hidden="true" />
-          </button>
+          <div className="skill-dialog-header-actions">
+            <a
+              className="skill-official-link"
+              href={PI_SKILL_CATALOG_URL}
+              target="_blank"
+              rel="noreferrer"
+            >
+              查看 Pi 官方 Skill
+              <ArrowSquareOut size={14} aria-hidden="true" />
+            </a>
+            <button className="icon-button" type="button" aria-label="关闭 Skill 中心" onClick={onClose}>
+              <X size={19} aria-hidden="true" />
+            </button>
+          </div>
         </header>
 
-        {catalog.length > 0 ? (
-          <div className="skill-toolbar">
-            <label className="search-field skill-search" htmlFor="skill-search">
-              <MagnifyingGlass size={15} aria-hidden="true" />
-            <input id="skill-search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索技能" />
-            </label>
-            <div className="segmented-control" aria-label="筛选 Skill">
-              <button className={view === "all" ? "is-active" : ""} type="button" onClick={() => setView("all")}>全部 {catalog.length}</button>
-              <button className={view === "installed" ? "is-active" : ""} type="button" onClick={() => setView("installed")}>已安装 {installedCount}</button>
-              <button className={view === "available" ? "is-active" : ""} type="button" onClick={() => setView("available")}>可下载 {catalog.length - installedCount}</button>
-            </div>
+        <div className="skill-toolbar">
+          <label className="search-field skill-search" htmlFor="skill-search">
+            <MagnifyingGlass size={15} aria-hidden="true" />
+            <input id="skill-search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索当前列表" />
+          </label>
+          <div className="segmented-control" aria-label="筛选 Skill">
+            <button className={view === "installed" ? "is-active" : ""} type="button" onClick={() => setView("installed")}>已安装 {installedCount}</button>
+            <button className={view === "candidates" ? "is-active" : ""} type="button" onClick={() => setView("candidates")}>已确认候选 {REVIEWED_SKILL_CANDIDATES.length}</button>
           </div>
-        ) : null}
+        </div>
 
         <div className="skill-list">
+          {catalogState.status === "loading" && view === "candidates" ? (
+            <div className="skill-loading" role="status">
+              <SpinnerGap className="spin" size={17} aria-hidden="true" />
+              正在核对已确认候选…
+            </div>
+          ) : null}
+          {catalogState.error && view === "candidates" ? (
+            <div className="skill-catalog-error" role="alert">
+              <WarningCircle size={17} aria-hidden="true" />
+              <span>{catalogState.error}</span>
+            </div>
+          ) : null}
+          {installedState.error && view === "installed" ? (
+            <div className="skill-catalog-error" role="alert">
+              <WarningCircle size={17} aria-hidden="true" />
+              <span>{installedState.error}</span>
+            </div>
+          ) : null}
+
           {visibleSkills.map((skill) => {
-            const state = skillState[skill.id];
-            const installing = installingId === skill.id;
+            const installing = action.id === skill.id && action.status === "inspecting";
+            const toggling = action.id === skill.id && action.status === "toggling";
+            const actionError = action.id === skill.id && action.status === "idle"
+              ? action.error
+              : null;
             return (
               <article
-                className={`skill-row${skill.kind === "workflow" || state?.enabled ? " is-enabled" : ""}`}
-                key={skill.id}
+                className={`skill-row${skill.kind === "workflow" || skill.enabled ? " is-enabled" : ""}`}
+                key={`${skill.kind}:${skill.id}`}
               >
                 <span className="skill-row-icon"><Package size={19} weight="regular" aria-hidden="true" /></span>
                 <div className="skill-row-copy">
                   <div className="skill-row-title">
                     <h3>{skill.name}</h3>
-                    <span>{skill.category}</span>
-                    <small>{skill.source}</small>
+                    <span>{skill.kind === "workflow" ? skill.category : "Skill"}</span>
+                    <small>
+                      {skill.kind === "workflow"
+                        ? skill.source
+                        : `${skill.version || "最新"} · ${formatDownloads(skill.downloads)}`}
+                    </small>
                   </div>
-                  <p>{skill.description}</p>
+                  <p>{skill.description || "这个包没有提供说明。"}</p>
                   <div className="skill-state-line">
-                    {skill.kind === "workflow" || state?.installed
+                    {skill.installed
                       ? <CheckCircle size={14} weight="fill" aria-hidden="true" />
                       : <DownloadSimple size={14} aria-hidden="true" />}
-                    <span>
-                      {skill.kind === "workflow"
-                        ? "内置流程，仅在当前一轮选择后使用"
-                        : state?.installed
-                          ? (state.enabled ? "已安装并启用" : "已安装，当前停用")
-                          : "尚未下载到本机"}
-                    </span>
+                    <span>{packageStateLine(skill)}</span>
+                    {skill.catalogUrl ? (
+                      <a href={skill.catalogUrl} target="_blank" rel="noreferrer" aria-label={`查看 ${skill.name} 的 Pi 目录页面`}>
+                        <ArrowSquareOut size={13} aria-hidden="true" />
+                      </a>
+                    ) : null}
                   </div>
+                  {actionError ? <div className="skill-action-error" role="alert">{actionError}</div> : null}
                 </div>
                 <div className="skill-row-action">
                   {skill.kind === "workflow" ? (
                     <span className="skill-builtin-label">按需</span>
-                  ) : state?.installed ? (
+                  ) : skill.installed ? (
                     <button
-                      className={`switch-control${state.enabled ? " is-on" : ""}`}
+                      className={`switch-control${skill.enabled ? " is-on" : ""}`}
                       type="button"
                       role="switch"
-                      aria-checked={state.enabled}
-                      aria-label={`${state.enabled ? "停用" : "启用"}${skill.name}`}
-                      onClick={() => onToggle(skill.id)}
+                      aria-checked={skill.enabled}
+                      aria-label={`${skill.enabled ? "停用" : "启用"}${skill.name}`}
+                      onClick={() => toggle(skill)}
+                      disabled={toggling}
                     >
-                      <span>{state.enabled ? <Check size={12} weight="bold" aria-hidden="true" /> : null}</span>
+                      <span>
+                        {toggling
+                          ? <SpinnerGap className="spin" size={11} aria-hidden="true" />
+                          : skill.enabled
+                            ? <Check size={12} weight="bold" aria-hidden="true" />
+                            : null}
+                      </span>
                     </button>
                   ) : (
-                    <button className="download-button" type="button" onClick={() => onInstall(skill.id)} disabled={installing}>
-                      {installing ? <SpinnerGap className="spin" size={15} aria-hidden="true" /> : <DownloadSimple size={15} weight="bold" aria-hidden="true" />}
-                      {installing ? "下载中" : "下载"}
+                    <button
+                      className="download-button"
+                      type="button"
+                      onClick={() => inspect(skill)}
+                      disabled={installing || !skill.installSupported}
+                      title={skill.unsupportedReason || undefined}
+                    >
+                      {installing
+                        ? <SpinnerGap className="spin" size={15} aria-hidden="true" />
+                        : <DownloadSimple size={15} weight="bold" aria-hidden="true" />}
+                      {installing ? "检查中" : skill.installSupported ? "检查并安装" : "暂不支持"}
                     </button>
                   )}
                 </div>
               </article>
             );
           })}
-          {catalog.length === 0 ? (
+
+          {visibleSkills.length === 0 && catalogState.status !== "loading" ? (
             <div className="skill-empty-state">
               <span><Package size={25} weight="regular" aria-hidden="true" /></span>
-              <h3>首个工作流已确认</h3>
-              <p>“期刊追踪与精读”会先作为完整工作流验证，内部能力暂不作为市场条目展示。</p>
-              <small>当前不会预装或推荐可下载能力包。</small>
+              <h3>{view === "installed" ? "没有安装任何 Skill" : "没有匹配的已确认候选"}</h3>
+              <p>{view === "installed" ? "候选安装后会先保持停用。" : "换一个关键词再试试。"}</p>
             </div>
           ) : null}
-          {catalog.length > 0 && visibleSkills.length === 0 ? <p className="empty-note skill-empty">没有匹配的技能</p> : null}
         </div>
 
         <footer className="skill-dialog-footer">
@@ -130,12 +427,24 @@ export function SkillCenter({ catalog, skillState, installingId, onInstall, onTo
             <ShieldCheck size={17} weight="regular" aria-hidden="true" />
             <p>
               <strong>保持上下文清爽</strong>
-              <span>内置流程不会常驻提示词；只有在当前消息选择后才注入一次。</span>
+              <span>安装不会自动启用；启用后只加载 Skill 描述与按需说明，不开放 Extension。</span>
             </p>
           </div>
           <button className="primary-action" type="button" onClick={onClose}>完成</button>
         </footer>
       </section>
+
+      <SkillInstallReview
+        preview={action.preview}
+        status={action.status}
+        error={action.error}
+        onConfirm={install}
+        onCancel={() => {
+          if (action.status !== "installing") {
+            setAction({ id: null, status: "idle", preview: null, error: null });
+          }
+        }}
+      />
     </div>
   );
 }

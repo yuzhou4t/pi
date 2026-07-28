@@ -1481,6 +1481,8 @@ test("settled activity is coalesced and collapsed above the final answer", async
     assert.match(html, /class="project-activity-body" hidden=""/);
     assert.match(html, /已完成/);
     assert.match(html, /2 项 · 查看过程/);
+    assert.match(html, /透明模式/);
+    assert.doesNotMatch(html, /Harness 快照/);
     assert.match(html, /查看与检索了 1 次/);
     assert.equal((html.match(/思考完成/g) ?? []).length, 1);
     assert.doesNotMatch(html, /agent\.thinking|37 条记录/);
@@ -1488,6 +1490,112 @@ test("settled activity is coalesced and collapsed above the final answer", async
       html.indexOf('aria-label="Pi Agent 活动"') < html.indexOf("这是本轮最终答案。"),
       "completed activity should render before the final answer",
     );
+  });
+});
+
+test("agent insight shows a safe harness snapshot and compact turn totals", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    const events = [
+      {
+        seq: 1,
+        type: "message.created",
+        at: "2026-07-28T02:00:00.000Z",
+      },
+      {
+        seq: 2,
+        type: "harness.snapshot",
+        at: "2026-07-28T02:00:00.100Z",
+        data: {
+          harnessVersion: "project-work-v1",
+          providerId: "openai-codex",
+          modelId: "gpt-5.3-codex",
+          thinkingLevel: "high",
+          activeTools: ["read", "grep"],
+          skills: ["pi"],
+          context: {
+            workspace: "bound_project",
+            snapshot: "current",
+            projectRules: 1,
+          },
+          prompt: {
+            layers: ["Pi SDK 基础提示", "项目审阅工作区规则", "当前回合指令"],
+          },
+        },
+      },
+      {
+        seq: 3,
+        type: "turn.started",
+        at: "2026-07-28T02:00:00.200Z",
+      },
+      {
+        seq: 4,
+        type: "tool.started",
+        toolName: "read",
+        toolCallId: "read-1",
+        at: "2026-07-28T02:00:01.000Z",
+      },
+      {
+        seq: 5,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "read-1",
+        status: "completed",
+        at: "2026-07-28T02:00:02.000Z",
+      },
+      {
+        seq: 6,
+        type: "turn.completed",
+        at: "2026-07-28T02:00:03.000Z",
+        data: {
+          usage: {
+            totalTokens: 1_240,
+          },
+        },
+      },
+      {
+        seq: 7,
+        type: "conversation.read",
+        at: "2026-07-31T02:00:03.000Z",
+      },
+    ];
+    const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+      events,
+      running: false,
+      compact: true,
+      transparentMode: true,
+      onOpenArtifact: () => {},
+    }));
+
+    assert.match(html, /Agent 透视/);
+    assert.match(html, /aria-expanded="true"/);
+    assert.match(html, /1 轮模型 · 1 次工具 · 3 秒 · 1\.2k Token/);
+    assert.match(html, /Harness 快照/);
+    assert.match(html, /openai-codex \/ gpt-5\.3-codex/);
+    assert.match(html, /读取文件、搜索内容/);
+    assert.match(html, /本轮未启用 Skill|pi/);
+    assert.match(html, /私有推理、密钥与未脱敏内容不会进入浏览器/);
+  });
+});
+
+test("repeated file inspection stays in one public activity layer", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const events = [
+      { seq: 1, type: "message.created", status: "accepted" },
+      ...Array.from({ length: 8 }, (_, index) => ({
+        seq: index + 2,
+        type: "tool.completed",
+        toolName: index % 2 === 0 ? "read" : "grep",
+        toolCallId: `inspect-${index + 1}`,
+        path: `src/file-${index + 1}.js`,
+        status: "completed",
+      })),
+    ];
+    const normalized = normalizeActivityEvents(events, false);
+
+    assert.equal(normalized.length, 1);
+    assert.equal(normalized[0].type, "activity.research_summary");
+    assert.equal(normalized[0].title, "查看与检索了 8 次");
+    assert.equal(normalized[0].detail, "项目资料 8 次");
   });
 });
 

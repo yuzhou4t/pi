@@ -164,6 +164,44 @@ function mapProject(raw) {
   };
 }
 
+function mapModelPricing(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const tiers = asArray(raw.tiers).flatMap((tier) => {
+    const inputTokensAbove = nullableNumber(
+      tier,
+      "input_tokens_above",
+      "inputTokensAbove",
+    );
+    if (inputTokensAbove === null) return [];
+    return [{
+      inputTokensAbove,
+      input: nullableNumber(tier, "input", "input"),
+      output: nullableNumber(tier, "output", "output"),
+      cacheRead: nullableNumber(tier, "cache_read", "cacheRead"),
+      cacheWrite: nullableNumber(tier, "cache_write", "cacheWrite"),
+    }];
+  });
+  const pricing = {
+    currency: pick(raw, "currency", "currency", "USD"),
+    unit: pick(raw, "unit", "unit", "per_million_tokens"),
+    source: pick(raw, "source", "source"),
+    version: pick(raw, "version", "version"),
+    input: nullableNumber(raw, "input", "input"),
+    output: nullableNumber(raw, "output", "output"),
+    cacheRead: nullableNumber(raw, "cache_read", "cacheRead"),
+    cacheWrite: nullableNumber(raw, "cache_write", "cacheWrite"),
+    tiers,
+  };
+  return [
+    pricing.input,
+    pricing.output,
+    pricing.cacheRead,
+    pricing.cacheWrite,
+  ].some((value) => value !== null)
+    ? pricing
+    : null;
+}
+
 function mapModel(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const id = pick(raw, "model_id", "modelId", raw.id);
@@ -189,6 +227,8 @@ function mapModel(raw) {
       "default_thinking_level",
       "defaultThinkingLevel",
     ),
+    billingKind: pick(raw, "billing_kind", "billingKind", "unknown"),
+    pricing: mapModelPricing(raw.pricing),
   };
 }
 
@@ -1209,6 +1249,458 @@ export async function fetchProjectWorkModels({ signal, fetchImpl } = {}) {
     ),
     capabilities: pick(payload, "capabilities", "capabilities", {}),
   };
+}
+
+function mapProviderConnection(raw) {
+  const id = pick(raw, "id", "id");
+  if (typeof id !== "string" || !id) return null;
+  return {
+    id,
+    name: pick(raw, "name", "name", id),
+    apiKeySupported: Boolean(
+      pick(raw, "api_key_supported", "apiKeySupported", false),
+    ),
+    apiKeyLabel: pick(raw, "api_key_label", "apiKeyLabel"),
+    oauthSupported: Boolean(
+      pick(raw, "oauth_supported", "oauthSupported", false),
+    ),
+    oauthLabel: pick(raw, "oauth_label", "oauthLabel"),
+    configured: Boolean(pick(raw, "configured", "configured", false)),
+    configuredType: pick(raw, "configured_type", "configuredType"),
+    configuredSource: pick(raw, "configured_source", "configuredSource"),
+    stored: Boolean(pick(raw, "stored", "stored", false)),
+    availableModelCount: Number(
+      pick(raw, "available_model_count", "availableModelCount", 0),
+    ) || 0,
+  };
+}
+
+export async function fetchProjectWorkProviderConnections({
+  signal,
+  fetchImpl,
+} = {}) {
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/provider-connections`,
+    { signal, fetchImpl },
+  );
+  return asArray(payload?.providers).map(mapProviderConnection).filter(Boolean);
+}
+
+export async function saveProjectWorkProviderApiKey({
+  providerId,
+  apiKey,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(providerId, "providerId");
+  if (typeof apiKey !== "string" || !apiKey.trim()) {
+    throw new TypeError("apiKey 必须是非空字符串");
+  }
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/provider-connections/${encodeURIComponent(providerId)}`,
+    {
+      method: "PUT",
+      body: {
+        schema_version: 1,
+        api_key: apiKey,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return asArray(payload?.providers).map(mapProviderConnection).filter(Boolean);
+}
+
+export async function removeProjectWorkProviderCredential({
+  providerId,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(providerId, "providerId");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/provider-connections/${encodeURIComponent(providerId)}`,
+    {
+      method: "DELETE",
+      signal,
+      fetchImpl,
+    },
+  );
+  return asArray(payload?.providers).map(mapProviderConnection).filter(Boolean);
+}
+
+function mapSkillPackage(raw) {
+  const name = pick(raw, "name", "name", pick(raw, "id", "id"));
+  if (typeof name !== "string" || !name) return null;
+  return {
+    id: name,
+    name,
+    version: pick(raw, "version", "version"),
+    description: pick(raw, "description", "description", ""),
+    author: pick(raw, "author", "author", ""),
+    types: asArray(pick(raw, "types", "types", [])),
+    downloads: Number(pick(raw, "downloads", "downloads", 0)) || 0,
+    publishedAt: pick(raw, "published_at", "publishedAt"),
+    source: pick(raw, "source", "source"),
+    catalogUrl: pick(raw, "catalog_url", "catalogUrl"),
+    npmUrl: pick(raw, "npm_url", "npmUrl"),
+    repoUrl: pick(raw, "repo_url", "repoUrl"),
+    installSupported: Boolean(
+      pick(raw, "install_supported", "installSupported", true),
+    ),
+    unsupportedReason: pick(raw, "unsupported_reason", "unsupportedReason"),
+    installed: Boolean(pick(raw, "installed", "installed", false)),
+    enabled: Boolean(pick(raw, "enabled", "enabled", false)),
+    installedVersion: pick(raw, "installed_version", "installedVersion"),
+    installedAt: pick(raw, "installed_at", "installedAt"),
+    skillCount: Number(pick(raw, "skill_count", "skillCount", 0)) || 0,
+    skillFiles: asArray(pick(raw, "skill_files", "skillFiles", [])),
+  };
+}
+
+export async function fetchProjectWorkSkillCatalog({
+  query = "",
+  sort = "downloads",
+  signal,
+  fetchImpl,
+} = {}) {
+  const search = new URLSearchParams();
+  if (query.trim()) search.set("query", query.trim());
+  search.set("sort", sort);
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/skills?${search.toString()}`,
+    { signal, fetchImpl },
+  );
+  return {
+    source: pick(payload, "source", "source"),
+    query: pick(payload, "query", "query", ""),
+    sort: pick(payload, "sort", "sort", sort),
+    packages: asArray(payload?.packages).map(mapSkillPackage).filter(Boolean),
+  };
+}
+
+export async function fetchInstalledProjectWorkSkills({ signal, fetchImpl } = {}) {
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/skills/installed`,
+    { signal, fetchImpl },
+  );
+  return {
+    revision: Number(pick(payload, "revision", "revision", 0)) || 0,
+    packages: asArray(payload?.packages).map(mapSkillPackage).filter(Boolean),
+  };
+}
+
+export async function inspectProjectWorkSkillPackage({
+  name,
+  version,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(name, "name");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/skill-previews`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        name,
+        version,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return {
+    previewId: pick(payload, "preview_id", "previewId"),
+    previewHash: pick(payload, "preview_hash", "previewHash"),
+    name: pick(payload, "name", "name"),
+    version: pick(payload, "version", "version"),
+    source: pick(payload, "source", "source"),
+    description: pick(payload, "description", "description", ""),
+    integrity: pick(payload, "integrity", "integrity"),
+    skillFiles: asArray(pick(payload, "skill_files", "skillFiles", [])),
+    skillCount: Number(pick(payload, "skill_count", "skillCount", 0)) || 0,
+    archiveFileCount: Number(
+      pick(payload, "archive_file_count", "archiveFileCount", 0),
+    ) || 0,
+    archiveBytes: Number(pick(payload, "archive_bytes", "archiveBytes", 0)) || 0,
+    defaultEnabled: Boolean(
+      pick(payload, "default_enabled", "defaultEnabled", false),
+    ),
+    expiresAt: pick(payload, "expires_at", "expiresAt"),
+  };
+}
+
+export async function installProjectWorkSkillPackage({
+  previewId,
+  previewHash,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(previewId, "previewId");
+  requiredId(previewHash, "previewHash");
+  const payload = await requestJson(`${PROJECT_WORK_API_ROOT}/skills`, {
+    method: "POST",
+    body: {
+      schema_version: 1,
+      preview_id: previewId,
+      preview_hash: previewHash,
+    },
+    signal,
+    fetchImpl,
+  });
+  return mapSkillPackage(payload);
+}
+
+export async function setProjectWorkSkillEnabled({
+  name,
+  enabled,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(name, "name");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/skills/${encodeURIComponent(name)}`,
+    {
+      method: "PATCH",
+      body: {
+        schema_version: 1,
+        enabled: enabled === true,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapSkillPackage(payload);
+}
+
+function mapUsageValues(raw) {
+  return {
+    calls: nullableNumber(raw, "calls", "calls") ?? 0,
+    tasks: nullableNumber(raw, "tasks", "tasks") ?? 0,
+    conversations: nullableNumber(raw, "conversations", "conversations") ?? 0,
+    inputTokens: nullableNumber(raw, "input_tokens", "inputTokens") ?? 0,
+    outputTokens: nullableNumber(raw, "output_tokens", "outputTokens") ?? 0,
+    cacheReadTokens: nullableNumber(
+      raw,
+      "cache_read_tokens",
+      "cacheReadTokens",
+    ) ?? 0,
+    cacheWriteTokens: nullableNumber(
+      raw,
+      "cache_write_tokens",
+      "cacheWriteTokens",
+    ) ?? 0,
+    totalTokens: nullableNumber(raw, "total_tokens", "totalTokens") ?? 0,
+    apiEquivalentCostUsd: nullableNumber(
+      raw,
+      "api_equivalent_cost_usd",
+      "apiEquivalentCostUsd",
+    ),
+    pricedCallCount: nullableNumber(
+      raw,
+      "priced_call_count",
+      "pricedCallCount",
+    ) ?? 0,
+    unpricedCallCount: nullableNumber(
+      raw,
+      "unpriced_call_count",
+      "unpricedCallCount",
+    ) ?? 0,
+    historicalBackfilledCallCount: nullableNumber(
+      raw,
+      "historical_backfilled_call_count",
+      "historicalBackfilledCallCount",
+    ) ?? 0,
+  };
+}
+
+export function mapProjectWorkUsage(raw) {
+  const source = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? raw
+    : {};
+  const coverage = source.coverage
+    && typeof source.coverage === "object"
+    && !Array.isArray(source.coverage)
+    ? source.coverage
+    : {};
+  return {
+    scope: pick(source, "scope", "scope", "retained_conversations"),
+    workflowScope: pick(
+      source,
+      "workflow_scope",
+      "workflowScope",
+      "project_work",
+    ),
+    source: pick(source, "source", "source", "durable_pi_turn_evidence"),
+    costSemantics: pick(
+      source,
+      "cost_semantics",
+      "costSemantics",
+      "api_equivalent_estimate",
+    ),
+    period: pick(source, "period", "period", "30d"),
+    periodStart: pick(source, "period_start", "periodStart"),
+    periodEnd: pick(source, "period_end", "periodEnd"),
+    generatedAt: pick(source, "generated_at", "generatedAt"),
+    quota: {
+      available: pick(source.quota, "available", "available", false) === true,
+      detail: pick(source.quota, "detail", "detail", "账户剩余额度不可获取"),
+    },
+    totals: mapUsageValues(source.totals),
+    coverage: {
+      conversationsScanned: nullableNumber(
+        coverage,
+        "conversations_scanned",
+        "conversationsScanned",
+      ) ?? 0,
+      legacyMessagesWithoutUsage: nullableNumber(
+        coverage,
+        "legacy_messages_without_usage",
+        "legacyMessagesWithoutUsage",
+      ) ?? 0,
+      undatedAssistantMessages: nullableNumber(
+        coverage,
+        "undated_assistant_messages",
+        "undatedAssistantMessages",
+      ) ?? 0,
+      includedKinds: asArray(
+        pick(coverage, "included_kinds", "includedKinds", []),
+      ),
+      excludedKinds: asArray(
+        pick(coverage, "excluded_kinds", "excludedKinds", []),
+      ),
+      accessIssues: asArray(
+        pick(coverage, "access_issues", "accessIssues", []),
+      ).map((issue) => ({
+        workflowScope: pick(
+          issue,
+          "workflow_scope",
+          "workflowScope",
+          "unknown",
+        ),
+        code: pick(issue, "code", "code", "USAGE_UNAVAILABLE"),
+        message: pick(
+          issue,
+          "message",
+          "message",
+          "部分模型用量暂时无法读取",
+        ),
+      })),
+      historicalLowerBound: pick(
+        coverage,
+        "historical_lower_bound",
+        "historicalLowerBound",
+        false,
+      ) === true,
+      historicalBackfilledCallCount: nullableNumber(
+        coverage,
+        "historical_backfilled_call_count",
+        "historicalBackfilledCallCount",
+      ) ?? 0,
+      historicalTestCallCount: nullableNumber(
+        coverage,
+        "historical_test_call_count",
+        "historicalTestCallCount",
+      ) ?? 0,
+      legacyTranslationArtifactsWithoutUsage: nullableNumber(
+        coverage,
+        "legacy_translation_artifacts_without_usage",
+        "legacyTranslationArtifactsWithoutUsage",
+      ) ?? 0,
+    },
+    workflows: asArray(source.workflows).flatMap((workflow) => {
+      const workflowScope = pick(
+        workflow,
+        "workflow_scope",
+        "workflowScope",
+      );
+      if (!workflowScope) return [];
+      return [{
+        workflowScope,
+        totals: mapUsageValues(workflow.totals),
+        coverage: pick(workflow, "coverage", "coverage", {}),
+      }];
+    }),
+    models: asArray(source.models).flatMap((model) => {
+      const providerId = pick(model, "provider_id", "providerId");
+      const modelId = pick(model, "model_id", "modelId");
+      if (!providerId || !modelId) return [];
+      return [{
+        providerId,
+        providerName: pick(
+          model,
+          "provider_name",
+          "providerName",
+          providerId,
+        ),
+        modelId,
+        modelName: pick(model, "model_name", "modelName", modelId),
+        billingKind: pick(model, "billing_kind", "billingKind", "unknown"),
+        workflowScope: pick(
+          model,
+          "workflow_scope",
+          "workflowScope",
+          pick(
+            source,
+            "workflow_scope",
+            "workflowScope",
+            "project_work",
+          ),
+        ),
+        ...mapUsageValues(model),
+        lastUsedAt: pick(model, "last_used_at", "lastUsedAt"),
+        stepBreakdown: asArray(
+          pick(model, "step_breakdown", "stepBreakdown", []),
+        ).flatMap((item) => {
+          const step = pick(item, "step", "step");
+          if (!step) return [];
+          return [{
+            step,
+            calls: nullableNumber(item, "calls", "calls") ?? 0,
+          }];
+        }),
+        currentPricing: mapModelPricing(
+          pick(model, "current_pricing", "currentPricing"),
+        ),
+      }];
+    }),
+  };
+}
+
+export async function fetchModelUsage({
+  period = "30d",
+  workflow = "all",
+  signal,
+  fetchImpl,
+} = {}) {
+  if (!["today", "7d", "30d", "all"].includes(period)) {
+    throw new TypeError("模型用量时间范围无效");
+  }
+  if (!["all", "project_work", "paper_reading"].includes(workflow)) {
+    throw new TypeError("模型用量工作类型无效");
+  }
+  const params = new URLSearchParams({ period, workflow });
+  const payload = await requestJson(
+    `/api/v1/model-usage?${params.toString()}`,
+    { signal, fetchImpl },
+  );
+  return mapProjectWorkUsage(payload);
+}
+
+export async function fetchProjectWorkUsage({
+  period = "30d",
+  signal,
+  fetchImpl,
+} = {}) {
+  if (!["today", "7d", "30d", "all"].includes(period)) {
+    throw new TypeError("模型用量时间范围无效");
+  }
+  const params = new URLSearchParams({ period });
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/usage?${params.toString()}`,
+    { signal, fetchImpl },
+  );
+  return mapProjectWorkUsage(payload);
 }
 
 export async function pickProjectWorkRoot({
@@ -2346,6 +2838,16 @@ export async function runProjectWorkVerification({
 export const projectWorkApi = {
   listProjects: listProjectWorkProjects,
   listModels: fetchProjectWorkModels,
+  listProviderConnections: fetchProjectWorkProviderConnections,
+  saveProviderApiKey: saveProjectWorkProviderApiKey,
+  removeProviderCredential: removeProjectWorkProviderCredential,
+  listSkillCatalog: fetchProjectWorkSkillCatalog,
+  listInstalledSkills: fetchInstalledProjectWorkSkills,
+  inspectSkillPackage: inspectProjectWorkSkillPackage,
+  installSkillPackage: installProjectWorkSkillPackage,
+  setSkillEnabled: setProjectWorkSkillEnabled,
+  getUsage: fetchModelUsage,
+  getProjectUsage: fetchProjectWorkUsage,
   pickRoot: pickProjectWorkRoot,
   registerProject: registerProjectWorkProject,
   removeProject: removeProjectWorkProject,

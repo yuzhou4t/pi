@@ -168,15 +168,6 @@ function projectWorkConversationLabel(status) {
   }[status] ?? status ?? "等待任务";
 }
 
-function createInitialSkillState() {
-  return Object.fromEntries(
-    skillCatalog.map((skill) => [
-      skill.id,
-      { installed: skill.defaultInstalled, enabled: skill.defaultEnabled },
-    ]),
-  );
-}
-
 function mergeProviderCatalog(catalogProviders) {
   return providers.map((definition) => {
     const catalogProvider = catalogProviders.find((item) => item.id === definition.id);
@@ -485,9 +476,8 @@ export function App() {
     error: null,
   });
   const [providerOpen, setProviderOpen] = useState(false);
-  const [skillState, setSkillState] = usePersistentState("pi-agent-skills-v2", createInitialSkillState());
   const [skillCenterOpen, setSkillCenterOpen] = useState(false);
-  const [installingSkillId, setInstallingSkillId] = useState(null);
+  const [installedPackageSkillCount, setInstalledPackageSkillCount] = useState(0);
   const [settingsView, setSettingsView] = useState(null);
   const [settingsSection, setSettingsSection] = useState("general");
   const [mobileView, setMobileView] = useState("agent");
@@ -675,10 +665,8 @@ export function App() {
     .find((provider) => provider.id === selectedProjectWorkProvider?.id)
     ?.models.find((model) => model.id === selectedProjectWorkModel);
   const installedSkillCount = useMemo(
-    () => skillCatalog.filter((skill) => (
-      skill.kind === "workflow" || skillState[skill.id]?.installed
-    )).length,
-    [skillState],
+    () => skillCatalog.length + installedPackageSkillCount,
+    [installedPackageSkillCount],
   );
   const activeRun = useMemo(() => ({
     id: journalRunState.run?.id
@@ -1283,6 +1271,60 @@ export function App() {
 
   useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
+  const refreshProjectWorkModels = useCallback(async ({ signal } = {}) => {
+    try {
+      const catalog = await projectWorkApi.listModels({ signal });
+      if (signal?.aborted) return;
+      setProjectWorkModelCatalog({
+        status: "ready",
+        providers: catalog.providers,
+        defaultProviderId: catalog.defaultProviderId,
+        defaultModelId: catalog.defaultModelId,
+        error: null,
+      });
+      setProjectWorkProviderConfig((current) => {
+        const currentProvider = catalog.providers.find(
+          (provider) => provider.id === current?.providerId,
+        );
+        if (
+          currentProvider
+          && currentProvider.models.some((model) => model.id === current?.model)
+        ) {
+          return current;
+        }
+        return {
+          providerId: catalog.defaultProviderId ?? catalog.providers[0]?.id ?? "",
+          model: catalog.defaultModelId
+            ?? catalog.providers[0]?.models[0]?.id
+            ?? "",
+        };
+      });
+    } catch (error) {
+      if (signal?.aborted) return;
+      setProjectWorkModelCatalog({
+        status: "error",
+        providers: [],
+        defaultProviderId: "",
+        defaultModelId: "",
+        error: error.message,
+      });
+    }
+  }, [setProjectWorkProviderConfig]);
+
+  const handleSkillStateChange = useCallback(({ installedCount }) => {
+    setInstalledPackageSkillCount(Number(installedCount) || 0);
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    projectWorkApi.listInstalledSkills({ signal: controller.signal }).then((result) => {
+      if (!controller.signal.aborted) {
+        setInstalledPackageSkillCount(result.packages.length);
+      }
+    }).catch(() => undefined);
+    return () => controller.abort();
+  }, []);
+
   useEffect(() => {
     const controller = new AbortController();
     fetchModelProviders({ signal: controller.signal }).then((catalog) => {
@@ -1308,43 +1350,9 @@ export function App() {
 
   useEffect(() => {
     const controller = new AbortController();
-    projectWorkApi.listModels({ signal: controller.signal }).then((catalog) => {
-      setProjectWorkModelCatalog({
-        status: "ready",
-        providers: catalog.providers,
-        defaultProviderId: catalog.defaultProviderId,
-        defaultModelId: catalog.defaultModelId,
-        error: null,
-      });
-      setProjectWorkProviderConfig((current) => {
-        const currentProvider = catalog.providers.find(
-          (provider) => provider.id === current?.providerId,
-        );
-        if (
-          currentProvider
-          && currentProvider.models.some((model) => model.id === current?.model)
-        ) {
-          return current;
-        }
-        return {
-          providerId: catalog.defaultProviderId ?? catalog.providers[0]?.id ?? "",
-          model: catalog.defaultModelId
-            ?? catalog.providers[0]?.models[0]?.id
-            ?? "",
-        };
-      });
-    }).catch((error) => {
-      if (controller.signal.aborted) return;
-      setProjectWorkModelCatalog({
-        status: "error",
-        providers: [],
-        defaultProviderId: "",
-        defaultModelId: "",
-        error: error.message,
-      });
-    });
+    void refreshProjectWorkModels({ signal: controller.signal });
     return () => controller.abort();
-  }, [setProjectWorkProviderConfig]);
+  }, [refreshProjectWorkModels]);
 
   useEffect(() => () => {
     candidateRequestController.current?.abort();
@@ -2453,25 +2461,6 @@ export function App() {
     setProviderOpen(true);
   };
 
-  const installSkill = (skillId) => {
-    setInstallingSkillId(skillId);
-    window.setTimeout(() => {
-      setSkillState((current) => ({
-        ...current,
-        [skillId]: { installed: true, enabled: true },
-      }));
-      setInstallingSkillId(null);
-      showToast("能力包已启用");
-    }, 700);
-  };
-
-  const toggleSkill = (skillId) => {
-    setSkillState((current) => ({
-      ...current,
-      [skillId]: { ...current[skillId], enabled: !current[skillId]?.enabled },
-    }));
-  };
-
   const exportRun = () => {
     const blob = new Blob([runToMarkdown(run)], { type: "text/markdown;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -3354,11 +3343,8 @@ export function App() {
 
       {skillCenterOpen ? (
         <SkillCenter
-          catalog={skillCatalog}
-          skillState={skillState}
-          installingId={installingSkillId}
-          onInstall={installSkill}
-          onToggle={toggleSkill}
+          builtinCatalog={skillCatalog}
+          onStateChange={handleSkillStateChange}
           onClose={() => setSkillCenterOpen(false)}
         />
       ) : null}
@@ -3387,6 +3373,12 @@ export function App() {
             projectWorkMode ? selectedProjectWorkModel : selectedModel,
           )}
           onOpenProvider={openProviderFromSettings}
+          onConnectionsChanged={refreshProjectWorkModels}
+          onOpenSkills={() => {
+            setSettingsView(null);
+            setSkillCenterOpen(true);
+          }}
+          installedSkillCount={installedSkillCount}
           onClose={closeSettings}
         />
       ) : null}

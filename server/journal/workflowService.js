@@ -3,6 +3,7 @@ import { access, lstat, mkdir, open, realpath } from "node:fs/promises";
 import { resolveModelMode } from "../modelMode.js";
 import path from "node:path";
 import { createMineruCloudAdapter, MineruCloudError } from "../mineruCloud.js";
+import { createModelUsageLedger } from "../modelUsageLedger.js";
 import { createModelProviderRegistry } from "../modelProviders.js";
 import { promptRegistry } from "../promptRegistry.js";
 import { createZoteroDesktopAdapter } from "../zoteroDesktop.js";
@@ -23,6 +24,7 @@ import { createProjectContextReader } from "./projectContext.js";
 import { createProjectStatePreviewService } from "./projectStatePreview.js";
 import { createReadingNoteActionService } from "./readingNoteAction.js";
 import { createReadingService } from "./readingService.js";
+import { createJournalModelUsageService } from "./modelUsageService.js";
 import { createRunStore } from "./runStore.js";
 import {
   commitJournalSourceScan,
@@ -193,13 +195,19 @@ export function createJournalWorkflowService({
   fetchImpl = globalThis.fetch,
   dataDir = path.resolve(env.PI_DATA_DIR || ".pi-agent"),
   runStore = createRunStore({ dataDir }),
+  usageLedger = createModelUsageLedger({ dataDir }),
+  modelUsageService = createJournalModelUsageService({ dataDir }),
   sourceStateStore = createSourceStateStore({ dataDir }),
   sourceScanner = scanJournalSources,
   sourceScanCommitter = commitJournalSourceScan,
   candidateRanker = rankCandidates,
   guideGenerator = generateFiveMinuteGuide,
   translationGenerator = translatePaperBatch,
-  modelProviders = createModelProviderRegistry({ env, fetchImpl }),
+  modelProviders = createModelProviderRegistry({
+    env,
+    fetchImpl,
+    usageRecorder: usageLedger.capture,
+  }),
   pdfDownloader = downloadPdf,
   mineruAdapter = env.PI_MINERU_API_TOKEN
     ? createMineruCloudAdapter({
@@ -1724,6 +1732,7 @@ export function createJournalWorkflowService({
       prompt_hash: translationProfile.promptHash,
       status: "running",
       blocks: {},
+      usage_receipts: [],
       last_error: null,
       generated_at: startedAt,
       updated_at: startedAt,
@@ -1793,6 +1802,26 @@ export function createJournalWorkflowService({
               "翻译批次返回的模型或提示来源与当前译文档案不一致",
               502,
             );
+          }
+          if (generated.operation_id && generated.usage) {
+            nextArtifact.usage_receipts = [
+              ...(Array.isArray(nextArtifact.usage_receipts)
+                ? nextArtifact.usage_receipts
+                : []),
+              {
+                schema_version: 1,
+                workflow_scope: "paper_reading",
+                step: "translation",
+                occurred_at: new Date().toISOString(),
+                run_id: runId,
+                paper_id: paperId,
+                provider_id: generated.provider_id,
+                model_id: generated.model_id,
+                operation_id: generated.operation_id,
+                upstream_request_id: generated.upstream_request_id ?? null,
+                usage: generated.usage,
+              },
+            ];
           }
           Object.assign(nextArtifact.blocks, generated.translations);
         } catch (error) {
@@ -2359,6 +2388,10 @@ export function createJournalWorkflowService({
     return runStore.listRuns();
   }
 
+  async function getUsage({ period = "30d" } = {}) {
+    return modelUsageService.getUsage({ period });
+  }
+
   function withArchiveStartLock(runId, task) {
     const previous = archiveStartLocks.get(runId) ?? Promise.resolve();
     const operation = previous.catch(() => undefined).then(task);
@@ -2467,6 +2500,7 @@ export function createJournalWorkflowService({
     promoteReadingConversation: reading.promoteConversation,
     generateReadingStage: reading.generateStage,
     getRun,
+    getUsage,
     getPaperDocument,
     getPaperGuide,
     getPaperImage,

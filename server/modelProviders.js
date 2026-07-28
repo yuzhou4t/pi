@@ -66,6 +66,7 @@ export function createModelProviderRegistry({
   fetchImpl = globalThis.fetch,
   codexRunner = runCodexSubscription,
   deepseekRunner = runDeepSeek,
+  usageRecorder = null,
 } = {}) {
   let codexQueue = Promise.resolve();
 
@@ -121,6 +122,26 @@ export function createModelProviderRegistry({
         timeoutMs: Number.parseInt(env.PI_DEEPSEEK_TIMEOUT_MS || "45000", 10),
       });
     }
+    let usage = result.usage;
+    if (
+      typeof usageRecorder === "function"
+      && result.operationId
+      && result.usage
+    ) {
+      try {
+        usage = await usageRecorder({
+          providerId: request.providerId,
+          modelId: request.modelId,
+          operationId: result.operationId,
+          upstreamRequestId: result.upstreamRequestId ?? null,
+          usage: result.usage,
+        });
+      } catch (error) {
+        console.warn(
+          `Pi Agent model usage capture failed (${error?.code || "unknown"})`,
+        );
+      }
+    }
     return {
       value: parseStructuredText(result.text),
       provider_id: request.providerId,
@@ -128,7 +149,7 @@ export function createModelProviderRegistry({
       reasoning_effort: request.reasoningEffort ?? null,
       operation_id: result.operationId,
       upstream_request_id: result.upstreamRequestId ?? null,
-      usage: result.usage,
+      usage,
     };
   }
 

@@ -44,6 +44,7 @@ import { resolveProjectWorkTurn } from "./projectWorkWorkflows.js";
 import { createMacOSProjectPicker } from "./macosProjectPicker.js";
 import { normalizeProjectWorkImages } from "./projectWorkImages.js";
 import { createProjectRegistry, publicProject } from "./projectRegistry.js";
+import { createSkillPackageService } from "./skillPackageService.js";
 import { normalizeTurnUsage } from "./turnEvidence.js";
 import { createVerificationRunner } from "./verificationRunner.js";
 import {
@@ -1628,6 +1629,263 @@ function defaultDocumentMaxPollAttempts(pollIntervalMs) {
   return Math.max(1, Math.ceil(timeoutMs / Math.max(pollIntervalMs, 1)));
 }
 
+const PROJECT_WORK_USAGE_PERIODS = new Set([
+  "today",
+  "7d",
+  "30d",
+  "all",
+]);
+
+function usagePeriodStart(period, currentDate) {
+  if (period === "all") return null;
+  const start = new Date(currentDate);
+  start.setHours(0, 0, 0, 0);
+  if (period === "7d") start.setDate(start.getDate() - 6);
+  if (period === "30d") start.setDate(start.getDate() - 29);
+  return start;
+}
+
+function usageCatalogIndex(catalog) {
+  const providers = new Map();
+  const models = new Map();
+  for (const provider of catalog?.providers ?? []) {
+    const providerId = compactText(
+      provider?.id ?? provider?.providerId,
+      120,
+    );
+    if (!providerId) continue;
+    providers.set(providerId, provider);
+    for (const model of provider?.models ?? []) {
+      const modelId = compactText(model?.id ?? model?.modelId, 200);
+      if (!modelId) continue;
+      models.set(`${providerId}/${modelId}`, model);
+    }
+  }
+  return { providers, models };
+}
+
+function usageTokens(usage, field) {
+  const value = usage?.[field];
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+export function aggregateProjectWorkUsage({
+  conversations = [],
+  catalog = null,
+  period = "30d",
+  now = new Date(),
+} = {}) {
+  if (!PROJECT_WORK_USAGE_PERIODS.has(period)) {
+    throw projectWorkError(
+      "PROJECT_WORK_USAGE_PERIOD_INVALID",
+      "模型用量时间范围无效",
+      400,
+    );
+  }
+  const currentDate = now instanceof Date ? new Date(now) : new Date(now);
+  if (Number.isNaN(currentDate.getTime())) {
+    throw new TypeError("now must be a valid date");
+  }
+  const periodStart = usagePeriodStart(period, currentDate);
+  const { providers, models: catalogModels } = usageCatalogIndex(catalog);
+  const totals = {
+    calls: 0,
+    tasks: 0,
+    conversations: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    totalTokens: 0,
+    apiEquivalentCostUsd: null,
+    pricedCallCount: 0,
+    unpricedCallCount: 0,
+  };
+  const coverage = {
+    conversationsScanned: conversations.length,
+    legacyMessagesWithoutUsage: 0,
+    undatedAssistantMessages: 0,
+    includedKinds: ["assistant_model_response"],
+    excludedKinds: ["compaction", "branch_summary", "tool_summary"],
+  };
+  const byModel = new Map();
+  const seen = new Set();
+  const totalTaskKeys = new Set();
+  const totalConversationIds = new Set();
+  let pricedCost = 0;
+
+  for (const conversation of conversations) {
+    for (const [messageIndex, message] of (conversation?.messages ?? []).entries()) {
+      if (message?.role !== "assistant") continue;
+      const capturedAt = message.turnEvidence?.capturedAt ?? message.createdAt;
+      const capturedDate = typeof capturedAt === "string"
+        ? new Date(capturedAt)
+        : null;
+      const hasDate = capturedDate && !Number.isNaN(capturedDate.getTime());
+      if (periodStart && !hasDate) {
+        coverage.undatedAssistantMessages += 1;
+        continue;
+      }
+      if (
+        periodStart
+        && (
+          capturedDate < periodStart
+          || capturedDate > currentDate
+        )
+      ) {
+        continue;
+      }
+      const usage = normalizeTurnUsage(message.turnEvidence?.usage);
+      if (!usage) {
+        coverage.legacyMessagesWithoutUsage += 1;
+        continue;
+      }
+      const conversationId = compactText(
+        conversation?.id,
+        180,
+        "conversation",
+      );
+      const identity = `${conversationId}:${
+        compactText(message.id, 180) || `message-${messageIndex}`
+      }`;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+
+      const providerId = compactText(
+        message.turnEvidence?.providerId ?? message.providerId,
+        120,
+        "unknown",
+      );
+      const modelId = compactText(
+        message.turnEvidence?.modelId ?? message.modelId,
+        200,
+        "unknown",
+      );
+      const modelKey = `${providerId}/${modelId}`;
+      const provider = providers.get(providerId);
+      const catalogModel = catalogModels.get(modelKey);
+      const model = byModel.get(modelKey) ?? {
+        providerId,
+        providerName: compactText(
+          provider?.name ?? provider?.label,
+          160,
+          providerId,
+        ),
+        modelId,
+        modelName: compactText(
+          catalogModel?.name ?? catalogModel?.label,
+          200,
+          modelId,
+        ),
+        billingKind: catalogModel?.billingKind
+          ?? (providerId === "openai-codex"
+            ? "chatgpt_subscription"
+            : "unknown"),
+        calls: 0,
+        tasks: 0,
+        conversations: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 0,
+        apiEquivalentCostUsd: null,
+        pricedCallCount: 0,
+        unpricedCallCount: 0,
+        lastUsedAt: null,
+        currentPricing: catalogModel?.pricing ?? null,
+        taskKeys: new Set(),
+        conversationIds: new Set(),
+      };
+      const inputTokens = usageTokens(usage, "inputTokens");
+      const outputTokens = usageTokens(usage, "outputTokens");
+      const cacheReadTokens = usageTokens(usage, "cacheReadTokens");
+      const cacheWriteTokens = usageTokens(usage, "cacheWriteTokens");
+      const totalTokens = Number.isFinite(usage.totalTokens)
+        ? usage.totalTokens
+        : inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+      const costUsd = Number.isFinite(usage.costUsd) && usage.costUsd >= 0
+        ? usage.costUsd
+        : null;
+
+      for (const target of [totals, model]) {
+        target.calls += 1;
+        target.inputTokens += inputTokens;
+        target.outputTokens += outputTokens;
+        target.cacheReadTokens += cacheReadTokens;
+        target.cacheWriteTokens += cacheWriteTokens;
+        target.totalTokens += totalTokens;
+        if (costUsd === null) {
+          target.unpricedCallCount += 1;
+        } else {
+          target.pricedCallCount += 1;
+          target.apiEquivalentCostUsd = (
+            target.apiEquivalentCostUsd ?? 0
+          ) + costUsd;
+        }
+      }
+      const taskKey = `${conversationId}:${
+        compactText(message.turnId, 180) || identity
+      }`;
+      totalTaskKeys.add(taskKey);
+      totalConversationIds.add(conversationId);
+      model.taskKeys.add(taskKey);
+      model.conversationIds.add(conversationId);
+      if (
+        hasDate
+        && (
+          !model.lastUsedAt
+          || capturedDate > new Date(model.lastUsedAt)
+        )
+      ) {
+        model.lastUsedAt = capturedDate.toISOString();
+      }
+      if (costUsd !== null) pricedCost += costUsd;
+      byModel.set(modelKey, model);
+    }
+  }
+
+  totals.tasks = totalTaskKeys.size;
+  totals.conversations = totalConversationIds.size;
+  totals.apiEquivalentCostUsd = totals.pricedCallCount > 0
+    ? pricedCost
+    : null;
+  const modelRows = [...byModel.values()].map((model) => {
+    const {
+      taskKeys,
+      conversationIds,
+      ...publicModel
+    } = model;
+    return {
+      ...publicModel,
+      tasks: taskKeys.size,
+      conversations: conversationIds.size,
+    };
+  });
+  return {
+    schemaVersion: 1,
+    scope: "retained_conversations",
+    workflowScope: "project_work",
+    source: "durable_pi_turn_evidence",
+    costSemantics: "api_equivalent_estimate",
+    period,
+    periodStart: periodStart?.toISOString() ?? null,
+    periodEnd: currentDate.toISOString(),
+    generatedAt: currentDate.toISOString(),
+    quota: {
+      available: false,
+      detail: "供应商未向 Pi Agent 提供可核验的套餐剩余额度",
+    },
+    totals,
+    coverage,
+    models: modelRows.sort((left, right) => (
+      right.totalTokens - left.totalTokens
+      || right.calls - left.calls
+      || left.modelName.localeCompare(right.modelName)
+    )),
+  };
+}
+
 export function createProjectWorkService({
   storageRoot = defaultStorageRoot(),
   sessionFactory,
@@ -1642,11 +1900,16 @@ export function createProjectWorkService({
   picker = createMacOSProjectPicker(),
   runner = createVerificationRunner(),
   previewSupervisor = createProjectPreviewSupervisor(),
+  skillPackageService,
   now = () => new Date(),
   idFactory = randomUUID,
 } = {}) {
   const configuredStorageRoot = path.resolve(storageRoot);
-  const effectiveSessionFactory = sessionFactory ?? createPiSessionFactory();
+  const effectiveSkillPackageService = skillPackageService
+    ?? createSkillPackageService({ storageRoot: configuredStorageRoot });
+  const effectiveSessionFactory = sessionFactory ?? createPiSessionFactory({
+    skillProvider: () => effectiveSkillPackageService.getEnabledSkillPaths(),
+  });
   const createSnapshot = snapshotter;
   const registry = createProjectRegistry({
     storageRoot: configuredStorageRoot,
@@ -3320,7 +3583,18 @@ export function createProjectWorkService({
   async function getRuntime(conversationId) {
     assertConversationNotDeleting(conversationId);
     const current = runtimes.get(conversationId);
-    if (current) return current;
+    const skillRevision = typeof effectiveSkillPackageService.getRevision === "function"
+      ? await effectiveSkillPackageService.getRevision()
+      : 0;
+    if (current && (current.completion || current.skillRevision === skillRevision)) {
+      return current;
+    }
+    if (current) {
+      if (current.eventQueue) await current.eventQueue;
+      current.unsubscribe?.();
+      current.host?.dispose?.();
+      runtimes.delete(conversationId);
+    }
     const conversation = await conversationStore.get(conversationId);
     const paths = conversationPaths(conversationId);
     const workspace = await resolveConversationWorkspace(conversation);
@@ -3356,6 +3630,7 @@ export function createProjectWorkService({
       modelId: conversation.modelId,
       modelRef: conversation.modelRef,
       thinkingLevel: conversation.thinkingLevel,
+      skillRevision,
       activeTurnSettings: null,
       host: null,
       unsubscribe: null,
@@ -3683,6 +3958,97 @@ export function createProjectWorkService({
 
   async function listModels() {
     return loadModelCatalog({ refresh: true });
+  }
+
+  async function listProviderConnections() {
+    assertActive();
+    if (typeof effectiveSessionFactory.listProviderConnections !== "function") {
+      throw projectWorkError(
+        "PROJECT_WORK_PROVIDER_CONNECTIONS_UNAVAILABLE",
+        "Pi 服务商连接当前不可管理",
+        503,
+        true,
+      );
+    }
+    return effectiveSessionFactory.listProviderConnections();
+  }
+
+  async function saveProviderApiKey({ providerId, apiKey } = {}) {
+    assertActive();
+    if (typeof effectiveSessionFactory.saveProviderApiKey !== "function") {
+      throw projectWorkError(
+        "PROJECT_WORK_PROVIDER_CONNECTIONS_UNAVAILABLE",
+        "Pi 服务商连接当前不可管理",
+        503,
+        true,
+      );
+    }
+    const result = await effectiveSessionFactory.saveProviderApiKey({
+      providerId,
+      apiKey,
+    });
+    modelCatalogCache = null;
+    return result;
+  }
+
+  async function removeProviderCredential(providerId) {
+    assertActive();
+    if (typeof effectiveSessionFactory.removeProviderCredential !== "function") {
+      throw projectWorkError(
+        "PROJECT_WORK_PROVIDER_CONNECTIONS_UNAVAILABLE",
+        "Pi 服务商连接当前不可管理",
+        503,
+        true,
+      );
+    }
+    const result = await effectiveSessionFactory.removeProviderCredential(providerId);
+    modelCatalogCache = null;
+    return result;
+  }
+
+  async function listSkillCatalog({ query, sort } = {}) {
+    assertActive();
+    return effectiveSkillPackageService.listCatalog({ query, sort });
+  }
+
+  async function listInstalledSkills() {
+    assertActive();
+    return effectiveSkillPackageService.listInstalled();
+  }
+
+  async function inspectSkillPackage({ name, version } = {}) {
+    assertActive();
+    return effectiveSkillPackageService.inspectPackage({ name, version });
+  }
+
+  async function installSkillPackage({ previewId, previewHash } = {}) {
+    assertActive();
+    return effectiveSkillPackageService.installPackage({
+      previewId,
+      previewHash,
+    });
+  }
+
+  async function setSkillPackageEnabled({ name, enabled } = {}) {
+    assertActive();
+    return effectiveSkillPackageService.setEnabled(name, enabled);
+  }
+
+  async function getUsage({ period = "30d" } = {}) {
+    assertActive();
+    const conversations = await conversationStore.list();
+    let catalog = null;
+    try {
+      catalog = await loadModelCatalog();
+    } catch {
+      // Durable usage remains readable while the live model catalog recovers.
+    }
+    return aggregateProjectWorkUsage({
+      conversations,
+      catalog,
+      period,
+      now: now(),
+    });
   }
 
   async function pickProjectRoot({ mode = "existing", name } = {}) {
@@ -4710,6 +5076,48 @@ export function createProjectWorkService({
         ...publicUserMessage
       } = userMessage;
       await appendEvent(conversationId, "message.created", publicUserMessage);
+      const hostHarnessSnapshot = typeof runtime.host.getHarnessSnapshot === "function"
+        ? runtime.host.getHarnessSnapshot()
+        : null;
+      await appendEvent(conversationId, "harness.snapshot", {
+        schemaVersion: 1,
+        runtime: hostHarnessSnapshot?.runtime ?? "pi-sdk",
+        harnessVersion: hostHarnessSnapshot?.harnessVersion ?? "project-work-v1",
+        providerId: turnSettings.providerId,
+        modelId: turnSettings.modelId,
+        thinkingLevel: turnSettings.thinkingLevel,
+        activeTools: Array.isArray(hostHarnessSnapshot?.activeTools)
+          ? hostHarnessSnapshot.activeTools
+          : [...turn.toolNames],
+        skills: Array.isArray(hostHarnessSnapshot?.skills)
+          ? hostHarnessSnapshot.skills
+          : [],
+        context: hostHarnessSnapshot?.context ?? {
+          workspace: conversationWorkspaceKind(existingConversation),
+          snapshot: existingConversation.workspaceSnapshot?.truncated === true
+            ? "bounded"
+            : "current",
+          projectRules: 0,
+          conversationDocuments: "on_demand",
+        },
+        prompt: hostHarnessSnapshot?.prompt ?? {
+          layers: [],
+          policyHash: null,
+        },
+        disclosure: hostHarnessSnapshot?.disclosure ?? {
+          publicAnswer: true,
+          toolLifecycle: true,
+          privateReasoning: false,
+          sensitiveValues: false,
+        },
+        executionPolicy: {
+          mode: turnSettings.executionPolicyMode,
+          revision: turnSettings.executionPolicyRevision,
+          version: turnSettings.executionPolicyVersion,
+        },
+        workflowId: turnSettings.workflowId,
+        capabilities: turnSettings.capabilities,
+      });
     } catch (error) {
       const safeError = safeProjectWorkError(error);
       await updateConversation(conversationId, {
@@ -7667,14 +8075,18 @@ export function createProjectWorkService({
     getConversationTree,
     getGitEvidence,
     getProjectTree,
+    getUsage,
     getWorkspace,
     enqueueFollowUp,
     listApplyJournal,
     listAskUserRequests,
     listConversations,
     listFollowUps,
+    listInstalledSkills,
     listModels,
+    listProviderConnections,
     listProjects,
+    listSkillCatalog,
     listStandaloneConversations,
     listVerifications,
     markConversationRead,
@@ -7684,10 +8096,13 @@ export function createProjectWorkService({
     readProjectFile,
     readProjectImage,
     registerProject,
+    inspectSkillPackage,
+    installSkillPackage,
     removeConversation,
     removeConversationDocument,
     removeFollowUp,
     removeProject,
+    removeProviderCredential,
     removeStandaloneConversation,
     renameConversation,
     renameStandaloneConversation,
@@ -7695,7 +8110,9 @@ export function createProjectWorkService({
     retryLastTurn,
     resumeVerificationRepair,
     runVerification,
+    saveProviderApiKey,
     sendMessage,
+    setSkillPackageEnabled,
     startPreview,
     steerConversation,
     subscribeEvents: conversationStore.subscribe,

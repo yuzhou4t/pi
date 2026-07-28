@@ -72,6 +72,9 @@ test("translation forwards and audits the selected reasoning profile", async () 
           provider_id: request.providerId,
           model_id: request.modelId,
           reasoning_effort: request.reasoningEffort,
+          operation_id: "translation-operation-1",
+          upstream_request_id: "translation-request-1",
+          usage: { total_tokens: 12 },
         };
       },
     },
@@ -80,6 +83,9 @@ test("translation forwards and audits the selected reasoning profile", async () 
   assert.equal(received.reasoningEffort, "low");
   assert.equal(generated.model_id, "gpt-5.3-codex-spark");
   assert.equal(generated.reasoning_effort, "low");
+  assert.equal(generated.operation_id, "translation-operation-1");
+  assert.equal(generated.upstream_request_id, "translation-request-1");
+  assert.deepEqual(generated.usage, { total_tokens: 12 });
 });
 
 test("live mode validates coverage and rejects untranslated prose", async () => {

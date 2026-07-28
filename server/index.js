@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { CandidateSummaryError, createCandidateSummaryService } from "./candidateSummaries.js";
 import { HttpRangeError, parseByteRange } from "./httpRange.js";
 import { createJournalWorkflowService } from "./journal/workflowService.js";
+import { combineModelUsageReports } from "./journal/modelUsageService.js";
+import { createModelUsageLedger } from "./modelUsageLedger.js";
 import { SOURCE_REGISTRY, SOURCE_REGISTRY_VERSION } from "./journal/sourceRegistry.js";
 import { createWeeklyJournalScheduler } from "./journal/weeklyScheduler.js";
 import {
@@ -34,8 +36,16 @@ const allowedOrigins = new Set([
 const projectWorkClientRequestIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const journalClientRequestIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const sha256Pattern = /^sha256:[a-f0-9]{64}$/;
-const candidateSummaries = createCandidateSummaryService();
-const journalWorkflow = createJournalWorkflowService();
+const piDataDir = path.resolve(process.env.PI_DATA_DIR || ".pi-agent");
+const paperUsageLedger = createModelUsageLedger({ dataDir: piDataDir });
+const candidateSummaries = createCandidateSummaryService({
+  dataDir: piDataDir,
+  usageRecorder: paperUsageLedger.capture,
+});
+const journalWorkflow = createJournalWorkflowService({
+  dataDir: piDataDir,
+  usageLedger: paperUsageLedger,
+});
 const projectWorkRuntimeOnly = process.env.PI_PROJECT_WORK_RUNTIME_ONLY === "1";
 const configuredProjectWorkRuntimeUrl = normalizeProjectWorkRuntimeUrl(
   process.env.PI_PROJECT_WORK_RUNTIME_URL,
@@ -1179,6 +1189,75 @@ export function createApiServer({
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/api/v1/model-usage") {
+    const period = url.searchParams.get("period") || "30d";
+    const workflow = url.searchParams.get("workflow") || "all";
+    if (
+      !["today", "7d", "30d", "all"].includes(period)
+      || !["all", "project_work", "paper_reading"].includes(workflow)
+    ) {
+      sendJson(response, 400, {
+        error: {
+          code: "MODEL_USAGE_FILTER_INVALID",
+          message: "模型用量筛选条件无效",
+          retryable: false,
+        },
+      }, origin);
+      return;
+    }
+    const reports = [];
+    const accessIssues = [];
+    if (workflow !== "paper_reading") {
+      try {
+        if (projectWorkService?.getUsage) {
+          reports.push(await projectWorkService.getUsage({ period }));
+        } else if (projectWorkRuntimeUrl) {
+          const runtimeUsageUrl = new URL(
+            `/api/v1/project-work/usage?period=${encodeURIComponent(period)}`,
+            projectWorkRuntimeUrl,
+          );
+          const runtimeResponse = await fetch(runtimeUsageUrl, {
+            headers: { accept: "application/json" },
+          });
+          const runtimeBody = await runtimeResponse.text();
+          if (!runtimeResponse.ok || Buffer.byteLength(runtimeBody) > 2 * 1024 * 1024) {
+            throw new Error("PROJECT_WORK_USAGE_UNAVAILABLE");
+          }
+          reports.push(JSON.parse(runtimeBody));
+        } else {
+          throw new Error("PROJECT_WORK_USAGE_UNAVAILABLE");
+        }
+      } catch {
+        accessIssues.push({
+          workflowScope: "project_work",
+          code: "PROJECT_WORK_USAGE_UNAVAILABLE",
+          message: "正常工作用量暂时无法读取",
+        });
+      }
+    }
+    if (workflow !== "project_work") {
+      try {
+        if (runtimeOnly || !journalWorkflowService?.getUsage) {
+          throw new Error("PAPER_USAGE_UNAVAILABLE");
+        }
+        reports.push(await journalWorkflowService.getUsage({ period }));
+      } catch {
+        accessIssues.push({
+          workflowScope: "paper_reading",
+          code: "PAPER_USAGE_UNAVAILABLE",
+          message: "论文精读用量暂时无法读取",
+        });
+      }
+    }
+    sendJson(response, 200, combineModelUsageReports({
+      reports,
+      period,
+      workflow,
+      accessIssues,
+    }), origin);
+    return;
+  }
+
   if (runtimeOnly && !url.pathname.startsWith("/api/v1/project-work")) {
     sendJson(response, 404, {
       error: {
@@ -1200,8 +1279,143 @@ export function createApiServer({
       return;
     }
     try {
+      if (
+        request.method === "GET"
+        && url.pathname === "/api/v1/project-work/skills/installed"
+      ) {
+        sendJson(
+          response,
+          200,
+          await projectWorkService.listInstalledSkills(),
+          origin,
+        );
+        return;
+      }
+
+      if (
+        request.method === "GET"
+        && url.pathname === "/api/v1/project-work/skills"
+      ) {
+        sendJson(
+          response,
+          200,
+          await projectWorkService.listSkillCatalog({
+            query: url.searchParams.get("query") || "",
+            sort: url.searchParams.get("sort") || "downloads",
+          }),
+          origin,
+        );
+        return;
+      }
+
+      if (
+        request.method === "POST"
+        && url.pathname === "/api/v1/project-work/skill-previews"
+      ) {
+        requireProjectWorkMutationOrigin(origin);
+        const payload = await readProjectWorkJson(request, { maxBytes: 16 * 1024 });
+        sendJson(
+          response,
+          200,
+          await projectWorkService.inspectSkillPackage({
+            name: payload.name,
+            version: payload.version,
+          }),
+          origin,
+        );
+        return;
+      }
+
+      if (
+        request.method === "POST"
+        && url.pathname === "/api/v1/project-work/skills"
+      ) {
+        requireProjectWorkMutationOrigin(origin);
+        const payload = await readProjectWorkJson(request, { maxBytes: 16 * 1024 });
+        sendJson(
+          response,
+          201,
+          await projectWorkService.installSkillPackage({
+            previewId: payload.preview_id,
+            previewHash: payload.preview_hash,
+          }),
+          origin,
+        );
+        return;
+      }
+
+      const skillPackageMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/skills\/([^/]+)$/,
+      );
+      if (skillPackageMatch && request.method === "PATCH") {
+        requireProjectWorkMutationOrigin(origin);
+        const payload = await readProjectWorkJson(request, { maxBytes: 8 * 1024 });
+        sendJson(
+          response,
+          200,
+          await projectWorkService.setSkillPackageEnabled({
+            name: decodeProjectWorkSegment(skillPackageMatch[1]),
+            enabled: payload.enabled === true,
+          }),
+          origin,
+        );
+        return;
+      }
+
+      if (
+        request.method === "GET"
+        && url.pathname === "/api/v1/project-work/provider-connections"
+      ) {
+        sendJson(
+          response,
+          200,
+          await projectWorkService.listProviderConnections(),
+          origin,
+        );
+        return;
+      }
+
+      const providerConnectionMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/provider-connections\/([^/]+)$/,
+      );
+      if (providerConnectionMatch && request.method === "PUT") {
+        requireProjectWorkMutationOrigin(origin);
+        const providerId = decodeProjectWorkSegment(providerConnectionMatch[1]);
+        const payload = await readProjectWorkJson(request, { maxBytes: 24 * 1024 });
+        sendJson(
+          response,
+          200,
+          await projectWorkService.saveProviderApiKey({
+            providerId,
+            apiKey: payload.api_key,
+          }),
+          origin,
+        );
+        return;
+      }
+
+      if (providerConnectionMatch && request.method === "DELETE") {
+        requireProjectWorkMutationOrigin(origin);
+        sendJson(
+          response,
+          200,
+          await projectWorkService.removeProviderCredential(
+            decodeProjectWorkSegment(providerConnectionMatch[1]),
+          ),
+          origin,
+        );
+        return;
+      }
+
       if (request.method === "GET" && url.pathname === "/api/v1/project-work/models") {
         sendJson(response, 200, await projectWorkService.listModels(), origin);
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/v1/project-work/usage") {
+        sendJson(response, 200, await projectWorkService.getUsage({
+          period: url.searchParams.get("period") || "30d",
+        }), origin);
         return;
       }
 
@@ -3581,7 +3795,7 @@ if (isMainModule) {
   )
     ? createWeeklyJournalScheduler({
         workflowService: journalWorkflow,
-        dataDir: path.resolve(process.env.PI_DATA_DIR || ".pi-agent"),
+        dataDir: piDataDir,
       })
     : null;
   server.listen(port, host, () => {

@@ -207,6 +207,48 @@ test("model output for an unknown paper is rejected and not cached", async () =>
   assert.equal(callCount, 2);
 });
 
+test("candidate usage is recorded before malformed provider output is rejected", async () => {
+  const captured = [];
+  const service = createCandidateSummaryService({
+    env: { PI_MODEL_MODE: "live" },
+    dataDir: null,
+    codexRunner: async () => providerResult(validModelItems, {
+      text: "not json",
+      operationId: "candidate-invalid-output",
+      upstreamRequestId: "upstream-invalid-output",
+    }),
+    usageRecorder: async (receipt) => {
+      captured.push(receipt);
+      return receipt.usage;
+    },
+  });
+
+  await assert.rejects(
+    service.summarize(createPayload()),
+    (error) => (
+      error instanceof CandidateSummaryError
+      && error.code === "MODEL_OUTPUT_INVALID"
+    ),
+  );
+  assert.equal(captured.length, 1);
+  assert.deepEqual(captured[0], {
+    providerId: "codex-subscription",
+    modelId: "account-default",
+    operationId: "candidate-invalid-output",
+    upstreamRequestId: "upstream-invalid-output",
+    usage: {
+      input_tokens: 120,
+      cached_input_tokens: 0,
+      output_tokens: 35,
+      total_tokens: 155,
+    },
+    step: "candidate_summaries",
+    runId: "run-test",
+    inputHash: captured[0].inputHash,
+  });
+  assert.match(captured[0].inputHash, /^sha256:[a-f0-9]{64}$/);
+});
+
 test("cache write failure preserves the paid result and memory cache prevents a repeat call", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-cache-write-"));
   t.after(() => rm(dataDir, { recursive: true, force: true }));

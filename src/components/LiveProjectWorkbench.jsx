@@ -217,6 +217,7 @@ const QUIET_EVENT_TYPES = new Set([
   "message.partial",
   "message.update",
   "assistant.delta",
+  "harness.snapshot",
   "plan.updated",
   "workspace.recorded",
   "document.created",
@@ -229,6 +230,7 @@ const QUIET_EVENT_TYPES = new Set([
 ]);
 
 const ARTIFACT_STORAGE_KEY = "pi-agent-project-work-artifacts-v1";
+const TRANSPARENT_MODE_STORAGE_KEY = "pi-agent-project-work-transparent-mode-v1";
 const PROJECT_MARKDOWN_COMPONENTS = {
   a: ({ node: _node, href, children, ...props }) => {
     const opensNewTab = /^https?:\/\//i.test(href ?? "");
@@ -267,6 +269,27 @@ function writeLastArtifact(conversationId, artifactId) {
     );
   } catch {
     // Artifact preference is optional; the live conversation remains authoritative.
+  }
+}
+
+function readTransparentMode() {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(TRANSPARENT_MODE_STORAGE_KEY) === "on";
+  } catch {
+    return false;
+  }
+}
+
+function writeTransparentMode(enabled) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      TRANSPARENT_MODE_STORAGE_KEY,
+      enabled ? "on" : "off",
+    );
+  } catch {
+    // The display preference is optional and never changes the Agent runtime.
   }
 }
 
@@ -825,17 +848,82 @@ function updateCommandSummary(event, commandEvent, running) {
   ].filter(Boolean).join(" · ");
 }
 
-export function normalizeActivityEvents(events, running, phase = null) {
+function currentTurnActivityEvents(events) {
   const safeEvents = Array.isArray(events) ? events : [];
   const latestMessageSeq = safeEvents.reduce((latest, event) => (
     event.type === "message.created" && Number.isSafeInteger(event.seq)
       ? Math.max(latest, event.seq)
       : latest
   ), 0);
-  const currentTurnEvents = safeEvents.filter((event) => (
-    !QUIET_EVENT_TYPES.has(event.type)
-    && !(latestMessageSeq > 0 && event.seq < latestMessageSeq)
+  return {
+    latestMessageSeq,
+    events: safeEvents.filter((event) => (
+      latestMessageSeq === 0 || event.seq >= latestMessageSeq
+    )),
+  };
+}
+
+function formatTraceDuration(milliseconds) {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return null;
+  if (milliseconds < 1_000) return "<1 秒";
+  const seconds = Math.round(milliseconds / 100) / 10;
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const remaining = Math.round(seconds - minutes * 60);
+  return remaining > 0 ? `${minutes} 分 ${remaining} 秒` : `${minutes} 分`;
+}
+
+function formatTraceTokens(value) {
+  if (!Number.isFinite(value) || value < 0) return null;
+  if (value < 1_000) return `${Math.round(value)} Token`;
+  const compact = Math.round(value / 100) / 10;
+  return `${compact}k Token`;
+}
+
+export function summarizeActivityTrace(events) {
+  const currentTurn = currentTurnActivityEvents(events).events;
+  const modelTurns = currentTurn.filter(
+    (event) => event.type === "turn.started",
+  ).length;
+  const toolCalls = collapseToolActivity(
+    currentTurn.filter((event) => TOOL_ACTIVITY_TYPES.has(event.type)),
+  ).length;
+  const startedAt = Date.parse(
+    currentTurn.find((event) => event.type === "message.created")?.createdAt
+      ?? currentTurn.find((event) => event.type === "message.created")?.at
+      ?? currentTurn.find((event) => event.type === "turn.started")?.createdAt
+      ?? currentTurn.find((event) => event.type === "turn.started")?.at
+      ?? "",
+  );
+  const completedEvent = [...currentTurn].reverse().find((event) => (
+    event.type === "message.completed" || event.type === "turn.completed"
   ));
+  const completedAt = Date.parse(
+    completedEvent?.createdAt ?? completedEvent?.at ?? "",
+  );
+  const duration = Number.isFinite(startedAt) && Number.isFinite(completedAt)
+    ? formatTraceDuration(completedAt - startedAt)
+    : null;
+  const totalTokens = currentTurn
+    .filter((event) => event.type === "turn.completed")
+    .reduce((sum, event) => (
+      sum + (Number(event.data?.usage?.totalTokens) || 0)
+    ), 0);
+  return [
+    modelTurns > 0 ? `${modelTurns} 轮模型` : "",
+    toolCalls > 0 ? `${toolCalls} 次工具` : "",
+    duration ?? "",
+    totalTokens > 0 ? formatTraceTokens(totalTokens) : "",
+  ].filter(Boolean).join(" · ");
+}
+
+export function normalizeActivityEvents(events, running, phase = null) {
+  const safeEvents = Array.isArray(events) ? events : [];
+  const currentTurn = currentTurnActivityEvents(safeEvents);
+  const latestMessageSeq = currentTurn.latestMessageSeq;
+  const currentTurnEvents = currentTurn.events.filter(
+    (event) => !QUIET_EVENT_TYPES.has(event.type),
+  );
   const completedVerificationIds = new Set(
     currentTurnEvents
       .filter((event) => event.type === "verification.completed" && event.eventId)
@@ -968,21 +1056,107 @@ export function normalizeActivityEvents(events, running, phase = null) {
   return normalized.slice(-100);
 }
 
-function ActivityTimeline({
+function HarnessSnapshot({ event }) {
+  const snapshot = event?.data;
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const tools = Array.isArray(snapshot.activeTools) ? snapshot.activeTools : [];
+  const skills = Array.isArray(snapshot.skills) ? snapshot.skills : [];
+  const layers = Array.isArray(snapshot.prompt?.layers)
+    ? snapshot.prompt.layers
+    : [];
+  const model = [snapshot.providerId, snapshot.modelId]
+    .filter(Boolean)
+    .join(" / ");
+  const thinking = THINKING_LEVEL_LABELS[snapshot.thinkingLevel]
+    ?? snapshot.thinkingLevel
+    ?? "未记录";
+  const workspace = snapshot.context?.workspace === "scratch"
+    ? "独立对话工作区"
+    : "项目审阅工作区";
+  const snapshotScope = snapshot.context?.snapshot === "bounded"
+    ? "有边界快照"
+    : "当前安全快照";
+
+  return (
+    <details className="project-harness-snapshot">
+      <summary>
+        <ShieldCheck size={14} weight="fill" aria-hidden="true" />
+        <span>
+          <strong>Harness 快照</strong>
+          <small>{snapshot.harnessVersion ?? "project-work"}</small>
+        </span>
+        <CaretDown size={12} aria-hidden="true" />
+      </summary>
+      <div className="project-harness-snapshot-body">
+        <dl>
+          <div>
+            <dt>模型</dt>
+            <dd>{model || "未记录"} · {thinking}</dd>
+          </div>
+          <div>
+            <dt>工具</dt>
+            <dd>
+              {tools.length > 0
+                ? tools.map((name) => TOOL_LABELS[name] ?? name).join("、")
+                : "本轮未启用工具"}
+            </dd>
+          </div>
+          <div>
+            <dt>Skills</dt>
+            <dd>{skills.length > 0 ? skills.join("、") : "本轮未启用 Skill"}</dd>
+          </div>
+          <div>
+            <dt>上下文</dt>
+            <dd>
+              {workspace} · {snapshotScope}
+              {snapshot.context?.projectRules > 0
+                ? ` · ${snapshot.context.projectRules} 份项目规则`
+                : ""}
+            </dd>
+          </div>
+        </dl>
+        {layers.length > 0 ? (
+          <p className="project-harness-prompt">
+            <strong>提示结构</strong>
+            <span>{layers.join(" → ")}</span>
+          </p>
+        ) : null}
+        <p className="project-harness-boundary">
+          展示可审计事件和公开输出；私有推理、密钥与未脱敏内容不会进入浏览器。
+        </p>
+      </div>
+    </details>
+  );
+}
+
+export function ActivityTimeline({
   events,
   running,
   compact,
+  transparentMode = false,
   phase,
   onOpenArtifact,
 }) {
-  const [expanded, setExpanded] = useState(!compact);
+  const [expanded, setExpanded] = useState(
+    transparentMode ? true : !compact,
+  );
   const visibleEvents = normalizeActivityEvents(events, running, phase);
+  const currentTurn = currentTurnActivityEvents(events).events;
+  const harnessEvent = [...currentTurn]
+    .reverse()
+    .find((event) => event.type === "harness.snapshot");
+  const traceSummary = summarizeActivityTrace(events);
 
   useEffect(() => {
-    setExpanded(!compact);
-  }, [compact]);
+    setExpanded(transparentMode ? true : !compact);
+  }, [compact, transparentMode]);
 
-  if (visibleEvents.length === 0) return null;
+  if (
+    visibleEvents.length === 0
+    && !(transparentMode && harnessEvent)
+  ) {
+    return null;
+  }
   return (
     <section
       className={[
@@ -1006,16 +1180,25 @@ function ActivityTimeline({
           <CheckCircle size={15} weight="fill" aria-hidden="true" />
         )}
         <span>
-          <strong>{running ? "Agent 正在工作" : "已完成"}</strong>
+          <strong>
+            {transparentMode
+              ? "Agent 透视"
+              : running
+                ? "Agent 正在工作"
+                : "已完成"}
+          </strong>
           <small>
-            {running
-              ? `${visibleEvents.length} 项实时进展`
-              : `${visibleEvents.length} 项 · 查看过程`}
+            {transparentMode
+              ? traceSummary || `${visibleEvents.length} 项过程`
+              : running
+                ? `${visibleEvents.length} 项实时进展`
+                : `${visibleEvents.length} 项 · 查看过程`}
           </small>
         </span>
         <CaretDown size={13} aria-hidden="true" />
       </button>
       <div className="project-activity-body" hidden={!expanded}>
+        {transparentMode ? <HarnessSnapshot event={harnessEvent} /> : null}
         {visibleEvents.map((event, index) => (
           <ActivityEvent
             event={event}
@@ -1909,6 +2092,8 @@ export function ProjectAgentPane({
   executionPolicyControl,
   thinkingLevelControl,
   contextUsageControl,
+  transparentMode = false,
+  onTransparentModeChange,
   pdfInputRef,
   uploadingPdf,
   onUploadPdf,
@@ -2030,6 +2215,7 @@ export function ProjectAgentPane({
         events={submitting && !running ? [] : conversation.events}
         running={workActive}
         compact={compact}
+        transparentMode={transparentMode}
         phase={submitting && !running ? "submitting" : null}
         onOpenArtifact={onOpenArtifact}
       />
@@ -2049,6 +2235,18 @@ export function ProjectAgentPane({
           <strong>{statusLabel}</strong>
         </div>
         <div className="live-project-session-actions">
+          <button
+            className={`header-meta-pill project-insight-toggle${transparentMode ? " is-active" : ""}`}
+            type="button"
+            aria-pressed={transparentMode}
+            title={transparentMode
+              ? "关闭后恢复精简的默认过程"
+              : "显示 Harness、模型轮次、工具与用量详情"}
+            onClick={() => onTransparentModeChange?.(!transparentMode)}
+          >
+            <Gauge size={13} weight={transparentMode ? "fill" : "regular"} aria-hidden="true" />
+            {transparentMode ? "透明模式 · 开" : "透明模式"}
+          </button>
           {running ? (
             <button
               className="header-meta-pill"
@@ -4015,6 +4213,7 @@ export function LiveProjectWorkbench({
   const [contextUsageOpen, setContextUsageOpen] = useState(false);
   const [executionPolicyOpen, setExecutionPolicyOpen] = useState(false);
   const [capabilityOpen, setCapabilityOpen] = useState(false);
+  const [transparentMode, setTransparentMode] = useState(readTransparentMode);
   const [selectedCapabilityIds, setSelectedCapabilityIds] = useState([]);
   const [selectedWorkflowId, setSelectedWorkflowId] = useState(null);
   const [runningMessageMode, setRunningMessageMode] = useState("steer");
@@ -4143,6 +4342,10 @@ export function LiveProjectWorkbench({
   useEffect(() => {
     writeLastArtifact(snapshot?.id, activeArtifactId);
   }, [activeArtifactId, snapshot?.id]);
+
+  useEffect(() => {
+    writeTransparentMode(transparentMode);
+  }, [transparentMode]);
 
   useEffect(() => {
     setPreviewError(null);
@@ -5056,6 +5259,8 @@ export function LiveProjectWorkbench({
               onCompact={compactContext}
             />
           )}
+          transparentMode={transparentMode}
+          onTransparentModeChange={setTransparentMode}
           pdfInputRef={pdfInputRef}
           uploadingPdf={uploadingPdf}
           onUploadPdf={uploadPdf}

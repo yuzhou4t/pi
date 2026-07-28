@@ -100,6 +100,42 @@ test("Pi-style provider registry forwards the fixed Spark reasoning profile", as
   assert.equal(result.reasoning_effort, "low");
 });
 
+test("provider usage is recorded before malformed structured output is rejected", async () => {
+  const captured = [];
+  const registry = createModelProviderRegistry({
+    deepseekRunner: async () => ({
+      text: "not json",
+      operationId: "deepseek-invalid-output",
+      upstreamRequestId: "upstream-invalid-output",
+      usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+    }),
+    usageRecorder: async (receipt) => {
+      captured.push(receipt);
+      return receipt.usage;
+    },
+  });
+
+  await assert.rejects(registry.completeStructured({
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+    system: "system",
+    prompt: "prompt",
+    input: {},
+    schema,
+  }), (error) => (
+    error instanceof ModelProviderRegistryError
+    && error.code === "MODEL_OUTPUT_INVALID"
+  ));
+  assert.equal(captured.length, 1);
+  assert.deepEqual(captured[0], {
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+    operationId: "deepseek-invalid-output",
+    upstreamRequestId: "upstream-invalid-output",
+    usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+  });
+});
+
 test("unknown providers and malformed JSON outputs are rejected", async () => {
   const registry = createModelProviderRegistry({
     deepseekRunner: async () => ({

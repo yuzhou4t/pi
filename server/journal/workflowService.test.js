@@ -118,7 +118,7 @@ function supportedModelRegistry() {
   };
 }
 
-function translationResult(translations) {
+function translationResult(translations, overrides = {}) {
   const prompt = promptRegistry.loadPrompt("translation");
   return {
     translations,
@@ -131,8 +131,56 @@ function translationResult(translations) {
     model_id: "gpt-5.3-codex-spark",
     reasoning_effort: "low",
     usage: null,
+    ...overrides,
   };
 }
+
+test("workflow wires the injected usage ledger into its default model registry", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-usage-ledger-"));
+  let captureReads = 0;
+  const usageLedger = {};
+  Object.defineProperty(usageLedger, "capture", {
+    get() {
+      captureReads += 1;
+      return async ({ usage }) => usage;
+    },
+  });
+
+  createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore: createRunStore({ dataDir }),
+    usageLedger,
+    modelUsageService: { getUsage: async () => ({}) },
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+  });
+
+  assert.equal(captureReads, 1);
+});
+
+test("workflow delegates paper usage queries to the injected usage service", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-usage-service-"));
+  const calls = [];
+  const expected = { period: "7d", totals: { totalTokens: 123 } };
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore: createRunStore({ dataDir }),
+    modelUsageService: {
+      getUsage: async (options) => {
+        calls.push(options);
+        return expected;
+      },
+    },
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+    modelProviders: supportedModelRegistry(),
+  });
+
+  assert.strictEqual(await service.getUsage({ period: "7d" }), expected);
+  assert.deepEqual(calls, [{ period: "7d" }]);
+});
 
 test("workflow runs scan, ranks five papers, submits one MinerU batch, and becomes review ready", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-workflow-"));
@@ -1234,6 +1282,75 @@ test("full-text translation runs in bounded batches and stays durable per revisi
   assert.equal(done.document_revision, document.revision);
   for (const zh of Object.values(done.blocks)) assert.ok(zh.length > 0);
 
+});
+
+test("successful model translation batches persist usage receipts", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun(
+    "pi-agent-translation-usage-",
+  );
+  const usage = {
+    input_tokens: 90,
+    cached_input_tokens: 30,
+    output_tokens: 10,
+    total_tokens: 100,
+    billing: {
+      kind: "chatgpt_subscription",
+      api_equivalent_cost_usd: null,
+      cost_source: "unpriced",
+    },
+  };
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    mineruAdapter: null,
+    modelProviders: supportedModelRegistry(),
+    translationGenerator: async ({ batch }) => translationResult(
+      Object.fromEntries(batch.map((block) => [
+        block.block_id,
+        `【译】${block.source}`,
+      ])),
+      {
+        source: "model",
+        operation_id: "translation-operation-1",
+        upstream_request_id: "translation-request-1",
+        usage,
+      },
+    ),
+  });
+
+  await service.generatePaperTranslation(runId, "paper-1");
+  await service.waitForTranslation(runId, "paper-1");
+
+  const artifact = await runStore.readArtifact(
+    runId,
+    "translation/paper-1.json",
+  );
+  assert.equal(artifact.status, "ready");
+  assert.equal(artifact.usage_receipts.length, 1);
+  const [receipt] = artifact.usage_receipts;
+  assert.deepEqual({
+    workflow_scope: receipt.workflow_scope,
+    step: receipt.step,
+    run_id: receipt.run_id,
+    paper_id: receipt.paper_id,
+    provider_id: receipt.provider_id,
+    model_id: receipt.model_id,
+    operation_id: receipt.operation_id,
+    upstream_request_id: receipt.upstream_request_id,
+  }, {
+    workflow_scope: "paper_reading",
+    step: "translation",
+    run_id: runId,
+    paper_id: "paper-1",
+    provider_id: "codex-subscription",
+    model_id: "gpt-5.3-codex-spark",
+    operation_id: "translation-operation-1",
+    upstream_request_id: "translation-request-1",
+  });
+  assert.deepEqual(receipt.usage, usage);
+  assert.match(receipt.occurred_at, /^\d{4}-\d{2}-\d{2}T/);
 });
 
 test("full-text translation reports formula passthrough separately from model progress", async () => {
