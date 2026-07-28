@@ -62,6 +62,8 @@ import {
 } from "./workspace.js";
 
 const SELECTION_TTL_MS = 10 * 60 * 1_000;
+const ASSISTANT_PARTIAL_INTERVAL_MS = 250;
+const ASSISTANT_PARTIAL_GROWTH_CHARS = 512;
 const LEGACY_THINKING_LEVELS = [
   "off",
   "minimal",
@@ -864,14 +866,15 @@ function conversationWorkspaceKind(conversation) {
 function normalizedWorkspaceRecord(conversation, at = null) {
   const conversationKind = conversationWorkspaceKind(conversation);
   const kind = conversationKind === "scratch" ? "scratch" : "sparse_overlay";
+  const recoverableIsolation = ["scratch", "sparse_overlay"].includes(kind);
   const defaults = {
     schemaVersion: 1,
     id: `workspace-${conversation.id}`,
     kind,
     isolation: kind === "scratch" ? "private_scratch" : "review_overlay",
     recovery: "apply_journal_v1",
-    recoverableIsolation: kind === "scratch",
-    automaticApplyAllowed: kind === "scratch",
+    recoverableIsolation,
+    automaticApplyAllowed: recoverableIsolation,
     status: "ready",
     rootLabel: kind === "scratch"
       ? STANDALONE_ROOT_LABEL
@@ -885,16 +888,15 @@ function normalizedWorkspaceRecord(conversation, at = null) {
     return defaults;
   }
   const sourceMatchesKind = source.kind === kind;
+  const status = sourceMatchesKind
+    && ["ready", "recovering", "recovery_blocked"].includes(source.status)
+    ? source.status
+    : "ready";
   return {
     ...defaults,
-    recoverableIsolation: sourceMatchesKind
-      && source.recoverableIsolation === true,
-    automaticApplyAllowed: sourceMatchesKind
-      && source.recoverableIsolation === true
-      && source.automaticApplyAllowed === true,
-    status: ["ready", "recovering", "recovery_blocked"].includes(source.status)
-      ? source.status
-      : "ready",
+    recoverableIsolation,
+    automaticApplyAllowed: recoverableIsolation && status === "ready",
+    status,
     revision: Number.isSafeInteger(source.revision) && source.revision > 0
       ? source.revision
       : 1,
@@ -2872,11 +2874,15 @@ export function createProjectWorkService({
             === turnSettings.executionPolicyRevision
         ),
       );
+      const verificationIsolated = normalizedWorkspaceRecord(
+        current,
+      ).recoverableIsolation === true;
       for (const verification of currentTurnVerifications) {
         const verificationDecision = changeApplied
           ? reviewAutoVerification(verification, {
               workflowId: turnSettings.workflowId,
               turnId: turnSettings.turnId,
+              isolated: verificationIsolated,
             })
           : {
               decision: "deny",
@@ -2928,8 +2934,7 @@ export function createProjectWorkService({
   }
 
   async function beginRuntimeThinking(runtime) {
-    if (runtime.thinkingObserved) return;
-    runtime.thinkingObserved = true;
+    if (runtime.thinkingActive) return;
     runtime.thinkingActive = true;
     await appendEvent(runtime.conversationId, "agent.thinking", {
       status: "active",
@@ -2942,6 +2947,67 @@ export function createProjectWorkService({
     await appendEvent(runtime.conversationId, "agent.thinking", {
       status: "finished",
     });
+  }
+
+  function resetAssistantPartialState(runtime) {
+    runtime.partialPublished = false;
+    runtime.partialPublishedLength = 0;
+    runtime.partialLastPublishedAtMs = null;
+    runtime.partialRevision = 0;
+  }
+
+  async function flushAssistantPartial(runtime, turnSettings, {
+    force = false,
+  } = {}) {
+    if (!runtime.activeAssistantId || runtime.assistantText.length === 0) {
+      return false;
+    }
+    const textLength = runtime.assistantText.length;
+    if (
+      runtime.partialPublished
+      && textLength === runtime.partialPublishedLength
+    ) {
+      return false;
+    }
+    const currentTimeMs = now().getTime();
+    const elapsedMs = runtime.partialLastPublishedAtMs === null
+      ? 0
+      : currentTimeMs - runtime.partialLastPublishedAtMs;
+    const growth = textLength - runtime.partialPublishedLength;
+    if (
+      !force
+      && runtime.partialPublished
+      && elapsedMs < ASSISTANT_PARTIAL_INTERVAL_MS
+      && growth < ASSISTANT_PARTIAL_GROWTH_CHARS
+    ) {
+      return false;
+    }
+    const text = await sanitizeForConversation(
+      runtime.conversationId,
+      runtime.assistantText,
+    );
+    const revision = runtime.partialRevision + 1;
+    await appendEvent(runtime.conversationId, "message.partial", {
+      id: runtime.activeAssistantId,
+      role: "assistant",
+      text,
+      status: "streaming",
+      isFinal: false,
+      revision,
+      turnId: turnSettings.turnId ?? runtime.activeAssistantId,
+      turnSeq: Number.isSafeInteger(turnSettings.turnSeq)
+        ? turnSettings.turnSeq
+        : null,
+      attempt: Number.isSafeInteger(turnSettings.attempt)
+        && turnSettings.attempt > 0
+        ? turnSettings.attempt
+        : 1,
+    });
+    runtime.partialPublished = true;
+    runtime.partialPublishedLength = textLength;
+    runtime.partialLastPublishedAtMs = currentTimeMs;
+    runtime.partialRevision = revision;
+    return true;
   }
 
   async function safeToolData(runtime, event) {
@@ -2982,7 +3048,7 @@ export function createProjectWorkService({
     switch (event?.type) {
       case "agent_start":
         await finishRuntimeThinking(runtime);
-        runtime.thinkingObserved = false;
+        resetAssistantPartialState(runtime);
         await updateConversation(conversationId, {
           status: "running",
           lastError: null,
@@ -3090,6 +3156,7 @@ export function createProjectWorkService({
         } else if (event.message?.role === "assistant") {
           runtime.activeAssistantId = `message-${idFactory()}`;
           runtime.assistantText = "";
+          resetAssistantPartialState(runtime);
           await appendEvent(conversationId, "message.started", {
             id: runtime.activeAssistantId,
             role: "assistant",
@@ -3106,16 +3173,21 @@ export function createProjectWorkService({
               256_000 - runtime.assistantText.length,
             );
           }
+          await flushAssistantPartial(runtime, turnSettings);
         } else if (
           assistantEvent?.type?.startsWith("thinking_")
-          && assistantEvent.type !== "thinking_end"
         ) {
-          await beginRuntimeThinking(runtime);
+          if (assistantEvent.type === "thinking_end") {
+            await finishRuntimeThinking(runtime);
+          } else {
+            await beginRuntimeThinking(runtime);
+          }
         }
         break;
       }
       case "message_end":
         if (event.message?.role === "assistant" && runtime.activeAssistantId) {
+          await flushAssistantPartial(runtime, turnSettings, { force: true });
           await finishRuntimeThinking(runtime);
           const fullText = await sanitizeForConversation(
             conversationId,
@@ -3187,6 +3259,7 @@ export function createProjectWorkService({
           });
           runtime.activeAssistantId = null;
           runtime.assistantText = "";
+          resetAssistantPartialState(runtime);
         }
         break;
       case "queue_update":
@@ -3273,8 +3346,11 @@ export function createProjectWorkService({
       turnIndex: 0,
       activeAssistantId: null,
       assistantText: "",
-      thinkingObserved: false,
       thinkingActive: false,
+      partialPublished: false,
+      partialPublishedLength: 0,
+      partialLastPublishedAtMs: null,
+      partialRevision: 0,
       completion: null,
       providerId: conversation.providerId,
       modelId: conversation.modelId,

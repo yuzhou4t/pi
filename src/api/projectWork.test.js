@@ -520,13 +520,13 @@ test("project-work subscription resumes after seq and maps incremental snapshots
   source.emit("snapshot", {
     data: JSON.stringify({
       schema_version: 1,
-      snapshot_watermark: 7,
-      last_seq: 7,
+      snapshot_watermark: 10,
+      last_seq: 10,
       conversation: {
         id: "conversation/control",
         project_id: "project-1",
         status: "awaiting_user",
-        last_event_seq: 7,
+        last_event_seq: 10,
         ask_user_requests: [{
           id: "ask-user-1",
           status: "pending",
@@ -535,15 +535,77 @@ test("project-work subscription resumes after seq and maps incremental snapshots
       },
       events: [{
         seq: 7,
+        type: "message.partial",
+        data: {
+          id: "message-stream-1",
+          turn_id: "turn-1",
+          text: "正在检查",
+          revision: 1,
+          replace: false,
+        },
+      }, {
+        seq: 8,
+        type: "message.partial",
+        data: {
+          messageId: "message-stream-1",
+          turnId: "turn-1",
+          text: "正在检查项目文件",
+          revision: 2,
+        },
+      }, {
+        seq: 9,
+        type: "message.partial",
+        data: {
+          id: "message-stream-1",
+          turn_id: "turn-1",
+          text: { unsafe: true },
+          revision: 3,
+        },
+      }, {
+        seq: 10,
         type: "ask_user.requested",
         data: { id: "ask-user-1" },
       }],
     }),
   });
-  assert.equal(snapshots[0].conversation.lastEventSeq, 7);
+  assert.equal(snapshots[0].conversation.lastEventSeq, 10);
   assert.equal(snapshots[0].conversation.askUserRequests[0].status, "pending");
   assert.equal(snapshots[0].metadata.events[0].seq, 7);
-  assert.equal(snapshots[0].metadata.snapshotWatermark, 7);
+  assert.equal(snapshots[0].metadata.snapshotWatermark, 10);
+  assert.deepEqual(
+    snapshots[0].conversation.events
+      .filter((event) => event.type === "message.partial")
+      .map((event) => ({
+        seq: event.seq,
+        messageId: event.messageId,
+        turnId: event.turnId,
+        text: event.text,
+        revision: event.revision,
+        replace: event.replace,
+      })),
+    [{
+      seq: 7,
+      messageId: "message-stream-1",
+      turnId: "turn-1",
+      text: "正在检查",
+      revision: 1,
+      replace: true,
+    }, {
+      seq: 8,
+      messageId: "message-stream-1",
+      turnId: "turn-1",
+      text: "正在检查项目文件",
+      revision: 2,
+      replace: true,
+    }, {
+      seq: 9,
+      messageId: "message-stream-1",
+      turnId: "turn-1",
+      text: "",
+      revision: 3,
+      replace: true,
+    }],
+  );
 
   source.emit("stream_error", {
     data: JSON.stringify({

@@ -833,6 +833,35 @@ test("durable ask-user renders text and choice questions without becoming write 
   });
 });
 
+test("ask-user explains that auto review independently applies only safe changes", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        executionPolicy: {
+          mode: "auto_review",
+          revision: 2,
+          policyVersion: 1,
+        },
+        askUserRequests: [{
+          id: "ask-auto-review",
+          status: "pending",
+          questions: [{
+            id: "scope",
+            kind: "text",
+            prompt: "需要修改哪些页面？",
+            required: true,
+          }],
+        }],
+      }),
+    }));
+
+    assert.match(html, /当前为“替我审批”/);
+    assert.match(html, /符合安全范围的修改会自动写入/);
+    assert.match(html, /超出范围的操作会直接阻止/);
+  });
+});
+
 test("running composer keeps steer separate from the durable follow-up queue", async () => {
   await withLiveWorkbench(({ ProjectAgentPane }) => {
     const html = renderToStaticMarkup(React.createElement(ProjectAgentPane, {
@@ -919,10 +948,10 @@ test("normal-work control mutations publish durable snapshots and refresh queue 
   assert.doesNotMatch(controlImplementation, /applyChangeSet|proposalHash/);
 });
 
-test("live workbench prefers incremental EventSource and keeps bounded polling fallback", async () => {
+test("live workbench keeps a bounded polling watchdog beside incremental EventSource", async () => {
   const source = await readFile(COMPONENT_URL, "utf8");
   const effectStart = source.indexOf(
-    "const refreshSnapshot = async",
+    "function schedulePoll()",
   );
   const effectEnd = source.indexOf(
     "useEffect(() => {\n    const changeSet",
@@ -938,7 +967,11 @@ test("live workbench prefers incremental EventSource and keeps bounded polling f
     /afterSeq: snapshotRef\.current\?\.lastEventSeq \?\? 0/,
   );
   assert.match(implementation, /mergeIncrementalConversationSnapshot/);
-  assert.match(implementation, /if \(!unsubscribe && shouldPollConversation\)/);
+  assert.match(
+    implementation,
+    /refreshSnapshot\(\{\s*continuePolling: shouldPollConversation,\s*\}\)/,
+  );
+  assert.match(implementation, /if \(shouldPollConversation\)/);
   assert.match(implementation, /api\.fetchConversation/);
   assert.match(implementation, /unsubscribe\?\.\(\)/);
 });
@@ -1540,6 +1573,128 @@ test("activity normalization collapses tool lifecycles into counted public summa
     assert.equal(normalized[1].status, "failed");
     assert.equal(normalized[2].type, "agent.thinking");
     assert.equal(normalized[2].status, "finished");
+  });
+});
+
+test("activity normalization hides bookkeeping events without dropping public work", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      { seq: 2, type: "workspace.recorded", status: "completed" },
+      { seq: 3, type: "conversation.read", status: "completed" },
+      { seq: 4, type: "agent.thinking", status: "active" },
+      {
+        seq: 5,
+        type: "tool.completed",
+        toolName: "edit",
+        toolCallId: "edit-1",
+        path: "src/app.js",
+        status: "completed",
+      },
+      {
+        seq: 6,
+        type: "change_set.ready",
+        status: "ready",
+        data: { stats: { files: 1 } },
+      },
+      { seq: 7, type: "agent.thinking", status: "finished" },
+    ], false);
+
+    assert.deepEqual(
+      normalized.map((event) => event.type),
+      ["tool.completed", "change_set.ready", "agent.thinking"],
+    );
+    assert.doesNotMatch(
+      JSON.stringify(normalized),
+      /workspace\.recorded|conversation\.read/,
+    );
+  });
+});
+
+test("a running turn always exposes a truthful public phase before tools or thinking arrive", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const starting = normalizeActivityEvents([
+      { seq: 11, type: "message.created", status: "accepted" },
+      { seq: 12, type: "agent.status", status: "running" },
+    ], true);
+    assert.equal(starting.length, 1);
+    assert.equal(starting[0].type, "activity.preparing");
+    assert.equal(starting[0].title, "正在准备本轮工作");
+    assert.match(starting[0].detail, /已接收任务/);
+
+    const submitting = normalizeActivityEvents([], true, "submitting");
+    assert.equal(submitting[0].title, "正在提交本轮任务");
+    assert.match(submitting[0].detail, /连接 Pi 会话/);
+
+    const responding = normalizeActivityEvents([
+      { seq: 20, type: "message.created", status: "accepted" },
+      {
+        seq: 21,
+        type: "message.partial",
+        messageId: "assistant-current",
+        text: "正在形成回答",
+      },
+    ], true);
+    assert.equal(responding[0].type, "activity.responding");
+    assert.equal(responding[0].title, "正在生成公开回复");
+  });
+});
+
+test("the latest safe partial answer renders as one replaceable streaming bubble", async () => {
+  await withLiveWorkbench(({
+    latestStreamingAssistant,
+    LiveProjectWorkbench,
+  }) => {
+    const events = [
+      { seq: 20, type: "message.created", status: "accepted" },
+      {
+        seq: 21,
+        type: "message.partial",
+        messageId: "assistant-current",
+        text: "第一段",
+      },
+      {
+        seq: 22,
+        type: "message.partial",
+        messageId: "assistant-current",
+        text: "第一段和第二段",
+      },
+    ];
+    assert.deepEqual(
+      latestStreamingAssistant(events, [], true),
+      {
+        id: "assistant-current",
+        text: "第一段和第二段",
+        seq: 22,
+        turnId: null,
+      },
+    );
+    assert.equal(latestStreamingAssistant(events, [], false), null);
+    assert.equal(
+      latestStreamingAssistant(events, [{
+        id: "assistant-current",
+        role: "assistant",
+        content: "最终回答",
+      }], true),
+      null,
+    );
+
+    const html = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      {
+        project,
+        conversation: conversation({
+          status: "running",
+          turnStatus: "running",
+          messages: [{ id: "message-user", role: "user", content: "继续检查" }],
+          events,
+        }),
+      },
+    ));
+    assert.match(html, /Pi Agent · 生成中/);
+    assert.match(html, /第一段和第二段/);
+    assert.match(html, /aria-label="Pi Agent 正在生成回复"/);
+    assert.equal((html.match(/第一段和第二段/g) ?? []).length, 1);
   });
 });
 

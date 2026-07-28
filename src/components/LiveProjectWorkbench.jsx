@@ -201,6 +201,7 @@ const OPERATION_LABELS = {
 
 const QUIET_EVENT_TYPES = new Set([
   "conversation.created",
+  "conversation.read",
   "message.created",
   "message.started",
   "message.completed",
@@ -213,9 +214,11 @@ const QUIET_EVENT_TYPES = new Set([
   "text_delta",
   "assistant_delta",
   "message.delta",
+  "message.partial",
   "message.update",
   "assistant.delta",
   "plan.updated",
+  "workspace.recorded",
   "document.created",
   "document.uploaded",
   "document.parsing_started",
@@ -374,6 +377,49 @@ function messageText(content) {
     .filter((part) => part?.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("\n");
+}
+
+export function latestStreamingAssistant(events, messages, running) {
+  if (!running) return null;
+  const safeEvents = Array.isArray(events) ? events : [];
+  const completedAssistantIds = new Set(
+    (Array.isArray(messages) ? messages : [])
+      .filter((message) => message?.role === "assistant" && message.id)
+      .map((message) => message.id),
+  );
+  const latestTurnStartSeq = safeEvents.reduce((latest, event) => (
+    event?.type === "message.created" && Number.isSafeInteger(event.seq)
+      ? Math.max(latest, event.seq)
+      : latest
+  ), 0);
+  let latest = null;
+  for (const event of safeEvents) {
+    if (
+      event?.type !== "message.partial"
+      || !Number.isSafeInteger(event.seq)
+      || event.seq < latestTurnStartSeq
+    ) {
+      continue;
+    }
+    const id = event.messageId ?? event.data?.id ?? event.data?.messageId;
+    const text = event.text ?? event.data?.text;
+    if (
+      typeof id !== "string"
+      || !id
+      || completedAssistantIds.has(id)
+      || typeof text !== "string"
+      || !text
+    ) {
+      continue;
+    }
+    latest = {
+      id,
+      text,
+      seq: event.seq,
+      turnId: event.turnId ?? event.data?.turnId ?? null,
+    };
+  }
+  return latest;
 }
 
 function ProjectAgentMarkdown({ children }) {
@@ -779,7 +825,7 @@ function updateCommandSummary(event, commandEvent, running) {
   ].filter(Boolean).join(" · ");
 }
 
-export function normalizeActivityEvents(events, running) {
+export function normalizeActivityEvents(events, running, phase = null) {
   const safeEvents = Array.isArray(events) ? events : [];
   const latestMessageSeq = safeEvents.reduce((latest, event) => (
     event.type === "message.created" && Number.isSafeInteger(event.seq)
@@ -893,6 +939,32 @@ export function normalizeActivityEvents(events, running) {
       : "本轮思考已完成";
     normalized.push(thinkingEvent);
   }
+  if (normalized.length === 0 && running) {
+    const hasPartialAnswer = safeEvents.some((event) => (
+      event.type === "message.partial"
+      && (
+        latestMessageSeq === 0
+        || (Number.isSafeInteger(event.seq) && event.seq >= latestMessageSeq)
+      )
+    ));
+    normalized.push({
+      type: hasPartialAnswer ? "activity.responding" : "activity.preparing",
+      seq: currentTurnEvents.at(-1)?.seq ?? latestMessageSeq ?? 0,
+      activityKey: `phase-${latestMessageSeq || "current"}`,
+      hideSequence: true,
+      status: "active",
+      title: phase === "submitting"
+        ? "正在提交本轮任务"
+        : hasPartialAnswer
+          ? "正在生成公开回复"
+          : "正在准备本轮工作",
+      detail: phase === "submitting"
+        ? "正在连接 Pi 会话并登记任务"
+        : hasPartialAnswer
+          ? "回答正文正在逐步写入"
+          : "Pi 已接收任务，正在准备上下文与模型回复",
+    });
+  }
   return normalized.slice(-100);
 }
 
@@ -900,10 +972,11 @@ function ActivityTimeline({
   events,
   running,
   compact,
+  phase,
   onOpenArtifact,
 }) {
   const [expanded, setExpanded] = useState(!compact);
-  const visibleEvents = normalizeActivityEvents(events, running);
+  const visibleEvents = normalizeActivityEvents(events, running, phase);
 
   useEffect(() => {
     setExpanded(!compact);
@@ -1610,6 +1683,7 @@ export function serializeAskUserAnswers(request, answerDraft) {
 export function ProjectAskUserCard({
   request,
   busy = false,
+  autoReview = false,
   onAnswer,
   onCancel,
 }) {
@@ -1639,7 +1713,9 @@ export function ProjectAskUserCard({
         <div>
           <strong>Agent 等待你的决定</strong>
           <p>
-            回答只用于明确任务需求，不代表批准任何文件修改。写入仍需在“更改”中核对并确认。
+            {autoReview
+              ? "回答只用于明确任务需求。当前为“替我审批”，符合安全范围的修改会自动写入；超出范围的操作会直接阻止。"
+              : "回答只用于明确任务需求，不代表批准任何文件修改。写入仍需在“更改”中核对并确认。"}
           </p>
         </div>
       </header>
@@ -1841,6 +1917,8 @@ export function ProjectAgentPane({
   standalone = false,
 }) {
   const running = isConversationRunning(conversation);
+  const submitting = action === "message";
+  const workActive = running || submitting;
   const pendingAskUserRequest = (conversation.askUserRequests ?? []).find(
     (request) => request.status === "pending",
   );
@@ -1895,7 +1973,7 @@ export function ProjectAgentPane({
     ),
     -1,
   );
-  const settledWithAnswer = !running && lastAssistantMessageIndex >= 0;
+  const settledWithAnswer = !workActive && lastAssistantMessageIndex >= 0;
   const canRetryLastTurn = settledWithAnswer
     && !awaitingUser
     && typeof onRetryLastTurn === "function";
@@ -1922,10 +2000,10 @@ export function ProjectAgentPane({
 
   useEffect(() => {
     const conversationChanged = previousConversationIdRef.current !== conversation.id;
-    const workStarted = running && !previousRunningRef.current;
+    const workStarted = workActive && !previousRunningRef.current;
     const userMessageAdded = userMessageCount > previousUserMessageCountRef.current;
     previousConversationIdRef.current = conversation.id;
-    previousRunningRef.current = running;
+    previousRunningRef.current = workActive;
     previousUserMessageCountRef.current = userMessageCount;
     if (conversationChanged || workStarted || userMessageAdded) {
       followLatestRef.current = true;
@@ -1941,7 +2019,7 @@ export function ProjectAgentPane({
     conversation.id,
     conversation.messages.length,
     latestEventSeq,
-    running,
+    workActive,
     userMessageCount,
   ]);
 
@@ -1949,12 +2027,18 @@ export function ProjectAgentPane({
     <>
       <PlanCard plan={conversation.plan} />
       <ActivityTimeline
-        events={conversation.events}
-        running={running}
+        events={submitting && !running ? [] : conversation.events}
+        running={workActive}
         compact={compact}
+        phase={submitting && !running ? "submitting" : null}
         onOpenArtifact={onOpenArtifact}
       />
     </>
+  );
+  const streamingAssistant = latestStreamingAssistant(
+    conversation.events,
+    conversation.messages,
+    running,
   );
 
   return (
@@ -2116,7 +2200,17 @@ export function ProjectAgentPane({
           })
         )}
 
-        {settledWithAnswer ? null : processBlock(!running)}
+        {settledWithAnswer ? null : processBlock(!workActive)}
+        {streamingAssistant ? (
+          <article
+            className="project-agent-message is-assistant is-streaming"
+            aria-label="Pi Agent 正在生成回复"
+            aria-live="polite"
+          >
+            <small>Pi Agent · 生成中</small>
+            <ProjectAgentMarkdown>{streamingAssistant.text}</ProjectAgentMarkdown>
+          </article>
+        ) : null}
         <ProjectFollowUpQueue
           items={queuedFollowUps}
           busy={Boolean(action)}
@@ -2127,6 +2221,7 @@ export function ProjectAgentPane({
           <ProjectAskUserCard
             request={pendingAskUserRequest}
             busy={Boolean(action)}
+            autoReview={autoReview}
             onAnswer={(answers) => onAnswerAskUser?.(
               pendingAskUserRequest.id,
               answers,
@@ -4093,10 +4188,27 @@ export function LiveProjectWorkbench({
     let requestActive = false;
     let unsubscribe = null;
 
-    const refreshSnapshot = async ({ continuePolling = false } = {}) => {
-      if (disposed || requestActive) return;
+    function schedulePoll() {
+      if (disposed || timeoutId !== null) return;
+      timeoutId = window.setTimeout(() => {
+        timeoutId = null;
+        void refreshSnapshot({ continuePolling: true });
+      }, pollIntervalMs);
+    }
+
+    async function refreshSnapshot({ continuePolling = false } = {}) {
+      if (disposed) return;
+      if (requestActive) {
+        if (continuePolling) schedulePoll();
+        return;
+      }
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      }
       requestActive = true;
       controller = new AbortController();
+      let keepPolling = continuePolling;
       try {
         const nextSnapshot = await api.fetchConversation({
           conversationId,
@@ -4104,31 +4216,18 @@ export function LiveProjectWorkbench({
         });
         if (disposed) return;
         const acceptedSnapshot = publishSnapshot(nextSnapshot);
-        if (
-          continuePolling
-          && (
+        keepPolling = continuePolling && (
           isConversationRunning(acceptedSnapshot)
           || hasProcessingDocuments(acceptedSnapshot)
-          )
-        ) {
-          timeoutId = window.setTimeout(
-            () => refreshSnapshot({ continuePolling: true }),
-            pollIntervalMs,
-          );
-        }
+        );
       } catch (error) {
         if (disposed || error?.name === "AbortError") return;
         errorRef.current?.(error);
-        if (continuePolling) {
-          timeoutId = window.setTimeout(
-            () => refreshSnapshot({ continuePolling: true }),
-            pollIntervalMs,
-          );
-        }
       } finally {
         requestActive = false;
+        if (keepPolling) schedulePoll();
       }
-    };
+    }
 
     if (typeof api.subscribeConversation === "function") {
       try {
@@ -4143,18 +4242,17 @@ export function LiveProjectWorkbench({
             ));
           },
           onError: () => {
-            void refreshSnapshot();
+            void refreshSnapshot({
+              continuePolling: shouldPollConversation,
+            });
           },
         });
       } catch (error) {
         errorRef.current?.(error);
       }
     }
-    if (!unsubscribe && shouldPollConversation) {
-      timeoutId = window.setTimeout(
-        () => refreshSnapshot({ continuePolling: true }),
-        pollIntervalMs,
-      );
+    if (shouldPollConversation) {
+      schedulePoll();
     }
     return () => {
       disposed = true;

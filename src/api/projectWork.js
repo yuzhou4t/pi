@@ -470,10 +470,16 @@ function mapEvent(raw) {
   const data = raw.data && typeof raw.data === "object" && !Array.isArray(raw.data)
     ? raw.data
     : {};
-  return {
+  const type = pick(
+    raw,
+    "type",
+    "type",
+    pick(raw, "kind", "kind", "activity"),
+  );
+  const event = {
     ...raw,
     seq,
-    type: pick(raw, "type", "type", pick(raw, "kind", "kind", "activity")),
+    type,
     eventId: pick(raw, "event_id", "eventId", data.id ?? null),
     title: pick(raw, "title", "title", data.title ?? null),
     detail: pick(
@@ -532,6 +538,28 @@ function mapEvent(raw) {
       pick(data, "reason_code", "reasonCode"),
     ),
     createdAt: pick(raw, "created_at", "createdAt", pick(raw, "at", "at")),
+  };
+  if (type !== "message.partial") return event;
+
+  const messageId = data.id
+    ?? pick(data, "message_id", "messageId", pick(raw, "message_id", "messageId"));
+  const turnId = pick(
+    data,
+    "turn_id",
+    "turnId",
+    pick(raw, "turn_id", "turnId"),
+  );
+  const text = pick(data, "text", "text", pick(raw, "text", "text", ""));
+  const revision = Number(
+    pick(data, "revision", "revision", pick(raw, "revision", "revision")),
+  );
+  return {
+    ...event,
+    messageId: typeof messageId === "string" ? messageId : null,
+    turnId: typeof turnId === "string" ? turnId : null,
+    text: typeof text === "string" ? text : "",
+    revision: Number.isSafeInteger(revision) && revision > 0 ? revision : null,
+    replace: true,
   };
 }
 

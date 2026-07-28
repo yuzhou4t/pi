@@ -19,11 +19,13 @@ function requestStream({
   return request;
 }
 
-function responseStream() {
+function responseStream({ onWrite } = {}) {
   const chunks = [];
   const response = new Writable({
     write(chunk, _encoding, callback) {
-      chunks.push(Buffer.from(chunk));
+      const bufferedChunk = Buffer.from(chunk);
+      chunks.push(bufferedChunk);
+      onWrite?.(bufferedChunk);
       callback();
     },
   });
@@ -171,6 +173,64 @@ test("proxy preserves the project-work request and streams the worker response",
   assert.equal(response.statusCode, 202);
   assert.equal(response.headers["x-runtime-seq"], "42");
   assert.deepEqual(JSON.parse(response.body()), { accepted: true });
+});
+
+test("proxy forwards the first worker chunk before the upstream response ends", async () => {
+  let resolveFirstChunk;
+  const firstChunkReceived = new Promise((resolve) => {
+    resolveFirstChunk = resolve;
+  });
+  const response = responseStream({
+    onWrite: () => resolveFirstChunk(),
+  });
+  let resolveUpstreamResponse;
+  const upstreamResponseReady = new Promise((resolve) => {
+    resolveUpstreamResponse = resolve;
+  });
+  const requestImpl = (_options, callback) => new Writable({
+    write(_chunk, _encoding, done) {
+      done();
+    },
+    final(done) {
+      const upstreamResponse = new Readable({
+        read() {},
+      });
+      upstreamResponse.statusCode = 200;
+      upstreamResponse.headers = {
+        "content-type": "text/event-stream",
+      };
+      callback(upstreamResponse);
+      resolveUpstreamResponse(upstreamResponse);
+      done();
+    },
+  });
+
+  let proxySettled = false;
+  const proxyPromise = proxyProjectWorkRequest(
+    requestStream({
+      url: "/api/v1/project-work/conversations/conversation-1/events",
+    }),
+    response,
+    normalizeProjectWorkRuntimeUrl("http://127.0.0.1:47888"),
+    { requestImpl },
+  ).finally(() => {
+    proxySettled = true;
+  });
+
+  const upstreamResponse = await upstreamResponseReady;
+  const firstChunk = "event: progress\ndata: first\n\n";
+  const secondChunk = "event: progress\ndata: second\n\n";
+  upstreamResponse.push(firstChunk);
+  await firstChunkReceived;
+
+  assert.equal(response.body(), firstChunk);
+  assert.equal(proxySettled, false);
+
+  upstreamResponse.push(secondChunk);
+  upstreamResponse.push(null);
+  await proxyPromise;
+
+  assert.equal(response.body(), firstChunk + secondChunk);
 });
 
 test("proxy returns a retryable recovery state while the worker is unavailable", async () => {

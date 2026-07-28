@@ -924,6 +924,12 @@ function turnContextLabel(turn) {
   return "仅论文上下文";
 }
 
+export function scrollReaderAgentHistoryToLatest(history) {
+  if (!history) return false;
+  history.scrollTop = history.scrollHeight;
+  return true;
+}
+
 function readingConversationLabel(conversation) {
   const kind = conversation?.canonical
     ? "主研读"
@@ -959,6 +965,7 @@ export function ReaderAgentComposer({
   const [conversationBusy, setConversationBusy] = useState(false);
   const [conversationError, setConversationError] = useState(null);
   const noteActionRequestIds = useRef(new Map());
+  const historyRef = useRef(null);
   const sessionKey = readerContext?.key ?? null;
   const reading = readerContext?.reading;
   const conversations = reading?.conversations ?? [];
@@ -1252,6 +1259,13 @@ export function ReaderAgentComposer({
     setRoundSelection(null);
   }, [roundKey]);
 
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      scrollReaderAgentHistoryToLatest(historyRef.current);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [chatState.status, chatState.turns, sessionKey]);
+
   const handleNewConversation = async () => {
     if (conversationBusy) return;
     setConversationBusy(true);
@@ -1512,7 +1526,12 @@ export function ReaderAgentComposer({
       ) : null}
 
       {visibleChatTurns.length ? (
-        <div className="reader-agent-history" aria-label="Agent 对话历史" aria-live="polite">
+        <div
+          ref={historyRef}
+          className="reader-agent-history"
+          aria-label="Agent 对话历史"
+          aria-live="polite"
+        >
           {visibleChatTurns.map((turn) => {
             const pinnedConclusion = pinnedConclusions.find(
               (conclusion) => (

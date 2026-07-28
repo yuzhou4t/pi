@@ -1,6 +1,6 @@
 # Pi Agent
 
-Pi Agent 是一个本地 Agent 工作空间：长期项目保存持续状态，独立对话承载无需先选文件夹的一次性任务，工作流负责周期性推进；用户在关键判断和正式修改前审阅确认。
+Pi Agent 是一个本地 Agent 工作空间：长期项目保存持续状态，独立对话承载无需先选文件夹的一次性任务，工作流负责周期性推进；正式修改按当前会话的“需确认”或“替我审批”权限执行。
 
 正式开发目录：`/Users/yuzhou4tc/Public/pi Agent`
 
@@ -10,9 +10,10 @@ Pi Agent 是一个本地 Agent 工作空间：长期项目保存持续状态，�
 - 日常启动器把项目工作 Runtime 从公共 API 中拆开监管。网页或 API 重启不会终止 Runtime 中的 turn；退出启动器时才受控停止并保存可恢复状态。
 - 两条工作流共用 `idle / running / awaiting_user / awaiting_review / verifying / recovering / stopped` 生命周期和版本化运行时合同，但各自保留业务状态。事件使用稳定 `seq`、snapshot watermark 和增量 SSE；操作失败不会把已经成功的 Agent 回答改写成整段会话失败。
 - `正常工作` 支持一级独立对话和已绑定本地项目。浏览器只收到安全标签与项目内相对路径；创建、打开、切换会话或工件、切换模型都不会调用模型，只有显式发送才启动 Pi。
-- 项目会话使用 conversation-owned 稀疏审阅层，独立对话使用私有 scratch。绑定项目在具备完整可恢复隔离前会把旧版 `替我审批` 降级为手动审阅；不会把自动批准伪装成已安全开放。
+- 项目会话使用 conversation-owned 稀疏审阅层，独立对话使用私有 scratch。两者都通过基础哈希、私有修改层、持久 apply journal 和读回校验提供可恢复隔离；选择 `替我审批` 后，安全范围内的修改会自动写入，超限、删除、危险路径、恢复阻塞或哈希冲突会直接阻止。
 - Pi SDK 会话保留持久 JSONL session、steer、后续消息队列、stop、compact、retry-last-turn、`ask_user`、未读水位和逐轮 provider/model/thinking/token/费用证据。`ask_user` 只表达业务决策，不能替代文件或归档批准。
-- 正常工作的唯一写回入口仍是右侧 `更改`：服务端重算 ChangeSet，绑定提案和逐文件 base/after hash，按项目串行原子写入并读回核验。apply journal 支持崩溃恢复和一次性 hash-bound 撤销；不会 stage、commit 或 push。
+- 正常工作在显式发送后立即显示真实的提交/连接阶段，随后实时呈现公开思考生命周期、受控工具活动和计划；回答正文以服务端脱敏、节流后的累计替换片段逐步出现。SSE 之外保留运行期低频同步兜底，断线时不会等到最终结果才一次性补齐；任何原始思维链、工具参数或未过滤结果都不会发送到浏览器。
+- 正常工作的唯一写回机制仍是 hash-bound ChangeSet：服务端重算逐文件 base/after hash，按项目串行原子写入并读回核验。`需确认`时由右侧 `更改`批准，`替我审批`时由同一安全策略自动批准并保留完整证据；apply journal 支持崩溃恢复和一次性 hash-bound 撤销，不会 stage、commit 或 push。
 - `运行`只执行解析后的 allowlist argv、现有 package scripts 和已安装依赖；不提供自由终端、安装、watcher、inline code 或隐式网络。每次 attempt、退出码和有界日志都会保留，验证在一次性隔离副本中进行。
 - `预览`只接受注册式 Vite、静态站点或 Uvicorn recipe，由 supervisor 拥有进程。手动模式会先展示安全 recipe、相对 cwd、参数边界和请求指纹，只有明确确认后才启动回环预览。
 - 论文监测使用 11 个来源各自声明的官方 primary adapter，Crossref/DBLP 只在失败时作为显式 fallback。Run 先持久化逐来源 staging、候选和 ranking 工件，再用 CAS 提交全局 cursor；缺少精确发布日期的记录不会算作本周新论文。

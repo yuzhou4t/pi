@@ -41,7 +41,15 @@ test("reader rail dedicates full height to paper Agent, reading notes, and proje
     const {
       WorkflowContextRail,
       createReaderSelectionReference,
+      scrollReaderAgentHistoryToLatest,
     } = await vite.ssrLoadModule("/src/components/WorkflowContextRail.jsx");
+    const history = {
+      scrollHeight: 1_200,
+      scrollTop: 0,
+    };
+    assert.equal(scrollReaderAgentHistoryToLatest(history), true);
+    assert.equal(history.scrollTop, 1_200);
+    assert.equal(scrollReaderAgentHistoryToLatest(null), false);
     const paper = {
       id: "paper-live-1",
       title: "Paper title",

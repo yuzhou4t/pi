@@ -7888,6 +7888,15 @@ h4.reader-rail-full-heading {
   border-color: var(--teal-border);
 }
 
+.project-agent-message.is-streaming > small {
+  color: var(--teal-accent);
+}
+
+.project-agent-message.is-streaming > div {
+  border-color: var(--teal-border);
+  box-shadow: inset 2px 0 0 var(--teal-accent);
+}
+
 .project-agent-plain-text {
   white-space: pre-wrap;
 }

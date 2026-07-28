@@ -557,31 +557,33 @@ function createThinkingSessionFactory() {
           type: "message_start",
           message: { role: "assistant" },
         });
-        subscriber?.({
-          type: "message_update",
-          assistantMessageEvent: {
-            type: "thinking_start",
-            contentIndex: 0,
-          },
-        });
-        for (let index = 0; index < 30; index += 1) {
+        for (let blockIndex = 0; blockIndex < 2; blockIndex += 1) {
           subscriber?.({
             type: "message_update",
             assistantMessageEvent: {
-              type: "thinking_delta",
-              contentIndex: 0,
-              delta: `private-${index}`,
+              type: "thinking_start",
+              contentIndex: blockIndex,
+            },
+          });
+          for (let index = 0; index < 15; index += 1) {
+            subscriber?.({
+              type: "message_update",
+              assistantMessageEvent: {
+                type: "thinking_delta",
+                contentIndex: blockIndex,
+                delta: `private-${blockIndex}-${index}`,
+              },
+            });
+          }
+          subscriber?.({
+            type: "message_update",
+            assistantMessageEvent: {
+              type: "thinking_end",
+              contentIndex: blockIndex,
+              content: `private reasoning block ${blockIndex} must not be persisted`,
             },
           });
         }
-        subscriber?.({
-          type: "message_update",
-          assistantMessageEvent: {
-            type: "thinking_end",
-            contentIndex: 0,
-            content: "private reasoning must not be persisted",
-          },
-        });
         subscriber?.({
           type: "message_update",
           assistantMessageEvent: {
@@ -607,6 +609,100 @@ function createThinkingSessionFactory() {
       async compact() {},
       async setModel() {},
       dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createStreamingSessionFactory({
+  firstDelta = "首段",
+  repeatedDelta = "x",
+  repeatedCount = 520,
+  finalDelta = "尾声",
+} = {}) {
+  const sessions = [];
+  const factory = async () => {
+    let subscriber = null;
+    let releaseAfterFirst;
+    const record = {
+      prompts: [],
+      release() {
+        releaseAfterFirst?.();
+        releaseAfterFirst = null;
+      },
+    };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt(prompt) {
+        record.prompts.push(prompt);
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({ type: "turn_start" });
+        subscriber?.({
+          type: "message_start",
+          message: { role: "assistant" },
+        });
+        subscriber?.({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_delta",
+            contentIndex: 0,
+            delta: firstDelta,
+          },
+        });
+        await new Promise((resolve) => {
+          releaseAfterFirst = resolve;
+        });
+        for (let index = 0; index < repeatedCount; index += 1) {
+          subscriber?.({
+            type: "message_update",
+            assistantMessageEvent: {
+              type: "text_delta",
+              contentIndex: 0,
+              delta: repeatedDelta,
+            },
+          });
+        }
+        subscriber?.({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_delta",
+            contentIndex: 0,
+            delta: finalDelta,
+          },
+        });
+        const text = `${firstDelta}${repeatedDelta.repeat(repeatedCount)}${finalDelta}`;
+        subscriber?.({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text }],
+            stopReason: "stop",
+          },
+        });
+        subscriber?.({ type: "turn_end" });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        subscriber?.({ type: "agent_settled" });
+      },
+      async steer() {},
+      async abort() {
+        record.release();
+      },
+      async compact() {},
+      async setModel() {},
+      dispose() {
+        record.release();
+      },
     };
     record.host = host;
     sessions.push(record);
@@ -1848,7 +1944,77 @@ test("restoring an interrupted automatic compaction terminates its running state
   assert.equal(restored.conversation.lastError.code, "PROJECT_WORK_SESSION_INTERRUPTED");
 });
 
-test("thinking deltas persist only one lifecycle pair per agent run", async (t) => {
+test("assistant text persists throttled cumulative partials before completion", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-message-partials-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionFactory = createStreamingSessionFactory();
+  const fixedNow = new Date("2026-07-28T06:00:00.000Z");
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    now: () => fixedNow,
+    idFactory: incrementalId("partial"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "流式回答" });
+  const streaming = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.events.some((event) => event.type === "message.partial")
+      && !snapshot.events.some((event) => event.type === "message.completed")
+    ),
+    "first assistant partial did not arrive before completion",
+  );
+  const firstPartial = streaming.events.find(
+    (event) => event.type === "message.partial",
+  );
+  assert.equal(firstPartial.data.text, "首段");
+  assert.equal(firstPartial.data.status, "streaming");
+  assert.equal(firstPartial.data.isFinal, false);
+
+  sessionFactory.sessions[0].release();
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.messages.length === 2
+    ),
+    "streaming assistant turn did not settle",
+  );
+  const partials = settled.events.filter(
+    (event) => event.type === "message.partial",
+  );
+  const completed = settled.events.find(
+    (event) => event.type === "message.completed",
+  );
+  const finalText = `首段${"x".repeat(520)}尾声`;
+  assert.equal(partials.length, 3);
+  assert.deepEqual(
+    partials.map((event) => event.data.text),
+    [
+      "首段",
+      `首段${"x".repeat(512)}`,
+      finalText,
+    ],
+  );
+  assert.deepEqual(
+    partials.map((event) => event.data.revision),
+    [1, 2, 3],
+  );
+  assert.ok(partials.every((event) => (
+    event.data.id === completed.data.id
+    && event.data.turnId === completed.data.turnId
+    && event.data.turnSeq === completed.data.turnSeq
+    && event.data.attempt === completed.data.attempt
+    && event.data.status === "streaming"
+  )));
+  assert.ok(partials.at(-1).seq < completed.seq);
+  assert.equal(completed.data.text, finalText);
+});
+
+test("thinking blocks persist lifecycle pairs without private reasoning", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-thinking-events-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const service = createProjectWorkService({
@@ -1883,19 +2049,27 @@ test("thinking deltas persist only one lifecycle pair per agent run", async (t) 
   );
   assert.deepEqual(
     thinkingEvents.map((event) => event.data.status),
-    ["active", "finished", "active", "finished"],
+    [
+      "active",
+      "finished",
+      "active",
+      "finished",
+      "active",
+      "finished",
+      "active",
+      "finished",
+    ],
   );
-  assert.equal(
-    JSON.stringify(thinkingEvents).includes("private reasoning"),
-    false,
-  );
-  assert.equal(JSON.stringify(thinkingEvents).includes("private-0"), false);
+  const persistedEvents = JSON.stringify(settled.events);
+  assert.equal(persistedEvents.includes("private reasoning"), false);
+  assert.equal(persistedEvents.includes("private-0-0"), false);
+  assert.equal(persistedEvents.includes("private-1-0"), false);
   const completedEvents = settled.events.filter(
     (event) => event.type === "message.completed",
   );
   assert.equal(completedEvents.length, 2);
-  assert.ok(thinkingEvents[1].seq < completedEvents[0].seq);
-  assert.ok(thinkingEvents[3].seq < completedEvents[1].seq);
+  assert.ok(thinkingEvents[3].seq < completedEvents[0].seq);
+  assert.ok(thinkingEvents[7].seq < completedEvents[1].seq);
 });
 
 test("a new turn clears the previous plan until it publishes its own", async (t) => {
@@ -3362,7 +3536,7 @@ test("execution policy defaults to manual review and configures with revision CA
   )));
 });
 
-test("bound-project auto review fails closed to manual while workspace isolation is limited", async (t) => {
+test("bound-project auto review cannot retroactively approve a pending manual change", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-auto-review-pending-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const projectRoot = path.join(temporaryRoot, "project");
@@ -3395,29 +3569,68 @@ test("bound-project auto review fails closed to manual while workspace isolation
     "manual change did not reach review",
   );
 
-  const configured = await service.configureExecutionPolicy(conversation.id, {
-    mode: "auto_review",
-    expectedRevision: 1,
-  });
-  assert.equal(
-    configured.conversation.executionPolicy.mode,
-    "manual_review",
+  await assert.rejects(
+    service.configureExecutionPolicy(conversation.id, {
+      mode: "auto_review",
+      expectedRevision: 1,
+    }),
+    (error) => error?.code === "PROJECT_WORK_AUTO_REVIEW_PENDING_CHANGE",
   );
-  assert.equal(
-    configured.conversation.workspace.automaticApplyAllowed,
-    false,
-  );
-  assert.ok(configured.events.some((event) => (
-    event.type === "execution_policy.downgraded"
-    && event.data.reasonCode === "workspace_isolation_unavailable"
-  )));
   assert.equal(
     await readFile(path.join(projectRoot, "app.js"), "utf8"),
     "export const version = 1;\n",
   );
 });
 
-test("auto review applies a safe change but blocks verification without an isolated runner", async (t) => {
+test("legacy bound workspaces gain recoverable auto-apply capability without trusting stored flags", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-auto-review-migration-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "original\n", "utf8");
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({ verificationRequest: null }),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("auto-review-migration"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  const statePath = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+    "conversation.json",
+  );
+  const legacyState = JSON.parse(await readFile(statePath, "utf8"));
+  legacyState.workspace = {
+    ...legacyState.workspace,
+    recoverableIsolation: false,
+    automaticApplyAllowed: false,
+  };
+  await writeFile(statePath, `${JSON.stringify(legacyState, null, 2)}\n`, "utf8");
+
+  const workspace = await service.getWorkspace(conversation.id);
+  assert.equal(workspace.recoverableIsolation, true);
+  assert.equal(workspace.automaticApplyAllowed, true);
+  const configured = await service.configureExecutionPolicy(conversation.id, {
+    mode: "auto_review",
+    expectedRevision: 1,
+  });
+  assert.equal(configured.conversation.executionPolicy.mode, "auto_review");
+  assert.equal(
+    configured.events.some((event) => event.type === "execution_policy.downgraded"),
+    false,
+  );
+});
+
+test("auto review applies a safe change and runs verification in an isolated snapshot", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-auto-review-safe-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const projectRoot = path.join(temporaryRoot, "project");
@@ -3453,10 +3666,6 @@ test("auto review applies a safe change but blocks verification without an isola
     selectionId: selection.selectionId,
   });
   const conversation = await service.createConversation(project.id);
-  await enableRecoverableWorkspaceForTest(
-    path.join(temporaryRoot, "private-state"),
-    conversation.id,
-  );
   await service.configureExecutionPolicy(conversation.id, {
     mode: "auto_review",
     expectedRevision: 1,
@@ -3471,10 +3680,10 @@ test("auto review applies a safe change but blocks verification without an isola
       &&
       snapshot.conversation.activeChangeSet?.status === "applied"
       && snapshot.conversation.verifications.some(
-        (verification) => verification.status === "blocked",
+        (verification) => verification.status === "passed",
       )
     ),
-    "auto review did not apply the safe turn and block its command",
+    "auto review did not apply the safe turn and run its command",
   );
 
   assert.equal(
@@ -3482,13 +3691,19 @@ test("auto review applies a safe change but blocks verification without an isola
     "export const version = 2;\n",
   );
   assert.equal(settled.conversation.activeChangeSet.status, "applied");
-  assert.equal(runnerCalls.length, 0);
-  const blocked = settled.conversation.verifications.find(
-    (verification) => verification.status === "blocked",
+  assert.equal(runnerCalls.length, 1);
+  assert.notEqual(runnerCalls[0].cwd, projectRoot);
+  const passed = settled.conversation.verifications.find(
+    (verification) => verification.status === "passed",
   );
-  assert.ok(blocked.turnId);
-  assert.equal(blocked.executionPolicyRevision, 2);
-  assert.equal(blocked.blockedReason, "verification_isolation_unavailable");
+  assert.ok(passed.turnId);
+  assert.equal(passed.executionPolicyRevision, 2);
+  assert.equal(passed.exitCode, 0);
+  assert.equal(settled.conversation.applyJournal.at(-1).status, "applied");
+  assert.equal(
+    settled.conversation.applyJournal.at(-1).undo.status,
+    "available",
+  );
   assert.deepEqual(
     settled.events
       .filter((event) => event.type === "auto_review.decision")
@@ -3498,7 +3713,7 @@ test("auto review applies a safe change but blocks verification without an isola
       })),
     [
       { actionType: "change_set", decision: "allow" },
-      { actionType: "verification", decision: "deny" },
+      { actionType: "verification", decision: "allow" },
     ],
   );
 });
