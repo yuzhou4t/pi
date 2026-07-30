@@ -13916,6 +13916,23 @@ h4.reader-rail-full-heading {
   font-size: 11.5px;
 }
 
+.topic-search-queries {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.topic-search-query-chip {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(15, 118, 110, 0.05);
+  color: var(--muted);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
 .topic-search-papers {
   list-style: none;
   margin: 0;

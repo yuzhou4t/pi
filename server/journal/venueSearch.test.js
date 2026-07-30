@@ -136,3 +136,69 @@ test("a failed venue stays visible without discarding other venues' results", as
   assert.equal(result.papers.length, 1);
   assert.equal(result.papers[0].source_id, "conference-iclr");
 });
+
+test("multi-query expansion merges hits, dedupes by identity, and unions venue success", async () => {
+  const openAlexByQuery = {
+    "llm agent memory": [{
+      id: "https://openalex.org/W1",
+      title: "Memory Mechanisms for Language Agents",
+      publication_date: "2026-02-01",
+      doi: "https://doi.org/10.1000/mem",
+      cited_by_count: 20,
+      relevance_score: 50,
+      authorships: [{ author: { display_name: "A. Author" } }],
+      primary_location: {
+        source: { id: "https://openalex.org/S196139623", display_name: "Artificial Intelligence" },
+      },
+    }],
+    "retrieval augmented agents": [
+      {
+        // 与第一个查询命中同一篇（相同 DOI），应被去重。
+        id: "https://openalex.org/W1",
+        title: "Memory Mechanisms for Language Agents",
+        publication_date: "2026-02-01",
+        doi: "https://doi.org/10.1000/mem",
+        cited_by_count: 20,
+        relevance_score: 50,
+        authorships: [{ author: { display_name: "A. Author" } }],
+        primary_location: {
+          source: { id: "https://openalex.org/S196139623", display_name: "Artificial Intelligence" },
+        },
+      },
+      {
+        id: "https://openalex.org/W2",
+        title: "Retrieval-Augmented Planning",
+        publication_date: "2026-03-01",
+        doi: "https://doi.org/10.1000/rag",
+        cited_by_count: 8,
+        relevance_score: 30,
+        authorships: [{ author: { display_name: "D. Researcher" } }],
+        primary_location: {
+          source: { id: "https://openalex.org/S196139623", display_name: "Artificial Intelligence" },
+        },
+      },
+    ],
+  };
+  const fetchImpl = async (url) => {
+    const target = new URL(url);
+    if (target.hostname === "api.openalex.org") {
+      const search = target.searchParams.get("search");
+      return openAlexResponse(openAlexByQuery[search] ?? []);
+    }
+    return dblpResponse([]);
+  };
+
+  const result = await searchRegisteredVenues({
+    queries: ["llm agent memory", "retrieval augmented agents", "llm agent memory"],
+    sources: [journal],
+    fetchImpl,
+    enrich: false,
+    observedAt: "2026-07-31T08:00:00.000Z",
+  });
+
+  // 两个去重后的唯一论文；同 DOI 命中不重复计入。
+  assert.equal(result.papers.length, 2);
+  assert.deepEqual(result.queries, ["llm agent memory", "retrieval augmented agents"]);
+  const journalStatus = result.venues.find((venue) => venue.source_id === "journal-ai");
+  assert.equal(journalStatus.status, "success");
+});

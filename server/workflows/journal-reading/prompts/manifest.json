@@ -16,7 +16,7 @@
     "reading-follow-up": "reading-follow-up.v1",
     "reading-chat": "reading-chat.v4",
     "translation": "translation.v1",
-    "venue-search-plan": "venue-search-plan.v1",
+    "venue-search-plan": "venue-search-plan.v2",
     "venue-search-recommend": "venue-search-recommend.v2",
     "venue-search-translate": "venue-search-translate.v1"
   },
@@ -116,6 +116,10 @@
     "venue-search-plan.v1": {
       "file": "venue-search-plan.v1.md",
       "schema": "venue-search-plan.v1.json"
+    },
+    "venue-search-plan.v2": {
+      "file": "venue-search-plan.v2.md",
+      "schema": "venue-search-plan.v2.json"
     },
     "venue-search-recommend.v1": {
       "file": "venue-search-recommend.v1.md",

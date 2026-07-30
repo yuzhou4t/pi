@@ -31,6 +31,9 @@ export function mapVenueSearchConversation(body) {
       createdAt: turn.created_at ?? null,
       completedAt: turn.completed_at ?? null,
       searchQuery: turn.plan?.search_query ?? null,
+      searchQueries: Array.isArray(turn.plan?.search_queries)
+        ? turn.plan.search_queries
+        : (turn.plan?.search_query ? [turn.plan.search_query] : []),
       fromYear: turn.plan?.from_year ?? null,
       venues: (turn.search?.venues ?? []).map((venue) => ({
         sourceId: venue.source_id,

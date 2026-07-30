@@ -69,6 +69,13 @@ function TurnCard({
       <div className="topic-search-answer">
         <p>{turn.answer}</p>
         <small>{venueCoverage(turn)}</small>
+        {turn.searchQueries?.length > 0 ? (
+          <div className="topic-search-queries" aria-label="本次检索使用的检索式">
+            {turn.searchQueries.map((item) => (
+              <span className="topic-search-query-chip" key={item}>{item}</span>
+            ))}
+          </div>
+        ) : null}
       </div>
       {orderedPapers.length > 0 ? (
         <ul className="topic-search-papers">

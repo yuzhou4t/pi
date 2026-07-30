@@ -24,6 +24,7 @@ const DEFAULT_PER_VENUE = 25;
 const DEFAULT_LIMIT = 20;
 const MAX_JOURNAL_ROWS = 50;
 const MAX_QUERY_CHARS = 300;
+const MAX_QUERIES = 4;
 const MAX_ENRICHMENT = 20;
 
 export class VenueSearchError extends Error {
@@ -327,6 +328,7 @@ function rankScore(paper) {
 
 export async function searchRegisteredVenues({
   query,
+  queries = null,
   sources = SOURCE_REGISTRY,
   fetchImpl = globalThis.fetch,
   limit = DEFAULT_LIMIT,
@@ -339,41 +341,74 @@ export async function searchRegisteredVenues({
   requestDelayMs = 700,
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 } = {}) {
-  const normalizedQuery = normalizeSearchQuery(query);
+  // 多查询扩展：同一个主题用若干互补检索式分别命中，在原始记录层合并，
+  // 再统一去重/补全/排序，提高召回而不破坏 venue 约束。
+  const requestedQueries = Array.isArray(queries) && queries.length > 0
+    ? queries
+    : [query];
+  const normalizedQueries = [];
+  const seenQueries = new Set();
+  for (const candidate of requestedQueries) {
+    const normalized = normalizeSearchQuery(candidate);
+    const key = normalized.toLowerCase();
+    if (seenQueries.has(key)) continue;
+    seenQueries.add(key);
+    normalizedQueries.push(normalized);
+    if (normalizedQueries.length >= MAX_QUERIES) break;
+  }
   const journals = sources.filter((source) => compact(source.openalex_source_id));
   const conferences = sources.filter(
     (source) => source.source_type === "conference" && compact(source.dblp_path),
   );
 
-  const [journalResult, conferenceResults] = await Promise.all([
-    journals.length > 0
-      ? searchJournalsViaOpenAlex(journals, {
-          query: normalizedQuery,
-          fetchImpl,
-          perVenue,
-          fromYear,
-          mailto,
-          timeoutMs,
-        })
-      : Promise.resolve({ records: [], statuses: [] }),
-    searchConferencesViaDblp(conferences, {
-      query: normalizedQuery,
-      fetchImpl,
-      perVenue,
-      timeoutMs,
-      requestDelayMs,
-      sleep,
-    }),
-  ]);
+  const rawRecords = [];
+  // source_id -> 合并后的状态：任一查询成功即视为成功，全部失败才算失败。
+  const statusById = new Map();
+  const mergeStatus = (status) => {
+    if (!status || !status.source_id) return;
+    const previous = statusById.get(status.source_id);
+    if (!previous) {
+      statusById.set(status.source_id, { ...status });
+      return;
+    }
+    const merged = { ...previous };
+    if (status.status === "success") merged.status = "success";
+    merged.count = (Number(previous.count) || 0) + (Number(status.count) || 0);
+    if (previous.status !== "success" && status.error) merged.error = status.error;
+    if (status.status === "success") merged.error = null;
+    statusById.set(status.source_id, merged);
+  };
 
-  const venueStatuses = [
-    ...journalResult.statuses,
-    ...conferenceResults.map((result) => result.status),
-  ];
-  const rawRecords = [
-    ...journalResult.records,
-    ...conferenceResults.flatMap((result) => result.records),
-  ];
+  // 查询之间串行，避免对 DBLP 等来源瞬时压力过大；单查询与旧行为完全一致。
+  for (const normalizedQuery of normalizedQueries) {
+    const [journalResult, conferenceResults] = await Promise.all([
+      journals.length > 0
+        ? searchJournalsViaOpenAlex(journals, {
+            query: normalizedQuery,
+            fetchImpl,
+            perVenue,
+            fromYear,
+            mailto,
+            timeoutMs,
+          })
+        : Promise.resolve({ records: [], statuses: [] }),
+      searchConferencesViaDblp(conferences, {
+        query: normalizedQuery,
+        fetchImpl,
+        perVenue,
+        timeoutMs,
+        requestDelayMs,
+        sleep,
+      }),
+    ]);
+    for (const status of journalResult.statuses) mergeStatus(status);
+    for (const result of conferenceResults) mergeStatus(result.status);
+    rawRecords.push(...journalResult.records);
+    rawRecords.push(...conferenceResults.flatMap((result) => result.records));
+  }
+
+  const normalizedQuery = normalizedQueries[0] ?? "";
+  const venueStatuses = [...statusById.values()];
 
   const normalized = [];
   for (const record of rawRecords) {
@@ -419,6 +454,7 @@ export async function searchRegisteredVenues({
   return {
     schema_version: 1,
     query: normalizedQuery,
+    queries: normalizedQueries,
     observed_at: observedAt,
     from_year: Number.isInteger(fromYear) ? fromYear : null,
     venues: venueStatuses,

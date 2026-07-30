@@ -21,6 +21,7 @@ const DEFAULT_CONVERSATION_TITLE = "新的检索";
 const TRANSLATION_PROVIDER_ID = "codex-subscription";
 const TRANSLATION_MODEL_ID = "gpt-5.3-codex-spark";
 const MAX_TRANSLATION_ITEMS = 40;
+const MAX_PLAN_QUERIES = 4;
 
 // 含连续英文字母才需要翻译；纯中文/纯数字不消耗翻译额度。
 function looksTranslatable(text) {
@@ -407,8 +408,10 @@ export function createVenueSearchService({
   }
 
   async function planQuery(question, projectContext, { providerId, modelId, reasoningEffort, onEvent = null }) {
+    const fallbackQuery = deterministicSearchQuery(question);
     const fallback = {
-      search_query: deterministicSearchQuery(question),
+      search_query: fallbackQuery,
+      search_queries: [fallbackQuery],
       from_year: null,
       source: "deterministic",
       usage: null,
@@ -431,10 +434,24 @@ export function createVenueSearchService({
           schema: prompt.schema,
           ...(typeof onEvent === "function" ? { onEvent } : {}),
         });
-        const searchQuery = compact(generated.value?.search_query, 200);
-        if (searchQuery.length < 3) throw new Error("VENUE_SEARCH_PLAN_INVALID");
+        // 兼容新版多查询 search_queries 与旧版单查询 search_query。
+        const rawQueries = Array.isArray(generated.value?.search_queries)
+          ? generated.value.search_queries
+          : [generated.value?.search_query];
+        const seen = new Set();
+        const searchQueries = [];
+        for (const candidate of rawQueries) {
+          const normalized = compact(candidate, 200);
+          const key = normalized.toLowerCase();
+          if (normalized.length < 3 || seen.has(key)) continue;
+          seen.add(key);
+          searchQueries.push(normalized);
+          if (searchQueries.length >= MAX_PLAN_QUERIES) break;
+        }
+        if (searchQueries.length === 0) throw new Error("VENUE_SEARCH_PLAN_INVALID");
         return {
-          search_query: searchQuery,
+          search_query: searchQueries[0],
+          search_queries: searchQueries,
           from_year: Number.isInteger(generated.value?.from_year)
             ? generated.value.from_year
             : null,
@@ -642,6 +659,7 @@ export function createVenueSearchService({
       const [search, web] = await Promise.all([
         venueSearcher({
           query: plan.search_query,
+          queries: plan.search_queries ?? [plan.search_query],
           fromYear: plan.from_year ?? null,
           limit: SEARCH_RESULT_LIMIT,
           fetchImpl,
@@ -704,6 +722,7 @@ export function createVenueSearchService({
         completed_at: now().toISOString(),
         plan: {
           search_query: plan.search_query,
+          search_queries: plan.search_queries ?? [plan.search_query],
           from_year: plan.from_year ?? null,
           source: plan.source,
           provider_id: plan.provider_id ?? null,

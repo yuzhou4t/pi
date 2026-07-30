@@ -329,9 +329,9 @@ test("live mode uses the model for plan and recommendation and falls back on mod
     modelProviders: {
       completeStructured: async ({ input, schema }) => {
         calls.push(schema);
-        if (Object.hasOwn(schema.properties, "search_query")) {
+        if (Object.hasOwn(schema.properties, "search_queries")) {
           return {
-            value: { search_query: "llm agent evaluation" },
+            value: { search_queries: ["llm agent evaluation", "agent benchmark reliability"] },
             provider_id: "deepseek",
             model_id: "deepseek-v4-flash",
             operation_id: "op-plan",
@@ -423,8 +423,8 @@ test("Spark translation fills non-recommended paper titles and web references", 
     modelMode: "live",
     modelProviders: {
       completeStructured: async ({ input, schema, modelId }) => {
-        if (Object.hasOwn(schema.properties, "search_query")) {
-          return { value: { search_query: "agentic retrieval" }, provider_id: "deepseek", model_id: "deepseek-v4-flash", operation_id: "op", usage: null };
+        if (Object.hasOwn(schema.properties, "search_queries")) {
+          return { value: { search_queries: ["agentic retrieval"] }, provider_id: "deepseek", model_id: "deepseek-v4-flash", operation_id: "op", usage: null };
         }
         if (Object.hasOwn(schema.properties, "translations")) {
           translateModel = modelId;
