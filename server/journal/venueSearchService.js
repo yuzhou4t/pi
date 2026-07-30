@@ -56,6 +56,24 @@ function deriveConversationTitle(question) {
   return text || DEFAULT_CONVERSATION_TITLE;
 }
 
+// 学术索引对整段中文提问几乎必然零命中；规划失败时只用问题里可检索的英文术语兜底。
+export function deterministicSearchQuery(question) {
+  const text = typeof question === "string" ? question : "";
+  const asciiRuns = text.match(/[A-Za-z][A-Za-z0-9+._-]{1,40}/g) ?? [];
+  const seen = new Set();
+  const terms = [];
+  for (const run of asciiRuns) {
+    const term = run.toLowerCase();
+    if (seen.has(term)) continue;
+    seen.add(term);
+    terms.push(run);
+    if (terms.length >= 12) break;
+  }
+  const extracted = compact(terms.join(" "), 200);
+  if (extracted.length >= 3) return extracted;
+  return compact(text, 200);
+}
+
 function recommendInput(question, projectContext, papers, webResults = []) {
   return {
     question: compact(question, MAX_QUESTION_CHARS),
@@ -174,6 +192,49 @@ export function createVenueSearchService({
         now,
       }).runWebSearch;
   let inFlight = null;
+  // 运行中检索回合的实时进度（仅内存，供前端轮询）。
+  const turnProgress = new Map();
+  const TURN_PROGRESS_TTL_MS = 5 * 60 * 1000;
+
+  function pruneTurnProgress() {
+    const cutoff = Date.now() - TURN_PROGRESS_TTL_MS;
+    for (const [key, value] of turnProgress) {
+      if (value.updated_at_ms < cutoff) turnProgress.delete(key);
+    }
+  }
+
+  function setTurnProgress(clientRequestId, patch) {
+    if (!clientRequestId) return;
+    pruneTurnProgress();
+    const previous = turnProgress.get(clientRequestId) ?? {};
+    turnProgress.set(clientRequestId, {
+      phase: patch.phase ?? previous.phase ?? "preparing",
+      thinking: patch.thinking !== undefined ? patch.thinking : previous.thinking ?? null,
+      query: patch.query ?? previous.query ?? null,
+      status: patch.status ?? previous.status ?? "running",
+      updated_at_ms: Date.now(),
+    });
+  }
+
+  function getTurnProgress(clientRequestId) {
+    pruneTurnProgress();
+    const value = turnProgress.get(clientRequestId);
+    if (!value) return { phase: "unknown", thinking: null, query: null, status: "unknown" };
+    return {
+      phase: value.phase,
+      thinking: value.thinking,
+      query: value.query,
+      status: value.status,
+    };
+  }
+
+  // 模型通道公开事件 → 面向人的阶段（不改变当前业务阶段，只补思考摘要）。
+  function progressFromModelEvent(event, phase) {
+    if (event?.type === "thinking_summary") {
+      return { phase, thinking: event.text ?? null };
+    }
+    return null;
+  }
 
   function newConversation(title) {
     const timestamp = now().toISOString();
@@ -336,43 +397,51 @@ export function createVenueSearchService({
     };
   }
 
-  async function planQuery(question, projectContext, { providerId, modelId, reasoningEffort }) {
+  async function planQuery(question, projectContext, { providerId, modelId, reasoningEffort, onEvent = null }) {
     const fallback = {
-      search_query: compact(question, 200),
+      search_query: deterministicSearchQuery(question),
       from_year: null,
       source: "deterministic",
       usage: null,
     };
     if (modelMode !== "live" || !modelProviders?.completeStructured) return fallback;
     const prompt = promptRegistry.loadPrompt("venue-search-plan");
-    try {
-      const generated = await modelProviders.completeStructured({
-        providerId,
-        modelId,
-        ...(reasoningEffort ? { reasoningEffort } : {}),
-        system: prompt.system,
-        prompt: prompt.body,
-        input: {
-          question: compact(question, MAX_QUESTION_CHARS),
-          project_goal: compact(projectContext?.goal, 300) || null,
-        },
-        schema: prompt.schema,
-      });
-      const searchQuery = compact(generated.value?.search_query, 200);
-      if (searchQuery.length < 3) throw new Error("VENUE_SEARCH_PLAN_INVALID");
-      return {
-        search_query: searchQuery,
-        from_year: Number.isInteger(generated.value?.from_year)
-          ? generated.value.from_year
-          : null,
-        source: "model",
-        provider_id: generated.provider_id,
-        model_id: generated.model_id,
-        usage: generated.usage ?? null,
-      };
-    } catch (error) {
-      return { ...fallback, source: "deterministic_fallback", error: publicError(error) };
+    let lastError = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const generated = await modelProviders.completeStructured({
+          providerId,
+          modelId,
+          ...(reasoningEffort ? { reasoningEffort } : {}),
+          system: prompt.system,
+          prompt: prompt.body,
+          input: {
+            question: compact(question, MAX_QUESTION_CHARS),
+            project_goal: compact(projectContext?.goal, 300) || null,
+          },
+          schema: prompt.schema,
+          ...(typeof onEvent === "function" ? { onEvent } : {}),
+        });
+        const searchQuery = compact(generated.value?.search_query, 200);
+        if (searchQuery.length < 3) throw new Error("VENUE_SEARCH_PLAN_INVALID");
+        return {
+          search_query: searchQuery,
+          from_year: Number.isInteger(generated.value?.from_year)
+            ? generated.value.from_year
+            : null,
+          source: "model",
+          provider_id: generated.provider_id,
+          model_id: generated.model_id,
+          usage: generated.usage ?? null,
+        };
+      } catch (error) {
+        lastError = error;
+        // 可重试的模型失败先重试一次，避免偶发抖动直接降级兜底。
+        if (attempt === 0 && error?.retryable === true) continue;
+        break;
+      }
     }
+    return { ...fallback, source: "deterministic_fallback", error: publicError(lastError) };
   }
 
   async function webDiscovery(query) {
@@ -392,7 +461,7 @@ export function createVenueSearchService({
     }
   }
 
-  async function recommend(question, projectContext, papers, webResults, { providerId, modelId, reasoningEffort }) {
+  async function recommend(question, projectContext, papers, webResults, { providerId, modelId, reasoningEffort, onEvent = null }) {
     const pool = papers.slice(0, MAX_RECOMMEND_INPUTS);
     if (
       modelMode !== "live"
@@ -415,6 +484,7 @@ export function createVenueSearchService({
         prompt: prompt.body,
         input: recommendInput(question, projectContext, pool, webResults),
         schema: prompt.schema,
+        ...(typeof onEvent === "function" ? { onEvent } : {}),
       });
       return {
         ...validateRecommendation(generated.value, pool),
@@ -487,10 +557,20 @@ export function createVenueSearchService({
         // 项目状态不可读时检索仍可进行，推荐将只依据问题与题录。
       }
       const startedAt = now().toISOString();
+      setTurnProgress(clientRequestId, { phase: "planning", status: "running" });
       const plan = await planQuery(normalizedQuestion, projectContext, {
         providerId,
         modelId,
         reasoningEffort,
+        onEvent: (event) => {
+          const patch = progressFromModelEvent(event, "planning");
+          if (patch) setTurnProgress(clientRequestId, patch);
+        },
+      });
+      setTurnProgress(clientRequestId, {
+        phase: "searching",
+        query: plan.search_query,
+        thinking: null,
       });
       const [search, web] = await Promise.all([
         venueSearcher({
@@ -502,12 +582,21 @@ export function createVenueSearchService({
         }),
         webDiscovery(plan.search_query),
       ]);
+      setTurnProgress(clientRequestId, { phase: "recommending" });
       const recommendation = await recommend(
         normalizedQuestion,
         projectContext,
         search.papers,
         web.results,
-        { providerId, modelId, reasoningEffort },
+        {
+          providerId,
+          modelId,
+          reasoningEffort,
+          onEvent: (event) => {
+            const patch = progressFromModelEvent(event, "recommending");
+            if (patch) setTurnProgress(clientRequestId, patch);
+          },
+        },
       );
       const turn = {
         turn_id: `vs-${idFactory().slice(0, 12)}`,
@@ -573,7 +662,12 @@ export function createVenueSearchService({
       return conversationView(updatedConv);
     })();
     try {
-      return await inFlight;
+      const result = await inFlight;
+      setTurnProgress(clientRequestId, { phase: "done", status: "complete" });
+      return result;
+    } catch (error) {
+      setTurnProgress(clientRequestId, { phase: "failed", status: "failed" });
+      throw error;
     } finally {
       inFlight = null;
     }
@@ -628,6 +722,7 @@ export function createVenueSearchService({
     createConversation,
     deleteConversation,
     submitTurn,
+    getTurnProgress,
     markPapersAdded,
     getTurn,
   });

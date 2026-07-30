@@ -13838,6 +13838,35 @@ h4.reader-rail-full-heading {
   margin: 0;
 }
 
+.topic-search-thinking {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.topic-search-thinking-query {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.topic-search-thinking-summary {
+  margin: 0;
+  padding: 7px 10px;
+  border-left: 2px solid rgba(15, 118, 110, 0.35);
+  background: rgba(15, 118, 110, 0.05);
+  border-radius: 0 8px 8px 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .topic-search-error {
   margin: 0;
   color: #7c3a2d;

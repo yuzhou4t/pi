@@ -16,6 +16,19 @@ function venueCoverage(turn) {
   return `${base} · ${failed.map((venue) => venue.shortName).join("、")}暂不可用`;
 }
 
+function topicPhaseLabel(progress) {
+  switch (progress?.phase) {
+    case "planning":
+      return "正在规划检索关键词…";
+    case "searching":
+      return "正在检索注册刊物与联网…";
+    case "recommending":
+      return "正在阅读命中结果并整理推荐…";
+    default:
+      return "正在检索注册刊物与联网并整理推荐…";
+  }
+}
+
 function paperMeta(paper) {
   return [
     paper.venue,
@@ -139,6 +152,7 @@ export function TopicSearchWorkspace({
   onAddToWeekly,
   onNewConversation,
   submitting,
+  progress,
   submitError,
   addingTurnId,
   addErrors,
@@ -263,10 +277,18 @@ export function TopicSearchWorkspace({
           />
         ))}
         {submitting ? (
-          <p className="topic-search-hint" role="status">
-            <CircleNotch className="spin" size={15} weight="bold" aria-hidden="true" />
-            正在检索注册刊物与联网并整理推荐…
-          </p>
+          <div className="topic-search-thinking" role="status">
+            <p className="topic-search-hint">
+              <CircleNotch className="spin" size={15} weight="bold" aria-hidden="true" />
+              {topicPhaseLabel(progress)}
+            </p>
+            {progress?.query ? (
+              <p className="topic-search-thinking-query">检索词：{progress.query}</p>
+            ) : null}
+            {progress?.thinking ? (
+              <p className="topic-search-thinking-summary">{progress.thinking}</p>
+            ) : null}
+          </div>
         ) : null}
         {submitError ? (
           <p className="topic-search-error" role="alert">{submitError}</p>

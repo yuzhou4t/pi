@@ -68,6 +68,7 @@ import {
   deleteVenueSearchConversation,
   fetchVenueSearchConversation,
   fetchVenueSearchConversations,
+  fetchVenueSearchTurnProgress,
   submitVenueSearchTurn,
 } from "./api/venueSearch.js";
 import { getModelDisplayName, providers, skillCatalog } from "./data.js";
@@ -519,6 +520,7 @@ export function App() {
     "",
   );
   const [topicSearchSubmitting, setTopicSearchSubmitting] = useState(false);
+  const [topicSearchProgress, setTopicSearchProgress] = useState(null);
   const [topicSearchSubmitError, setTopicSearchSubmitError] = useState(null);
   const [topicSearchAddingTurnId, setTopicSearchAddingTurnId] = useState(null);
   const [topicSearchAddErrors, setTopicSearchAddErrors] = useState({});
@@ -1896,6 +1898,27 @@ export function App() {
   const submitTopicSearchQuestion = useCallback(async (question) => {
     setTopicSearchSubmitting(true);
     setTopicSearchSubmitError(null);
+    const clientRequestId = `venue-search-${globalThis.crypto?.randomUUID?.()
+      ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+    setTopicSearchProgress({ phase: "planning", thinking: null, query: null });
+    // 轮询服务端的分阶段思考进度，与研读对话一致。
+    let cancelled = false;
+    const pollProgress = async () => {
+      while (!cancelled) {
+        try {
+          const progress = await fetchVenueSearchTurnProgress({ clientRequestId });
+          if (cancelled) break;
+          if (progress) {
+            setTopicSearchProgress(progress);
+            if (progress.status === "complete" || progress.status === "failed") break;
+          }
+        } catch {
+          // 进度轮询失败不影响检索本身。
+        }
+        await new Promise((resolve) => setTimeout(resolve, 900));
+      }
+    };
+    const polling = pollProgress();
     try {
       const conversation = await submitVenueSearchTurn({
         conversationId: activeTopicConversationId || undefined,
@@ -1903,6 +1926,7 @@ export function App() {
         providerId: selectedProvider?.id,
         modelId: selectedModel,
         thinkingLevel: journalSupportsThinking ? activeJournalThinkingLevel : null,
+        clientRequestId,
       });
       setTopicSearchState({ status: "ready", conversation, error: null });
       if (conversation.conversationId) {
@@ -1912,7 +1936,10 @@ export function App() {
     } catch (error) {
       setTopicSearchSubmitError(error.message);
     } finally {
+      cancelled = true;
+      await polling;
       setTopicSearchSubmitting(false);
+      setTopicSearchProgress(null);
     }
   }, [
     activeTopicConversationId,
@@ -3393,6 +3420,7 @@ export function App() {
             onAddToWeekly={addTopicSearchPapers}
             onNewConversation={createTopicConversation}
             submitting={topicSearchSubmitting}
+            progress={topicSearchProgress}
             submitError={topicSearchSubmitError}
             addingTurnId={topicSearchAddingTurnId}
             addErrors={topicSearchAddErrors}

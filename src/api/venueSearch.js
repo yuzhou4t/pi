@@ -163,6 +163,23 @@ export async function submitVenueSearchTurn({
   return mapVenueSearchConversation(body);
 }
 
+export async function fetchVenueSearchTurnProgress({ clientRequestId, signal } = {}) {
+  if (typeof clientRequestId !== "string" || !clientRequestId.trim()) return null;
+  const response = await fetch(
+    `/api/v1/venue-search/turn-progress?client_request_id=${encodeURIComponent(clientRequestId)}`,
+    { signal },
+  );
+  if (!response.ok) return null;
+  const body = await response.json().catch(() => null);
+  if (!body || typeof body !== "object") return null;
+  return {
+    phase: typeof body.phase === "string" ? body.phase : "unknown",
+    thinking: typeof body.thinking === "string" ? body.thinking : null,
+    query: typeof body.query === "string" ? body.query : null,
+    status: typeof body.status === "string" ? body.status : "unknown",
+  };
+}
+
 export async function addVenueSearchPapersToWeekly({
   conversationId,
   turnId,

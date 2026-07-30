@@ -13,6 +13,7 @@ import { createSourceStateStore } from "./sourceStateStore.js";
 import {
   createVenueSearchService,
   deterministicRecommendation,
+  deterministicSearchQuery,
 } from "./venueSearchService.js";
 import { createWebSearchRunner } from "../project-work/externalRetrieval.js";
 import { resolveProjectWorkDoubaoQuotaFilePath } from "../project-work/projectWorkPaths.js";
@@ -66,7 +67,8 @@ test("a fixture-mode search turn is durable, idempotent, and keeps failed venues
     modelMode: "fixture",
     venueSearcher: async ({ query }) => {
       searchCalls += 1;
-      assert.equal(query, "帮我找 LLM Agent 评估的论文");
+      // 兜底时只提取问题里可检索的英文术语，不把整段中文发给学术索引。
+      assert.equal(query, "LLM Agent");
       return searchResult(papers);
     },
   });
@@ -466,4 +468,34 @@ test("accepted search papers join the current weekly run once with retrieval lab
     replay.conversation.turns.at(-1).added_paper_ids.sort(),
     target.papers.map((paper) => paper.paper_id).sort(),
   );
+});
+
+test("deterministicSearchQuery extracts English terms from a Chinese question", () => {
+  assert.equal(
+    deterministicSearchQuery("帮我找 LLM Agent 长期记忆 memory 机制的论文"),
+    "LLM Agent memory",
+  );
+  // 去重保留首次出现顺序。
+  assert.equal(deterministicSearchQuery("RAG rag RAG retrieval"), "RAG retrieval");
+  // 没有英文术语时回退到原文。
+  assert.equal(deterministicSearchQuery("帮我找一些论文"), "帮我找一些论文");
+});
+
+test("submitTurn records phased progress that finishes complete", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-venue-search-progress-"));
+  const service = createVenueSearchService({
+    dataDir,
+    modelMode: "fixture",
+    venueSearcher: async () => searchResult([searchPaper("p1", "Agent Memory")]),
+  });
+  await service.submitTurn({
+    question: "LLM Agent memory",
+    clientRequestId: "vs-progress-1",
+  });
+  const progress = service.getTurnProgress("vs-progress-1");
+  assert.equal(progress.phase, "done");
+  assert.equal(progress.status, "complete");
+  const unknown = service.getTurnProgress("vs-progress-missing");
+  assert.equal(unknown.phase, "unknown");
+  assert.equal(unknown.status, "unknown");
 });

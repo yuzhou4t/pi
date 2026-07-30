@@ -2730,6 +2730,24 @@ export function createApiServer({
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/api/v1/venue-search/turn-progress") {
+    try {
+      const clientRequestId = url.searchParams.get("client_request_id") || "";
+      if (!clientRequestId.trim()) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "进度查询必须提供稳定的请求标识", 400);
+      }
+      sendJson(
+        response,
+        200,
+        { schema_version: 1, ...journalWorkflowService.getVenueSearchTurnProgress(clientRequestId) },
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法读取主题检索进度");
+    }
+    return;
+  }
+
   if (request.method === "POST" && url.pathname === "/api/v1/venue-search/turns") {
     try {
       requireJournalMutationOrigin(origin);

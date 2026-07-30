@@ -773,6 +773,10 @@ export function createJournalWorkflowService({
     });
   }
 
+  function getVenueSearchTurnProgress(clientRequestId) {
+    return venueSearch.getTurnProgress(clientRequestId);
+  }
+
   async function addVenueSearchPapersToWeekly({ conversationId = null, turnId, paperIds } = {}) {
     if (!Array.isArray(paperIds) || paperIds.length === 0) {
       throw artifactError(
@@ -2727,6 +2731,7 @@ export function createJournalWorkflowService({
     createVenueSearchConversation,
     deleteVenueSearchConversation,
     submitVenueSearchTurn,
+    getVenueSearchTurnProgress,
     addVenueSearchPapersToWeekly,
     retryPaperDocument,
     restartReadingFromGuide: reading.restartFromGuide,
