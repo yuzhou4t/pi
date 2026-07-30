@@ -204,6 +204,15 @@ function normalizeProviderConfig(config, catalogProviders, defaultProviderId) {
     ?? catalogProviders.find((item) => item.id === defaultProviderId && item.available)
     ?? catalogProviders.find((item) => item.available)
     ?? catalogProviders[0];
+  // codex-subscription 的完整 GPT 模型清单是稍后从项目工作目录合并进来的，
+  // 基础目录里只有 account-default。这里不能用基础清单去校验并清掉用户已保存的
+  // GPT 模型选择，否则每次加载都会被重置回默认模型；保留已保存值，渲染时再兜底。
+  if (provider?.id === "codex-subscription") {
+    const savedModel = typeof config?.model === "string" && config.model.trim()
+      ? config.model
+      : provider?.models[0] ?? "";
+    return { providerId: provider?.id ?? "", model: savedModel };
+  }
   const model = provider?.models.includes(config?.model) ? config.model : provider?.models[0] ?? "";
   return { providerId: provider?.id ?? "", model };
 }

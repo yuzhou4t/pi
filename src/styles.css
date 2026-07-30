@@ -14055,6 +14055,13 @@ h4.reader-rail-full-heading {
   color: var(--muted);
 }
 
+.topic-search-web-original {
+  display: block;
+  color: var(--muted);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
 .topic-search-web-note {
   margin: 8px 0 0;
   padding-top: 8px;

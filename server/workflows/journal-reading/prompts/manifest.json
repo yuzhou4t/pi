@@ -17,7 +17,8 @@
     "reading-chat": "reading-chat.v4",
     "translation": "translation.v1",
     "venue-search-plan": "venue-search-plan.v1",
-    "venue-search-recommend": "venue-search-recommend.v2"
+    "venue-search-recommend": "venue-search-recommend.v2",
+    "venue-search-translate": "venue-search-translate.v1"
   },
   "versions": {
     "candidate-ranking.v1": {
@@ -123,6 +124,10 @@
     "venue-search-recommend.v2": {
       "file": "venue-search-recommend.v2.md",
       "schema": "venue-search-recommend.v2.json"
+    },
+    "venue-search-translate.v1": {
+      "file": "venue-search-translate.v1.md",
+      "schema": "venue-search-translate.v1.json"
     }
   }
 }

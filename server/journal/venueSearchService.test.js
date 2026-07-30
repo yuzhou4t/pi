@@ -338,6 +338,17 @@ test("live mode uses the model for plan and recommendation and falls back on mod
             usage: { input_tokens: 10, output_tokens: 4 },
           };
         }
+        if (Object.hasOwn(schema.properties, "translations")) {
+          return {
+            value: {
+              translations: input.items.map((item) => ({ id: item.id, zh: `中文：${item.text}` })),
+            },
+            provider_id: "codex-subscription",
+            model_id: "gpt-5.3-codex-spark",
+            operation_id: "op-tr",
+            usage: { input_tokens: 12, output_tokens: 8 },
+          };
+        }
         assert.equal(input.papers.length, 1);
         return {
           value: {
@@ -372,7 +383,10 @@ test("live mode uses the model for plan and recommendation and falls back on mod
   assert.equal(turn.plan.source, "model");
   assert.equal(turn.recommendation_source, "model");
   assert.equal(turn.recommendations[0].paper_id, "p1");
-  assert.equal(calls.length, 2);
+  // 规划 + 推荐 + 翻译共三次有界调用。
+  assert.equal(calls.length, 3);
+  // 推荐已提供中文标题，优先保留推荐的译名。
+  assert.equal(turn.papers[0].title_zh, "面向可验证 Agent 评估的系统化协议");
 
   const failing = createVenueSearchService({
     dataDir: await mkdtemp(path.join(os.tmpdir(), "pi-agent-venue-search-fb-")),
@@ -398,6 +412,51 @@ test("deterministic recommendation is honest about empty hits", () => {
   const empty = deterministicRecommendation("agent planning", []);
   assert.deepEqual(empty.recommendations, []);
   assert.ok(empty.answer.includes("没有检索到"));
+});
+
+test("Spark translation fills non-recommended paper titles and web references", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-venue-translate-"));
+  const papers = [searchPaper("p1", "Agentic Retrieval Benchmarks")];
+  let translateModel = null;
+  const service = createVenueSearchService({
+    dataDir,
+    modelMode: "live",
+    modelProviders: {
+      completeStructured: async ({ input, schema, modelId }) => {
+        if (Object.hasOwn(schema.properties, "search_query")) {
+          return { value: { search_query: "agentic retrieval" }, provider_id: "deepseek", model_id: "deepseek-v4-flash", operation_id: "op", usage: null };
+        }
+        if (Object.hasOwn(schema.properties, "translations")) {
+          translateModel = modelId;
+          return {
+            value: { translations: input.items.map((item) => ({ id: item.id, zh: `译:${item.text}` })) },
+            provider_id: "codex-subscription",
+            model_id: modelId,
+            operation_id: "op-tr",
+            usage: null,
+          };
+        }
+        // 无推荐，只依靠翻译填充中文标题。
+        return { value: { answer: "本次命中较弱，暂无可推荐论文。", recommendations: [] }, provider_id: "deepseek", model_id: "deepseek-v4-flash", operation_id: "op-rec", usage: null };
+      },
+    },
+    venueSearcher: async () => searchResult(papers),
+    webSearcher: async () => ({
+      provider: "tavily",
+      results: [{ title: "Skills Documentation", url: "https://example.com/skills", excerpt: "Skills are self-contained packages" }],
+    }),
+  });
+
+  const conversation = await service.submitTurn({
+    question: "agentic retrieval",
+    clientRequestId: "vs-tr-1",
+  });
+  const [turn] = conversation.turns;
+  // 翻译固定走 Codex 5.3 Spark，不受会话所选模型影响。
+  assert.equal(translateModel, "gpt-5.3-codex-spark");
+  assert.equal(turn.papers[0].title_zh, "译:Agentic Retrieval Benchmarks");
+  assert.equal(turn.web.results[0].title_zh, "译:Skills Documentation");
+  assert.equal(turn.web.results[0].excerpt_zh, "译:Skills are self-contained packages");
 });
 
 test("accepted search papers join the current weekly run once with retrieval labels", async () => {

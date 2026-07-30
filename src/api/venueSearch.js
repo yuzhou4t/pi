@@ -52,6 +52,7 @@ export function mapVenueSearchConversation(body) {
       papers: (turn.papers ?? []).map((paper) => ({
         id: paper.paper_id,
         title: paper.title,
+        titleZh: paper.title_zh ?? null,
         authors: paper.authors ?? [],
         venue: paper.venue,
         publishedAt: paper.published_at ?? null,
@@ -67,8 +68,10 @@ export function mapVenueSearchConversation(body) {
         provider: turn.web?.provider ?? null,
         results: (turn.web?.results ?? []).map((item) => ({
           title: item.title,
+          titleZh: item.title_zh ?? null,
           url: item.url,
           excerpt: item.excerpt || "",
+          excerptZh: item.excerpt_zh ?? null,
           publishedDate: item.published_date ?? null,
         })),
       },

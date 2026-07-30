@@ -24,6 +24,8 @@ function topicPhaseLabel(progress) {
       return "正在检索注册刊物与联网…";
     case "recommending":
       return "正在阅读命中结果并整理推荐…";
+    case "translating":
+      return "正在翻译英文标题与摘要…";
     default:
       return "正在检索注册刊物与联网并整理推荐…";
   }
@@ -86,8 +88,8 @@ function TurnCard({
                     onChange={() => onToggleSelect(turn.turnId, paper.id)}
                   />
                   <span className="topic-search-paper-body">
-                    <strong>{recommendation?.titleZh || paper.title}</strong>
-                    {recommendation?.titleZh ? (
+                    <strong>{recommendation?.titleZh || paper.titleZh || paper.title}</strong>
+                    {(recommendation?.titleZh || paper.titleZh) ? (
                       <small className="topic-search-paper-original">{paper.title}</small>
                     ) : null}
                     <small>{paperMeta(paper)}</small>
@@ -132,9 +134,14 @@ function TurnCard({
             {turn.web.results.map((item) => (
               <li key={item.url}>
                 <a href={item.url} target="_blank" rel="noreferrer noopener">
-                  {item.title}
+                  {item.titleZh || item.title}
                 </a>
-                {item.excerpt ? <p>{item.excerpt.slice(0, 160)}</p> : null}
+                {item.titleZh && item.titleZh !== item.title ? (
+                  <small className="topic-search-web-original">{item.title}</small>
+                ) : null}
+                {(item.excerptZh || item.excerpt) ? (
+                  <p>{(item.excerptZh || item.excerpt).slice(0, 200)}</p>
+                ) : null}
               </li>
             ))}
           </ul>

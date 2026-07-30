@@ -17,6 +17,15 @@ const MAX_WEB_EXCERPT_CHARS = 400;
 const MAX_CONVERSATIONS = 50;
 const MAX_TITLE_CHARS = 60;
 const DEFAULT_CONVERSATION_TITLE = "新的检索";
+// 英文标题/摘要统一用 Codex 5.3 Spark 翻译，不受当前会话所选模型影响。
+const TRANSLATION_PROVIDER_ID = "codex-subscription";
+const TRANSLATION_MODEL_ID = "gpt-5.3-codex-spark";
+const MAX_TRANSLATION_ITEMS = 40;
+
+// 含连续英文字母才需要翻译；纯中文/纯数字不消耗翻译额度。
+function looksTranslatable(text) {
+  return typeof text === "string" && /[A-Za-z]{4,}/.test(text);
+}
 
 export class VenueSearchServiceError extends Error {
   constructor(code, message, status = 409, retryable = false) {
@@ -461,6 +470,64 @@ export function createVenueSearchService({
     }
   }
 
+  // 用 Codex Spark 把标题/摘要里的英文批量翻成中文；尽力而为，失败就保留原文。
+  async function translateDiscoveries({ papers, webResults, onEvent = null }) {
+    const empty = { titles: new Map(), webTitles: new Map(), webExcerpts: new Map() };
+    if (modelMode !== "live" || !modelProviders?.completeStructured) return empty;
+    const items = [];
+    papers.forEach((paper, index) => {
+      if (looksTranslatable(paper.title)) {
+        items.push({ id: `p${index}`, text: compact(paper.title, 300) });
+      }
+    });
+    webResults.forEach((item, index) => {
+      if (looksTranslatable(item.title)) {
+        items.push({ id: `wt${index}`, text: compact(item.title, 300) });
+      }
+      if (looksTranslatable(item.excerpt)) {
+        items.push({ id: `we${index}`, text: compact(item.excerpt, MAX_WEB_EXCERPT_CHARS) });
+      }
+    });
+    if (items.length === 0) return empty;
+    const bounded = items.slice(0, MAX_TRANSLATION_ITEMS);
+    try {
+      const prompt = promptRegistry.loadPrompt("venue-search-translate");
+      const generated = await modelProviders.completeStructured({
+        providerId: TRANSLATION_PROVIDER_ID,
+        modelId: TRANSLATION_MODEL_ID,
+        reasoningEffort: "low",
+        system: prompt.system,
+        prompt: prompt.body,
+        input: { items: bounded },
+        schema: prompt.schema,
+        ...(typeof onEvent === "function" ? { onEvent } : {}),
+      });
+      const byId = new Map();
+      for (const entry of generated.value?.translations ?? []) {
+        const id = typeof entry?.id === "string" ? entry.id : "";
+        const zh = compact(entry?.zh, 600);
+        if (id && zh) byId.set(id, zh);
+      }
+      const titles = new Map();
+      const webTitles = new Map();
+      const webExcerpts = new Map();
+      papers.forEach((_, index) => {
+        const zh = byId.get(`p${index}`);
+        if (zh) titles.set(index, zh);
+      });
+      webResults.forEach((_, index) => {
+        const zhTitle = byId.get(`wt${index}`);
+        const zhExcerpt = byId.get(`we${index}`);
+        if (zhTitle) webTitles.set(index, zhTitle);
+        if (zhExcerpt) webExcerpts.set(index, zhExcerpt);
+      });
+      return { titles, webTitles, webExcerpts };
+    } catch {
+      // 翻译是锦上添花；失败时保留英文原文，不影响检索结果。
+      return empty;
+    }
+  }
+
   async function recommend(question, projectContext, papers, webResults, { providerId, modelId, reasoningEffort, onEvent = null }) {
     const pool = papers.slice(0, MAX_RECOMMEND_INPUTS);
     if (
@@ -598,6 +665,36 @@ export function createVenueSearchService({
           },
         },
       );
+      // 把标题/摘要里的英文翻成中文（尽力而为）。
+      setTurnProgress(clientRequestId, { phase: "translating" });
+      const recommendedTitleZh = new Map(
+        (recommendation.recommendations ?? [])
+          .filter((item) => item.title_zh)
+          .map((item) => [item.paper_id, item.title_zh]),
+      );
+      const translations = await translateDiscoveries({
+        papers: search.papers,
+        webResults: web.results,
+        onEvent: (event) => {
+          const patch = progressFromModelEvent(event, "translating");
+          if (patch) setTurnProgress(clientRequestId, patch);
+        },
+      });
+      const translatedPapers = search.papers.map((paper, index) => {
+        const titleZh = recommendedTitleZh.get(paper.paper_id)
+          ?? translations.titles.get(index)
+          ?? paper.title_zh
+          ?? null;
+        return titleZh ? { ...paper, title_zh: titleZh } : paper;
+      });
+      const translatedWeb = web.results.map((item, index) => {
+        const next = { ...item };
+        const titleZh = translations.webTitles.get(index);
+        const excerptZh = translations.webExcerpts.get(index);
+        if (titleZh) next.title_zh = titleZh;
+        if (excerptZh) next.excerpt_zh = excerptZh;
+        return next;
+      });
       const turn = {
         turn_id: `vs-${idFactory().slice(0, 12)}`,
         client_request_id: clientRequestId,
@@ -621,11 +718,11 @@ export function createVenueSearchService({
           total_found: search.total_found,
           truncated: search.truncated,
         },
-        papers: search.papers,
+        papers: translatedPapers,
         web: {
           status: web.status,
           provider: web.provider,
-          results: web.results,
+          results: translatedWeb,
           error: web.error,
         },
         answer: recommendation.answer,

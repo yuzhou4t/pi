@@ -23,6 +23,7 @@ const expectedPrompts = [
   "translation",
   "venue-search-plan",
   "venue-search-recommend",
+  "venue-search-translate",
 ];
 
 function hash(value) {
