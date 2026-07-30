@@ -397,6 +397,61 @@ test("workflow stays reviewable when MinerU is not configured", async () => {
   assert.equal(completed.mineru.status, "not_configured");
 });
 
+test("resumeRun re-executes a run interrupted during the source scan", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-resume-scan-"));
+  const runStore = createRunStore({ dataDir });
+  const interrupted = await runStore.createRun({ sourceIds: ["source-ok"] });
+  await runStore.updateRun(interrupted.run_id, {
+    source_progress: {
+      total_count: 11,
+      completed_source_ids: ["journal-ai", "journal-tpami", "journal-ijcv", "journal-jmlr"],
+      successful_source_ids: ["journal-ai", "journal-tpami", "journal-ijcv", "journal-jmlr"],
+      failed_source_ids: [],
+    },
+  });
+  let scannerCalls = 0;
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    sourceScanner: async () => {
+      scannerCalls += 1;
+      return {
+        summary: { source_count: 11, successful_source_count: 11, failed_source_ids: [] },
+        candidateBatch: { mode: "classic_review", candidates: candidates() },
+      };
+    },
+    candidateRanker: async ({ papers }) => ({
+      candidates: papers.map((paper, index) => ({
+        ...paper,
+        rank: index + 1,
+        selection_summary: "一条足够长的经典论文选择说明。",
+        project_impact: "与项目相关。",
+      })),
+      source: "deterministic",
+    }),
+    pdfDownloader: async ({ paperId, outputDir }) => {
+      const filePath = path.join(outputDir, `${paperId}.pdf`);
+      await writeFile(filePath, "%PDF-1.7\nmock");
+      return { file_path: filePath, sha256: "hash", byte_length: 13 };
+    },
+    mineruAdapter: null,
+  });
+
+  const stuck = await runStore.getRun(interrupted.run_id);
+  assert.equal(stuck.status, "scanning");
+  const resumed = await service.resumeRun(interrupted.run_id);
+  assert.equal(resumed.run_id, interrupted.run_id);
+  const completed = await service.waitForRun(interrupted.run_id);
+  assert.equal(completed.status, "review_ready");
+  assert.equal(scannerCalls, 1);
+
+  const again = await service.resumeRun(interrupted.run_id);
+  assert.equal(again.status, "review_ready");
+  assert.equal(scannerCalls, 1);
+});
+
 test("one failed paper can retry without reprocessing papers that are already ready", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-paper-retry-"));
   const runStore = createRunStore({ dataDir });

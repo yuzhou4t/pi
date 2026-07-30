@@ -346,6 +346,7 @@ export function PaperReader({
   purpose = "document",
   providerId = null,
   modelId = null,
+  thinkingLevel = null,
   guide = null,
   guideDecision = null,
   guideDecisionBusy = false,

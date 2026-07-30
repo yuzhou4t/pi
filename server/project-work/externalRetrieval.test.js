@@ -1,4 +1,12 @@
 import assert from "node:assert/strict";
+import {
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   createExternalRetrievalTools,
@@ -38,6 +46,16 @@ test("external capability status is safe and depends only on dedicated keys", ()
       reason: "Context7 尚未配置",
     },
   });
+
+  assert.deepEqual(getExternalRetrievalCapabilities({
+    env: {
+      PI_DOUBAO_API_KEY: "doubao-secret",
+      PI_TAVILY_API_KEY: "tavily-secret",
+    },
+  }).web_search, {
+    available: true,
+    reason: "豆包优先，本月 500 次后回退 Tavily",
+  });
 });
 
 test("external retrieval tools are explicitly unavailable without dedicated server keys", async () => {
@@ -56,8 +74,8 @@ test("external retrieval tools are explicitly unavailable without dedicated serv
   await assert.rejects(
     toolByName(tools, "search_web").execute("search", { query: "Node.js fetch" }),
     (error) => {
-      assert.equal(error.code, "PROJECT_WORK_TAVILY_UNAVAILABLE");
-      assert.match(error.message, /尚未配置 Tavily API Key/);
+      assert.equal(error.code, "PROJECT_WORK_WEB_SEARCH_UNAVAILABLE");
+      assert.match(error.message, /尚未配置豆包或 Tavily API Key/);
       return true;
     },
   );
@@ -252,6 +270,170 @@ test("search_web uses only the bounded Tavily search contract and marks results 
   assert.equal(body.results.length, 1);
   assert.equal(body.results[0].excerpt.length, 1_500);
   assert.doesNotMatch(result.content[0].text, /user:secret/);
+});
+
+test("search_web prefers Doubao and durably counts the monthly request before calling it", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-doubao-quota-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const quotaFile = path.join(directory, "usage.json");
+  const calls = [];
+  const tools = createExternalRetrievalTools({
+    env: {
+      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_DOUBAO_SEARCH_MODEL: "doubao-search-model",
+      PI_TAVILY_API_KEY: "tavily-key",
+    },
+    doubaoQuotaFilePath: quotaFile,
+    now: () => new Date("2026-07-29T08:00:00+08:00"),
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        output: [
+          {
+            type: "web_search_call",
+            action: {
+              sources: [{
+                title: "Node.js documentation",
+                url: "https://nodejs.org/api/globals.html#fetch",
+                snippet: "The current fetch API.",
+              }],
+            },
+          },
+          {
+            type: "message",
+            content: [{
+              type: "output_text",
+              text: "Node.js provides a browser-compatible fetch implementation.",
+            }],
+          },
+        ],
+      });
+    },
+  });
+
+  const result = await toolByName(tools, "search_web").execute("search", {
+    query: "current Node.js fetch API",
+    max_results: 2,
+  });
+  const body = JSON.parse(result.content[0].text);
+  const requestBody = JSON.parse(calls[0].options.body);
+  const quota = JSON.parse(await readFile(quotaFile, "utf8"));
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://ark.cn-beijing.volces.com/api/v3/responses");
+  assert.equal(calls[0].options.headers.authorization, "Bearer doubao-key");
+  assert.equal(requestBody.model, "doubao-search-model");
+  assert.deepEqual(requestBody.tools, [{ type: "web_search" }]);
+  assert.equal(requestBody.stream, false);
+  assert.equal(requestBody.store, false);
+  assert.equal(body.provider, "doubao");
+  assert.equal(body.results[0].url, "https://nodejs.org/api/globals.html#fetch");
+  assert.equal(body.monthly_quota.limit, 500);
+  assert.equal(body.monthly_quota.used, 1);
+  assert.deepEqual(quota, {
+    version: 1,
+    period: "2026-07",
+    used: 1,
+    updated_at: "2026-07-29T00:00:00.000Z",
+  });
+});
+
+test("search_web falls back to Tavily after the durable Doubao monthly limit", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-doubao-limit-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const quotaFile = path.join(directory, "usage.json");
+  await writeFile(quotaFile, JSON.stringify({
+    version: 1,
+    period: "2026-07",
+    used: 500,
+  }));
+  const calls = [];
+  const tools = createExternalRetrievalTools({
+    env: {
+      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_TAVILY_API_KEY: "tavily-key",
+    },
+    doubaoQuotaFilePath: quotaFile,
+    now: () => new Date("2026-07-29T08:00:00+08:00"),
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        results: [{
+          title: "Fallback result",
+          url: "https://example.com/fallback",
+          content: "Tavily result",
+        }],
+      });
+    },
+  });
+
+  const result = await toolByName(tools, "search_web").execute("search", {
+    query: "current Node.js fetch API",
+  });
+  const body = JSON.parse(result.content[0].text);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.tavily.com/search");
+  assert.equal(body.provider, "tavily");
+  assert.equal(body.fallback_reason, "doubao_monthly_limit_reached");
+  assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).used, 500);
+});
+
+test("concurrent searches cannot reserve more than the final Doubao monthly slot", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-doubao-concurrent-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const quotaFile = path.join(directory, "usage.json");
+  await writeFile(quotaFile, JSON.stringify({
+    version: 1,
+    period: "2026-07",
+    used: 499,
+  }));
+  const calls = [];
+  const tools = createExternalRetrievalTools({
+    env: {
+      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_TAVILY_API_KEY: "tavily-key",
+    },
+    doubaoQuotaFilePath: quotaFile,
+    now: () => new Date("2026-07-29T08:00:00+08:00"),
+    fetchImpl: async (url) => {
+      calls.push(url);
+      if (url.includes("volces.com")) {
+        return jsonResponse({
+          output: [{
+            type: "web_search_call",
+            action: {
+              sources: [{
+                title: "Doubao result",
+                url: "https://example.com/doubao",
+              }],
+            },
+          }],
+        });
+      }
+      return jsonResponse({
+        results: [{
+          title: "Tavily result",
+          url: "https://example.com/tavily",
+          content: "Fallback",
+        }],
+      });
+    },
+  });
+  const searchWeb = toolByName(tools, "search_web");
+
+  const results = await Promise.all([
+    searchWeb.execute("search-1", { query: "query one" }),
+    searchWeb.execute("search-2", { query: "query two" }),
+  ]);
+  const providers = results
+    .map((result) => JSON.parse(result.content[0].text).provider)
+    .sort();
+
+  assert.deepEqual(providers, ["doubao", "tavily"]);
+  assert.equal(calls.filter((url) => url.includes("volces.com")).length, 1);
+  assert.equal(calls.filter((url) => url.includes("tavily.com")).length, 1);
+  assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).used, 500);
 });
 
 test("search_web has a hard timeout and returns a bounded safe error", async () => {

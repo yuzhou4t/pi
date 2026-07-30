@@ -61,6 +61,11 @@ import {
   startJournalRun,
   subscribeJournalRun,
 } from "./api/journalRuns.js";
+import {
+  addVenueSearchPapersToWeekly,
+  fetchVenueSearchConversation,
+  submitVenueSearchTurn,
+} from "./api/venueSearch.js";
 import { getModelDisplayName, providers, skillCatalog } from "./data.js";
 import { usePersistentReducer } from "./hooks/usePersistentReducer.js";
 import { usePersistentState } from "./hooks/usePersistentState.js";
@@ -86,6 +91,9 @@ const WorkflowWorkspace = lazy(() => import(
 const WorkflowContextRail = lazy(() => import(
   "./components/WorkflowContextRail.jsx"
 ).then((module) => ({ default: module.WorkflowContextRail })));
+const TopicSearchWorkspace = lazy(() => import(
+  "./components/TopicSearchWorkspace.jsx"
+).then((module) => ({ default: module.TopicSearchWorkspace })));
 const WORKFLOW_FIXTURES_ENABLED = import.meta.env.VITE_ENABLE_WORKFLOW_FIXTURES === "true";
 
 const runStatusLabels = {
@@ -469,6 +477,10 @@ export function App() {
     providerId: "",
     model: "",
   });
+  const [journalThinkingLevelPref, setJournalThinkingLevelPref] = usePersistentState(
+    "pi-agent-journal-thinking-v1",
+    "",
+  );
   const [providerCatalog, setProviderCatalog] = useState({
     status: "loading",
     mode: null,
@@ -491,6 +503,16 @@ export function App() {
     "pi-agent-active-conversation-v1",
     "",
   );
+  const [topicSearchState, setTopicSearchState] = useState({
+    status: "idle",
+    conversation: null,
+    error: null,
+  });
+  const [topicSearchSubmitting, setTopicSearchSubmitting] = useState(false);
+  const [topicSearchSubmitError, setTopicSearchSubmitError] = useState(null);
+  const [topicSearchAddingTurnId, setTopicSearchAddingTurnId] = useState(null);
+  const [topicSearchAddErrors, setTopicSearchAddErrors] = useState({});
+  const topicSearchLoadedRef = useRef(false);
   const [liveProjectWork, setLiveProjectWork] = useState(createLiveProjectWorkState);
   const [projectWorkModelCatalog, setProjectWorkModelCatalog] = useState({
     status: "loading",
@@ -617,12 +639,54 @@ export function App() {
       updated: "",
     };
   const catalogProviders = providerCatalog.providers;
-  const selectedProvider = catalogProviders.find(
+  // 论文侧 GPT 订阅复用写代码同一份 ChatGPT 订阅目录（模型 + 思考强度），
+  // 执行仍走已验证的 Codex CLI 结构化通道，故沿用 codex-subscription 的 id 与
+  // 本机登录可用性，仅把可选模型清单换成完整目录。
+  const journalCodexCatalog = projectWorkModelCatalog.providers.find(
+    (provider) => provider.id === "openai-codex",
+  );
+  const journalCodexModelThinking = new Map(
+    (journalCodexCatalog?.models ?? []).map((model) => [
+      model.id,
+      {
+        thinkingLevels: Array.isArray(model.thinkingLevels) ? model.thinkingLevels : [],
+        defaultThinkingLevel: model.defaultThinkingLevel ?? null,
+        supportsThinking: Boolean(model.supportsThinking),
+      },
+    ]),
+  );
+  const journalProviders = catalogProviders.map((provider) => {
+    if (provider.id !== "codex-subscription") return provider;
+    const catalogModels = (journalCodexCatalog?.models ?? []).map((model) => model.id);
+    const models = [...new Set(["account-default", ...catalogModels])];
+    return { ...provider, models };
+  });
+  const selectedProvider = journalProviders.find(
     (item) => item.id === providerConfig.providerId && item.available,
-  ) ?? catalogProviders.find((item) => item.available) ?? catalogProviders[0];
+  ) ?? journalProviders.find((item) => item.available) ?? journalProviders[0];
   const selectedModel = selectedProvider?.models.includes(providerConfig.model)
     ? providerConfig.model
     : selectedProvider?.models[0] ?? "";
+  const CODEX_DEFAULT_THINKING_LEVELS = ["low", "medium", "high", "xhigh"];
+  const selectedModelThinking = selectedProvider?.id === "codex-subscription"
+    ? (journalCodexModelThinking.get(selectedModel) ?? {
+        thinkingLevels: CODEX_DEFAULT_THINKING_LEVELS,
+        defaultThinkingLevel: "medium",
+        supportsThinking: true,
+      })
+    : null;
+  const journalThinkingLevels = selectedModelThinking
+    ? (selectedModelThinking.thinkingLevels.length > 0
+        ? selectedModelThinking.thinkingLevels
+        : CODEX_DEFAULT_THINKING_LEVELS)
+    : null;
+  const journalSupportsThinking = Boolean(selectedModelThinking?.supportsThinking ?? true)
+    && selectedProvider?.id === "codex-subscription";
+  const activeJournalThinkingLevel = journalThinkingLevels?.includes(journalThinkingLevelPref)
+    ? journalThinkingLevelPref
+    : selectedModelThinking?.defaultThinkingLevel
+      ?? journalThinkingLevels?.[0]
+      ?? null;
   const hasProjectWorkCodexProvider = projectWorkModelCatalog.providers.some(
     (provider) => provider.id === "openai-codex",
   );
@@ -715,7 +779,10 @@ export function App() {
   const activeProjectWorkState = liveProjectWork.conversation;
   const projectWorkMode = workspaceKind === "project_work";
   const readingMode = Boolean(readerPaper) && activeConversationId === paperConversationId;
-  const workflowMode = !projectWorkMode && !readingMode;
+  const topicSearchMode = !projectWorkMode
+    && !readingMode
+    && activeConversationId === "topic-search";
+  const workflowMode = !projectWorkMode && !readingMode && !topicSearchMode;
   const readerGuideArtifactState = readerTarget
     ? readerRun?.guides?.papers?.[readerTarget.paperId] ?? null
     : null;
@@ -1678,6 +1745,7 @@ export function App() {
       const nextRun = await startJournalRun({
         providerId: selectedProvider?.id,
         modelId: selectedModel,
+        thinkingLevel: journalSupportsThinking ? activeJournalThinkingLevel : null,
         signal: controller.signal,
       });
       syncJournalRun(nextRun);
@@ -1691,7 +1759,13 @@ export function App() {
     } finally {
       if (journalStartController.current === controller) journalStartController.current = null;
     }
-  }, [selectedModel, selectedProvider?.id, syncJournalRun]);
+  }, [
+    selectedModel,
+    selectedProvider?.id,
+    journalSupportsThinking,
+    activeJournalThinkingLevel,
+    syncJournalRun,
+  ]);
 
   const resumeCurrentJournalRun = useCallback(async () => {
     const runId = journalRunState.run?.id;
@@ -1716,6 +1790,69 @@ export function App() {
     }
   }, [journalRunState.run?.id, syncJournalRun]);
 
+  // 打开主题检索只读取缓存的检索记录，不会触发任何模型或联网检索。
+  // 依赖只放 topicSearchMode：用 ref 守护单次加载，避免把 status 放进依赖后
+  // setState('loading') 触发 effect 重跑、清理函数把自己的请求 abort 导致永远转圈。
+  useEffect(() => {
+    if (!topicSearchMode) {
+      topicSearchLoadedRef.current = false;
+      return undefined;
+    }
+    if (topicSearchLoadedRef.current) return undefined;
+    topicSearchLoadedRef.current = true;
+    const controller = new AbortController();
+    setTopicSearchState({ status: "loading", conversation: null, error: null });
+    fetchVenueSearchConversation({ signal: controller.signal })
+      .then((conversation) => {
+        setTopicSearchState({ status: "ready", conversation, error: null });
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        topicSearchLoadedRef.current = false;
+        setTopicSearchState({ status: "error", conversation: null, error: error.message });
+      });
+    return () => controller.abort();
+  }, [topicSearchMode]);
+
+  const openTopicSearch = useCallback(() => {
+    setReaderTarget(null);
+    setActiveConversationId("topic-search");
+    setMobileView("run");
+  }, [setActiveConversationId]);
+
+  const submitTopicSearchQuestion = useCallback(async (question) => {
+    setTopicSearchSubmitting(true);
+    setTopicSearchSubmitError(null);
+    try {
+      const conversation = await submitVenueSearchTurn({
+        question,
+        providerId: selectedProvider?.id,
+        modelId: selectedModel,
+        thinkingLevel: journalSupportsThinking ? activeJournalThinkingLevel : null,
+      });
+      setTopicSearchState({ status: "ready", conversation, error: null });
+    } catch (error) {
+      setTopicSearchSubmitError(error.message);
+    } finally {
+      setTopicSearchSubmitting(false);
+    }
+  }, [selectedModel, selectedProvider?.id, journalSupportsThinking, activeJournalThinkingLevel]);
+
+  const addTopicSearchPapers = useCallback(async (turnId, paperIds) => {
+    setTopicSearchAddingTurnId(turnId);
+    setTopicSearchAddErrors((current) => ({ ...current, [turnId]: null }));
+    try {
+      const result = await addVenueSearchPapersToWeekly({ turnId, paperIds });
+      setTopicSearchState({ status: "ready", conversation: result.conversation, error: null });
+      syncJournalRun(result.run);
+      showToast("已加入本周推荐，可从每周追踪准备全文");
+    } catch (error) {
+      setTopicSearchAddErrors((current) => ({ ...current, [turnId]: error.message }));
+    } finally {
+      setTopicSearchAddingTurnId(null);
+    }
+  }, [showToast, syncJournalRun]);
+
   const retryPaperDocument = useCallback(async (paperId) => {
     const runId = journalRunState.run?.id;
     if (!runId || !paperId) {
@@ -1733,7 +1870,9 @@ export function App() {
   }, [journalRunState.run?.id, syncJournalRun]);
 
   useEffect(() => {
-    if (journalRunState.run?.status !== "committing") return;
+    // 扫描/排序阶段的 Run 在服务端重启后没有执行者：恢复时主动请求
+    // resume，让服务端幂等地重新接管；正常进行中的 Run 会被 inFlight 保护。
+    if (!["scanning", "ranking", "committing"].includes(journalRunState.run?.status)) return;
     void resumeCurrentJournalRun();
   }, [journalRunState.run?.status, resumeCurrentJournalRun]);
 
@@ -2095,6 +2234,7 @@ export function App() {
         paperIds: run.selectedPaperIds,
         providerId: selectedProvider.id,
         modelId: selectedModel,
+        thinkingLevel: journalSupportsThinking ? activeJournalThinkingLevel : null,
         signal: controller.signal,
       });
       syncJournalRun(nextRun);
@@ -2402,7 +2542,7 @@ export function App() {
   }, []);
 
   const selectProvider = (providerId) => {
-    const nextProvider = catalogProviders.find((item) => item.id === providerId && item.available);
+    const nextProvider = journalProviders.find((item) => item.id === providerId && item.available);
     if (!nextProvider) return;
     if (nextProvider.id === selectedProvider.id && nextProvider.models[0] === selectedModel) return;
     candidateRequestController.current?.abort();
@@ -2417,6 +2557,11 @@ export function App() {
     candidateRequestController.current?.abort();
     setCandidateSummaryState(createIdleSummaryState());
     setProviderConfig({ providerId: selectedProvider.id, model });
+  };
+
+  const selectJournalThinkingLevel = (level) => {
+    if (!journalThinkingLevels?.includes(level)) return;
+    setJournalThinkingLevelPref(level);
   };
 
   const selectProjectWorkProvider = (providerId) => {
@@ -3003,7 +3148,12 @@ export function App() {
             // 布局把论文渲染到中栏、把论文 Agent 挤到右栏（位置调换 bug）。
             closeJournalPaper();
           }}
-          providers={catalogProviders}
+          topicSearchActive={topicSearchMode}
+          onSelectTopicSearch={workspaceKind === "paper_reading"
+            && project.id === workflowFixture.project.id
+            ? openTopicSearch
+            : undefined}
+          providers={journalProviders}
           providerId={selectedProvider.id}
           model={selectedModel}
           providerOpen={providerOpen}
@@ -3081,11 +3231,16 @@ export function App() {
             readerPeerPapers={readerPeerPapers}
             readerContext={readerContext}
             readerSelectionState={readerSelectionState}
-            providers={catalogProviders}
+            providers={journalProviders}
             providerId={selectedProvider?.id}
             modelId={selectedModel}
             readingProviderId={selectedProvider?.id}
             readingModelId={selectedModel}
+            readingThinkingLevel={journalSupportsThinking ? activeJournalThinkingLevel : null}
+            thinkingLevels={journalThinkingLevels}
+            thinkingLevel={activeJournalThinkingLevel}
+            supportsThinking={journalSupportsThinking}
+            onThinkingLevelChange={selectJournalThinkingLevel}
             projectContextState={projectContextState}
             onReloadProjectContext={loadProjectContext}
             onSwitchPaper={(paperId) => openJournalPaperFromRun(
@@ -3135,6 +3290,36 @@ export function App() {
             }
             mobileActive={mobileView === "run" || mobileView === "evidence"}
             mobileView={mobileView}
+          />
+        ) : topicSearchMode ? (
+          <TopicSearchWorkspace
+            conversationState={topicSearchState}
+            onSubmitQuestion={submitTopicSearchQuestion}
+            onAddToWeekly={addTopicSearchPapers}
+            submitting={topicSearchSubmitting}
+            submitError={topicSearchSubmitError}
+            addingTurnId={topicSearchAddingTurnId}
+            addErrors={topicSearchAddErrors}
+            sidebarOpen={sidebarOpen}
+            onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
+            providers={journalProviders}
+            providerId={selectedProvider?.id}
+            model={selectedModel}
+            providerOpen={providerOpen}
+            onProviderOpenChange={(open) => {
+              setProviderOpen(open);
+              if (open) {
+                setSettingsView(null);
+                setSkillCenterOpen(false);
+              }
+            }}
+            onProviderChange={selectProvider}
+            onModelChange={selectModel}
+            thinkingLevels={journalThinkingLevels}
+            thinkingLevel={activeJournalThinkingLevel}
+            supportsThinking={journalSupportsThinking}
+            onThinkingLevelChange={selectJournalThinkingLevel}
+            mobileActive={mobileView === "run"}
           />
         ) : (
           <>
@@ -3227,7 +3412,7 @@ export function App() {
           onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
           contextRailOpen={contextRailOpen}
           onToggleContextRail={() => setContextRailOpen((prev) => !prev)}
-          providers={catalogProviders}
+          providers={journalProviders}
           providerId={selectedProvider.id}
           model={selectedModel}
           providerOpen={providerOpen}
@@ -3240,6 +3425,10 @@ export function App() {
           }}
           onProviderChange={selectProvider}
           onModelChange={selectModel}
+          thinkingLevels={journalThinkingLevels}
+          thinkingLevel={activeJournalThinkingLevel}
+          supportsThinking={journalSupportsThinking}
+          onThinkingLevelChange={selectJournalThinkingLevel}
           onOpenSkills={() => {
             setProviderOpen(false);
             setSettingsView(null);
@@ -3260,9 +3449,10 @@ export function App() {
           readerSelectionState={readerSelectionState}
           activeView={contextRailView}
           onActiveViewChange={setContextRailView}
-          providers={catalogProviders}
+          providers={journalProviders}
           providerId={selectedProvider?.id}
           modelId={selectedModel}
+          thinkingLevel={journalSupportsThinking ? activeJournalThinkingLevel : null}
           projectContextState={projectContextState}
           onReloadProjectContext={loadProjectContext}
           onOpenReaderBlock={openReaderBlock}

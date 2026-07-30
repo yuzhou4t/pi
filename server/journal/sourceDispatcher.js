@@ -197,6 +197,17 @@ export function createSourceDispatcher({
           ...options,
           route: candidate.route,
         });
+        // 抓到 0 条不算成功：空结果说明该路由失效或解析失败，
+        // 记为路由级失败并继续尝试下一条路由，保持覆盖缺口可见。
+        if (!Array.isArray(result?.papers) || result.papers.length === 0) {
+          attempts.push({
+            role: candidate.role,
+            adapter: candidate.key,
+            status: "failed",
+            error: { code: "SOURCE_ROUTE_EMPTY", retryable: true },
+          });
+          continue;
+        }
         attempts.push({
           role: candidate.role,
           adapter: candidate.key,

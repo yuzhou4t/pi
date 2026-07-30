@@ -12,6 +12,30 @@ import { SOURCE_REGISTRY } from "./sourceRegistry.js";
 const MAX_PAPERS_PER_SOURCE = 80;
 const MAX_ENRICHMENT_PAPERS = 40;
 const WEEK_WINDOW_MS = 8 * 24 * 60 * 60 * 1000;
+const SOURCE_FETCH_TIMEOUT_MS = 4 * 60 * 1000;
+
+function fetchSourceWithWatchdog(fetchSource, source, options, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const error = new Error(`Source ${source.source_id} timed out after ${timeoutMs}ms`);
+      error.code = "SOURCE_SCAN_TIMEOUT";
+      error.retryable = true;
+      reject(error);
+    }, timeoutMs);
+    Promise.resolve()
+      .then(() => fetchSource(source, options))
+      .then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+  });
+}
 
 export function publicationDiscovery(
   publishedAt,
@@ -201,6 +225,7 @@ export async function scanJournalSources({
   maxPapersPerSource = MAX_PAPERS_PER_SOURCE,
   concurrency = 1,
   sourceDelayMs = 0,
+  sourceTimeoutMs = SOURCE_FETCH_TIMEOUT_MS,
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   openAlexMailto = "",
   deferCursorCommit = false,
@@ -278,7 +303,12 @@ export async function scanJournalSources({
   const sourceScans = await mapWithConcurrency(sources, concurrency, async (source, index) => {
     const cursorBefore = stateBeforeScan.sources[source.source_id]?.cursor ?? null;
     try {
-      const fetched = await fetchSource(source, { fetchImpl });
+      const fetched = await fetchSourceWithWatchdog(
+        fetchSource,
+        source,
+        { fetchImpl },
+        sourceTimeoutMs,
+      );
       const normalizedAll = fetched.papers
         .map((paper) => normalizePaper(paper, {
           sourceId: source.source_id,

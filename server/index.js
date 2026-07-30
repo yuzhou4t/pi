@@ -1639,6 +1639,25 @@ export function createApiServer({
         return;
       }
 
+      const generatedImageMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/generated-images\/([^/]+)\/content$/,
+      );
+      if (generatedImageMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(
+          generatedImageMatch[1],
+        );
+        const imageId = decodeProjectWorkSegment(generatedImageMatch[2]);
+        sendProjectWorkImage(
+          response,
+          await projectWorkService.readGeneratedImage(
+            conversationId,
+            imageId,
+          ),
+          origin,
+        );
+        return;
+      }
+
       const conversationFileMatch = url.pathname.match(
         /^\/api\/v1\/project-work\/conversations\/([^/]+)\/file$/,
       );
@@ -2591,6 +2610,129 @@ export function createApiServer({
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/api/v1/journal-venue-search") {
+    try {
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      const allowedKeys = ["schema_version", "query", "limit", "from_year"];
+      if (
+        body?.schema_version !== 1
+        || typeof body?.query !== "string"
+        || Object.keys(body).some((key) => !allowedKeys.includes(key))
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "期刊检索请求版本或字段无效", 400);
+      }
+      const limit = Number.isInteger(body?.limit)
+        ? Math.min(Math.max(body.limit, 1), 50)
+        : undefined;
+      const fromYear = Number.isInteger(body?.from_year) ? body.from_year : null;
+      const result = await journalWorkflowService.searchVenues({
+        query: body.query,
+        limit,
+        fromYear,
+      });
+      sendJson(response, 200, result, origin);
+    } catch (error) {
+      if (error instanceof CandidateSummaryError) {
+        sendJson(response, error.status, {
+          error: { code: error.code, message: error.message, retryable: error.retryable },
+        }, origin);
+        return;
+      }
+      const retryable = Boolean(error?.retryable);
+      sendJson(response, retryable ? 502 : 400, {
+        error: {
+          code: typeof error?.code === "string" ? error.code : "JOURNAL_VENUE_SEARCH_FAILED",
+          message: typeof error?.message === "string" ? error.message : "期刊检索失败",
+          retryable,
+        },
+      }, origin);
+    }
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/v1/venue-search") {
+    try {
+      sendJson(
+        response,
+        200,
+        await journalWorkflowService.getVenueSearchConversation(),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法读取主题检索记录");
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/v1/venue-search/turns") {
+    try {
+      requireJournalMutationOrigin(origin);
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      const allowedKeys = [
+        "schema_version",
+        "question",
+        "provider_id",
+        "model_id",
+        "thinking_level",
+        "client_request_id",
+      ];
+      if (
+        body?.schema_version !== 1
+        || typeof body?.question !== "string"
+        || Object.keys(body).some((key) => !allowedKeys.includes(key))
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "主题检索请求版本或字段无效", 400);
+      }
+      const conversation = await journalWorkflowService.submitVenueSearchTurn({
+        question: body.question,
+        providerId: body.provider_id,
+        modelId: body.model_id,
+        thinkingLevel: body.thinking_level ?? null,
+        clientRequestId: body.client_request_id,
+      });
+      sendJson(response, 200, conversation, origin);
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "主题检索失败");
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/v1/venue-search/add-to-weekly") {
+    try {
+      requireJournalMutationOrigin(origin);
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      const allowedKeys = ["schema_version", "turn_id", "paper_ids", "client_request_id"];
+      if (
+        body?.schema_version !== 1
+        || typeof body?.turn_id !== "string"
+        || !Array.isArray(body?.paper_ids)
+        || Object.keys(body).some((key) => !allowedKeys.includes(key))
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "加入本周推荐的请求无效", 400);
+      }
+      const result = await journalWorkflowService.addVenueSearchPapersToWeekly({
+        turnId: body.turn_id,
+        paperIds: body.paper_ids,
+      });
+      sendJson(response, 200, {
+        run: publicRun(result.run),
+        conversation: result.conversation,
+      }, origin);
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法加入本周推荐");
+    }
+    return;
+  }
+
   if (request.method === "GET" && url.pathname === "/api/v1/project-context") {
     try {
       sendJson(
@@ -2614,7 +2756,7 @@ export function createApiServer({
       if (
         body?.schema_version !== 1
         || Object.keys(body).some(
-          (key) => !["schema_version", "provider_id", "model_id"].includes(key),
+          (key) => !["schema_version", "provider_id", "model_id", "thinking_level"].includes(key),
         )
       ) {
         throw new CandidateSummaryError("INVALID_REQUEST", "期刊扫描请求版本或字段无效", 400);
@@ -2623,6 +2765,7 @@ export function createApiServer({
         trigger: "manual",
         providerId: body?.provider_id,
         modelId: body?.model_id,
+        thinkingLevel: body?.thinking_level ?? null,
       });
       sendJson(response, 202, publicRun(run), origin);
     } catch (error) {
@@ -3109,6 +3252,7 @@ export function createApiServer({
         "include_project_context",
         "provider_id",
         "model_id",
+        "thinking_level",
       ]);
       const allowedReferenceKeys = new Set([
         "document_revision",
@@ -3165,6 +3309,7 @@ export function createApiServer({
             includeProjectContext: body.include_project_context === true,
             providerId: body.provider_id,
             modelId: body.model_id,
+            thinkingLevel: body.thinking_level ?? null,
           },
         ),
         origin,
@@ -3624,6 +3769,7 @@ export function createApiServer({
           paperIds: body.paper_ids,
           providerId: body.provider_id,
           modelId: body.model_id,
+          thinkingLevel: body.thinking_level ?? null,
         })),
         origin,
       );

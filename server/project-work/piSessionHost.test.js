@@ -12,16 +12,21 @@ import { writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   createPublicHarnessSnapshot,
+  createProjectWorkSubagentPolicyExtension,
   createProjectWorkTurnGuidanceExtension,
   createPiSessionFactory,
   createProjectWorkTools,
   getProjectWorkDefaultThinkingLevel,
   getProjectWorkThinkingLevels,
   PROJECT_WORK_DEFAULT_TOOL_NAMES,
+  PROJECT_WORK_IMAGE_TOOL_NAME,
   PROJECT_WORK_PREVIEW_TOOL_NAME,
   PROJECT_WORK_REPAIR_TOOL_NAMES,
+  PROJECT_WORK_SUBAGENT_TOOL_NAME,
+  PROJECT_WORK_ULTRA_THINKING_LEVEL,
   readProjectWorkOverlayTextFile,
 } from "./piSessionHost.js";
 
@@ -46,6 +51,11 @@ test("project-work model catalog exposes safe external capability status", async
         PI_TAVILY_API_KEY: "must-not-appear-in-catalog",
       },
     },
+    imageGenerationProbe: async () => ({
+      available: true,
+      status: "ready",
+      reasonCode: "CHATGPT_SUBSCRIPTION",
+    }),
   });
   const catalog = await factory.listModels();
   assert.deepEqual(catalog.capabilities, {
@@ -57,8 +67,37 @@ test("project-work model catalog exposes safe external capability status", async
       available: false,
       reason: "Context7 尚未配置",
     },
+    image_generation: {
+      available: true,
+      reason: "GPT Image 2 · ChatGPT 订阅已连接",
+    },
   });
   assert.doesNotMatch(JSON.stringify(catalog), /must-not-appear-in-catalog/);
+});
+
+test("project-work model catalog reports Image2 unavailable without exposing auth details", async () => {
+  const factory = createPiSessionFactory({
+    modelRuntime: {
+      async getAvailable() {
+        return [];
+      },
+      getProvider() {
+        return null;
+      },
+    },
+    imageGenerationProbe: async () => ({
+      available: false,
+      status: "unavailable",
+      reasonCode: "CODEX_AUTH_NOT_CHATGPT",
+      token: "must-not-appear",
+    }),
+  });
+  const catalog = await factory.listModels();
+  assert.deepEqual(catalog.capabilities.image_generation, {
+    available: false,
+    reason: "Codex 尚未使用 ChatGPT 订阅登录",
+  });
+  assert.doesNotMatch(JSON.stringify(catalog), /must-not-appear/);
 });
 
 test("project-work model catalog derives image support from Pi model input modalities", async () => {
@@ -351,6 +390,123 @@ test("project-work turn guidance modifies only the current system prompt", async
   );
 });
 
+test("Ultra subagents stay foreground, read-only, and capped at three per turn", async () => {
+  const handlers = new Map();
+  createProjectWorkSubagentPolicyExtension().factory({
+    on(event, handler) {
+      handlers.set(event, handler);
+    },
+  });
+  const agentStart = handlers.get("agent_start");
+  const toolCall = handlers.get("tool_call");
+  assert.equal(typeof agentStart, "function");
+  assert.equal(typeof toolCall, "function");
+
+  await agentStart();
+  const allowedInput = {
+    tasks: [
+      { agent: "delegate", task: "检查入口" },
+      { agent: "delegate", task: "检查测试" },
+      { agent: "delegate", task: "检查边界" },
+    ],
+    async: true,
+    context: "fork",
+    artifacts: true,
+  };
+  assert.equal(
+    await toolCall({
+      toolName: PROJECT_WORK_SUBAGENT_TOOL_NAME,
+      input: allowedInput,
+    }),
+    undefined,
+  );
+  assert.equal(allowedInput.async, false);
+  assert.equal(allowedInput.context, "fresh");
+  assert.equal(allowedInput.artifacts, false);
+  assert.equal(allowedInput.concurrency, 3);
+  assert.equal(allowedInput.agentScope, "user");
+
+  const fourth = await toolCall({
+    toolName: PROJECT_WORK_SUBAGENT_TOOL_NAME,
+    input: { agent: "delegate", task: "第四个任务" },
+  });
+  assert.equal(fourth.block, true);
+  assert.match(fourth.reason, /最多启动 3 个/);
+
+  await agentStart();
+  const unsafe = await toolCall({
+    toolName: PROJECT_WORK_SUBAGENT_TOOL_NAME,
+    input: {
+      agent: "delegate",
+      task: "修改项目",
+      output: "result.md",
+    },
+  });
+  assert.equal(unsafe.block, true);
+  assert.match(unsafe.reason, /只允许前台只读/);
+
+  const unknownAgent = await toolCall({
+    toolName: PROJECT_WORK_SUBAGENT_TOOL_NAME,
+    input: { agent: "worker", task: "检查项目" },
+  });
+  assert.equal(unknownAgent.block, true);
+  assert.match(unknownAgent.reason, /内置 delegate/);
+});
+
+test("project-work host loads the pinned subagent tool only for an active Ultra turn", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-ultra-host-"));
+  let host = null;
+  t.after(async () => {
+    host?.dispose();
+    await rm(temporaryRoot, { recursive: true, force: true });
+  });
+  const directories = Object.fromEntries(
+    ["agent", "project", "base", "workspace", "sessions"].map(
+      (name) => [name, path.join(temporaryRoot, name)],
+    ),
+  );
+  await Promise.all(Object.values(directories).map((directory) => mkdir(directory)));
+  const runtime = await ModelRuntime.create({ allowModelNetwork: false });
+  const model = runtime.getModel("openai-codex", "gpt-5.6-sol");
+  assert.ok(model);
+  const modelRuntime = new Proxy(runtime, {
+    get(target, property, receiver) {
+      if (property === "getAvailable") return async () => [model];
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const factory = createPiSessionFactory({
+    agentDir: directories.agent,
+    modelRuntime,
+  });
+  host = await factory({
+    projectRoot: directories.project,
+    baseRoot: directories.base,
+    workspaceRoot: directories.workspace,
+    sessionDir: directories.sessions,
+    modelRef: "openai-codex/gpt-5.6-sol",
+    thinkingLevel: PROJECT_WORK_ULTRA_THINKING_LEVEL,
+    workspaceSnapshot: { truncated: false },
+  });
+
+  assert.equal(host.thinkingLevel, PROJECT_WORK_ULTRA_THINKING_LEVEL);
+  assert.equal(
+    host.getHarnessSnapshot().activeTools.includes(
+      PROJECT_WORK_SUBAGENT_TOOL_NAME,
+    ),
+    false,
+  );
+  host.setActiveToolsByName(["read", "grep"], { allowSubagents: true });
+  assert.deepEqual(host.getHarnessSnapshot().activeTools, [
+    "read",
+    "grep",
+    PROJECT_WORK_SUBAGENT_TOOL_NAME,
+  ]);
+  host.setThinkingLevel("high");
+  assert.deepEqual(host.getHarnessSnapshot().activeTools, ["read", "grep"]);
+});
+
 test("public harness snapshots expose structure without paths or private reasoning", () => {
   const snapshot = createPublicHarnessSnapshot({
     model: {
@@ -422,6 +578,17 @@ test("project-work thinking levels follow each Pi model's runtime capability map
     getProjectWorkDefaultThinkingLevel(mappedModel, "max"),
     "max",
   );
+  assert.deepEqual(getProjectWorkThinkingLevels({
+    ...mappedModel,
+    provider: "openai-codex",
+    id: "gpt-5.6-sol",
+  }), [
+    "low",
+    "medium",
+    "high",
+    "max",
+    PROJECT_WORK_ULTRA_THINKING_LEVEL,
+  ]);
 });
 
 test("controlled Uvicorn, Vite, and static previews use closed schemas and stay inactive by default", async (t) => {
@@ -597,6 +764,54 @@ test("ask_user returns durable answered and cancelled outcomes without implying 
     answers: [],
   });
   assert.equal(PROJECT_WORK_DEFAULT_TOOL_NAMES.includes("ask_user"), true);
+});
+
+test("generate_image is an explicit conversation-owned tool with no project write", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-image-tool-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const baseRoot = path.join(temporaryRoot, "base");
+  const workspaceRoot = path.join(temporaryRoot, "workspace");
+  await Promise.all([
+    mkdir(projectRoot),
+    mkdir(baseRoot),
+    mkdir(workspaceRoot),
+  ]);
+  const requests = [];
+  const tools = await createProjectWorkTools({
+    projectRoot,
+    baseRoot,
+    workspaceRoot,
+    onPlan: async () => {},
+    onVerificationRequest: async () => ({ id: "verification-1" }),
+    onImageGenerationRequest: async (request) => {
+      requests.push(request);
+      return {
+        id: "image-1",
+        modelId: "gpt-image-2",
+        width: 1254,
+        height: 1254,
+      };
+    },
+  });
+  const generateImage = toolByName(tools, PROJECT_WORK_IMAGE_TOOL_NAME);
+  const controller = new AbortController();
+  const generated = await generateImage.execute(
+    "tool-call-1",
+    { prompt: "暖象牙背景上的深青色球体" },
+    controller.signal,
+  );
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].prompt, "暖象牙背景上的深青色球体");
+  assert.equal(requests[0].toolCallId, "tool-call-1");
+  assert.equal(requests[0].signal, controller.signal);
+  assert.equal(generated.details.id, "image-1");
+  assert.match(generated.content[0].text, /has not been written to the project/i);
+  assert.equal(
+    PROJECT_WORK_DEFAULT_TOOL_NAMES.includes(PROJECT_WORK_IMAGE_TOOL_NAME),
+    false,
+  );
 });
 
 test("contained project tools read live files and keep writes in the sparse review overlay", async (t) => {

@@ -44,6 +44,7 @@ export const THINKING_LEVEL_LABELS = {
   high: "高",
   xhigh: "很高",
   max: "最高",
+  ultra: "Ultra · 并行",
 };
 
 function getProviderStatus(item) {

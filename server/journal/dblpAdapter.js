@@ -89,7 +89,7 @@ export function parseDblpIndexTargets(xml, { type = "conference", maxVolumes = 3
   return targets;
 }
 
-function pdfCandidatesForUrl(url) {
+export function pdfCandidatesForUrl(url) {
   if (!url) return [];
   if (/\.pdf(?:$|[?#])/i.test(url)) return [url];
   if (/^https:\/\/aclanthology\.org\/[^?#]+\/?$/i.test(url)) {

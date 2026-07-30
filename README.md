@@ -14,7 +14,8 @@ Pi Agent 是一个本地 Agent 工作空间：长期项目保存持续状态，�
 - Pi SDK 会话保留持久 JSONL session、steer、后续消息队列、stop、compact、retry-last-turn、`ask_user`、未读水位和逐轮 provider/model/thinking/token/费用证据。`ask_user` 只表达业务决策，不能替代文件或归档批准。
 - 正常工作在显式发送后立即显示真实的提交/连接阶段，随后实时呈现公开思考生命周期、受控工具活动和计划；回答正文以服务端脱敏、节流后的累计替换片段逐步出现。SSE 之外保留运行期低频同步兜底，断线时不会等到最终结果才一次性补齐；任何原始思维链、工具参数或未过滤结果都不会发送到浏览器。
 - 正常工作的唯一写回机制仍是 hash-bound ChangeSet：服务端重算逐文件 base/after hash，按项目串行原子写入并读回核验。`需确认`时由右侧 `更改`批准，`替我审批`时由同一安全策略自动批准并保留完整证据；apply journal 支持崩溃恢复和一次性 hash-bound 撤销，不会 stage、commit 或 push。
-- `运行`只执行解析后的 allowlist argv、现有 package scripts 和已安装依赖；不提供自由终端、安装、watcher、inline code 或隐式网络。每次 attempt、退出码和有界日志都会保留，验证在一次性隔离副本中进行。
+- `运行`只执行解析后的 allowlist argv、现有 package scripts 和已安装依赖；不提供自由终端、安装、watcher、inline code 或隐式网络。每次 attempt、退出码和完整已采集日志都会保留，验证在一次性隔离副本中进行；RTK 只压缩失败后回灌给 Pi 的修复上下文，缺失或压缩失败时原样回退，绝不替换右侧日志证据。
+- 正常工作的 `gpt-image-2` 默认关闭；只有用户为当前消息明确选择“生成图片”并发送后才启用。它复用本机 Codex CLI 的 ChatGPT 订阅登录，一轮最多生成一张会话私有 PNG，校验真实格式、尺寸、哈希并读回后才展示在对话和“文件”工件；生成结果不会直接写入项目，订阅消耗记录 Token 与图片次数但不伪造 API 美元价格。
 - `预览`只接受注册式 Vite、静态站点或 Uvicorn recipe，由 supervisor 拥有进程。手动模式会先展示安全 recipe、相对 cwd、参数边界和请求指纹，只有明确确认后才启动回环预览。
 - 论文监测使用 11 个来源各自声明的官方 primary adapter，Crossref/DBLP 只在失败时作为显式 fallback。Run 先持久化逐来源 staging、候选和 ranking 工件，再用 CAS 提交全局 cursor；缺少精确发布日期的记录不会算作本周新论文。
 - 最终五篇全文采用有限并发和逐篇恢复；下载、额度、上传、解析失败分别保存，成功论文不会重复处理。Live 模式遇到扫描失败、恢复中、无候选或缺少 `project_state.md` 时如实停住，不回退测试数据。

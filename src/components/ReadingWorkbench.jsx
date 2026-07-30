@@ -39,6 +39,11 @@ export function ReadingWorkbench({
   modelId = null,
   readingProviderId = null,
   readingModelId = null,
+  readingThinkingLevel = null,
+  thinkingLevels = null,
+  thinkingLevel = null,
+  supportsThinking = false,
+  onThinkingLevelChange,
   projectContextState = null,
   onReloadProjectContext,
   onSwitchPaper,
@@ -141,6 +146,10 @@ export function ReadingWorkbench({
               model={modelId}
               onProviderChange={onProviderChange}
               onModelChange={onModelChange}
+              thinkingLevels={thinkingLevels}
+              thinkingLevel={thinkingLevel}
+              supportsThinking={supportsThinking}
+              onThinkingLevelChange={onThinkingLevelChange}
             />
           ) : null}
           {onRestartFromGuide ? (
@@ -216,6 +225,7 @@ export function ReadingWorkbench({
                   purpose={readerTarget.purpose}
                   providerId={readingProviderId}
                   modelId={readingModelId}
+                  thinkingLevel={readingThinkingLevel}
                   guide={readerGuide}
                   guideDecision={guideDecision}
                   guideDecisionBusy={guideDecisionBusy}

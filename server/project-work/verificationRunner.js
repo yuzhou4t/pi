@@ -3,15 +3,51 @@ import { projectWorkError } from "./errors.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 128 * 1024;
+const TRUNCATION_MARKER = Buffer.from(
+  "\n… 验证输出达到安全采集上限；以下保留末尾诊断内容 …\n",
+);
 
-function boundedChunk(current, chunk, maxBytes) {
-  if (current.length >= maxBytes) return { value: current, truncated: true };
-  const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-  const remaining = maxBytes - current.length;
+function createBoundedOutput() {
   return {
-    value: Buffer.concat([current, buffer.subarray(0, remaining)]),
-    truncated: buffer.length > remaining,
+    complete: Buffer.alloc(0),
+    head: Buffer.alloc(0),
+    tail: Buffer.alloc(0),
+    truncated: false,
+    maxBytes: null,
   };
+}
+
+function appendBoundedOutput(state, chunk, maxBytes) {
+  const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+  if (!state.truncated) {
+    const combined = Buffer.concat([state.complete, buffer]);
+    if (combined.length <= maxBytes) {
+      state.complete = combined;
+      return;
+    }
+    const evidenceBytes = Math.max(0, maxBytes - TRUNCATION_MARKER.length);
+    const headBytes = Math.ceil(evidenceBytes / 2);
+    const tailBytes = evidenceBytes - headBytes;
+    state.complete = Buffer.alloc(0);
+    state.head = combined.subarray(0, headBytes);
+    state.tail = combined.subarray(Math.max(0, combined.length - tailBytes));
+    state.truncated = true;
+    state.maxBytes = maxBytes;
+    return;
+  }
+  const tailBytes = Math.max(
+    0,
+    maxBytes - TRUNCATION_MARKER.length - state.head.length,
+  );
+  state.tail = tailBytes > 0
+    ? Buffer.concat([state.tail, buffer]).subarray(-tailBytes)
+    : Buffer.alloc(0);
+}
+
+function boundedOutputBuffer(state) {
+  if (!state.truncated) return state.complete;
+  return Buffer.concat([state.head, TRUNCATION_MARKER, state.tail])
+    .subarray(0, state.maxBytes);
 }
 
 function safeEnvironment() {
@@ -73,10 +109,8 @@ export function createVerificationRunner({
           NO_COLOR: "1",
         },
       });
-      let stdout = Buffer.alloc(0);
-      let stderr = Buffer.alloc(0);
-      let stdoutTruncated = false;
-      let stderrTruncated = false;
+      const stdout = createBoundedOutput();
+      const stderr = createBoundedOutput();
       let timedOut = false;
       let settled = false;
       let forceKill;
@@ -101,9 +135,9 @@ export function createVerificationRunner({
           timedOut,
           aborted: signal?.aborted === true,
           durationMs: Math.max(0, now() - startedAt),
-          stdout: stdout.toString("utf8"),
-          stderr: stderr.toString("utf8"),
-          truncated: stdoutTruncated || stderrTruncated,
+          stdout: boundedOutputBuffer(stdout).toString("utf8"),
+          stderr: boundedOutputBuffer(stderr).toString("utf8"),
+          truncated: stdout.truncated || stderr.truncated,
         });
       };
 
@@ -128,14 +162,10 @@ export function createVerificationRunner({
       if (signal?.aborted) onAbort();
 
       child.stdout?.on("data", (chunk) => {
-        const bounded = boundedChunk(stdout, chunk, maxOutputBytes);
-        stdout = bounded.value;
-        stdoutTruncated ||= bounded.truncated;
+        appendBoundedOutput(stdout, chunk, maxOutputBytes);
       });
       child.stderr?.on("data", (chunk) => {
-        const bounded = boundedChunk(stderr, chunk, maxOutputBytes);
-        stderr = bounded.value;
-        stderrTruncated ||= bounded.truncated;
+        appendBoundedOutput(stderr, chunk, maxOutputBytes);
       });
       child.on("error", (error) => {
         if (settled) return;
@@ -153,9 +183,9 @@ export function createVerificationRunner({
           timedOut,
           aborted: signal?.aborted === true,
           durationMs: Math.max(0, now() - startedAt),
-          stdout: stdout.toString("utf8"),
-          stderr: stderr.toString("utf8"),
-          truncated: stdoutTruncated || stderrTruncated,
+          stdout: boundedOutputBuffer(stdout).toString("utf8"),
+          stderr: boundedOutputBuffer(stderr).toString("utf8"),
+          truncated: stdout.truncated || stderr.truncated,
         });
       });
     });

@@ -505,6 +505,36 @@ function mapMessage(raw) {
   };
 }
 
+function mapGeneratedImage(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const id = pick(raw, "image_id", "imageId", raw.id);
+  if (typeof id !== "string" || !id) return null;
+  return {
+    id,
+    turnId: pick(raw, "turn_id", "turnId"),
+    status: pick(raw, "status", "status", "failed"),
+    prompt: typeof raw.prompt === "string" ? raw.prompt : "",
+    fileName: pick(raw, "file_name", "fileName"),
+    mimeType: pick(raw, "mime_type", "mimeType"),
+    byteLength: nullableNumber(raw, "byte_length", "byteLength"),
+    width: nullableNumber(raw, "width", "width"),
+    height: nullableNumber(raw, "height", "height"),
+    sha256: pick(raw, "sha256", "sha256"),
+    requestedSize: pick(raw, "requested_size", "requestedSize"),
+    requestedQuality: pick(raw, "requested_quality", "requestedQuality"),
+    providerId: pick(raw, "provider_id", "providerId"),
+    modelId: pick(raw, "model_id", "modelId"),
+    operationId: pick(raw, "operation_id", "operationId"),
+    billingKind: pick(raw, "billing_kind", "billingKind"),
+    pricingStatus: pick(raw, "pricing_status", "pricingStatus"),
+    usageStatus: pick(raw, "usage_status", "usageStatus", "unknown"),
+    usage: mapTurnUsage(raw.usage),
+    error: pick(raw, "error", "error"),
+    createdAt: pick(raw, "created_at", "createdAt"),
+    completedAt: pick(raw, "completed_at", "completedAt"),
+  };
+}
+
 function mapConversationTurn(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const id = pick(raw, "turn_id", "turnId", raw.id);
@@ -969,6 +999,12 @@ function mapVerificationRun(raw) {
   if (typeof id !== "string" || !id) return null;
   const command = raw.command && typeof raw.command === "object" ? raw.command : null;
   const output = raw.output;
+  const rawCompression = pick(
+    raw,
+    "output_compression",
+    "outputCompression",
+    {},
+  );
   return {
     id,
     commandId: pick(raw, "command_id", "commandId"),
@@ -1022,6 +1058,34 @@ function mapVerificationRun(raw) {
           : [],
     stdout: typeof raw.stdout === "string" ? raw.stdout : "",
     stderr: typeof raw.stderr === "string" ? raw.stderr : "",
+    outputCompression: rawCompression
+      && typeof rawCompression === "object"
+      && !Array.isArray(rawCompression)
+      ? {
+          applied: pick(
+            rawCompression,
+            "applied",
+            "applied",
+            false,
+          ) === true,
+          rawBytes: nullableNumber(
+            rawCompression,
+            "raw_bytes",
+            "rawBytes",
+          ),
+          compactBytes: nullableNumber(
+            rawCompression,
+            "compact_bytes",
+            "compactBytes",
+          ),
+          ratio: nullableNumber(rawCompression, "ratio", "ratio"),
+          command: asArray(
+            pick(rawCompression, "command", "command", []),
+          ).map(String),
+          version: pick(rawCompression, "version", "version"),
+          reason: pick(rawCompression, "reason", "reason"),
+        }
+      : null,
     truncated: Boolean(raw.truncated),
     startedAt: pick(raw, "started_at", "startedAt"),
     completedAt: pick(raw, "completed_at", "completedAt"),
@@ -1361,6 +1425,9 @@ export function mapProjectWorkConversation(raw) {
     preview: pick(source, "preview", "preview"),
     compaction: mapCompaction(pick(source, "compaction", "compaction")),
     documents: asArray(source.documents).map(mapProjectWorkDocument).filter(Boolean),
+    generatedImages: asArray(
+      pick(source, "generated_images", "generatedImages", []),
+    ).map(mapGeneratedImage).filter(Boolean),
     followUpQueue: asArray(
       pick(source, "follow_up_queue", "followUpQueue", []),
     ).map(mapFollowUpItem).filter(Boolean),
@@ -2844,6 +2911,17 @@ export function projectWorkImageUrl({
   return `${PROJECT_WORK_API_ROOT}/${scope}/image?${query.toString()}`;
 }
 
+export function projectWorkGeneratedImageUrl({
+  conversationId,
+  imageId,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(imageId, "imageId");
+  return `${PROJECT_WORK_API_ROOT}/conversations/${
+    encodeURIComponent(conversationId)
+  }/generated-images/${encodeURIComponent(imageId)}/content`;
+}
+
 export async function fetchProjectWorkFile({
   projectId,
   conversationId,
@@ -3100,6 +3178,7 @@ export const projectWorkApi = {
   fetchTree: fetchProjectWorkTree,
   fetchFile: fetchProjectWorkFile,
   imageUrl: projectWorkImageUrl,
+  generatedImageUrl: projectWorkGeneratedImageUrl,
   uploadAttachment: uploadProjectWorkAttachment,
   removeAttachment: removeProjectWorkAttachment,
   uploadPdf: uploadProjectWorkPdf,

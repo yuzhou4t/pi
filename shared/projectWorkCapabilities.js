@@ -11,6 +11,12 @@ export const PROJECT_WORK_CAPABILITIES = [
     description: "按库和版本查找 Context7 文档片段。",
     toolNames: ["resolve_library_id", "query_docs"],
   },
+  {
+    id: "image_generation",
+    label: "生成图片",
+    description: "本轮允许使用 GPT Image 2 生成一张会话图片。",
+    toolNames: ["generate_image"],
+  },
 ];
 
 export const PROJECT_WORK_WORKFLOWS = [

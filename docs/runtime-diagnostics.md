@@ -40,7 +40,11 @@ GET http://127.0.0.1:4173/api/v1/health
 ~/Library/Application Support/Pi Agent/project-work
 ```
 
-可用服务端环境变量 `PI_PROJECT_WORK_STORAGE_ROOT` 指向另一处私有目录。存储内容包括会话状态、单调事件流、Pi JSONL session、会话审阅层、Workspace 记录、验证 attempt 与 apply journal。公共 API 只返回安全标签和项目内相对路径，不返回这些目录的绝对路径。
+可用服务端环境变量 `PI_PROJECT_WORK_STORAGE_ROOT` 指向另一处私有目录。存储内容包括会话状态、单调事件流、Pi JSONL session、会话审阅层、Workspace 记录、验证 attempt、会话生成图片与 apply journal。公共 API 只返回安全标签和项目内相对路径，不返回这些目录的绝对路径。
+
+验证 attempt 的完整已采集 stdout/stderr 是“运行”工件中的权威证据；达到采集上限时会显示明确标记。若本机安装 RTK，失败日志会额外生成一份只供 Pi 修复回合使用的压缩投影，并保留关键诊断与日志末尾；RTK 不可用、失败、超时或压缩收益不足时自动使用原始已采集内容。RTK 遥测被禁用，也不会成为验证命令的外层执行器。
+
+正常工作的图片生成要求本机 Codex CLI 已使用 ChatGPT 订阅登录，可用 `PI_CODEX_CLI_PATH` 固定 CLI 路径。适配器只开放内置图片生成能力，并在临时空目录中关闭 shell、网页、插件和其他工具；生成 PNG 经尺寸、内容哈希与读回校验后保存到会话私有工件目录。订阅路径只记录返回的 Token 与图片次数，不计算 API 美元费用。
 
 论文 Run Store、来源游标和归档 ledger 也只保存在服务端。Live 模式遇到缺少项目状态、扫描失败、恢复中或无候选时会保留真实状态；fixture 只在测试或显式 `PI_MODEL_MODE=fixture` 的开发运行中启用。
 

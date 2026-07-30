@@ -7,6 +7,8 @@ import {
   CODEX_ACCOUNT_MODEL_ID,
   CODEX_PROVIDER_ID,
   CODEX_SPARK_MODEL_ID,
+  codexReasoningEffortFromThinking,
+  isAllowedCodexModel,
   probeCodexSubscription,
   runCodexSubscription,
 } from "./codexSubscription.js";
@@ -77,6 +79,30 @@ test("exports stable provider and account model ids", () => {
   assert.equal(CODEX_PROVIDER_ID, "codex-subscription");
   assert.equal(CODEX_ACCOUNT_MODEL_ID, "account-default");
   assert.equal(CODEX_SPARK_MODEL_ID, "gpt-5.3-codex-spark");
+});
+
+test("allows the account default plus any safe subscription model name, rejecting unsafe ones", () => {
+  assert.equal(isAllowedCodexModel("account-default"), true);
+  assert.equal(isAllowedCodexModel("gpt-5.3-codex-spark"), true);
+  assert.equal(isAllowedCodexModel("gpt-5-codex"), true);
+  assert.equal(isAllowedCodexModel("gpt-5.6"), true);
+  assert.equal(isAllowedCodexModel(""), false);
+  assert.equal(isAllowedCodexModel("bad model"), false);
+  assert.equal(isAllowedCodexModel('gpt";rm -rf'), false);
+  assert.equal(isAllowedCodexModel(null), false);
+});
+
+test("maps Pi thinking levels onto Codex reasoning efforts", () => {
+  assert.equal(codexReasoningEffortFromThinking("off"), "low");
+  assert.equal(codexReasoningEffortFromThinking("minimal"), "low");
+  assert.equal(codexReasoningEffortFromThinking("low"), "low");
+  assert.equal(codexReasoningEffortFromThinking("medium"), "medium");
+  assert.equal(codexReasoningEffortFromThinking("high"), "high");
+  assert.equal(codexReasoningEffortFromThinking("xhigh"), "xhigh");
+  assert.equal(codexReasoningEffortFromThinking("max"), "xhigh");
+  assert.equal(codexReasoningEffortFromThinking("ultra"), "xhigh");
+  assert.equal(codexReasoningEffortFromThinking(null), null);
+  assert.equal(codexReasoningEffortFromThinking("unknown"), null);
 });
 
 test("probe accepts only the exact ChatGPT login status", async () => {

@@ -54,6 +54,34 @@ test("verification runner captures a successful bounded command without a shell"
   assert.equal(calls[0].options.env.CI, "1");
 });
 
+test("verification runner marks truncation and preserves the final diagnostic excerpt", async () => {
+  const runner = createVerificationRunner({
+    maxOutputBytes: 160,
+    spawnImpl: () => {
+      const child = fakeChild();
+      queueMicrotask(() => {
+        child.stdout.write(`start marker\n${"progress\n".repeat(80)}`);
+        child.stdout.end("AssertionError: final failure detail\n");
+        child.stderr.end("");
+        child.emit("close", 1, null);
+      });
+      return child;
+    },
+  });
+
+  const result = await runner({
+    file: "node",
+    args: ["--test"],
+    cwd: "/tmp/safe-workspace",
+  });
+
+  assert.equal(result.truncated, true);
+  assert.match(result.stdout, /^start marker/);
+  assert.match(result.stdout, /验证输出达到安全采集上限/);
+  assert.match(result.stdout, /AssertionError: final failure detail/);
+  assert.ok(Buffer.byteLength(result.stdout, "utf8") <= 160);
+});
+
 test("verification runner terminates and marks a timed-out child", async () => {
   const signals = [];
   const runner = createVerificationRunner({

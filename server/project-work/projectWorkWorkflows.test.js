@@ -5,6 +5,7 @@ import { resolveProjectWorkTurn } from "./projectWorkWorkflows.js";
 const availableCapabilities = {
   web_search: { available: true, reason: "Tavily 已配置" },
   docs_search: { available: true, reason: "Context7 已配置" },
+  image_generation: { available: true, reason: "GPT Image 2 已连接" },
 };
 
 test("a normal turn keeps the default tools without extra guidance", () => {
@@ -15,7 +16,32 @@ test("a normal turn keeps the default tools without extra guidance", () => {
   assert.deepEqual(turn.capabilityIds, []);
   assert.ok(turn.toolNames.includes("edit"));
   assert.ok(turn.toolNames.includes("write"));
+  assert.equal(turn.toolNames.includes("generate_image"), false);
   assert.equal(turn.guidance, "");
+});
+
+test("image generation is enabled only by an explicit available turn capability", () => {
+  const enabled = resolveProjectWorkTurn({
+    capabilityIds: ["image_generation"],
+    capabilityStatus: availableCapabilities,
+  });
+  assert.deepEqual(enabled.capabilityIds, ["image_generation"]);
+  assert.ok(enabled.toolNames.includes("generate_image"));
+  assert.match(enabled.guidance, /explicitly enabled image generation/i);
+
+  assert.throws(
+    () => resolveProjectWorkTurn({
+      capabilityIds: ["image_generation"],
+      capabilityStatus: {
+        ...availableCapabilities,
+        image_generation: {
+          available: false,
+          reason: "GPT Image 2 当前不可用",
+        },
+      },
+    }),
+    { code: "PROJECT_WORK_CAPABILITY_UNAVAILABLE" },
+  );
 });
 
 test("code review is one-turn read-only while optional search is explicit", () => {
@@ -31,7 +57,7 @@ test("code review is one-turn read-only while optional search is explicit", () =
   assert.equal(turn.toolNames.includes("edit"), false);
   assert.equal(turn.toolNames.includes("write"), false);
   assert.match(turn.guidance, /Review only/);
-  assert.match(turn.guidance, /Tavily/);
+  assert.match(turn.guidance, /web search/);
 });
 
 test("official docs requires configured Context7 and activates both docs tools", () => {

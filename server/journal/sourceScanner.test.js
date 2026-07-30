@@ -43,6 +43,52 @@ test("publication labels distinguish weekly publication from historical first di
   );
 });
 
+test("a hung source is timed out, recorded as failed, and later sources still complete", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-source-watchdog-"));
+  const runStore = createRunStore({ dataDir });
+  const sourceStateStore = createSourceStateStore({ dataDir });
+  const run = await runStore.createRun({ sourceIds: sources.map((source) => source.source_id) });
+
+  const result = await scanJournalSources({
+    runId: run.run_id,
+    runStore,
+    sourceStateStore,
+    sources,
+    fetchSource: (source) => source.source_id === "source-ok"
+      ? new Promise(() => {})
+      : Promise.resolve({
+          fetched_at: "2026-07-23T08:00:00.000Z",
+          index_url: "https://dblp.org/db/journals/jmlr/index.xml",
+          target_urls: ["https://dblp.org/db/journals/jmlr/jmlr26.xml"],
+          papers: [{
+            title: "Reliable LLM Agent Evaluation",
+            authors: ["A. Author"],
+            venue: "JMLR",
+            published_at: "2026-07-20",
+            official_id: "journals/jmlr/Agent26",
+            official_url: "https://jmlr.org/papers/v27/agent26.html",
+            pdf_url: "https://jmlr.org/papers/v27/agent26.pdf",
+            abstract: "A benchmark for reliable and verifiable language agents.",
+          }],
+        }),
+    fetchImpl: async () => new Response(JSON.stringify({ results: [] }), { status: 200 }),
+    observedAt: "2026-07-23T08:00:00.000Z",
+    sourceTimeoutMs: 25,
+  });
+
+  assert.equal(result.summary.successful_source_count, 1);
+  assert.deepEqual(result.summary.failed_source_ids, ["source-ok"]);
+  const hungScan = result.sourceScans.find((scan) => scan.source_id === "source-ok");
+  assert.equal(hungScan.status, "failed");
+  assert.equal(hungScan.error.code, "SOURCE_SCAN_TIMEOUT");
+  assert.equal(hungScan.error.retryable, true);
+  const runState = await runStore.getRun(run.run_id);
+  assert.deepEqual(runState.source_progress.completed_source_ids.sort(), [
+    "source-failed",
+    "source-ok",
+  ]);
+});
+
 test("source cap keeps title-matched papers even when they appear after the raw limit", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-source-priority-"));
   const runStore = createRunStore({ dataDir });

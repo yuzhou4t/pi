@@ -604,7 +604,7 @@ test("composer thinking control exposes only model-supported Chinese levels", as
   });
 });
 
-test("current-message capability menu exposes only configured retrieval and one workflow", async () => {
+test("current-message capability menu exposes retrieval, explicit image generation, and workflows", async () => {
   await withLiveWorkbench(({ ProjectCapabilityMenu }) => {
     const html = renderToStaticMarkup(React.createElement(
       ProjectCapabilityMenu,
@@ -614,6 +614,10 @@ test("current-message capability menu exposes only configured retrieval and one 
         capabilityStatus: {
           web_search: { available: true, reason: "Tavily 已配置" },
           docs_search: { available: false, reason: "Context7 尚未配置" },
+          image_generation: {
+            available: true,
+            reason: "ChatGPT 订阅已连接",
+          },
         },
         selectedCapabilityIds: ["web_search"],
         onToggleCapability: () => {},
@@ -628,7 +632,10 @@ test("current-message capability menu exposes only configured retrieval and one 
 
     assert.match(html, /能力 · 2/);
     assert.match(html, /只在显式发送的这一轮生效/);
+    assert.match(html, /本轮能力/);
     assert.match(html, /联网搜索/);
+    assert.match(html, /生成图片/);
+    assert.match(html, /ChatGPT 订阅已连接/);
     assert.match(html, /aria-pressed="true"/);
     assert.match(html, /Context7 尚未配置/);
     assert.match(html, /当前模型不支持识图/);
@@ -1024,6 +1031,54 @@ test("safe image metadata is visible without returning image data to the browser
   });
 });
 
+test("completed Image2 output renders in the conversation with subscription usage evidence", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      {
+        project,
+        conversation: conversation({
+          messages: [{
+            id: "message-user-image-generation",
+            role: "user",
+            turnId: "turn-image-1",
+            content: "生成一张深青色陶瓷球体",
+          }, {
+            id: "message-assistant-image-generation",
+            role: "assistant",
+            turnId: "turn-image-1",
+            content: "图片已经生成。",
+          }],
+          generatedImages: [{
+            id: "image-1",
+            turnId: "turn-image-1",
+            status: "completed",
+            prompt: "暖象牙背景上的深青色陶瓷球体",
+            fileName: "image-1.png",
+            mimeType: "image/png",
+            byteLength: 1_885_527,
+            width: 1254,
+            height: 1254,
+            modelId: "gpt-image-2",
+            usage: { totalTokens: 35_258 },
+          }],
+        }),
+      },
+    ));
+
+    assert.match(html, /GPT Image 2/);
+    assert.match(html, /1254 × 1254/);
+    assert.match(html, /35,258 tokens/);
+    assert.match(html, /ChatGPT 订阅 · 未提供单次价格/);
+    assert.match(
+      html,
+      /generated-images\/image-1\/content/,
+    );
+    assert.match(html, /在文件中查看/);
+    assert.doesNotMatch(html, /Users\/|generated_images/);
+  });
+});
+
 test("normal-work keeps context usage beside the composer model and out of the header", async () => {
   const source = await readFile(COMPONENT_URL, "utf8");
   const headerStart = source.indexOf("const headerActions");
@@ -1300,6 +1355,11 @@ test("failed and passing verification evidence keeps the saved command retryable
           stderr: "",
           exitCode: 1,
           durationMs: 418,
+          outputCompression: {
+            applied: true,
+            rawBytes: 4096,
+            compactBytes: 512,
+          },
         }, {
           id: "run-passed",
           status: "passed",
@@ -1320,6 +1380,10 @@ test("failed and passing verification evidence keeps the saved command retryable
     assert.match(html, /运行验证/);
     assert.match(html, /首次验证发现布局断言失败/);
     assert.match(html, /AssertionError: footer overlaps content/);
+    assert.match(html, /查看完整已采集日志/);
+    assert.match(html, /完整日志保留在这里/);
+    assert.match(html, /4\.0 KB/);
+    assert.match(html, /512 B/);
     assert.match(html, /退出码 1/);
     assert.match(html, /修复后验证通过/);
     assert.match(html, /1 test passed/);

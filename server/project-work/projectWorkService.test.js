@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   access,
   mkdir,
@@ -263,6 +264,47 @@ test("project-work usage rejects unknown time ranges", () => {
   );
 });
 
+test("project-work usage includes durable GPT Image 2 subscription generations", () => {
+  const usage = aggregateProjectWorkUsage({
+    period: "30d",
+    now: new Date("2026-07-28T12:00:00.000Z"),
+    conversations: [{
+      id: "conversation-image",
+      messages: [],
+      generatedImages: [{
+        id: "image-1",
+        turnId: "turn-1",
+        status: "completed",
+        providerId: "codex-subscription",
+        modelId: "gpt-image-2",
+        createdAt: "2026-07-28T10:00:00.000Z",
+        completedAt: "2026-07-28T10:01:00.000Z",
+        usage: {
+          inputTokens: 230,
+          cacheReadTokens: 120,
+          outputTokens: 20,
+          cacheWriteTokens: 0,
+          totalTokens: 370,
+          costUsd: null,
+        },
+      }],
+    }],
+  });
+
+  assert.equal(usage.totals.calls, 1);
+  assert.equal(usage.totals.tasks, 1);
+  assert.equal(usage.totals.totalTokens, 370);
+  assert.equal(usage.totals.unpricedCallCount, 1);
+  assert.equal(usage.totals.apiEquivalentCostUsd, null);
+  assert.deepEqual(usage.coverage.includedKinds, [
+    "assistant_model_response",
+    "image_generation",
+  ]);
+  assert.equal(usage.models[0].providerId, "codex-subscription");
+  assert.equal(usage.models[0].modelId, "gpt-image-2");
+  assert.equal(usage.models[0].billingKind, "chatgpt_subscription");
+});
+
 function createFakePreviewSupervisor({ startError = null } = {}) {
   const active = new Set();
   const starts = [];
@@ -386,6 +428,154 @@ function createFakeSessionFactory({
     return host;
   };
   factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+const GENERATED_IMAGE_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1EAAAAASUVORK5CYII=",
+  "base64",
+);
+
+function createImageGenerationSessionFactory({
+  captureImageError = false,
+} = {}) {
+  const sessions = [];
+  const factory = async (options) => {
+    let subscriber = null;
+    const record = { generated: [], activeToolCalls: [] };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt() {
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({ type: "turn_start" });
+        try {
+          const generated = await options.onImageGenerationRequest({
+            prompt: "暖象牙背景上的深青色陶瓷球体",
+            toolCallId: "image-tool-call-1",
+            signal: new AbortController().signal,
+          });
+          record.generated.push(generated);
+        } catch (error) {
+          record.imageError = error;
+          if (!captureImageError) throw error;
+        }
+        subscriber?.({
+          type: "message_start",
+          message: { role: "assistant" },
+        });
+        subscriber?.({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{
+              type: "text",
+              text: "图片已经生成，并保存在当前会话中。",
+            }],
+            stopReason: "stop",
+          },
+        });
+        subscriber?.({ type: "turn_end" });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        subscriber?.({ type: "agent_settled" });
+      },
+      setActiveToolsByName(names) {
+        record.activeToolCalls.push([...names]);
+        return [...names];
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => ({
+    ...modelCatalog(),
+    capabilities: {
+      image_generation: {
+        available: true,
+        reason: "GPT Image 2 已连接",
+      },
+    },
+  });
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createConcurrentImageGenerationSessionFactory() {
+  const sessions = [];
+  const factory = async (options) => {
+    let subscriber = null;
+    const record = { results: [], activeToolCalls: [] };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt() {
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({ type: "turn_start" });
+        record.results = await Promise.allSettled([
+          options.onImageGenerationRequest({
+            prompt: "第一张图片",
+            toolCallId: "image-tool-call-a",
+            signal: new AbortController().signal,
+          }),
+          options.onImageGenerationRequest({
+            prompt: "第二张图片",
+            toolCallId: "image-tool-call-b",
+            signal: new AbortController().signal,
+          }),
+        ]);
+        subscriber?.({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{
+              type: "text",
+              text: "图片请求已经处理。",
+            }],
+            stopReason: "stop",
+          },
+        });
+        subscriber?.({ type: "turn_end" });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        subscriber?.({ type: "agent_settled" });
+      },
+      setActiveToolsByName(names) {
+        record.activeToolCalls.push([...names]);
+        return [...names];
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => ({
+    ...modelCatalog(),
+    capabilities: {
+      image_generation: {
+        available: true,
+        reason: "GPT Image 2 已连接",
+      },
+    },
+  });
   factory.dispose = async () => {};
   factory.sessions = sessions;
   return factory;
@@ -2876,6 +3066,7 @@ test("real project-work chain binds context and changes, applies by hash, and pr
 
   const sessionFactory = createFakeSessionFactory();
   const runnerCalls = [];
+  const longVerificationOutput = `${"verification progress\n".repeat(4_000)}final evidence`;
   let verificationAttempt = 0;
   const service = createProjectWorkService({
     storageRoot,
@@ -2891,7 +3082,7 @@ test("real project-work chain binds context and changes, applies by hash, and pr
         ? {
             exitCode: 0,
             durationMs: 12,
-            stdout: `passed in ${request.cwd}`,
+            stdout: `passed in ${request.cwd}\n${longVerificationOutput}`,
             stderr: "",
             truncated: false,
             timedOut: false,
@@ -3068,6 +3259,9 @@ test("real project-work chain binds context and changes, applies by hash, and pr
   assert.equal(passed.exitCode, 0);
   assert.equal(passed.output.includes(storageRoot), false);
   assert.match(passed.output, /<workspace>/);
+  assert.match(passed.output, /final evidence$/);
+  assert.ok(passed.output.length > 64_000);
+  assert.equal(passed.truncated, false);
   assert.equal(failed.status, "failed");
   assert.equal(failed.exitCode, 1);
   const afterFailedVerification = await service.getConversation(conversation.id);
@@ -3089,6 +3283,10 @@ test("real project-work chain binds context and changes, applies by hash, and pr
     history.map((item) => item.status),
     ["requested", "passed", "failed"],
   );
+  const publicPassed = afterFailedVerification.conversation.verifications.find(
+    (item) => item.id === passed.id,
+  );
+  assert.equal(Object.hasOwn(publicPassed, "modelOutput"), false);
 });
 
 test("a confirmed failed verification is repaired once and rerun against the same isolated command", async (t) => {
@@ -3104,6 +3302,7 @@ test("a confirmed failed verification is repaired once and rerun against the sam
   );
   const sessionFactory = createVerificationRepairSessionFactory();
   const runnerCalls = [];
+  const compactedRepairOutput = "stderr:\nverification failed at <workspace>/app.js";
   const service = createProjectWorkService({
     storageRoot,
     sessionFactory,
@@ -3122,6 +3321,17 @@ test("a confirmed failed verification is repaired once and rerun against the sam
         aborted: false,
       };
     },
+    verificationOutputCompactor: async ({ output }) => ({
+      output: compactedRepairOutput,
+      applied: true,
+      rawBytes: Buffer.byteLength(output, "utf8"),
+      compactBytes: Buffer.byteLength(compactedRepairOutput, "utf8"),
+      ratio: Buffer.byteLength(compactedRepairOutput, "utf8")
+        / Buffer.byteLength(output, "utf8"),
+      command: ["rtk", "log"],
+      version: "rtk 0.44.0",
+      reason: null,
+    }),
     idFactory: incrementalId("repair-pass"),
   });
   t.after(() => service.dispose());
@@ -3166,7 +3376,23 @@ test("a confirmed failed verification is repaired once and rerun against the sam
   assert.equal(repairPayload.repairAttempt, 1);
   assert.equal(repairPayload.maxRepairAttempts, 2);
   assert.equal(repairPayload.failure.output.includes(storageRoot), false);
-  assert.match(repairPayload.failure.output, /<workspace>/);
+  assert.equal(repairPayload.failure.output, compactedRepairOutput);
+  const failedAttempt = (await service.listVerifications(conversation.id)).find(
+    (verification) => verification.status === "failed",
+  );
+  assert.match(failedAttempt.output, /verification failed/);
+  assert.notEqual(failedAttempt.output, compactedRepairOutput);
+  assert.equal(failedAttempt.modelOutput, compactedRepairOutput);
+  assert.deepEqual(failedAttempt.outputCompression, {
+    applied: true,
+    rawBytes: Buffer.byteLength(failedAttempt.output, "utf8"),
+    compactBytes: Buffer.byteLength(compactedRepairOutput, "utf8"),
+    ratio: Buffer.byteLength(compactedRepairOutput, "utf8")
+      / Buffer.byteLength(failedAttempt.output, "utf8"),
+    command: ["rtk", "log"],
+    version: "rtk 0.44.0",
+    reason: null,
+  });
   assert.ok(sessionFactory.sessions[0].activeToolCalls.some((names) => (
     names.join(",") === "read,edit,write,grep,find,ls,update_plan"
   )));
@@ -3191,6 +3417,90 @@ test("a confirmed failed verification is repaired once and rerun against the sam
   assert.equal(
     await readFile(path.join(projectRoot, "app.js"), "utf8"),
     "export const verificationState = \"original\";\n",
+  );
+});
+
+test("stop during verification compaction stays stopped and never starts repair", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-verification-stop-compaction-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  await writeFile(
+    path.join(projectRoot, "app.js"),
+    "export const verificationState = \"original\";\n",
+    "utf8",
+  );
+  const sessionFactory = createVerificationRepairSessionFactory();
+  let notifyCompactorStarted;
+  const compactorStarted = new Promise((resolve) => {
+    notifyCompactorStarted = resolve;
+  });
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async () => ({
+      exitCode: 1,
+      durationMs: 3,
+      stdout: "",
+      stderr: "AssertionError: still broken",
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+    }),
+    verificationOutputCompactor: ({ output, signal }) => new Promise((resolve) => {
+      notifyCompactorStarted();
+      const finish = () => resolve({
+        output,
+        applied: false,
+        rawBytes: Buffer.byteLength(output, "utf8"),
+        compactBytes: Buffer.byteLength(output, "utf8"),
+        ratio: 1,
+        command: ["rtk", "log"],
+        version: "rtk 0.44.0",
+        reason: "aborted",
+      });
+      if (signal.aborted) {
+        finish();
+      } else {
+        signal.addEventListener("abort", finish, { once: true });
+      }
+    }),
+    idFactory: incrementalId("stop-compaction"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, { text: "修复并验证" });
+  const pending = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "awaiting_confirmation",
+    "change set was not ready",
+  );
+  const request = pending.conversation.verifications.find(
+    (verification) => verification.status === "requested",
+  );
+
+  const runPromise = service.runVerification(conversation.id, {
+    requestId: request.id,
+  });
+  await compactorStarted;
+  await service.abortConversation(conversation.id);
+  const completed = await runPromise;
+  const stopped = await service.getConversation(conversation.id);
+
+  assert.equal(completed.status, "aborted");
+  assert.equal(stopped.conversation.status, "aborted");
+  assert.equal(sessionFactory.sessions[0].repairCalls.length, 0);
+  assert.equal(
+    stopped.conversation.operations.some(
+      (operation) => operation.type === "verification_repair",
+    ),
+    false,
   );
 });
 
@@ -5330,4 +5640,351 @@ test("one-turn screenshot review passes a bounded image to Pi without persisting
   assert.equal(sessions.length, sessionsBeforeRejectedImage);
   const rejectedSnapshot = await service.getConversation(textConversation.id);
   assert.equal(rejectedSnapshot.conversation.messages.length, 0);
+});
+
+test("explicit Image2 generation stays conversation-owned, readable, and usage-accounted", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-generated-image-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "project remains text-only\n");
+  const sessionFactory = createImageGenerationSessionFactory();
+  const generatorCalls = [];
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    imageGenerator: async (request) => {
+      generatorCalls.push(request);
+      await mkdir(request.artifactDirectory, { recursive: true });
+      await writeFile(
+        path.join(request.artifactDirectory, `${request.requestId}.png`),
+        GENERATED_IMAGE_PNG,
+      );
+      return {
+        providerId: "codex-subscription",
+        modelId: "gpt-image-2",
+        operationId: "image-operation-1",
+        billingMode: "subscription",
+        pricingStatus: "unpriced",
+        usage: {
+          input_tokens: 350,
+          cached_input_tokens: 120,
+          cache_write_input_tokens: 0,
+          output_tokens: 20,
+          reasoning_output_tokens: 5,
+          total_tokens: 370,
+          image_generations: 1,
+        },
+        artifact: {
+          id: request.requestId,
+          fileName: `${request.requestId}.png`,
+          mimeType: "image/png",
+          byteLength: GENERATED_IMAGE_PNG.length,
+          width: 1,
+          height: 1,
+          sha256: `sha256:${
+            createHash("sha256").update(GENERATED_IMAGE_PNG).digest("hex")
+          }`,
+          requestedSize: request.requestedSize,
+          requestedQuality: request.quality,
+        },
+      };
+    },
+    idFactory: incrementalId("generated-image"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, {
+    text: "请生成一张暖象牙背景上的深青色陶瓷球体图片",
+    capabilities: ["image_generation"],
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.generatedImages?.[0]?.status === "completed"
+    ),
+    "generated image did not settle",
+  );
+
+  assert.equal(generatorCalls.length, 1);
+  assert.equal(generatorCalls[0].requestedSize, "1024x1024");
+  assert.equal(generatorCalls[0].quality, "low");
+  const [image] = settled.conversation.generatedImages;
+  assert.equal(image.modelId, "gpt-image-2");
+  assert.equal(image.billingKind, "chatgpt_subscription");
+  assert.equal(image.pricingStatus, "unpriced");
+  assert.equal(image.usageStatus, "reported");
+  assert.equal(image.usage.totalTokens, 370);
+  assert.equal(image.usage.inputTokens, 230);
+  assert.equal(image.usage.cacheReadTokens, 120);
+  assert.equal(JSON.stringify(image).includes(storageRoot), false);
+  const content = await service.readGeneratedImage(conversation.id, image.id);
+  assert.equal(content.bytes.equals(GENERATED_IMAGE_PNG), true);
+  assert.equal(
+    await readFile(path.join(projectRoot, "app.js"), "utf8"),
+    "project remains text-only\n",
+  );
+  await assert.rejects(
+    access(path.join(projectRoot, image.fileName)),
+    { code: "ENOENT" },
+  );
+
+  const usage = await service.getUsage({ period: "30d" });
+  const imageUsage = usage.models.find(
+    (model) => model.modelId === "gpt-image-2",
+  );
+  assert.equal(imageUsage.calls, 1);
+  assert.equal(imageUsage.totalTokens, 370);
+  assert.equal(imageUsage.unpricedCallCount, 1);
+});
+
+test("Image2 callback rejects an unauthorized turn before spending subscription quota", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-image-auth-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "unchanged\n");
+  const sessionFactory = createImageGenerationSessionFactory({
+    captureImageError: true,
+  });
+  let generatorCalls = 0;
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    imageGenerator: async () => {
+      generatorCalls += 1;
+      throw new Error("must not run");
+    },
+    idFactory: incrementalId("image-auth"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, {
+    text: "普通代码任务，不授权生图",
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "unauthorized image callback did not fail the turn",
+  );
+  assert.equal(generatorCalls, 0);
+  assert.deepEqual(settled.conversation.generatedImages, []);
+  assert.equal(
+    sessionFactory.sessions[0].imageError.code,
+    "CODEX_IMAGE_NOT_AUTHORIZED",
+  );
+  assert.equal(
+    sessionFactory.sessions[0].activeToolCalls.at(-1).includes("generate_image"),
+    false,
+  );
+});
+
+test("Image2 claim is atomic, keeps all metadata, and allows only one attempt per turn", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-image-claim-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "unchanged\n");
+  const sessionFactory = createConcurrentImageGenerationSessionFactory();
+  const generatorCalls = [];
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    imageGenerator: async (request) => {
+      generatorCalls.push(request);
+      await mkdir(request.artifactDirectory, { recursive: true });
+      await writeFile(
+        path.join(request.artifactDirectory, `${request.requestId}.png`),
+        GENERATED_IMAGE_PNG,
+      );
+      return {
+        providerId: "codex-subscription",
+        modelId: "gpt-image-2",
+        operationId: "atomic-image-operation",
+        billingMode: "subscription",
+        pricingStatus: "unpriced",
+        usage: {
+          input_tokens: 10,
+          cached_input_tokens: 0,
+          cache_write_input_tokens: 0,
+          output_tokens: 2,
+          reasoning_output_tokens: 0,
+          total_tokens: 12,
+          image_generations: 1,
+        },
+        artifact: {
+          fileName: `${request.requestId}.png`,
+          mimeType: "image/png",
+          byteLength: GENERATED_IMAGE_PNG.length,
+          width: 1,
+          height: 1,
+          sha256: `sha256:${
+            createHash("sha256").update(GENERATED_IMAGE_PNG).digest("hex")
+          }`,
+          requestedSize: request.requestedSize,
+          requestedQuality: request.quality,
+        },
+      };
+    },
+    idFactory: incrementalId("image-claim"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const conversation = await service.createConversation(project.id);
+  const statePath = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+    "conversation.json",
+  );
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.generatedImages = Array.from({ length: 50 }, (_, index) => ({
+    id: `legacy-image-${index}`,
+    turnId: `legacy-turn-${index}`,
+    toolCallId: `legacy-tool-${index}`,
+    status: "failed",
+    providerId: "codex-subscription",
+    modelId: "gpt-image-2",
+    billingKind: "chatgpt_subscription",
+    pricingStatus: "unpriced",
+    usageStatus: "unknown",
+    usage: null,
+    createdAt: state.createdAt,
+    completedAt: state.createdAt,
+  }));
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  await service.sendMessage(conversation.id, {
+    text: "本轮只生成一张图片",
+    capabilities: ["image_generation"],
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.generatedImages.some(
+        (image) => image.status === "completed",
+      )
+    ),
+    "atomic image claim did not settle",
+  );
+  assert.equal(generatorCalls.length, 1);
+  assert.equal(settled.conversation.generatedImages.length, 51);
+  assert.deepEqual(
+    sessionFactory.sessions[0].results.map((result) => result.status).sort(),
+    ["fulfilled", "rejected"],
+  );
+  const rejected = sessionFactory.sessions[0].results.find(
+    (result) => result.status === "rejected",
+  );
+  assert.equal(rejected.reason.code, "CODEX_IMAGE_REQUEST_IN_PROGRESS");
+});
+
+test("stale Image2 records recover a verified artifact or become interrupted without a paid retry", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-image-recovery-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "unchanged\n");
+  const firstService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory(),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("image-recovery-first"),
+  });
+  const selection = await firstService.pickProjectRoot({ mode: "existing" });
+  const project = await firstService.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await firstService.createConversation(project.id);
+  await firstService.dispose();
+
+  const conversationDirectory = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+  );
+  const statePath = path.join(conversationDirectory, "conversation.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  const staleRecord = (id, turnId) => ({
+    id,
+    turnId,
+    toolCallId: `tool-${id}`,
+    status: "generating",
+    prompt: "恢复图片",
+    fileName: null,
+    mimeType: null,
+    byteLength: null,
+    width: null,
+    height: null,
+    sha256: null,
+    requestedSize: "1024x1024",
+    requestedQuality: "low",
+    providerId: "codex-subscription",
+    modelId: "gpt-image-2",
+    operationId: null,
+    billingKind: "chatgpt_subscription",
+    pricingStatus: "unpriced",
+    usageStatus: "unknown",
+    usage: null,
+    error: null,
+    createdAt: state.createdAt,
+    completedAt: null,
+  });
+  state.generatedImages = [
+    staleRecord("image-recoverable", "turn-recoverable"),
+    staleRecord("image-missing", "turn-missing"),
+  ];
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const artifactsRoot = path.join(conversationDirectory, "generated-artifacts");
+  await writeFile(
+    path.join(artifactsRoot, "image-recoverable.png"),
+    GENERATED_IMAGE_PNG,
+  );
+
+  let generatorCalls = 0;
+  const recoveredService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory(),
+    imageGenerator: async () => {
+      generatorCalls += 1;
+      throw new Error("recovery must not generate");
+    },
+    idFactory: incrementalId("image-recovery-second"),
+  });
+  t.after(() => recoveredService.dispose());
+  const recovered = await recoveredService.getConversation(conversation.id);
+  const recoveredImage = recovered.conversation.generatedImages.find(
+    (image) => image.id === "image-recoverable",
+  );
+  const interruptedImage = recovered.conversation.generatedImages.find(
+    (image) => image.id === "image-missing",
+  );
+  assert.equal(generatorCalls, 0);
+  assert.equal(recoveredImage.status, "completed");
+  assert.equal(recoveredImage.usageStatus, "unknown");
+  assert.equal(recoveredImage.usage, null);
+  assert.equal(interruptedImage.status, "interrupted");
+  assert.equal(interruptedImage.error.code, "CODEX_IMAGE_INTERRUPTED");
+  const content = await recoveredService.readGeneratedImage(
+    conversation.id,
+    recoveredImage.id,
+  );
+  assert.equal(content.bytes.equals(GENERATED_IMAGE_PNG), true);
 });

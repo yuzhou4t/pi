@@ -945,6 +945,7 @@ export function ReaderAgentComposer({
   providers,
   providerId,
   modelId,
+  thinkingLevel = null,
   reference,
   referenceError,
   onReferenceChange,
@@ -1229,6 +1230,7 @@ export function ReaderAgentComposer({
         clientRequestId: nextAttempt.clientRequestId,
         providerId,
         modelId,
+        thinkingLevel,
       });
       publishReading(nextReading);
       setDraft("");
@@ -1916,6 +1918,7 @@ export function WorkflowContextRail({
   providers = [],
   providerId = null,
   modelId = null,
+  thinkingLevel = null,
   projectContextState = null,
   onReloadProjectContext,
   onOpenReaderBlock,
@@ -2036,6 +2039,7 @@ export function WorkflowContextRail({
               providers={providers}
               providerId={providerId}
               modelId={modelId}
+              thinkingLevel={thinkingLevel}
               reference={selectionState.reference}
               referenceError={selectionState.error}
               onReferenceChange={onReaderSelectionChange ?? NOOP_SELECTION_CHANGE}

@@ -140,11 +140,15 @@ export function resolveProjectWorkTurn({
       activeToolNames.add(toolName);
     }
   }
-  const capabilityGuidance = activeCapabilityIds.map((capabilityId) => (
-    capabilityId === "web_search"
-      ? "Use Tavily only when current public web evidence is needed; keep queries short and cite returned URLs."
-      : "Use Context7 only for public package documentation; resolve the exact library ID before querying and cite the returned source."
-  ));
+  const capabilityGuidance = activeCapabilityIds.map((capabilityId) => {
+    if (capabilityId === "web_search") {
+      return "Use web search only when current public evidence is needed; keep queries short and cite returned URLs.";
+    }
+    if (capabilityId === "image_generation") {
+      return "The user explicitly enabled image generation for this turn. Use generate_image at most once, only for the requested image, and keep the result conversation-owned.";
+    }
+    return "Use Context7 only for public package documentation; resolve the exact library ID before querying and cite the returned source.";
+  });
 
   return {
     workflowId: workflow?.id ?? null,

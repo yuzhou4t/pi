@@ -11,7 +11,9 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createTwoFilesPatch } from "diff";
+import { createJiti } from "jiti";
 import { Type } from "typebox";
 import {
   createAgentSession,
@@ -52,7 +54,10 @@ export const PROJECT_WORK_DEFAULT_TOOL_NAMES = [
   "ask_user",
   "request_verification",
 ];
+export const PROJECT_WORK_IMAGE_TOOL_NAME = "generate_image";
 export const PROJECT_WORK_PREVIEW_TOOL_NAME = "request_preview";
+export const PROJECT_WORK_SUBAGENT_TOOL_NAME = "subagent";
+export const PROJECT_WORK_ULTRA_THINKING_LEVEL = "ultra";
 export const PROJECT_WORK_REPAIR_TOOL_NAMES = [
   "read",
   "edit",
@@ -64,7 +69,9 @@ export const PROJECT_WORK_REPAIR_TOOL_NAMES = [
 ];
 const TOOL_NAMES = [
   ...PROJECT_WORK_DEFAULT_TOOL_NAMES,
+  PROJECT_WORK_IMAGE_TOOL_NAME,
   PROJECT_WORK_PREVIEW_TOOL_NAME,
+  PROJECT_WORK_SUBAGENT_TOOL_NAME,
   ...EXTERNAL_RETRIEVAL_TOOL_NAMES,
 ];
 const MAX_TOOL_FILE_BYTES = 1024 * 1024;
@@ -78,12 +85,48 @@ const STANDARD_THINKING_LEVELS = [
   "medium",
   "high",
 ];
+const PI_SUBAGENTS_EXTENSION_PATH = fileURLToPath(import.meta.resolve("pi-subagents"));
+const SUBAGENT_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
+const SUBAGENT_MAX_TASKS_PER_TURN = 3;
+const SUBAGENT_ALLOWED_TOP_LEVEL_FIELDS = new Set([
+  "agent",
+  "task",
+  "tasks",
+  "concurrency",
+  "context",
+  "timeoutMs",
+  "maxRuntimeMs",
+  "turnBudget",
+  "toolBudget",
+  "includeProgress",
+  "agentScope",
+  "clarify",
+  "artifacts",
+  "async",
+]);
+const SUBAGENT_ALLOWED_TASK_FIELDS = new Set([
+  "agent",
+  "task",
+  "count",
+  "toolBudget",
+]);
+const ULTRA_GUIDANCE = [
+  "Ultra mode combines the current model's native max thinking level with bounded read-only subagents.",
+  "Delegate only independent codebase inspection or review tasks that materially benefit from parallel work.",
+  "Use the subagent tool in foreground mode only, with the built-in delegate agent, fresh context, and at most three total child tasks in this turn.",
+  "The delegate agent is already available. Do not call subagent management actions such as list or status.",
+  "Subagents can only read, grep, find, and list files. They cannot edit files, run shell commands, load extensions, approve changes, or bypass the parent review overlay.",
+  "Treat child reports as advisory. Verify relevant findings with the parent's contained tools before proposing changes or making claims.",
+].join("\n");
+const subagentJiti = createJiti(import.meta.url);
+let subagentCapabilityApiPromise = null;
 const APP_GUIDANCE = [
   "You are working through a contained review overlay for the user's project.",
   "Reads use the latest safe project files unless a proposed overlay file exists.",
   "Use only the provided contained file tools. They cannot access paths outside the project and review overlay.",
   "Keep the public plan current with update_plan.",
   "Use request_verification only to propose a bounded verification command. The app's deterministic server policy decides whether it waits, is blocked, or continues after the turn settles.",
+  "Use generate_image only when the user's current explicit message asks to create an image. It creates one conversation-owned image and never writes that binary asset into the project.",
   "Edits are written only to the review overlay. Never claim that the live project changed before the app reports a successfully applied change set.",
 ].join("\n");
 const STANDALONE_GUIDANCE = [
@@ -92,6 +135,7 @@ const STANDALONE_GUIDANCE = [
   "Do not claim that you inspected, changed, or can discover files elsewhere on the user's computer.",
   "Keep the public plan current with update_plan.",
   "Use request_verification only to propose a bounded verification command. The app's deterministic server policy decides whether it waits, is blocked, or continues after the turn settles.",
+  "Use generate_image only when the user's current explicit message asks to create an image. It creates one conversation-owned image and never writes that binary asset into the scratch workspace.",
   "Edits remain in the private review overlay until the app reports a successfully applied change set, and they can only be saved inside this conversation's private scratch workspace.",
 ].join("\n");
 const DOCUMENT_GUIDANCE = [
@@ -187,6 +231,116 @@ export function createProjectWorkTurnGuidanceExtension(getGuidance) {
             guidance,
           ].filter(Boolean).join("\n\n"),
         };
+      });
+    },
+  };
+}
+
+function loadSubagentCapabilityApi() {
+  subagentCapabilityApiPromise ??= subagentJiti.import(
+    "pi-subagents/capability-ceiling",
+  );
+  return subagentCapabilityApiPromise;
+}
+
+function isAllowedSubagentFieldSet(input, allowedFields) {
+  return Object.keys(input).every((field) => allowedFields.has(field));
+}
+
+function requestedSubagentTaskCount(input) {
+  if (Array.isArray(input.tasks)) {
+    return input.tasks.reduce((total, task) => (
+      total + (Number.isInteger(task?.count) ? task.count : 1)
+    ), 0);
+  }
+  return typeof input.agent === "string" && input.agent.trim() ? 1 : 0;
+}
+
+export function createProjectWorkSubagentPolicyExtension() {
+  let spawnedThisTurn = 0;
+  return {
+    name: "pi-agent-subagent-policy",
+    hidden: true,
+    factory(pi) {
+      pi.on("agent_start", () => {
+        spawnedThisTurn = 0;
+      });
+      pi.on("tool_call", (event) => {
+        if (event.toolName !== PROJECT_WORK_SUBAGENT_TOOL_NAME) {
+          return undefined;
+        }
+        const input = event.input;
+        if (
+          !input
+          || typeof input !== "object"
+          || Array.isArray(input)
+          || !isAllowedSubagentFieldSet(input, SUBAGENT_ALLOWED_TOP_LEVEL_FIELDS)
+          || input.action !== undefined
+          || input.chain !== undefined
+          || input.worktree !== undefined
+          || input.cwd !== undefined
+          || input.output !== undefined
+          || input.model !== undefined
+          || input.thinking !== undefined
+          || input.skill !== undefined
+          || input.sessionDir !== undefined
+          || input.share !== undefined
+        ) {
+          return {
+            block: true,
+            reason: "Ultra 子智能体只允许前台只读的单任务或并行检查。",
+          };
+        }
+        const tasks = Array.isArray(input.tasks) ? input.tasks : null;
+        if (
+          tasks
+          && (
+            tasks.length === 0
+            || tasks.some((task) => (
+              !task
+              || typeof task !== "object"
+              || Array.isArray(task)
+              || !isAllowedSubagentFieldSet(task, SUBAGENT_ALLOWED_TASK_FIELDS)
+              || task.agent !== "delegate"
+              || (task.count !== undefined && task.count !== 1)
+            ))
+          )
+        ) {
+          return {
+            block: true,
+            reason: "Ultra 并行任务只能使用内置 delegate，且每项只能启动一次。",
+          };
+        }
+        if (!tasks && input.agent !== "delegate") {
+          return {
+            block: true,
+            reason: "Ultra 子智能体只能使用经过约束的内置 delegate。",
+          };
+        }
+        const requestedTasks = requestedSubagentTaskCount(input);
+        if (
+          requestedTasks < 1
+          || requestedTasks > SUBAGENT_MAX_TASKS_PER_TURN
+          || spawnedThisTurn + requestedTasks > SUBAGENT_MAX_TASKS_PER_TURN
+        ) {
+          return {
+            block: true,
+            reason: "Ultra 每轮最多启动 3 个只读子智能体。",
+          };
+        }
+        spawnedThisTurn += requestedTasks;
+        input.async = false;
+        input.clarify = false;
+        input.context = "fresh";
+        input.artifacts = false;
+        input.agentScope = "user";
+        if (tasks) {
+          input.concurrency = Math.min(
+            SUBAGENT_MAX_TASKS_PER_TURN,
+            requestedTasks,
+          );
+        }
+        return undefined;
       });
     },
   };
@@ -1000,6 +1154,7 @@ export async function createProjectWorkTools({
   onPlan,
   onAskUserRequest,
   onVerificationRequest,
+  onImageGenerationRequest,
   onPreviewRequest,
 } = {}) {
   const roots = await canonicalOverlayRoots({
@@ -1086,6 +1241,35 @@ export async function createProjectWorkTools({
       return textResult(
         `Verification request ${created.id} is ready for user review. It has not run.`,
         { id: created.id },
+      );
+    },
+  });
+  const generateImage = defineTool({
+    name: PROJECT_WORK_IMAGE_TOOL_NAME,
+    label: PROJECT_WORK_IMAGE_TOOL_NAME,
+    description: "Generate exactly one conversation-owned PNG with GPT Image 2 only when the current user message explicitly requests image creation. This does not write to the project.",
+    promptSnippet: "Generate one reviewed conversation image",
+    executionMode: "sequential",
+    parameters: Type.Object({
+      prompt: Type.String({ minLength: 1, maxLength: 8_000 }),
+    }, { additionalProperties: false }),
+    async execute(toolCallId, { prompt }, signal) {
+      if (typeof onImageGenerationRequest !== "function") {
+        throw projectWorkError(
+          "CODEX_IMAGE_UNAVAILABLE",
+          "当前没有可用的 Codex 图片生成能力",
+          503,
+          true,
+        );
+      }
+      const generated = await onImageGenerationRequest({
+        prompt,
+        toolCallId,
+        signal,
+      });
+      return textResult(
+        `Generated conversation image ${generated.id} with ${generated.modelId}. Actual size: ${generated.width} × ${generated.height}. The image is available in the conversation and Files artifact; it has not been written to the project.`,
+        generated,
       );
     },
   });
@@ -1299,6 +1483,7 @@ export async function createProjectWorkTools({
     updatePlan,
     askUser,
     requestVerification,
+    generateImage,
     requestPreview,
   ];
 }
@@ -1333,12 +1518,21 @@ export function getProjectWorkThinkingLevels(model) {
       (level) => !STANDARD_THINKING_LEVELS.includes(level),
     ),
   ];
-  return levels.filter((level) => {
+  const supported = levels.filter((level) => {
     const mapped = thinkingLevelMap[level];
     if (mapped === null) return false;
     if (STANDARD_THINKING_LEVELS.includes(level)) return true;
     return mapped !== undefined;
   });
+  if (
+    model?.provider === "openai-codex"
+    && typeof model?.id === "string"
+    && model.id.startsWith("gpt-5.6-")
+    && supported.includes("max")
+  ) {
+    supported.push(PROJECT_WORK_ULTRA_THINKING_LEVEL);
+  }
+  return supported;
 }
 
 export function getProjectWorkDefaultThinkingLevel(model, configuredLevel = null) {
@@ -1352,6 +1546,18 @@ export function getProjectWorkDefaultThinkingLevel(model, configuredLevel = null
     "off",
     ...thinkingLevels,
   ].find((level) => thinkingLevels.includes(level)) ?? "off";
+}
+
+function toNativeThinkingLevel(model, thinkingLevel) {
+  if (
+    thinkingLevel === PROJECT_WORK_ULTRA_THINKING_LEVEL
+    && getProjectWorkThinkingLevels(model).includes(
+      PROJECT_WORK_ULTRA_THINKING_LEVEL,
+    )
+  ) {
+    return "max";
+  }
+  return thinkingLevel;
 }
 
 function findSelectedModel(available, requestedModelId, defaults) {
@@ -1462,6 +1668,7 @@ export function createPiSessionFactory({
   agentDir = getAgentDir(),
   modelRuntime,
   externalRetrievalOptions,
+  imageGenerationProbe,
   skillProvider,
 } = {}) {
   const runtimePromise = modelRuntime
@@ -1471,12 +1678,47 @@ export function createPiSessionFactory({
 
   async function listModels() {
     const runtime = await runtimePromise;
-    const available = [...await runtime.getAvailable()];
+    const [availableModels, imageStatus] = await Promise.all([
+      runtime.getAvailable(),
+      typeof imageGenerationProbe === "function"
+        ? Promise.resolve()
+            .then(() => imageGenerationProbe())
+            .catch(() => ({
+              available: false,
+              status: "unavailable",
+              reasonCode: "CODEX_STATUS_FAILED",
+            }))
+        : Promise.resolve({
+            available: false,
+            status: "unavailable",
+            reasonCode: "CODEX_STATUS_UNCHECKED",
+          }),
+    ]);
+    const available = [...availableModels];
+    const externalCapabilities = getExternalRetrievalCapabilities(
+      externalRetrievalOptions,
+    );
+    const imageCapability = imageStatus?.available === true
+      ? {
+          available: true,
+          reason: "GPT Image 2 · ChatGPT 订阅已连接",
+        }
+      : {
+          available: false,
+          reason: imageStatus?.reasonCode === "CODEX_CLI_MISSING"
+            ? "本机未找到可用的 Codex CLI"
+            : imageStatus?.reasonCode === "CODEX_AUTH_NOT_CHATGPT"
+              ? "Codex 尚未使用 ChatGPT 订阅登录"
+              : "GPT Image 2 当前不可用",
+        };
     return publicModelCatalog(
       runtime,
       available,
       defaults,
-      getExternalRetrievalCapabilities(externalRetrievalOptions),
+      {
+        ...externalCapabilities,
+        image_generation: imageCapability,
+      },
     );
   }
 
@@ -1606,6 +1848,7 @@ export function createPiSessionFactory({
     onPlan,
     onAskUserRequest,
     onVerificationRequest,
+    onImageGenerationRequest,
     onPreviewRequest,
   } = {}) => {
     const cwd = await realpath(workspaceRoot);
@@ -1652,9 +1895,18 @@ export function createPiSessionFactory({
       DOCUMENT_GUIDANCE,
     ].filter(Boolean);
     let pendingTurnGuidance = "";
+    let publicThinkingLevel = thinkingLevel;
+    let subagentsAllowedForTurn = false;
     const turnGuidanceExtension = createProjectWorkTurnGuidanceExtension(
-      () => pendingTurnGuidance,
+      () => [
+        pendingTurnGuidance,
+        publicThinkingLevel === PROJECT_WORK_ULTRA_THINKING_LEVEL
+          && subagentsAllowedForTurn
+          ? ULTRA_GUIDANCE
+          : "",
+      ].filter(Boolean).join("\n\n"),
     );
+    const subagentPolicyExtension = createProjectWorkSubagentPolicyExtension();
     const enabledSkillPaths = typeof skillProvider === "function"
       ? await skillProvider()
       : [];
@@ -1667,16 +1919,27 @@ export function createPiSessionFactory({
       noPromptTemplates: true,
       noThemes: true,
       noContextFiles: true,
+      additionalExtensionPaths: [PI_SUBAGENTS_EXTENSION_PATH],
       additionalSkillPaths: enabledSkillPaths,
-      extensionFactories: [turnGuidanceExtension],
+      extensionFactories: [turnGuidanceExtension, subagentPolicyExtension],
       systemPrompt: "",
       appendSystemPrompt: appendedGuidance,
       extensionsOverride: (base) => ({
         ...base,
         extensions: base.extensions.filter(
-          (extension) => extension.path === "<inline:pi-agent-turn-guidance>",
+          (extension) => (
+            extension.path === "<inline:pi-agent-turn-guidance>"
+            || extension.path === "<inline:pi-agent-subagent-policy>"
+            || path.resolve(extension.resolvedPath) === path.resolve(
+              PI_SUBAGENTS_EXTENSION_PATH,
+            )
+          ),
         ),
-        errors: [],
+        errors: base.errors.filter(
+          (error) => path.resolve(error.path) === path.resolve(
+            PI_SUBAGENTS_EXTENSION_PATH,
+          ),
+        ),
       }),
       skillsOverride: (base) => base,
       promptsOverride: () => ({ prompts: [], diagnostics: [] }),
@@ -1686,6 +1949,21 @@ export function createPiSessionFactory({
       appendSystemPromptOverride: () => appendedGuidance,
     });
     await resourceLoader.reload();
+    const subagentExtensionResult = resourceLoader.getExtensions();
+    const subagentLoadError = subagentExtensionResult.errors[0];
+    const subagentLoaded = subagentExtensionResult.extensions.some(
+      (extension) => path.resolve(extension.resolvedPath) === path.resolve(
+        PI_SUBAGENTS_EXTENSION_PATH,
+      ),
+    );
+    if (subagentLoadError || !subagentLoaded) {
+      throw projectWorkError(
+        "PROJECT_WORK_SUBAGENT_RUNTIME_UNAVAILABLE",
+        "Ultra 子智能体运行时未能加载",
+        500,
+        true,
+      );
+    }
     const customTools = await createProjectWorkTools({
       projectRoot,
       baseRoot,
@@ -1696,6 +1974,7 @@ export function createPiSessionFactory({
       onPlan,
       onAskUserRequest,
       onVerificationRequest,
+      onImageGenerationRequest,
       onPreviewRequest,
     });
     const { session } = await createAgentSession({
@@ -1703,14 +1982,34 @@ export function createPiSessionFactory({
       agentDir,
       modelRuntime: runtime,
       model,
-      thinkingLevel,
+      thinkingLevel: toNativeThinkingLevel(model, thinkingLevel),
       settingsManager,
       resourceLoader,
       sessionManager,
       noTools: "builtin",
       customTools,
     });
+    const { registerSubagentCapabilityCeiling } = await loadSubagentCapabilityApi();
+    const subagentCapabilityCeiling = registerSubagentCapabilityCeiling({
+      sessionId: sessionManager.getSessionId(),
+      source: "pi-agent-project-work",
+      ceiling: {
+        allowedTools: SUBAGENT_READ_ONLY_TOOLS,
+        denyExtensions: true,
+      },
+    });
     session.setActiveToolsByName(PROJECT_WORK_DEFAULT_TOOL_NAMES);
+    let requestedToolNames = [...PROJECT_WORK_DEFAULT_TOOL_NAMES];
+    function applyActiveTools() {
+      const activeTools = (
+        publicThinkingLevel === PROJECT_WORK_ULTRA_THINKING_LEVEL
+        && subagentsAllowedForTurn
+      )
+        ? [...requestedToolNames, PROJECT_WORK_SUBAGENT_TOOL_NAME]
+        : requestedToolNames;
+      session.setActiveToolsByName([...new Set(activeTools)]);
+      return session.getActiveToolNames();
+    }
     async function setModel(nextModelRef) {
       const currentAvailable = [...await runtime.getAvailable()];
       const nextModel = findSelectedModel(currentAvailable, nextModelRef, defaults);
@@ -1723,6 +2022,17 @@ export function createPiSessionFactory({
         );
       }
       await session.setModel(nextModel);
+      const nextThinkingLevels = getProjectWorkThinkingLevels(nextModel);
+      if (!nextThinkingLevels.includes(publicThinkingLevel)) {
+        publicThinkingLevel = getProjectWorkDefaultThinkingLevel(
+          nextModel,
+          defaults.thinkingLevel,
+        );
+        session.setThinkingLevel(
+          toNativeThinkingLevel(nextModel, publicThinkingLevel),
+        );
+      }
+      applyActiveTools();
       return {
         providerId: nextModel.provider,
         modelId: nextModel.id,
@@ -1735,7 +2045,7 @@ export function createPiSessionFactory({
       };
     }
     function setThinkingLevel(nextThinkingLevel) {
-      const thinkingLevels = session.getAvailableThinkingLevels();
+      const thinkingLevels = getProjectWorkThinkingLevels(session.model);
       if (!thinkingLevels.includes(nextThinkingLevel)) {
         throw projectWorkError(
           "PROJECT_WORK_THINKING_LEVEL_UNSUPPORTED",
@@ -1743,10 +2053,17 @@ export function createPiSessionFactory({
           400,
         );
       }
-      session.setThinkingLevel(nextThinkingLevel);
-      return session.thinkingLevel;
+      session.setThinkingLevel(
+        toNativeThinkingLevel(session.model, nextThinkingLevel),
+      );
+      publicThinkingLevel = nextThinkingLevel;
+      applyActiveTools();
+      return publicThinkingLevel;
     }
-    function setActiveToolsByName(nextToolNames) {
+    function setActiveToolsByName(
+      nextToolNames,
+      { allowSubagents = false } = {},
+    ) {
       if (!Array.isArray(nextToolNames)) {
         throw projectWorkError(
           "PROJECT_WORK_TOOLS_INVALID",
@@ -1757,7 +2074,11 @@ export function createPiSessionFactory({
       const normalized = [...new Set(nextToolNames)];
       if (
         normalized.some(
-          (name) => typeof name !== "string" || !TOOL_NAMES.includes(name),
+          (name) => (
+            typeof name !== "string"
+            || !TOOL_NAMES.includes(name)
+            || name === PROJECT_WORK_SUBAGENT_TOOL_NAME
+          ),
         )
       ) {
         throw projectWorkError(
@@ -1766,8 +2087,9 @@ export function createPiSessionFactory({
           400,
         );
       }
-      session.setActiveToolsByName(normalized);
-      return session.getActiveToolNames();
+      requestedToolNames = normalized;
+      subagentsAllowedForTurn = allowSubagents === true;
+      return applyActiveTools();
     }
     return {
       get isStreaming() {
@@ -1780,12 +2102,12 @@ export function createPiSessionFactory({
         return session.getContextUsage();
       },
       get thinkingLevel() {
-        return session.thinkingLevel;
+        return publicThinkingLevel;
       },
       getHarnessSnapshot() {
         return createPublicHarnessSnapshot({
           model: session.model,
-          thinkingLevel: session.thinkingLevel,
+          thinkingLevel: publicThinkingLevel,
           activeTools: session.getActiveToolNames(),
           enabledSkillPaths,
           workspaceKind,
@@ -1974,6 +2296,7 @@ export function createPiSessionFactory({
         return session.subscribe(listener);
       },
       dispose() {
+        subagentCapabilityCeiling.dispose();
         session.dispose();
       },
     };

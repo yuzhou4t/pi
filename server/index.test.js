@@ -2656,6 +2656,7 @@ test("Journal mutation entry routes require a versioned JSON envelope before dis
       trigger: "manual",
       providerId: "deepseek",
       modelId: "deepseek-v4-flash",
+      thinkingLevel: null,
     },
   }, {
     action: "resume",
@@ -3170,6 +3171,7 @@ test("reading HTTP routes preserve request fields and return durable stage state
       includeProjectContext: true,
       providerId: "deepseek",
       modelId: "deepseek-v4-flash",
+      thinkingLevel: null,
     },
   });
 
@@ -3446,6 +3448,16 @@ test("project-work file routes forward bounded paging and serve validated image 
         bytes: imageBytes,
       };
     },
+    async readGeneratedImage(conversationId, imageId) {
+      calls.push({ action: "generated-image", conversationId, imageId });
+      return {
+        path: "image-1.png",
+        mimeType: "image/png",
+        byteLength: imageBytes.length,
+        hash: "sha256:generated-image",
+        bytes: imageBytes,
+      };
+    },
   };
   const server = await startTestServer(
     {},
@@ -3482,6 +3494,19 @@ test("project-work file routes forward bounded paging and serve validated image 
   assert.equal(imageResponse.headers.get("cache-control"), "private, no-store");
   assert.equal(imageResponse.headers.get("x-content-type-options"), "nosniff");
   assert.deepEqual(Buffer.from(await imageResponse.arrayBuffer()), imageBytes);
+  const generatedImageResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-files/generated-images/image-1/content`,
+  );
+  assert.equal(generatedImageResponse.status, 200);
+  assert.equal(generatedImageResponse.headers.get("content-type"), "image/png");
+  assert.equal(
+    generatedImageResponse.headers.get("cache-control"),
+    "private, no-store",
+  );
+  assert.deepEqual(
+    Buffer.from(await generatedImageResponse.arrayBuffer()),
+    imageBytes,
+  );
   assert.deepEqual(calls, [{
     action: "tree",
     conversationId: "conversation-files",
@@ -3498,5 +3523,9 @@ test("project-work file routes forward bounded paging and serve validated image 
     options: {
       filePath: "assets/settings.png",
     },
+  }, {
+    action: "generated-image",
+    conversationId: "conversation-files",
+    imageId: "image-1",
   }]);
 });

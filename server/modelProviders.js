@@ -2,6 +2,7 @@ import {
   CODEX_ACCOUNT_MODEL_ID,
   CODEX_PROVIDER_ID,
   CODEX_SPARK_MODEL_ID,
+  isAllowedCodexModel,
   runCodexSubscription,
 } from "./providers/codexSubscription.js";
 import {
@@ -78,10 +79,7 @@ export function createModelProviderRegistry({
 
   function supports(providerId, modelId) {
     return (
-      (
-        providerId === CODEX_PROVIDER_ID
-        && [CODEX_ACCOUNT_MODEL_ID, CODEX_SPARK_MODEL_ID].includes(modelId)
-      )
+      (providerId === CODEX_PROVIDER_ID && isAllowedCodexModel(modelId))
       || (providerId === DEEPSEEK_PROVIDER_ID && DEEPSEEK_MODELS.includes(modelId))
     );
   }

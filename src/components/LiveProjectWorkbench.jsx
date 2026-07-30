@@ -171,7 +171,9 @@ const TOOL_LABELS = {
   query_docs: "查询技术文档",
   update_plan: "更新计划",
   request_verification: "保存验证命令",
+  generate_image: "生成图片",
   request_preview: "登记本机预览",
+  subagent: "并行子智能体",
 };
 
 const TOOL_ACTIVITY_TYPES = new Set([
@@ -518,6 +520,9 @@ function eventTitle(event) {
   if (type === "preview.blocked") return "本机预览已被阻止";
   if (type === "preview.failed") return "本机预览启动失败";
   if (type === "preview.stopped") return "本机预览已停止";
+  if (type === "image.generation_started") return "正在生成图片";
+  if (type === "image.generation_completed") return "图片已生成";
+  if (type === "image.generation_failed") return "图片生成未完成";
   if (/tool.*(?:start|call)|tool_call/.test(type)) {
     return TOOL_LABELS[event.toolName] ?? `调用 ${tool}`;
   }
@@ -592,6 +597,7 @@ function eventArtifact(event) {
   ) return "files";
   if (/bash|command|verification|test|build/.test(type)) return "run_result";
   if (/preview/.test(type)) return "preview";
+  if (/image/.test(type)) return "files";
   return null;
 }
 
@@ -1636,7 +1642,7 @@ export function ProjectCapabilityMenu({
             </header>
 
             <div className="project-capability-section">
-              <span>检索</span>
+              <span>本轮能力</span>
               {PROJECT_WORK_CAPABILITIES.map((capability) => {
                 const status = capabilityAvailability(
                   capabilityStatus,
@@ -1655,6 +1661,8 @@ export function ProjectCapabilityMenu({
                     <span className="project-capability-option-icon">
                       {capability.id === "web_search" ? (
                         <GlobeSimple size={15} aria-hidden="true" />
+                      ) : capability.id === "image_generation" ? (
+                        <ImageSquare size={15} aria-hidden="true" />
                       ) : (
                         <Files size={15} aria-hidden="true" />
                       )}
@@ -1662,7 +1670,11 @@ export function ProjectCapabilityMenu({
                     <span>
                       <strong>{capability.label}</strong>
                       <small>
-                        {status.available ? capability.description : status.reason}
+                        {status.available
+                          ? capability.id === "image_generation"
+                            ? status.reason || capability.description
+                            : capability.description
+                          : status.reason}
                       </small>
                     </span>
                     {selected ? (
@@ -2056,6 +2068,52 @@ function TurnEvidence({ message }) {
   );
 }
 
+function GeneratedImageCards({
+  conversationId,
+  images,
+  imageUrl,
+  onOpenArtifact,
+}) {
+  if (!Array.isArray(images) || images.length === 0) return null;
+  return (
+    <div className="project-agent-generated-images" aria-label="本轮生成图片">
+      {images.map((image) => {
+        const src = typeof imageUrl === "function"
+          ? imageUrl({ conversationId, imageId: image.id })
+          : null;
+        return (
+          <figure key={image.id}>
+            {src ? (
+              <img
+                src={src}
+                alt={image.prompt?.slice(0, 160) || "Pi Agent 生成的图片"}
+              />
+            ) : null}
+            <figcaption>
+              <span>
+                <strong>GPT Image 2</strong>
+                <small>
+                  {image.width && image.height
+                    ? `${image.width} × ${image.height}`
+                    : "图片已生成"}
+                  {image.usage?.totalTokens
+                    ? ` · ${formatTurnTokenCount(image.usage.totalTokens)} tokens`
+                    : ""}
+                  {" · ChatGPT 订阅 · 未提供单次价格"}
+                </small>
+              </span>
+              <button type="button" onClick={() => onOpenArtifact?.("files")}>
+                在文件中查看
+                <CaretRight size={12} aria-hidden="true" />
+              </button>
+            </figcaption>
+          </figure>
+        );
+      })}
+    </div>
+  );
+}
+
 export function ProjectAgentPane({
   conversation,
   draft,
@@ -2086,6 +2144,7 @@ export function ProjectAgentPane({
   onRemoveFollowUp,
   onClearFollowUps,
   onOpenArtifact,
+  generatedImageUrl,
   action,
   error,
   modelLabel,
@@ -2336,10 +2395,22 @@ export function ProjectAgentPane({
             const messageAttachments = Array.isArray(message.attachments)
               ? message.attachments
               : [];
+            const isLastAssistantForTurn = message.role === "assistant"
+              && !conversation.messages.slice(index + 1).some((candidate) => (
+                candidate.role === "assistant"
+                && candidate.turnId === message.turnId
+              ));
+            const generatedImages = isLastAssistantForTurn
+              ? (conversation.generatedImages ?? []).filter((image) => (
+                  image.status === "completed"
+                  && image.turnId === message.turnId
+                ))
+              : [];
             if (
               !text
               && messageImages.length === 0
               && messageAttachments.length === 0
+              && generatedImages.length === 0
             ) return null;
             return (
               <Fragment key={message.id}>
@@ -2351,7 +2422,17 @@ export function ProjectAgentPane({
                 >
                   <small>{message.role === "user" ? "你" : "Pi Agent"}</small>
                   {message.role === "assistant" ? (
-                    <ProjectAgentMarkdown>{text}</ProjectAgentMarkdown>
+                    <>
+                      {text ? (
+                        <ProjectAgentMarkdown>{text}</ProjectAgentMarkdown>
+                      ) : null}
+                      <GeneratedImageCards
+                        conversationId={conversation.id}
+                        images={generatedImages}
+                        imageUrl={generatedImageUrl}
+                        onOpenArtifact={onOpenArtifact}
+                      />
+                    </>
                   ) : messageImages.length > 0 || messageAttachments.length > 0 ? (
                     <div className="project-agent-user-message-content">
                       {text ? (
@@ -2530,6 +2611,8 @@ export function ProjectAgentPane({
               <span key={capability.id}>
                 {capability.id === "web_search" ? (
                   <GlobeSimple size={13} aria-hidden="true" />
+                ) : capability.id === "image_generation" ? (
+                  <ImageSquare size={13} aria-hidden="true" />
                 ) : (
                   <Files size={13} aria-hidden="true" />
                 )}
@@ -2737,6 +2820,7 @@ function FileArtifact({
   conversationId,
   standalone = false,
   documents = [],
+  generatedImages = [],
   api,
   selectedPath,
   requestedPath,
@@ -2752,6 +2836,7 @@ function FileArtifact({
   const [expandedPaths, setExpandedPaths] = useState([]);
   const [activePath, setActivePath] = useState(selectedPath ?? "");
   const [activeDocumentId, setActiveDocumentId] = useState("");
+  const [activeGeneratedImageId, setActiveGeneratedImageId] = useState("");
   const [fileCache, setFileCache] = useState({});
   const [activeLineIndex, setActiveLineIndex] = useState(0);
   const [loadingTree, setLoadingTree] = useState(false);
@@ -2815,6 +2900,7 @@ function FileArtifact({
   const loadFile = useCallback(async (path) => {
     if (!conversationId || !path) return;
     setActiveDocumentId("");
+    setActiveGeneratedImageId("");
     setActivePath(path);
     setImageLoadFailed(false);
     if (PROJECT_FILE_IMAGE_PATTERN.test(path)) {
@@ -2894,6 +2980,7 @@ function FileArtifact({
     setExpandedPaths([]);
     setActivePath("");
     setActiveDocumentId("");
+    setActiveGeneratedImageId("");
     setFileCache({});
     setDirectoryCursors({});
     setSearchDraft("");
@@ -2946,6 +3033,19 @@ function FileArtifact({
   const selectedDocument = documents.find(
     (document) => document.id === activeDocumentId,
   ) ?? null;
+  const completedGeneratedImages = generatedImages.filter(
+    (image) => image.status === "completed",
+  );
+  const selectedGeneratedImage = completedGeneratedImages.find(
+    (image) => image.id === activeGeneratedImageId,
+  ) ?? null;
+  const selectedGeneratedImageUrl = selectedGeneratedImage
+    && typeof api.generatedImageUrl === "function"
+    ? api.generatedImageUrl({
+        conversationId,
+        imageId: selectedGeneratedImage.id,
+      })
+    : null;
   const addFileLineContext = useCallback((index) => {
     if (!selectedFile || !Number.isSafeInteger(index)) return;
     const lineNumber = (selectedFile.startLine ?? 1) + index;
@@ -2966,6 +3066,39 @@ function FileArtifact({
   return (
     <div className="project-file-artifact">
       <aside aria-label={standalone ? "私有草稿文件" : "项目文件"}>
+        {completedGeneratedImages.length > 0 ? (
+          <>
+            <div className="project-file-section-heading">
+              <ImageSquare size={15} aria-hidden="true" />
+              会话生成
+            </div>
+            {completedGeneratedImages.map((image) => (
+              <button
+                className={`project-generated-image-file${
+                  image.id === activeGeneratedImageId ? " is-active" : ""
+                }`}
+                type="button"
+                key={image.id}
+                onClick={() => {
+                  setActivePath("");
+                  setActiveDocumentId("");
+                  setActiveGeneratedImageId(image.id);
+                  setImageLoadFailed(false);
+                }}
+              >
+                <ImageSquare size={15} aria-hidden="true" />
+                <span>
+                  <strong>{image.fileName || "GPT Image 2 图片"}</strong>
+                  <small>
+                    {image.width && image.height
+                      ? `${image.width} × ${image.height}`
+                      : "已生成"}
+                  </small>
+                </span>
+              </button>
+            ))}
+          </>
+        ) : null}
         {documents.length > 0 ? (
           <>
             <div className="project-file-section-heading">
@@ -2982,6 +3115,7 @@ function FileArtifact({
                 onClick={() => {
                   setActivePath("");
                   setActiveDocumentId(document.id);
+                  setActiveGeneratedImageId("");
                 }}
               >
                 <FilePdf size={15} aria-hidden="true" />
@@ -3054,6 +3188,7 @@ function FileArtifact({
             type="button"
             key={entry.path}
             onClick={() => {
+              setActiveGeneratedImageId("");
               if (entry.kind === "directory") {
                 if (searchQuery) {
                   const segments = entry.path.split("/");
@@ -3150,10 +3285,17 @@ function FileArtifact({
         <header>
           <div>
             <strong>
-              {selectedDocument?.fileName || activePath || "选择一个文件"}
+              {selectedGeneratedImage?.fileName
+                || selectedDocument?.fileName
+                || activePath
+                || "选择一个文件"}
             </strong>
             <small>
-              {selectedDocument
+              {selectedGeneratedImage
+                ? `GPT Image 2 · ${
+                    selectedGeneratedImage.width
+                  } × ${selectedGeneratedImage.height} · 会话工件`
+                : selectedDocument
                 ? `${documentStatusLabel(selectedDocument)} · ${
                     formatDocumentSize(selectedDocument.byteLength)
                   }`
@@ -3193,7 +3335,34 @@ function FileArtifact({
             </button>
           ) : null}
         </header>
-        {selectedDocument ? (
+        {selectedGeneratedImageUrl ? (
+          <div className="project-image-preview project-generated-image-preview">
+            {imageLoadFailed ? (
+              <div className="project-run-empty" role="alert">
+                <WarningCircle size={24} aria-hidden="true" />
+                <h3>无法预览这张生成图片</h3>
+                <p>图片未通过当前读回校验，原项目文件没有变化。</p>
+              </div>
+            ) : (
+              <figure>
+                <img
+                  src={selectedGeneratedImageUrl}
+                  alt={selectedGeneratedImage.prompt?.slice(0, 160)
+                    || "GPT Image 2 生成图片"}
+                  onError={() => setImageLoadFailed(true)}
+                />
+                <figcaption>
+                  <span>{selectedGeneratedImage.prompt}</span>
+                  <small>
+                    {selectedGeneratedImage.modelId} · ChatGPT 订阅 ·
+                    {" "}未提供单次价格 ·
+                    {" "}{formatDocumentSize(selectedGeneratedImage.byteLength)}
+                  </small>
+                </figcaption>
+              </figure>
+            )}
+          </div>
+        ) : selectedDocument ? (
           <div className="project-document-detail">
             <div className={`project-document-detail-icon is-${selectedDocument.status}`}>
               {PROCESSING_DOCUMENT_STATUSES.has(selectedDocument.status) ? (
@@ -3919,7 +4088,7 @@ function RunArtifact({
           </h3>
           <p>
             {command
-              ? "点击“运行验证”后，会核对隔离修改并保留真实退出码与有界日志。"
+              ? "点击“运行验证”后，会核对隔离修改并保留真实退出码与完整有界日志。"
               : "Pi 保存验证命令后，这里才会出现可运行操作。"}
           </p>
         </section>
@@ -3977,11 +4146,23 @@ function RunArtifact({
                 {!blocked ? (
                   <details className="project-run-log">
                     <summary>
-                      查看日志
+                      查看完整已采集日志
                       <CaretDown size={12} aria-hidden="true" />
                     </summary>
                     <pre>{logs.length > 0 ? logs.join("\n") : "命令没有产生输出"}</pre>
                   </details>
+                ) : null}
+                {!blocked && run.truncated ? (
+                  <p className="project-run-compression-note">
+                    日志达到安全采集上限；以上内容已完整保留，但进程后续输出未进入本次记录。
+                  </p>
+                ) : null}
+                {!blocked && run.outputCompression?.applied ? (
+                  <p className="project-run-compression-note">
+                    完整日志保留在这里；回灌给 Pi 的修复上下文已由 RTK 从{" "}
+                    {formatDocumentSize(run.outputCompression.rawBytes)} 压缩到{" "}
+                    {formatDocumentSize(run.outputCompression.compactBytes)}。
+                  </p>
                 ) : null}
                 <footer>
                   <span>
@@ -4134,6 +4315,7 @@ function ArtifactPane({
               conversationId={conversation.id}
               standalone={standalone}
               documents={conversation.documents ?? []}
+              generatedImages={conversation.generatedImages ?? []}
               api={api}
               requestedPath={requestedFilePath}
               onRequestedPathHandled={onRequestedFilePathHandled}
@@ -5502,6 +5684,7 @@ export function LiveProjectWorkbench({
           onRemoveFollowUp={removeFollowUp}
           onClearFollowUps={clearFollowUps}
           onOpenArtifact={openArtifact}
+          generatedImageUrl={api.generatedImageUrl}
           action={action}
           error={actionError}
           modelLabel={activeModelId}

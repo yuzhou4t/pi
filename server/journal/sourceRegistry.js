@@ -24,6 +24,7 @@ export const SOURCE_REGISTRY = Object.freeze([
     },
     adapter: "sciencedirect-journal",
     dblp_path: "journals/ai",
+    openalex_source_id: "S196139623",
   },
   {
     source_id: "journal-tpami",
@@ -43,6 +44,7 @@ export const SOURCE_REGISTRY = Object.freeze([
     },
     adapter: "ieee-recent-issue",
     dblp_path: "journals/pami",
+    openalex_source_id: "S199944782",
   },
   {
     source_id: "journal-ijcv",
@@ -62,6 +64,7 @@ export const SOURCE_REGISTRY = Object.freeze([
     },
     adapter: "springer-journal",
     dblp_path: "journals/ijcv",
+    openalex_source_id: "S25538012",
   },
   {
     source_id: "journal-jmlr",
@@ -81,6 +84,7 @@ export const SOURCE_REGISTRY = Object.freeze([
     },
     adapter: "jmlr-papers-index",
     dblp_path: "journals/jmlr",
+    openalex_source_id: "S118988714",
   },
   {
     source_id: "conference-aaai",

@@ -21,6 +21,8 @@ const expectedPrompts = [
     "reading-follow-up",
   "research-question",
   "translation",
+  "venue-search-plan",
+  "venue-search-recommend",
 ];
 
 function hash(value) {

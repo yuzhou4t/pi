@@ -7,11 +7,36 @@ export const CODEX_PROVIDER_ID = "codex-subscription";
 export const CODEX_ACCOUNT_MODEL_ID = "account-default";
 export const CODEX_SPARK_MODEL_ID = "gpt-5.3-codex-spark";
 
-const CODEX_MODEL_IDS = new Set([
-  CODEX_ACCOUNT_MODEL_ID,
-  CODEX_SPARK_MODEL_ID,
-]);
+// 论文侧 GPT 订阅复用与写代码相同的 ChatGPT 订阅目录，模型清单在运行时
+// 由 Pi 目录提供，这里只做格式白名单：允许账户默认或任意安全的模型名，
+// 由 Codex CLI 与账户权限做最终校验，而不再把可选模型钉死为两个。
+const CODEX_MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+
+export function isAllowedCodexModel(modelId) {
+  return modelId === CODEX_ACCOUNT_MODEL_ID
+    || (typeof modelId === "string" && CODEX_MODEL_ID_PATTERN.test(modelId));
+}
+
 const CODEX_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
+
+// Pi 思考档位（off/minimal/low/medium/high/xhigh/max/ultra）映射到 Codex CLI
+// 支持的 reasoning effort（low/medium/high/xhigh）。Pi 专属的 max/ultra 归入
+// CLI 能表达的最高档 xhigh；off/minimal 归入 low。
+const THINKING_TO_REASONING_EFFORT = Object.freeze({
+  off: "low",
+  minimal: "low",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  max: "xhigh",
+  ultra: "xhigh",
+});
+
+export function codexReasoningEffortFromThinking(thinkingLevel) {
+  if (typeof thinkingLevel !== "string" || !thinkingLevel) return null;
+  return THINKING_TO_REASONING_EFFORT[thinkingLevel] ?? null;
+}
 
 const CHATGPT_LOGIN_STATUS = "Logged in using ChatGPT";
 const CODEX_PATH_ALIAS_WARNING = "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)";
@@ -309,8 +334,8 @@ export async function runCodexSubscription({
   if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
     throw commandError("CODEX_INVALID_REQUEST", "schema 必须是 JSON Schema 对象", false);
   }
-  if (!CODEX_MODEL_IDS.has(modelId)) {
-    throw commandError("CODEX_INVALID_REQUEST", "Codex 模型不在允许列表中", false);
+  if (!isAllowedCodexModel(modelId)) {
+    throw commandError("CODEX_INVALID_REQUEST", "Codex 模型名不合法", false);
   }
   if (reasoningEffort !== null && !CODEX_REASONING_EFFORTS.has(reasoningEffort)) {
     throw commandError("CODEX_INVALID_REQUEST", "Codex 思考强度无效", false);

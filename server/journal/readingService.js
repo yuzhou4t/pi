@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { codexReasoningEffortFromThinking } from "../providers/codexSubscription.js";
 import {
   generateReadingFollowUp,
   generateReadingStage,
@@ -1901,12 +1902,22 @@ export function createReadingService({
     prepared,
     providerId,
     modelId,
+    reasoningEffort = null,
   }) {
+    const scopedProviders = reasoningEffort && typeof modelProviders?.completeStructured === "function"
+      ? {
+          ...modelProviders,
+          completeStructured: (request) => modelProviders.completeStructured({
+            reasoningEffort,
+            ...request,
+          }),
+        }
+      : modelProviders;
     const generated = await chatGenerator({
       prepared,
       providerId,
       modelId,
-      modelProviders,
+      modelProviders: scopedProviders,
       modelMode,
     });
     const artifactBase = {
@@ -1995,6 +2006,7 @@ export function createReadingService({
     includeProjectContext = false,
     providerId = defaultProviderId,
     modelId = defaultModelId,
+    thinkingLevel = null,
     requestFingerprint = null,
   } = {}) {
     const requestId = clientRequestId;
@@ -2210,6 +2222,9 @@ export function createReadingService({
         prepared,
         providerId,
         modelId,
+        reasoningEffort: providerId === "codex-subscription"
+          ? codexReasoningEffortFromThinking(thinkingLevel)
+          : null,
       });
       const answeredAt = now().toISOString();
       await update(runId, (current) => {
@@ -2283,6 +2298,7 @@ export function createReadingService({
         : String(options.roundId).trim(),
       providerId: options?.providerId ?? defaultProviderId,
       modelId: options?.modelId ?? defaultModelId,
+      thinkingLevel: options?.thinkingLevel ?? null,
     };
     if (
       typeof normalized.clientRequestId !== "string"

@@ -761,7 +761,7 @@ export async function commitZoteroProposal({
   return mapJournalRun(body);
 }
 
-export async function startJournalRun({ providerId, modelId, signal } = {}) {
+export async function startJournalRun({ providerId, modelId, thinkingLevel, signal } = {}) {
   const response = await fetch("/api/v1/journal-runs", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -769,6 +769,7 @@ export async function startJournalRun({ providerId, modelId, signal } = {}) {
       schema_version: 1,
       provider_id: providerId,
       model_id: modelId,
+      ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
     }),
     signal,
   });
@@ -1021,6 +1022,7 @@ export async function sendJournalReadingChatMessage({
   includeProjectContext = false,
   providerId,
   modelId,
+  thinkingLevel = null,
   signal,
 } = {}) {
   if (typeof clientRequestId !== "string" || !clientRequestId.trim()) {
@@ -1056,6 +1058,7 @@ export async function sendJournalReadingChatMessage({
         include_project_context: includeProjectContext,
         provider_id: providerId,
         model_id: modelId,
+        ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
       }),
       signal,
     },
@@ -1595,6 +1598,7 @@ export async function startJournalGuides({
   paperIds,
   providerId,
   modelId,
+  thinkingLevel,
   signal,
 } = {}) {
   const response = await fetch(
@@ -1607,6 +1611,7 @@ export async function startJournalGuides({
         paper_ids: paperIds,
         provider_id: providerId,
         model_id: modelId,
+        ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
       }),
       signal,
     },

@@ -26,6 +26,7 @@ import {
   markProjectWorkConversationRead,
   mapProjectWorkConversation,
   mapProjectWorkUsage,
+  projectWorkGeneratedImageUrl,
   projectWorkImageUrl,
   removeProjectWorkFollowUp,
   removeProjectWorkPdf,
@@ -1925,6 +1926,50 @@ test("project image URLs remain conversation-scoped and reject unsafe paths", ()
       path: "/Users/private/secret.png",
     }),
     /安全的项目内相对路径/,
+  );
+});
+
+test("generated Image2 metadata and content URLs stay conversation-scoped", () => {
+  const mapped = mapProjectWorkConversation({
+    conversation: {
+      id: "conversation/image",
+      project_id: "project-1",
+      generated_images: [{
+        id: "image-1",
+        turn_id: "turn-1",
+        status: "completed",
+        prompt: "暖象牙背景上的深青色球体",
+        file_name: "image-1.png",
+        mime_type: "image/png",
+        byte_length: 1885527,
+        width: 1254,
+        height: 1254,
+        sha256: `sha256:${"a".repeat(64)}`,
+        requested_size: "1024x1024",
+        requested_quality: "low",
+        provider_id: "codex-subscription",
+        model_id: "gpt-image-2",
+        billing_kind: "chatgpt_subscription",
+        pricing_status: "unpriced",
+        usage: {
+          input_tokens: 8944,
+          cache_read_tokens: 26112,
+          output_tokens: 202,
+          total_tokens: 35258,
+        },
+      }],
+    },
+  });
+
+  assert.equal(mapped.generatedImages[0].modelId, "gpt-image-2");
+  assert.equal(mapped.generatedImages[0].width, 1254);
+  assert.equal(mapped.generatedImages[0].usage.totalTokens, 35258);
+  assert.equal(
+    projectWorkGeneratedImageUrl({
+      conversationId: "conversation/image",
+      imageId: "image 1",
+    }),
+    "/api/v1/project-work/conversations/conversation%2Fimage/generated-images/image%201/content",
   );
 });
 

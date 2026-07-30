@@ -193,6 +193,8 @@ export function ProjectRail({
   activeRun,
   onSelectRun,
   selectedRunId = null,
+  topicSearchActive = false,
+  onSelectTopicSearch,
   onMouseDownResizer,
   isResizing,
 }) {
@@ -407,6 +409,20 @@ export function ProjectRail({
                       <span>
                         <strong>每周追踪</strong>
                         <small>{activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}</small>
+                      </span>
+                    </button>
+                  ) : null}
+                  {workspaceKind === "paper_reading" && onSelectTopicSearch ? (
+                    <button
+                      className={`capability-row project-run-row${topicSearchActive ? " is-active" : ""}`}
+                      type="button"
+                      aria-label="打开主题检索"
+                      onClick={() => onSelectTopicSearch()}
+                    >
+                      <MagnifyingGlass size={17} weight="regular" aria-hidden="true" />
+                      <span>
+                        <strong>主题检索</strong>
+                        <small>在注册刊物内检索</small>
                       </span>
                     </button>
                   ) : null}

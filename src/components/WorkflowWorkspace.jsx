@@ -141,6 +141,8 @@ function formatZoteroTarget(target) {
 
 function mineruDisplay(status, runStatus) {
   if (status === "ready") return { label: "全文已解析", tone: "ready" };
+  // 主题检索加入的论文尚未准备全文，允许直接从候选卡片发起准备。
+  if (status === "pdf_not_prepared") return { label: "全文待准备", tone: "failed" };
   if (runStatus === "not_configured" && status === "pdf_ready") {
     return { label: "全文解析待启用", tone: "pending" };
   }
@@ -515,6 +517,10 @@ function WorkflowHeader({
   onProviderOpenChange,
   onProviderChange,
   onModelChange,
+  thinkingLevels = null,
+  thinkingLevel = null,
+  supportsThinking = false,
+  onThinkingLevelChange,
   onOpenSkills,
   installedSkillCount,
   viewStepId,
@@ -554,6 +560,10 @@ function WorkflowHeader({
               model={model}
               onProviderChange={onProviderChange}
               onModelChange={onModelChange}
+              thinkingLevels={thinkingLevels}
+              thinkingLevel={thinkingLevel}
+              supportsThinking={supportsThinking}
+              onThinkingLevelChange={onThinkingLevelChange}
             />
           ) : null}
 
@@ -932,7 +942,9 @@ function CandidateReview({
                           : null}
                         {documentRetryState.paperId === paper.id
                           ? "正在重试"
-                          : "重试全文准备"}
+                          : paper.mineruStatus === "pdf_not_prepared"
+                            ? "准备全文"
+                            : "重试全文准备"}
                       </button>
                     ) : null}
                   </div>
@@ -2055,6 +2067,10 @@ export function WorkflowWorkspace({
   onProviderOpenChange,
   onProviderChange,
   onModelChange,
+  thinkingLevels = null,
+  thinkingLevel = null,
+  supportsThinking = false,
+  onThinkingLevelChange,
   onOpenSkills,
   installedSkillCount,
   readingProviderId,
@@ -2331,6 +2347,10 @@ export function WorkflowWorkspace({
         onProviderOpenChange={onProviderOpenChange}
         onProviderChange={onProviderChange}
         onModelChange={onModelChange}
+        thinkingLevels={thinkingLevels}
+        thinkingLevel={thinkingLevel}
+        supportsThinking={supportsThinking}
+        onThinkingLevelChange={onThinkingLevelChange}
         onOpenSkills={onOpenSkills}
         installedSkillCount={installedSkillCount}
         viewStepId={viewedStep.id}

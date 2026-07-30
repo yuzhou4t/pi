@@ -31,7 +31,7 @@ test("dispatcher uses the declared primary adapter when it is available", async 
           fetched_at: "2026-07-27T08:00:00.000Z",
           index_url: route.url,
           target_urls: [route.url],
-          papers: [],
+          papers: [{ title: "Primary LLM Agent Paper", official_id: "primary-1" }],
         };
       },
     },
@@ -65,7 +65,7 @@ test("dispatcher records an unavailable primary and explicitly degrades to fallb
         fetched_at: "2026-07-27T08:00:00.000Z",
         index_url: route.url,
         target_urls: [route.url],
-        papers: [],
+        papers: [{ title: "Fallback LLM Agent Paper", official_id: "fallback-1" }],
       }),
     },
   });
@@ -79,6 +79,68 @@ test("dispatcher records an unavailable primary and explicitly degrades to fallb
     result.dispatch.attempts[0].error.code,
     "SOURCE_ADAPTER_NOT_IMPLEMENTED",
   );
+});
+
+test("a primary that returns zero papers is not treated as success and degrades to fallback", async () => {
+  const dispatch = createSourceDispatcher({
+    primaryAdapters: {
+      "publisher-test": async (_source, { route }) => ({
+        fetched_at: "2026-07-27T08:00:00.000Z",
+        index_url: route.url,
+        target_urls: [route.url],
+        papers: [],
+      }),
+    },
+    fallbackAdapters: {
+      "crossref-api": async (_source, { route }) => ({
+        fetched_at: "2026-07-27T08:00:00.000Z",
+        index_url: route.url,
+        target_urls: [route.url],
+        papers: [{ title: "Fallback LLM Agent Paper", official_id: "fallback-1" }],
+      }),
+    },
+  });
+
+  const result = await dispatch(source);
+
+  assert.equal(result.dispatch.status, "degraded");
+  assert.equal(result.dispatch.selected_adapter, "crossref-api");
+  assert.deepEqual(
+    result.dispatch.attempts.map((attempt) => [attempt.role, attempt.status, attempt.error?.code ?? null]),
+    [
+      ["primary", "failed", "SOURCE_ROUTE_EMPTY"],
+      ["fallback", "success", null],
+    ],
+  );
+  assert.equal(result.papers.length, 1);
+});
+
+test("a source whose every route returns zero papers is exhausted rather than falsely successful", async () => {
+  const dispatch = createSourceDispatcher({
+    primaryAdapters: {
+      "publisher-test": async (_source, { route }) => ({
+        fetched_at: "2026-07-27T08:00:00.000Z",
+        index_url: route.url,
+        target_urls: [route.url],
+        papers: [],
+      }),
+    },
+    fallbackAdapters: {
+      "crossref-api": async (_source, { route }) => ({
+        fetched_at: "2026-07-27T08:00:00.000Z",
+        index_url: route.url,
+        target_urls: [route.url],
+        papers: [],
+      }),
+    },
+  });
+
+  await assert.rejects(dispatch(source), (error) => (
+    error instanceof SourceDispatchError
+    && error.code === "SOURCE_ROUTES_EXHAUSTED"
+    && error.attempts.every((attempt) => attempt.error?.code === "SOURCE_ROUTE_EMPTY")
+    && error.retryable === true
+  ));
 });
 
 test("unknown primary and fallback adapters fail explicitly without a DBLP substitution", async () => {

@@ -15,7 +15,9 @@
     "project-relation": "project-relation.v3",
     "reading-follow-up": "reading-follow-up.v1",
     "reading-chat": "reading-chat.v4",
-    "translation": "translation.v1"
+    "translation": "translation.v1",
+    "venue-search-plan": "venue-search-plan.v1",
+    "venue-search-recommend": "venue-search-recommend.v1"
   },
   "versions": {
     "candidate-ranking.v1": {
@@ -105,6 +107,14 @@
     "reading-chat.v4": {
       "file": "reading-chat.v4.md",
       "schema": "reading-chat.v4.json"
+    },
+    "venue-search-plan.v1": {
+      "file": "venue-search-plan.v1.md",
+      "schema": "venue-search-plan.v1.json"
+    },
+    "venue-search-recommend.v1": {
+      "file": "venue-search-recommend.v1.md",
+      "schema": "venue-search-recommend.v1.json"
     }
   }
 }

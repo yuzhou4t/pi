@@ -5,6 +5,7 @@ import path from "node:path";
 import { createMineruCloudAdapter, MineruCloudError } from "../mineruCloud.js";
 import { createModelUsageLedger } from "../modelUsageLedger.js";
 import { createModelProviderRegistry } from "../modelProviders.js";
+import { codexReasoningEffortFromThinking } from "../providers/codexSubscription.js";
 import { promptRegistry } from "../promptRegistry.js";
 import { createZoteroDesktopAdapter } from "../zoteroDesktop.js";
 import { deterministicCandidateRanking, rankCandidates } from "./candidateRanking.js";
@@ -25,13 +26,15 @@ import { createProjectStatePreviewService } from "./projectStatePreview.js";
 import { createReadingNoteActionService } from "./readingNoteAction.js";
 import { createReadingService } from "./readingService.js";
 import { createJournalModelUsageService } from "./modelUsageService.js";
-import { createRunStore } from "./runStore.js";
+import { createRunStore, journalWeekWindowKey } from "./runStore.js";
 import {
   commitJournalSourceScan,
   scanJournalSources,
 } from "./sourceScanner.js";
 import { createSourceStateStore } from "./sourceStateStore.js";
 import { SOURCE_REGISTRY } from "./sourceRegistry.js";
+import { searchRegisteredVenues } from "./venueSearch.js";
+import { createVenueSearchService } from "./venueSearchService.js";
 import { createZoteroArchivalService } from "./zoteroArchival.js";
 
 function positiveInteger(value, fallback) {
@@ -43,6 +46,27 @@ function providerDefaults(env) {
   return env.PI_DEFAULT_PROVIDER === "deepseek"
     ? { providerId: "deepseek", modelId: "deepseek-v4-flash" }
     : { providerId: "codex-subscription", modelId: "account-default" };
+}
+
+// GPT 订阅通道下把选中的思考强度转成 Codex reasoning effort；DeepSeek 或未选
+// 时返回 null（不注入）。用于包装 modelProviders，让各结构化步骤沿用用户所选
+// 强度，而无需逐个改生成器签名。
+function reasoningEffortFor(providerId, thinkingLevel) {
+  if (providerId !== "codex-subscription") return null;
+  return codexReasoningEffortFromThinking(thinkingLevel);
+}
+
+function withReasoningEffort(providers, reasoningEffort) {
+  if (!reasoningEffort || typeof providers?.completeStructured !== "function") {
+    return providers;
+  }
+  return {
+    ...providers,
+    completeStructured: (request) => providers.completeStructured({
+      reasoningEffort,
+      ...request,
+    }),
+  };
 }
 
 function safeName(value) {
@@ -221,6 +245,7 @@ export function createJournalWorkflowService({
     fetchImpl,
   }),
   zoteroArchivalService = null,
+  venueSearchService = null,
   obsidianPreviewService = null,
   projectStatePreviewService = null,
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
@@ -268,6 +293,14 @@ export function createJournalWorkflowService({
       getPaperGuide,
       getPaperPdf,
     });
+  const venueSearch = venueSearchService ?? createVenueSearchService({
+    dataDir,
+    fetchImpl,
+    modelProviders,
+    modelMode,
+    projectContextReader: projectContext,
+    mailto: env.PI_OPENALEX_MAILTO || "",
+  });
 
   async function update(runId, patch, event) {
     const run = await runStore.updateRun(runId, patch);
@@ -585,7 +618,8 @@ export function createJournalWorkflowService({
     }
   }
 
-  async function executeRun(runId, { providerId, modelId } = defaults) {
+  async function executeRun(runId, { providerId, modelId, reasoningEffort = null } = defaults) {
+    const rankingProviders = withReasoningEffort(modelProviders, reasoningEffort);
     try {
       const scan = await sourceScanner({
         runId,
@@ -620,7 +654,7 @@ export function createJournalWorkflowService({
           projectContext: currentProjectContext.state,
           providerId,
           modelId,
-          modelProviders,
+          modelProviders: rankingProviders,
           modelMode,
         });
         ranking.project_context_source_path = currentProjectContext.source_path;
@@ -693,10 +727,134 @@ export function createJournalWorkflowService({
     }
   }
 
+  async function searchVenues({ query, limit, fromYear } = {}) {
+    return searchRegisteredVenues({
+      query,
+      sources: SOURCE_REGISTRY,
+      fetchImpl,
+      limit,
+      fromYear,
+      mailto: env.PI_OPENALEX_MAILTO || "",
+    });
+  }
+
+  function getVenueSearchConversation() {
+    return venueSearch.getConversation();
+  }
+
+  function submitVenueSearchTurn({
+    question,
+    providerId = defaults.providerId,
+    modelId = defaults.modelId,
+    thinkingLevel = null,
+    clientRequestId,
+  } = {}) {
+    return venueSearch.submitTurn({
+      question,
+      providerId,
+      modelId,
+      reasoningEffort: reasoningEffortFor(providerId, thinkingLevel),
+      clientRequestId,
+    });
+  }
+
+  async function addVenueSearchPapersToWeekly({ turnId, paperIds } = {}) {
+    if (!Array.isArray(paperIds) || paperIds.length === 0) {
+      throw artifactError(
+        "VENUE_SEARCH_PAPER_IDS_REQUIRED",
+        "请先选择要加入本周推荐的论文",
+        400,
+      );
+    }
+    const conversation = await venueSearch.getConversation();
+    const turn = venueSearch.getTurn(conversation, turnId);
+    const byId = new Map(turn.papers.map((paper) => [paper.paper_id, paper]));
+    for (const paperId of paperIds) {
+      if (!byId.has(paperId)) {
+        throw artifactError(
+          "VENUE_SEARCH_PAPER_NOT_FOUND",
+          "所选论文不在该次检索结果中",
+          404,
+        );
+      }
+    }
+    const runs = await runStore.listRuns();
+    const windowKey = journalWeekWindowKey(new Date().toISOString());
+    const targetRun = runs.find((run) => (
+      (run.window_key || journalWeekWindowKey(run.created_at)) === windowKey
+      && ["review_ready", "guide_ready", "reading", "draft_ready", "reading_ready"].includes(run.status)
+    ));
+    if (!targetRun) {
+      throw artifactError(
+        "WEEKLY_RUN_NOT_READY",
+        "本周运行还没有进入候选审阅，请先完成每周扫描",
+        409,
+      );
+    }
+    const reasonById = new Map(
+      (turn.recommendations ?? []).map((item) => [item.paper_id, item]),
+    );
+    const updatedRun = await update(targetRun.run_id, (current) => {
+      const existingIds = new Set(
+        (current.candidates ?? []).map((paper) => paper.paper_id),
+      );
+      const existingKeys = new Set(
+        (current.candidates ?? []).map((paper) => paper.dedupe_key).filter(Boolean),
+      );
+      let nextRank = (current.candidates ?? []).reduce(
+        (max, paper) => Math.max(max, Number(paper.rank) || 0),
+        0,
+      );
+      const added = [];
+      for (const paperId of paperIds) {
+        const paper = byId.get(paperId);
+        if (existingIds.has(paperId) || (paper.dedupe_key && existingKeys.has(paper.dedupe_key))) {
+          continue;
+        }
+        nextRank += 1;
+        const recommendation = reasonById.get(paperId);
+        added.push({
+          ...paper,
+          rank: nextRank,
+          candidate_origin: "venue_search",
+          display_label: "主题检索推荐 · 非本周新论文",
+          selection_summary: recommendation?.reason
+            ?? (paper.abstract
+              ? paper.abstract.slice(0, 220)
+              : `${paper.title}：来自主题检索，价值待全文核验。`),
+          project_impact: recommendation?.project_impact ?? "对项目的具体作用待核验。",
+        });
+        existingIds.add(paperId);
+        if (paper.dedupe_key) existingKeys.add(paper.dedupe_key);
+      }
+      if (added.length === 0) return {};
+      return {
+        candidates: [...(current.candidates ?? []), ...added],
+        mineru: {
+          ...current.mineru,
+          papers: {
+            ...(current.mineru?.papers ?? {}),
+            ...Object.fromEntries(added.map((paper) => [
+              paper.paper_id,
+              { status: "pdf_not_prepared", error: null },
+            ])),
+          },
+        },
+      };
+    }, {
+      type: "venue_search_papers_added",
+      turn_id: turnId,
+      paper_ids: paperIds,
+    });
+    const updatedConversation = await venueSearch.markPapersAdded(turnId, paperIds);
+    return { run: updatedRun, conversation: updatedConversation };
+  }
+
   async function startRun({
     trigger = "manual",
     providerId = defaults.providerId,
     modelId = defaults.modelId,
+    thinkingLevel = null,
   } = {}) {
     const creation = typeof runStore.createOrReuseActiveRun === "function"
       ? await runStore.createOrReuseActiveRun({
@@ -712,10 +870,20 @@ export function createJournalWorkflowService({
         };
     const { run } = creation;
     if (!creation.created) return run;
-    const completion = executeRun(run.run_id, { providerId, modelId })
+    const reasoningEffort = reasoningEffortFor(providerId, thinkingLevel);
+    // 记录本轮所选模型与强度，供扫描/排序阶段中断后恢复时沿用。
+    const persisted = await update(run.run_id, {
+      model_selection: {
+        provider_id: providerId,
+        model_id: modelId,
+        thinking_level: thinkingLevel ?? null,
+        reasoning_effort: reasoningEffort,
+      },
+    });
+    const completion = executeRun(run.run_id, { providerId, modelId, reasoningEffort })
       .finally(() => inFlight.delete(run.run_id));
     inFlight.set(run.run_id, completion);
-    return run;
+    return persisted;
   }
 
   async function resumeRun(runId) {
@@ -727,6 +895,17 @@ export function createJournalWorkflowService({
     }
     if (run.status === "committing" && run.zotero?.status === "committing") {
       return zoteroArchival.resumeCommit(runId);
+    }
+    if (["scanning", "ranking"].includes(run.status)) {
+      const selection = run.model_selection ?? {};
+      const completion = executeRun(runId, {
+        providerId: selection.provider_id ?? defaults.providerId,
+        modelId: selection.model_id ?? defaults.modelId,
+        reasoningEffort: selection.reasoning_effort ?? null,
+      })
+        .finally(() => inFlight.delete(runId));
+      inFlight.set(runId, completion);
+      return run;
     }
     run = await reading.resume(runId) ?? run;
     if (["reading", "draft_ready"].includes(run.status)) return run;
@@ -1209,7 +1388,7 @@ export function createJournalWorkflowService({
     }
   }
 
-  async function generatePaperGuide(runId, paperId, providerId, modelId) {
+  async function generatePaperGuide(runId, paperId, providerId, modelId, reasoningEffort = null) {
     const { paper } = await runPaper(runId, paperId);
     const document = await getPaperDocument(runId, paperId);
     const reused = await reuseGuideArtifact({
@@ -1265,7 +1444,7 @@ export function createJournalWorkflowService({
       document,
       providerId,
       modelId,
-      modelProviders,
+      modelProviders: withReasoningEffort(modelProviders, reasoningEffort),
       modelMode,
     });
     const artifact = {
@@ -1361,7 +1540,7 @@ export function createJournalWorkflowService({
       if (!paperId) break;
       job.processedIds.add(paperId);
       try {
-        await generatePaperGuide(runId, paperId, job.providerId, job.modelId);
+        await generatePaperGuide(runId, paperId, job.providerId, job.modelId, job.reasoningEffort);
       } catch (error) {
         await update(runId, (current) => {
           const guides = normalizedGuides(current);
@@ -1433,6 +1612,7 @@ export function createJournalWorkflowService({
     paperIds,
     providerId = defaults.providerId,
     modelId = defaults.modelId,
+    thinkingLevel = null,
   } = {}) {
     return withGuideStartLock(runId, async () => {
       await validateGuideRequest(runId, paperIds, providerId, modelId);
@@ -1462,6 +1642,7 @@ export function createJournalWorkflowService({
       const job = {
         providerId,
         modelId,
+        reasoningEffort: reasoningEffortFor(providerId, thinkingLevel),
         requestedIds: new Set(paperIds),
         processedIds: new Set(),
         promise: null,
@@ -2520,6 +2701,10 @@ export function createJournalWorkflowService({
     listRuns,
     readEvents: runStore.readEvents,
     resumeRun,
+    searchVenues,
+    getVenueSearchConversation,
+    submitVenueSearchTurn,
+    addVenueSearchPapersToWeekly,
     retryPaperDocument,
     restartReadingFromGuide: reading.restartFromGuide,
     resetPaperReading: reading.resetPaperReading,

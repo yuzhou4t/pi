@@ -48,10 +48,20 @@ import {
   createConversationAttachmentService,
   projectWorkAttachmentManifestPrompt,
 } from "./projectWorkAttachments.js";
+import {
+  CODEX_IMAGE_MODEL_ID,
+  CODEX_IMAGE_PROVIDER_ID,
+  generateCodexSubscriptionImage,
+  inspectCodexPng,
+  probeCodexImageGeneration,
+} from "./codexImageGeneration.js";
 import { createProjectRegistry, publicProject } from "./projectRegistry.js";
 import { createSkillPackageService } from "./skillPackageService.js";
 import { normalizeTurnUsage } from "./turnEvidence.js";
 import { createVerificationRunner } from "./verificationRunner.js";
+import {
+  createVerificationOutputCompactor,
+} from "./verificationOutputCompactor.js";
 import {
   applyBoundFileTransitions,
   applySelectedChangeSet,
@@ -420,6 +430,89 @@ function publicConversationMessage(message) {
     turnEvidence: publicTurnEvidence(message.turnEvidence),
     createdAt: message.createdAt,
   };
+}
+
+function publicGeneratedImage(image) {
+  if (!image || typeof image !== "object" || Array.isArray(image)) return null;
+  const id = compactText(image.id, 180);
+  if (!id) return null;
+  const usage = normalizeTurnUsage(image.usage);
+  return {
+    id,
+    turnId: compactText(image.turnId, 180) || null,
+    toolCallId: compactText(image.toolCallId, 180) || null,
+    status: [
+      "generating",
+      "completed",
+      "failed",
+      "aborted",
+      "interrupted",
+    ].includes(
+      image.status,
+    )
+      ? image.status
+      : "failed",
+    prompt: compactText(image.prompt, 8_000) || "",
+    fileName: compactText(image.fileName, 180) || null,
+    mimeType: image.mimeType === "image/png" ? image.mimeType : null,
+    byteLength: Number.isSafeInteger(image.byteLength)
+      && image.byteLength >= 0
+      ? image.byteLength
+      : null,
+    width: Number.isSafeInteger(image.width) && image.width > 0
+      ? image.width
+      : null,
+    height: Number.isSafeInteger(image.height) && image.height > 0
+      ? image.height
+      : null,
+    sha256: SHA256_PATTERN.test(String(image.sha256 ?? ""))
+      ? image.sha256
+      : null,
+    requestedSize: compactText(image.requestedSize, 40) || null,
+    requestedQuality: compactText(image.requestedQuality, 40) || null,
+    providerId: compactText(image.providerId, 120)
+      || CODEX_IMAGE_PROVIDER_ID,
+    modelId: compactText(image.modelId, 200) || CODEX_IMAGE_MODEL_ID,
+    operationId: compactText(image.operationId, 180) || null,
+    billingKind: image.billingKind === "chatgpt_subscription"
+      ? image.billingKind
+      : "unknown",
+    pricingStatus: image.pricingStatus === "unpriced"
+      ? image.pricingStatus
+      : "unknown",
+    usageStatus: image.usageStatus === "reported"
+      ? "reported"
+      : "unknown",
+    usage,
+    error: image.error && typeof image.error === "object"
+      ? {
+          code: compactText(image.error.code, 120) || "CODEX_IMAGE_FAILED",
+          message: compactText(
+            image.error.message,
+            300,
+            "图片生成没有完成",
+          ),
+          retryable: image.error.retryable === true,
+        }
+      : null,
+    createdAt: typeof image.createdAt === "string" ? image.createdAt : null,
+    completedAt: typeof image.completedAt === "string"
+      ? image.completedAt
+      : null,
+  };
+}
+
+function publicVerification(verification) {
+  if (
+    !verification
+    || typeof verification !== "object"
+    || Array.isArray(verification)
+  ) {
+    return null;
+  }
+  const publicRecord = structuredClone(verification);
+  delete publicRecord.modelOutput;
+  return publicRecord;
 }
 
 function publicConversationOperation(operation) {
@@ -1130,9 +1223,9 @@ function publicConversationState(conversation, lastEventSeq, {
     activeChangeSet: conversation.activeChangeSet
       ? structuredClone(conversation.activeChangeSet)
       : null,
-    verifications: (conversation.verifications ?? []).map((verification) => (
-      structuredClone(verification)
-    )),
+    verifications: (conversation.verifications ?? [])
+      .map(publicVerification)
+      .filter(Boolean),
     workspaceSnapshot: conversation.workspaceSnapshot
       ? structuredClone(conversation.workspaceSnapshot)
       : null,
@@ -1144,6 +1237,9 @@ function publicConversationState(conversation, lastEventSeq, {
     compaction: normalizedCompactionState(conversation.compaction),
     documents: (conversation.documents ?? [])
       .map(publicConversationDocument)
+      .filter(Boolean),
+    generatedImages: (conversation.generatedImages ?? [])
+      .map(publicGeneratedImage)
       .filter(Boolean),
     preview: publicPreviewState(conversation.preview),
     followUpQueue: (conversation.followUpQueue ?? []).map(publicFollowUpItem),
@@ -1737,7 +1833,7 @@ export function aggregateProjectWorkUsage({
     conversationsScanned: conversations.length,
     legacyMessagesWithoutUsage: 0,
     undatedAssistantMessages: 0,
-    includedKinds: ["assistant_model_response"],
+    includedKinds: ["assistant_model_response", "image_generation"],
     excludedKinds: ["compaction", "branch_summary", "tool_summary"],
   };
   const byModel = new Map();
@@ -1747,7 +1843,26 @@ export function aggregateProjectWorkUsage({
   let pricedCost = 0;
 
   for (const conversation of conversations) {
-    for (const [messageIndex, message] of (conversation?.messages ?? []).entries()) {
+    const usageMessages = [
+      ...(conversation?.messages ?? []),
+      ...(conversation?.generatedImages ?? [])
+        .filter((image) => image?.status === "completed" && image?.usage)
+        .map((image) => ({
+          id: `generated-image:${image.id}`,
+          role: "assistant",
+          turnId: image.turnId,
+          createdAt: image.completedAt ?? image.createdAt,
+          providerId: image.providerId,
+          modelId: image.modelId,
+          turnEvidence: {
+            providerId: image.providerId,
+            modelId: image.modelId,
+            capturedAt: image.completedAt ?? image.createdAt,
+            usage: image.usage,
+          },
+        })),
+    ];
+    for (const [messageIndex, message] of usageMessages.entries()) {
       if (message?.role !== "assistant") continue;
       const capturedAt = message.turnEvidence?.capturedAt ?? message.createdAt;
       const capturedDate = typeof capturedAt === "string"
@@ -1810,7 +1925,7 @@ export function aggregateProjectWorkUsage({
           modelId,
         ),
         billingKind: catalogModel?.billingKind
-          ?? (providerId === "openai-codex"
+          ?? (["openai-codex", CODEX_IMAGE_PROVIDER_ID].includes(providerId)
             ? "chatgpt_subscription"
             : "unknown"),
         calls: 0,
@@ -1931,6 +2046,8 @@ export function createProjectWorkService({
   gitInspector = inspectGitEvidence,
   picker = createMacOSProjectPicker(),
   runner = createVerificationRunner(),
+  verificationOutputCompactor = createVerificationOutputCompactor(),
+  imageGenerator = generateCodexSubscriptionImage,
   previewSupervisor = createProjectPreviewSupervisor(),
   skillPackageService,
   now = () => new Date(),
@@ -1940,6 +2057,14 @@ export function createProjectWorkService({
   const effectiveSkillPackageService = skillPackageService
     ?? createSkillPackageService({ storageRoot: configuredStorageRoot });
   const effectiveSessionFactory = sessionFactory ?? createPiSessionFactory({
+    externalRetrievalOptions: {
+      doubaoQuotaFilePath: path.join(
+        configuredStorageRoot,
+        "external-retrieval-usage.json",
+      ),
+      now,
+    },
+    imageGenerationProbe: () => probeCodexImageGeneration(),
     skillProvider: () => effectiveSkillPackageService.getEnabledSkillPaths(),
   });
   const createSnapshot = snapshotter;
@@ -2107,6 +2232,7 @@ export function createProjectWorkService({
       workspaceRoot: path.join(directory, "workspace"),
       scratchRoot: path.join(directory, "scratch"),
       sessionDir: path.join(directory, "pi-sessions"),
+      generatedArtifactsRoot: path.join(directory, "generated-artifacts"),
     };
   }
 
@@ -2165,7 +2291,7 @@ export function createProjectWorkService({
     });
   }
 
-  async function sanitizeForConversation(conversationId, value) {
+  async function sanitizeConversationPaths(conversationId, value) {
     let text = String(value ?? "");
     const conversation = await conversationStore.get(conversationId);
     const workspace = await resolveConversationWorkspace(conversation);
@@ -2187,7 +2313,11 @@ export function createProjectWorkService({
     ]) {
       text = text.replaceAll(target, replacement);
     }
-    return text.slice(0, 64_000);
+    return text;
+  }
+
+  async function sanitizeForConversation(conversationId, value) {
+    return (await sanitizeConversationPaths(conversationId, value)).slice(0, 64_000);
   }
 
   async function updateConversation(conversationId, patch) {
@@ -2671,6 +2801,342 @@ export function createProjectWorkService({
       checks: verification.checks,
     });
     return verification;
+  }
+
+  async function recordImageGenerationRequest(
+    conversationId,
+    request,
+    turnSettings,
+    signal,
+  ) {
+    if (typeof imageGenerator !== "function") {
+      throw projectWorkError(
+        "CODEX_IMAGE_UNAVAILABLE",
+        "当前没有可用的 Codex 图片生成能力",
+        503,
+        true,
+      );
+    }
+    const prompt = compactText(request?.prompt, 8_000);
+    const turnId = compactText(turnSettings?.turnId, 180);
+    const toolCallId = compactText(request?.toolCallId, 180);
+    if (!prompt || !turnId || !toolCallId) {
+      throw projectWorkError(
+        "CODEX_IMAGE_INVALID_REQUEST",
+        "图片生成请求缺少当前回合或图片描述",
+        400,
+      );
+    }
+    if (
+      !Array.isArray(turnSettings?.capabilities)
+      || !turnSettings.capabilities.includes("image_generation")
+    ) {
+      throw projectWorkError(
+        "CODEX_IMAGE_NOT_AUTHORIZED",
+        "当前回合没有启用图片生成能力",
+        403,
+      );
+    }
+
+    const requestDigest = createHash("sha256")
+      .update(`${conversationId}:${turnId}:${toolCallId}`)
+      .digest("hex")
+      .slice(0, 40);
+    const imageId = `image-${requestDigest}`;
+    const createdAt = timestamp();
+    const pending = {
+      id: imageId,
+      turnId,
+      toolCallId,
+      status: "generating",
+      prompt,
+      fileName: null,
+      mimeType: null,
+      byteLength: null,
+      width: null,
+      height: null,
+      sha256: null,
+      requestedSize: "1024x1024",
+      requestedQuality: "low",
+      providerId: CODEX_IMAGE_PROVIDER_ID,
+      modelId: CODEX_IMAGE_MODEL_ID,
+      operationId: null,
+      billingKind: "chatgpt_subscription",
+      pricingStatus: "unpriced",
+      usageStatus: "unknown",
+      usage: null,
+      error: null,
+      createdAt,
+      completedAt: null,
+    };
+    let priorCompleted = null;
+    await updateConversation(conversationId, (conversation) => {
+      if (
+        !Array.isArray(turnSettings?.capabilities)
+        || !turnSettings.capabilities.includes("image_generation")
+      ) {
+        throw projectWorkError(
+          "CODEX_IMAGE_NOT_AUTHORIZED",
+          "当前回合没有启用图片生成能力",
+          403,
+        );
+      }
+      const priorByCall = (conversation.generatedImages ?? []).find(
+        (image) => (
+          image.toolCallId === toolCallId
+          && image.turnId === turnId
+        ),
+      );
+      if (priorByCall?.status === "completed") {
+        priorCompleted = priorByCall;
+        return {};
+      }
+      const priorInTurn = (conversation.generatedImages ?? []).find(
+        (image) => image.turnId === turnId,
+      );
+      if (priorInTurn) {
+        throw projectWorkError(
+          priorInTurn.status === "generating"
+            ? "CODEX_IMAGE_REQUEST_IN_PROGRESS"
+            : "CODEX_IMAGE_TURN_LIMIT",
+          priorInTurn.status === "generating"
+            ? "当前回合的图片生成仍在进行"
+            : "每次明确发送的任务最多尝试生成一张图片",
+          409,
+        );
+      }
+      if ((conversation.generatedImages ?? []).some((image) => (
+        image.id === imageId
+      ))) {
+        throw projectWorkError(
+          "CODEX_IMAGE_REQUEST_CONFLICT",
+          "图片请求标识发生冲突",
+          409,
+        );
+      }
+      return {
+        generatedImages: [
+          ...(conversation.generatedImages ?? []),
+          pending,
+        ],
+      };
+    });
+    if (priorCompleted) return publicGeneratedImage(priorCompleted);
+    await appendEvent(conversationId, "image.generation_started", {
+      id: imageId,
+      turnId,
+      status: "generating",
+      artifactId: "files",
+      detail: "正在通过 GPT Image 2 生成一张会话图片",
+    });
+
+    const paths = conversationPaths(conversationId);
+    try {
+      const generated = await imageGenerator({
+        prompt,
+        artifactDirectory: paths.generatedArtifactsRoot,
+        requestId: imageId,
+        requestedSize: pending.requestedSize,
+        quality: pending.requestedQuality,
+        signal,
+      });
+      const providerInputTokens = nullableNonNegativeNumber(
+        generated.usage?.input_tokens,
+      ) ?? 0;
+      const cacheReadTokens = Math.min(
+        providerInputTokens,
+        nullableNonNegativeNumber(
+          generated.usage?.cached_input_tokens,
+        ) ?? 0,
+      );
+      const usage = normalizeTurnUsage({
+        inputTokens: Math.max(0, providerInputTokens - cacheReadTokens),
+        outputTokens: generated.usage?.output_tokens,
+        cacheReadTokens,
+        cacheWriteTokens: generated.usage?.cache_write_input_tokens,
+        totalTokens: generated.usage?.total_tokens,
+      });
+      const completedAt = timestamp();
+      const completed = {
+        ...pending,
+        status: "completed",
+        fileName: generated.artifact?.fileName,
+        mimeType: generated.artifact?.mimeType,
+        byteLength: generated.artifact?.byteLength,
+        width: generated.artifact?.width,
+        height: generated.artifact?.height,
+        sha256: generated.artifact?.sha256,
+        requestedSize: generated.artifact?.requestedSize
+          ?? pending.requestedSize,
+        requestedQuality: generated.artifact?.requestedQuality
+          ?? pending.requestedQuality,
+        providerId: generated.providerId ?? pending.providerId,
+        modelId: generated.modelId ?? pending.modelId,
+        operationId: generated.operationId ?? null,
+        billingKind: generated.billingMode === "subscription"
+          ? "chatgpt_subscription"
+          : "unknown",
+        pricingStatus: generated.pricingStatus === "unpriced"
+          ? "unpriced"
+          : "unknown",
+        usageStatus: usage ? "reported" : "unknown",
+        usage,
+        completedAt,
+      };
+      await updateConversation(conversationId, (conversation) => ({
+        generatedImages: (conversation.generatedImages ?? []).map((image) => (
+          image.id === imageId && image.status === "generating"
+            ? completed
+            : image
+        )),
+      }));
+      await appendEvent(conversationId, "image.generation_completed", {
+        image: publicGeneratedImage(completed),
+        artifactId: "files",
+        status: "completed",
+        detail: `图片已生成并完成读回校验：${completed.width} × ${completed.height}`,
+      });
+      return publicGeneratedImage(completed);
+    } catch (error) {
+      const safeError = {
+        code: compactText(error?.code, 120, "CODEX_IMAGE_FAILED"),
+        message: compactText(
+          error?.message,
+          300,
+          "Codex 图片生成没有完成",
+        ),
+        retryable: error?.retryable === true,
+      };
+      const failedAt = timestamp();
+      const failedStatus = signal?.aborted
+        || safeError.code === "CODEX_IMAGE_ABORTED"
+        ? "aborted"
+        : "failed";
+      await updateConversation(conversationId, (conversation) => ({
+        generatedImages: (conversation.generatedImages ?? []).map((image) => (
+          image.id === imageId && image.status === "generating"
+            ? {
+                ...image,
+                status: failedStatus,
+                error: safeError,
+                completedAt: failedAt,
+              }
+            : image
+        )),
+      }));
+      await appendEvent(conversationId, "image.generation_failed", {
+        id: imageId,
+        turnId,
+        artifactId: "files",
+        status: failedStatus,
+        error: safeError,
+        detail: safeError.message,
+      });
+      throw projectWorkError(
+        safeError.code,
+        safeError.message,
+        safeError.code === "CODEX_IMAGE_INVALID_REQUEST" ? 400 : 502,
+        safeError.retryable,
+      );
+    }
+  }
+
+  async function inspectRecoveredGeneratedImage(conversationId, image) {
+    const paths = conversationPaths(conversationId);
+    const fileName = compactText(image?.fileName, 180)
+      || `${compactText(image?.id, 180)}.png`;
+    try {
+      const content = await readProjectImageFile(
+        paths.generatedArtifactsRoot,
+        { filePath: fileName },
+      );
+      const dimensions = inspectCodexPng(content.bytes);
+      return {
+        ...image,
+        status: "completed",
+        fileName,
+        mimeType: "image/png",
+        byteLength: content.byteLength,
+        width: dimensions.width,
+        height: dimensions.height,
+        sha256: content.hash,
+        billingKind: "chatgpt_subscription",
+        pricingStatus: "unpriced",
+        usageStatus: "unknown",
+        usage: null,
+        error: null,
+        completedAt: timestamp(),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async function recoverStaleGeneratedImages(conversationId, conversation) {
+    if (
+      runtimes.has(conversationId)
+      || activeMessageClaims.has(conversationId)
+    ) {
+      return conversation;
+    }
+    const stale = (conversation.generatedImages ?? []).filter(
+      (image) => image.status === "generating",
+    );
+    if (stale.length === 0) return conversation;
+
+    const resolutions = new Map();
+    for (const image of stale) {
+      resolutions.set(
+        image.id,
+        await inspectRecoveredGeneratedImage(conversationId, image),
+      );
+    }
+    const interruptedAt = timestamp();
+    const recoveredIds = new Set();
+    const interruptedIds = new Set();
+    const updated = await updateConversation(conversationId, (current) => ({
+      generatedImages: (current.generatedImages ?? []).map((image) => {
+        if (image.status !== "generating" || !resolutions.has(image.id)) {
+          return image;
+        }
+        const recovered = resolutions.get(image.id);
+        if (recovered) {
+          recoveredIds.add(image.id);
+          return recovered;
+        }
+        interruptedIds.add(image.id);
+        return {
+          ...image,
+          status: "interrupted",
+          usageStatus: "unknown",
+          usage: null,
+          error: {
+            code: "CODEX_IMAGE_INTERRUPTED",
+            message: "上一次图片生成未正常结束，请在新任务中重新生成",
+            retryable: true,
+          },
+          completedAt: interruptedAt,
+        };
+      }),
+    }));
+    for (const imageId of recoveredIds) {
+      await appendEvent(conversationId, "image.generation_recovered", {
+        id: imageId,
+        artifactId: "files",
+        status: "completed",
+        usageStatus: "unknown",
+        detail: "已恢复上次生成并完成图片读回校验；订阅用量未知",
+      });
+    }
+    for (const imageId of interruptedIds) {
+      await appendEvent(conversationId, "image.generation_interrupted", {
+        id: imageId,
+        artifactId: "files",
+        status: "interrupted",
+        detail: "上一次图片生成未正常结束",
+      });
+    }
+    return updated;
   }
 
   async function recordPreviewRequest(
@@ -3737,6 +4203,16 @@ export function createProjectWorkService({
         request,
         runtime.activeTurnSettings,
       ),
+      onImageGenerationRequest: ({
+        prompt,
+        toolCallId,
+        signal,
+      }) => recordImageGenerationRequest(
+        conversationId,
+        { prompt, toolCallId },
+        runtime.activeTurnSettings,
+        signal,
+      ),
       onPreviewRequest: (request) => recordPreviewRequest(
         conversationId,
         request,
@@ -3765,6 +4241,10 @@ export function createProjectWorkService({
   async function snapshot(conversationId, options = {}) {
     await documentService.resumeConversation(conversationId);
     let conversation = await recoverOutstandingApplyJournals(conversationId);
+    conversation = await recoverStaleGeneratedImages(
+      conversationId,
+      conversation,
+    );
     if (
       conversation.status === "verifying"
       && !verificationControllers.has(conversationId)
@@ -4339,6 +4819,10 @@ export function createProjectWorkService({
         mkdir(paths.baseRoot, { recursive: false, mode: 0o700 }),
         mkdir(paths.workspaceRoot, { recursive: false, mode: 0o700 }),
         mkdir(paths.sessionDir, { recursive: false, mode: 0o700 }),
+        mkdir(paths.generatedArtifactsRoot, {
+          recursive: false,
+          mode: 0o700,
+        }),
         ...(workspaceKind === "scratch"
           ? [mkdir(paths.scratchRoot, { recursive: false, mode: 0o700 })]
           : []),
@@ -4368,6 +4852,7 @@ export function createProjectWorkService({
         operations: [],
         documents: [],
         attachments: [],
+        generatedImages: [],
         applyJournal: [],
         workspaceSnapshot: {
           schemaVersion: 1,
@@ -5165,6 +5650,9 @@ export function createProjectWorkService({
           previewAllowed
             ? [...turn.toolNames, PROJECT_WORK_PREVIEW_TOOL_NAME]
             : turn.toolNames,
+          {
+            allowSubagents: selectedThinkingLevel === "ultra",
+          },
         );
         previewToolActive = previewAllowed;
       }
@@ -5553,6 +6041,9 @@ export function createProjectWorkService({
           previewAllowed
             ? [...turn.toolNames, PROJECT_WORK_PREVIEW_TOOL_NAME]
             : turn.toolNames,
+          {
+            allowSubagents: selectedConversation.thinkingLevel === "ultra",
+          },
         );
         previewToolActive = previewAllowed;
       }
@@ -6319,6 +6810,38 @@ export function createProjectWorkService({
       projectRoot: workspace.projectRoot,
       workspaceRoot: paths.workspaceRoot,
     });
+  }
+
+  async function readGeneratedImage(conversationId, imageId) {
+    assertActive();
+    const conversation = await conversationStore.get(conversationId);
+    const image = (conversation.generatedImages ?? []).find(
+      (item) => item.id === imageId && item.status === "completed",
+    );
+    if (!image?.fileName) {
+      throw projectWorkError(
+        "CODEX_IMAGE_NOT_FOUND",
+        "会话生成图片不存在",
+        404,
+      );
+    }
+    const paths = conversationPaths(conversationId);
+    const content = await readProjectImageFile(
+      paths.generatedArtifactsRoot,
+      { filePath: image.fileName },
+    );
+    if (
+      content.mimeType !== image.mimeType
+      || content.byteLength !== image.byteLength
+      || content.hash !== image.sha256
+    ) {
+      throw projectWorkError(
+        "CODEX_IMAGE_READBACK_FAILED",
+        "会话生成图片的读回校验失败",
+        409,
+      );
+    }
+    return content;
   }
 
   async function getConversationTree(conversationId, options = {}) {
@@ -7439,7 +7962,7 @@ export function createProjectWorkService({
               exitCode: lastAttempt?.exitCode ?? null,
               timedOut: lastAttempt?.timedOut === true,
               truncated: lastAttempt?.truncated === true,
-              output: lastAttempt?.output ?? "",
+              output: lastAttempt?.modelOutput ?? lastAttempt?.output ?? "",
             },
           });
           await runtime.eventQueue;
@@ -7907,68 +8430,112 @@ export function createProjectWorkService({
     } finally {
       await rm(verificationDirectory, { recursive: true, force: true })
         .catch(() => undefined);
+    }
+    try {
+      const rawOutput = [
+        result.stdout ? `stdout:\n${result.stdout}` : "",
+        result.stderr ? `stderr:\n${result.stderr}` : "",
+      ].filter(Boolean).join("\n\n");
+      const output = await sanitizeConversationPaths(conversationId, rawOutput);
+      const runnerFailed = (
+        result.aborted !== true
+        && (result.exitCode !== 0 || result.timedOut === true)
+      );
+      const compactedOutput = typeof verificationOutputCompactor === "function"
+        ? await verificationOutputCompactor({
+            output,
+            signal: controller.signal,
+            failed: runnerFailed,
+          })
+        : {
+            output,
+            applied: false,
+            rawBytes: Buffer.byteLength(output, "utf8"),
+            compactBytes: Buffer.byteLength(output, "utf8"),
+            ratio: 1,
+            command: ["rtk", "log"],
+            version: null,
+            reason: "unavailable",
+          };
+      const operationAborted = (
+        result.aborted === true
+        || controller.signal.aborted
+      );
+      const status = operationAborted
+        ? "aborted"
+        : result.exitCode === 0 && !result.timedOut
+          ? "passed"
+          : "failed";
+      const completedAt = timestamp();
+      const completed = {
+        ...attempt,
+        status,
+        exitCode: result.exitCode ?? null,
+        durationMs: result.durationMs ?? null,
+        output,
+        modelOutput: compactedOutput.output,
+        outputCompression: {
+          applied: compactedOutput.applied === true,
+          rawBytes: compactedOutput.rawBytes,
+          compactBytes: compactedOutput.compactBytes,
+          ratio: compactedOutput.ratio,
+          command: compactedOutput.command,
+          version: compactedOutput.version,
+          reason: compactedOutput.reason,
+        },
+        truncated: result.truncated === true,
+        timedOut: result.timedOut === true,
+        errorCode: failureCode,
+        completedAt,
+      };
+      await updateConversation(conversationId, (current) => ({
+        status: preserveConversationStatus
+          || operationAborted
+          || ["aborted", "stopped"].includes(current.status)
+          ? current.status
+          : resumeStatus,
+        verifications: current.verifications.map((item) => (
+          item.id === attempt.id ? completed : item
+        )),
+      }));
+      await appendEvent(conversationId, "verification.completed", {
+        id: attempt.id,
+        commandId: verification.id,
+        status,
+        exitCode: completed.exitCode,
+        durationMs: completed.durationMs,
+        truncated: completed.truncated,
+        outputCompression: completed.outputCompression,
+        errorCode: completed.errorCode,
+        repairOperationId: completed.repairOperationId,
+        repairAttempt: completed.repairAttempt,
+      });
+      if (
+        !suppressRepairLoop
+        && !autoReviewSettlement
+        && !controller.signal.aborted
+        && status === "failed"
+        && !completed.timedOut
+        && completed.exitCode !== null
+        && completed.changeSetHash
+        && !completed.errorCode
+      ) {
+        if (verificationControllers.get(conversationId) === controller) {
+          verificationControllers.delete(conversationId);
+        }
+        return startVerificationRepairLoop(conversationId, {
+          commandId: verification.id,
+          commandBindingHash,
+          failedAttempt: completed,
+          resumeStatus,
+        });
+      }
+      return completed;
+    } finally {
       if (verificationControllers.get(conversationId) === controller) {
         verificationControllers.delete(conversationId);
       }
     }
-    const rawOutput = [
-      result.stdout ? `stdout:\n${result.stdout}` : "",
-      result.stderr ? `stderr:\n${result.stderr}` : "",
-    ].filter(Boolean).join("\n\n");
-    const output = await sanitizeForConversation(conversationId, rawOutput);
-    const status = result.aborted
-      ? "aborted"
-      : result.exitCode === 0 && !result.timedOut
-        ? "passed"
-        : "failed";
-    const completedAt = timestamp();
-    const completed = {
-      ...attempt,
-      status,
-      exitCode: result.exitCode ?? null,
-      durationMs: result.durationMs ?? null,
-      output,
-      truncated: result.truncated === true,
-      timedOut: result.timedOut === true,
-      errorCode: failureCode,
-      completedAt,
-    };
-    await updateConversation(conversationId, (current) => ({
-      status: preserveConversationStatus
-        ? current.status
-        : resumeStatus,
-      verifications: current.verifications.map((item) => (
-        item.id === attempt.id ? completed : item
-      )),
-    }));
-    await appendEvent(conversationId, "verification.completed", {
-      id: attempt.id,
-      commandId: verification.id,
-      status,
-      exitCode: completed.exitCode,
-      durationMs: completed.durationMs,
-      truncated: completed.truncated,
-      errorCode: completed.errorCode,
-      repairOperationId: completed.repairOperationId,
-      repairAttempt: completed.repairAttempt,
-    });
-    if (
-      !suppressRepairLoop
-      && !autoReviewSettlement
-      && status === "failed"
-      && !completed.timedOut
-      && completed.exitCode !== null
-      && completed.changeSetHash
-      && !completed.errorCode
-    ) {
-      return startVerificationRepairLoop(conversationId, {
-        commandId: verification.id,
-        commandBindingHash,
-        failedAttempt: completed,
-        resumeStatus,
-      });
-    }
-    return completed;
   }
 
   async function removeScopedConversation({
@@ -8222,6 +8789,7 @@ export function createProjectWorkService({
     pickProjectRoot,
     readConversationFile,
     readConversationImage,
+    readGeneratedImage,
     readProjectFile,
     readProjectImage,
     registerProject,
