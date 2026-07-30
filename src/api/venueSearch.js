@@ -21,7 +21,8 @@ export function mapVenueSearchConversation(body) {
     throw new Error("主题检索记录格式无效");
   }
   return {
-    conversationId: body.conversation_id ?? "topic-search",
+    conversationId: body.conversation_id ?? null,
+    title: body.title ?? null,
     updatedAt: body.updated_at ?? null,
     turns: body.turns.map((turn) => ({
       turnId: turn.turn_id,
@@ -60,18 +61,79 @@ export function mapVenueSearchConversation(body) {
         searchRank: paper.search_rank ?? null,
       })),
       addedPaperIds: turn.added_paper_ids ?? [],
+      web: {
+        status: turn.web?.status ?? "success",
+        provider: turn.web?.provider ?? null,
+        results: (turn.web?.results ?? []).map((item) => ({
+          title: item.title,
+          url: item.url,
+          excerpt: item.excerpt || "",
+          publishedDate: item.published_date ?? null,
+        })),
+      },
     })),
   };
 }
 
-export async function fetchVenueSearchConversation({ signal } = {}) {
-  const response = await fetch("/api/v1/venue-search", { signal });
+export function mapVenueSearchList(body) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.conversations)) {
+    throw new Error("主题检索会话列表格式无效");
+  }
+  return {
+    activeConversationId: body.active_conversation_id ?? null,
+    conversations: body.conversations.map((item) => ({
+      id: item.conversation_id,
+      title: item.title || "新的检索",
+      turnCount: item.turn_count ?? 0,
+      updatedAt: item.updated_at ?? null,
+    })),
+  };
+}
+
+export async function fetchVenueSearchConversation({ conversationId, signal } = {}) {
+  const query = conversationId
+    ? `?conversation_id=${encodeURIComponent(conversationId)}`
+    : "";
+  const response = await fetch(`/api/v1/venue-search${query}`, { signal });
   const body = await jsonResponse(response, "本地服务返回了无法解析的主题检索记录");
   if (!response.ok) throw requestError(response, body, "无法读取主题检索记录");
   return mapVenueSearchConversation(body);
 }
 
+export async function fetchVenueSearchConversations({ signal } = {}) {
+  const response = await fetch("/api/v1/venue-search/conversations", { signal });
+  const body = await jsonResponse(response, "本地服务返回了无法解析的会话列表");
+  if (!response.ok) throw requestError(response, body, "无法读取主题检索会话列表");
+  return mapVenueSearchList(body);
+}
+
+export async function createVenueSearchConversation({ title, signal } = {}) {
+  const response = await fetch("/api/v1/venue-search/conversations", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      schema_version: 1,
+      ...(title ? { title } : {}),
+    }),
+    signal,
+  });
+  const body = await jsonResponse(response, "本地服务返回了无法解析的新建结果");
+  if (!response.ok) throw requestError(response, body, "无法新建主题检索会话");
+  return mapVenueSearchConversation(body);
+}
+
+export async function deleteVenueSearchConversation({ conversationId, signal } = {}) {
+  const response = await fetch(
+    `/api/v1/venue-search/conversations/${encodeURIComponent(conversationId)}`,
+    { method: "DELETE", signal },
+  );
+  const body = await jsonResponse(response, "本地服务返回了无法解析的删除结果");
+  if (!response.ok) throw requestError(response, body, "无法删除主题检索会话");
+  return mapVenueSearchList(body);
+}
+
 export async function submitVenueSearchTurn({
+  conversationId,
   question,
   providerId,
   modelId,
@@ -86,6 +148,7 @@ export async function submitVenueSearchTurn({
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       schema_version: 1,
+      ...(conversationId ? { conversation_id: conversationId } : {}),
       question,
       ...(providerId ? { provider_id: providerId } : {}),
       ...(modelId ? { model_id: modelId } : {}),
@@ -100,6 +163,7 @@ export async function submitVenueSearchTurn({
 }
 
 export async function addVenueSearchPapersToWeekly({
+  conversationId,
   turnId,
   paperIds,
   signal,
@@ -109,6 +173,7 @@ export async function addVenueSearchPapersToWeekly({
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       schema_version: 1,
+      ...(conversationId ? { conversation_id: conversationId } : {}),
       turn_id: turnId,
       paper_ids: paperIds,
     }),

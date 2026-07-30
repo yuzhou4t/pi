@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,6 +14,8 @@ import {
   createVenueSearchService,
   deterministicRecommendation,
 } from "./venueSearchService.js";
+import { createWebSearchRunner } from "../project-work/externalRetrieval.js";
+import { resolveProjectWorkDoubaoQuotaFilePath } from "../project-work/projectWorkPaths.js";
 import { createJournalWorkflowService } from "./workflowService.js";
 
 function searchResult(papers) {
@@ -91,6 +98,220 @@ test("a fixture-mode search turn is durable, idempotent, and keeps failed venues
     venueSearcher: async () => searchResult([]),
   }).getConversation();
   assert.equal(reloaded.turns.length, 1);
+});
+
+test("web discovery results are stored, deduped by url, and never become recommendable", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-venue-web-"));
+  const papers = [searchPaper("p1", "Reliable Agents")];
+  let webCalls = 0;
+  const service = createVenueSearchService({
+    dataDir,
+    modelMode: "fixture",
+    venueSearcher: async () => searchResult(papers),
+    webSearcher: async (query, options) => {
+      webCalls += 1;
+      assert.equal(typeof query, "string");
+      assert.equal(options.maxResults, 6);
+      return {
+        provider: "doubao",
+        results: [
+          {
+            title: "LLM Agent 长期记忆综述",
+            url: "https://example.com/memory",
+            excerpt: "综述了 Agent 长期记忆机制。",
+            published_date: "2026-06-01",
+          },
+          { title: "无链接项应被过滤", url: null, excerpt: "drop me" },
+        ],
+      };
+    },
+  });
+
+  const conversation = await service.submitTurn({
+    question: "LLM Agent 长期记忆有什么值得读的？",
+    clientRequestId: "vs-web-1",
+  });
+  const [turn] = conversation.turns;
+  assert.equal(webCalls, 1);
+  assert.equal(turn.web.status, "success");
+  assert.equal(turn.web.provider, "doubao");
+  assert.equal(turn.web.results.length, 1);
+  assert.equal(turn.web.results[0].url, "https://example.com/memory");
+  assert.ok(turn.recommendations.every((rec) => rec.paper_id === "p1"));
+});
+
+test("project work and venue search share one 500-request Doubao ledger", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-shared-doubao-"));
+  const storageRoot = path.join(dataDir, "project-work");
+  const env = {
+    PI_PROJECT_WORK_STORAGE_ROOT: storageRoot,
+    PI_DOUBAO_API_KEY: "doubao-key",
+    PI_TAVILY_API_KEY: "tavily-key",
+  };
+  const quotaFilePath = resolveProjectWorkDoubaoQuotaFilePath({ env });
+  const now = () => new Date("2026-07-29T08:00:00+08:00");
+  await mkdir(path.dirname(quotaFilePath), { recursive: true });
+  await writeFile(quotaFilePath, JSON.stringify({
+    version: 1,
+    period: "2026-07",
+    used: 499,
+  }));
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(url);
+    if (url.includes("volces.com")) {
+      return new Response(JSON.stringify({
+        output: [{
+          type: "web_search_call",
+          action: {
+            sources: [{
+              title: "Doubao result",
+              url: "https://example.com/doubao",
+            }],
+          },
+        }],
+      }), { headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      results: [{
+        title: "Tavily result",
+        url: "https://example.com/tavily",
+        content: "Fallback",
+      }],
+    }), { headers: { "content-type": "application/json" } });
+  };
+
+  const projectWorkSearch = createWebSearchRunner({
+    env,
+    fetchImpl,
+    doubaoQuotaFilePath: quotaFilePath,
+    now,
+  });
+  const projectResult = await projectWorkSearch.runWebSearch("project query");
+  assert.equal(projectResult.provider, "doubao");
+
+  const venueSearch = createVenueSearchService({
+    dataDir,
+    env,
+    fetchImpl,
+    now,
+    modelMode: "fixture",
+    venueSearcher: async () => searchResult([]),
+  });
+  const conversation = await venueSearch.submitTurn({
+    question: "venue query",
+    clientRequestId: "shared-quota-1",
+  });
+
+  assert.equal(conversation.turns[0].web.provider, "tavily");
+  assert.equal(calls.filter((url) => url.includes("volces.com")).length, 1);
+  assert.equal(calls.filter((url) => url.includes("tavily.com")).length, 1);
+  assert.equal(JSON.parse(await readFile(quotaFilePath, "utf8")).used, 500);
+  await assert.rejects(
+    () => readFile(path.join(dataDir, "venue-search", "web-usage.json"), "utf8"),
+    { code: "ENOENT" },
+  );
+});
+
+test("a failing web lane never breaks the turn and empty academic hits still stay honest", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-venue-web-fail-"));
+  const service = createVenueSearchService({
+    dataDir,
+    modelMode: "fixture",
+    venueSearcher: async () => searchResult([]),
+    webSearcher: async () => {
+      throw new Error("web lane down");
+    },
+  });
+  const conversation = await service.submitTurn({
+    question: "niche topic with no hits",
+    clientRequestId: "vs-web-2",
+  });
+  const [turn] = conversation.turns;
+  assert.equal(turn.status, "complete");
+  assert.equal(turn.web.status, "failed");
+  assert.equal(turn.papers.length, 0);
+  assert.equal(turn.recommendations.length, 0);
+  assert.ok(turn.answer.includes("没有检索到"));
+});
+
+test("conversations can be created, switched, and deleted with isolated turns", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-venue-multi-"));
+  const service = createVenueSearchService({
+    dataDir,
+    modelMode: "fixture",
+    venueSearcher: async () => searchResult([searchPaper("p1", "Paper")]),
+    webSearcher: async () => ({ provider: null, results: [] }),
+  });
+
+  const list0 = await service.listConversations();
+  assert.equal(list0.conversations.length, 0);
+  assert.equal(list0.active_conversation_id, null);
+
+  const conv1 = await service.submitTurn({ question: "topic one", clientRequestId: "c1" });
+  assert.ok(conv1.conversation_id);
+  assert.equal(conv1.turns.length, 1);
+  assert.equal(conv1.title, "topic one");
+
+  const conv2 = await service.createConversation({ title: "第二个检索" });
+  assert.equal(conv2.title, "第二个检索");
+  assert.equal(conv2.turns.length, 0);
+
+  const list1 = await service.listConversations();
+  assert.equal(list1.conversations.length, 2);
+  assert.equal(list1.active_conversation_id, conv2.conversation_id);
+
+  const conv2b = await service.submitTurn({
+    conversationId: conv2.conversation_id,
+    question: "topic two",
+    clientRequestId: "c2",
+  });
+  assert.equal(conv2b.conversation_id, conv2.conversation_id);
+  assert.equal(conv2b.turns.length, 1);
+
+  const conv1again = await service.getConversation(conv1.conversation_id);
+  assert.equal(conv1again.turns.length, 1);
+
+  const afterDelete = await service.deleteConversation(conv2.conversation_id);
+  assert.equal(afterDelete.conversations.length, 1);
+  assert.equal(afterDelete.active_conversation_id, conv1.conversation_id);
+  await assert.rejects(
+    () => service.getConversation(conv2.conversation_id),
+    /会话不存在/,
+  );
+});
+
+test("a legacy single-conversation file is migrated into the multi-conversation store", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-venue-migrate-"));
+  await mkdir(path.join(dataDir, "venue-search"), { recursive: true });
+  await writeFile(
+    path.join(dataDir, "venue-search", "conversation.json"),
+    JSON.stringify({
+      schema_version: 1,
+      conversation_id: "topic-search",
+      updated_at: "2026-07-20T00:00:00.000Z",
+      turns: [{
+        turn_id: "vs-old",
+        client_request_id: "old-1",
+        question: "旧的检索问题",
+        status: "complete",
+        papers: [],
+        recommendations: [],
+        added_paper_ids: [],
+      }],
+    }),
+  );
+  const service = createVenueSearchService({
+    dataDir,
+    modelMode: "fixture",
+    venueSearcher: async () => searchResult([]),
+  });
+  const list = await service.listConversations();
+  assert.equal(list.conversations.length, 1);
+  assert.equal(list.conversations[0].turn_count, 1);
+  const conv = await service.getConversation();
+  assert.equal(conv.turns[0].turn_id, "vs-old");
+  assert.equal(conv.title, "旧的检索问题");
 });
 
 test("live mode uses the model for plan and recommendation and falls back on model failure", async () => {

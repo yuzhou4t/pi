@@ -295,6 +295,7 @@ export function createJournalWorkflowService({
     });
   const venueSearch = venueSearchService ?? createVenueSearchService({
     dataDir,
+    env,
     fetchImpl,
     modelProviders,
     modelMode,
@@ -738,11 +739,24 @@ export function createJournalWorkflowService({
     });
   }
 
-  function getVenueSearchConversation() {
-    return venueSearch.getConversation();
+  function getVenueSearchConversation(conversationId = null) {
+    return venueSearch.getConversation(conversationId);
+  }
+
+  function listVenueSearchConversations() {
+    return venueSearch.listConversations();
+  }
+
+  function createVenueSearchConversation({ title } = {}) {
+    return venueSearch.createConversation({ title });
+  }
+
+  function deleteVenueSearchConversation(conversationId) {
+    return venueSearch.deleteConversation(conversationId);
   }
 
   function submitVenueSearchTurn({
+    conversationId = null,
     question,
     providerId = defaults.providerId,
     modelId = defaults.modelId,
@@ -750,6 +764,7 @@ export function createJournalWorkflowService({
     clientRequestId,
   } = {}) {
     return venueSearch.submitTurn({
+      conversationId,
       question,
       providerId,
       modelId,
@@ -758,7 +773,7 @@ export function createJournalWorkflowService({
     });
   }
 
-  async function addVenueSearchPapersToWeekly({ turnId, paperIds } = {}) {
+  async function addVenueSearchPapersToWeekly({ conversationId = null, turnId, paperIds } = {}) {
     if (!Array.isArray(paperIds) || paperIds.length === 0) {
       throw artifactError(
         "VENUE_SEARCH_PAPER_IDS_REQUIRED",
@@ -766,7 +781,7 @@ export function createJournalWorkflowService({
         400,
       );
     }
-    const conversation = await venueSearch.getConversation();
+    const conversation = await venueSearch.getConversation(conversationId);
     const turn = venueSearch.getTurn(conversation, turnId);
     const byId = new Map(turn.papers.map((paper) => [paper.paper_id, paper]));
     for (const paperId of paperIds) {
@@ -846,7 +861,11 @@ export function createJournalWorkflowService({
       turn_id: turnId,
       paper_ids: paperIds,
     });
-    const updatedConversation = await venueSearch.markPapersAdded(turnId, paperIds);
+    const updatedConversation = await venueSearch.markPapersAdded(
+      conversation.conversation_id,
+      turnId,
+      paperIds,
+    );
     return { run: updatedRun, conversation: updatedConversation };
   }
 
@@ -2703,6 +2722,9 @@ export function createJournalWorkflowService({
     resumeRun,
     searchVenues,
     getVenueSearchConversation,
+    listVenueSearchConversations,
+    createVenueSearchConversation,
+    deleteVenueSearchConversation,
     submitVenueSearchTurn,
     addVenueSearchPapersToWeekly,
     retryPaperDocument,

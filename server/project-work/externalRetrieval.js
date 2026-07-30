@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import {
+  link,
   mkdir,
+  open,
+  readdir,
   readFile,
   rename,
   unlink,
@@ -272,6 +275,198 @@ async function readQuotaState(filePath) {
   }
 }
 
+function quotaReservationDirectory(filePath, period) {
+  // Exclusive slot files are the quota authority across the gateway and worker.
+  return path.join(`${filePath}.reservations`, period);
+}
+
+async function readQuotaBaseline(filePath, period) {
+  try {
+    const parsed = JSON.parse(await readFile(filePath, "utf8"));
+    if (
+      parsed?.version !== 1
+      || parsed.period !== period
+      || !Number.isSafeInteger(parsed.baseline_used)
+      || parsed.baseline_used < 0
+      || parsed.baseline_used > DOUBAO_MONTHLY_SEARCH_LIMIT
+    ) {
+      throw new Error("invalid quota baseline");
+    }
+    return parsed.baseline_used;
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw projectWorkError(
+      "PROJECT_WORK_DOUBAO_QUOTA_STATE_INVALID",
+      "豆包月度搜索额度状态不可用",
+      503,
+      true,
+    );
+  }
+}
+
+async function ensureQuotaBaseline({
+  filePath,
+  period,
+  existing,
+  now,
+}) {
+  const directory = quotaReservationDirectory(filePath, period);
+  const baselinePath = path.join(directory, "baseline.json");
+  try {
+    await mkdir(directory, { recursive: true });
+  } catch {
+    throw projectWorkError(
+      "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE",
+      "无法初始化豆包月度搜索额度",
+      503,
+      true,
+    );
+  }
+  const current = await readQuotaBaseline(baselinePath, period);
+  if (current !== null) return { baseline: current, directory };
+
+  const baseline = existing?.period === period
+    ? Math.min(existing.used, DOUBAO_MONTHLY_SEARCH_LIMIT)
+    : 0;
+  const temporaryPath = path.join(
+    directory,
+    `.baseline.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    await writeFile(
+      temporaryPath,
+      `${JSON.stringify({
+        version: 1,
+        period,
+        baseline_used: baseline,
+        created_at: (typeof now === "function" ? now() : new Date()).toISOString(),
+      }, null, 2)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    try {
+      await link(temporaryPath, baselinePath);
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+  } catch {
+    throw projectWorkError(
+      "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE",
+      "无法初始化豆包月度搜索额度",
+      503,
+      true,
+    );
+  } finally {
+    await unlink(temporaryPath).catch(() => undefined);
+  }
+  const durableBaseline = await readQuotaBaseline(baselinePath, period);
+  if (durableBaseline === null) {
+    throw projectWorkError(
+      "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE",
+      "无法初始化豆包月度搜索额度",
+      503,
+      true,
+    );
+  }
+  return { baseline: durableBaseline, directory };
+}
+
+async function readHighestQuotaReservation(directory, baseline) {
+  try {
+    const entries = await readdir(directory, { withFileTypes: true });
+    let highest = baseline;
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const match = /^slot-(\d{3})\.json$/.exec(entry.name);
+      if (!match) continue;
+      const slot = Number(match[1]);
+      if (
+        Number.isSafeInteger(slot)
+        && slot > highest
+        && slot <= DOUBAO_MONTHLY_SEARCH_LIMIT
+      ) {
+        highest = slot;
+      }
+    }
+    return highest;
+  } catch {
+    throw projectWorkError(
+      "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE",
+      "无法读取豆包月度搜索额度",
+      503,
+      true,
+    );
+  }
+}
+
+async function claimQuotaReservation(directory, firstSlot, now) {
+  for (
+    let slot = firstSlot;
+    slot <= DOUBAO_MONTHLY_SEARCH_LIMIT;
+    slot += 1
+  ) {
+    const slotPath = path.join(
+      directory,
+      `slot-${String(slot).padStart(3, "0")}.json`,
+    );
+    let handle;
+    try {
+      handle = await open(slotPath, "wx", 0o600);
+    } catch (error) {
+      if (error?.code === "EEXIST") continue;
+      throw projectWorkError(
+        "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE",
+        "无法占用豆包月度搜索额度",
+        503,
+        true,
+      );
+    }
+    try {
+      await handle.writeFile(`${JSON.stringify({
+        version: 1,
+        period_slot: slot,
+        reserved_at: (typeof now === "function" ? now() : new Date()).toISOString(),
+        pid: process.pid,
+      })}\n`);
+    } catch {
+      // The exclusive slot file itself is the durable reservation.
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+    return slot;
+  }
+  return null;
+}
+
+async function refreshQuotaSummary({
+  filePath,
+  period,
+  baseline,
+  directory,
+  now,
+}) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const current = await readQuotaState(filePath);
+    const persisted = current?.period === period
+      ? Math.min(current.used, DOUBAO_MONTHLY_SEARCH_LIMIT)
+      : 0;
+    const highest = await readHighestQuotaReservation(directory, baseline);
+    const used = Math.max(baseline, persisted, highest);
+    if (current?.period === period && current.used >= used) return;
+    await writeQuotaState(filePath, {
+      version: 1,
+      period,
+      used,
+      updated_at: (typeof now === "function" ? now() : new Date()).toISOString(),
+    });
+    const confirmed = await readQuotaState(filePath);
+    const required = Math.max(
+      baseline,
+      await readHighestQuotaReservation(directory, baseline),
+    );
+    if (confirmed?.period === period && confirmed.used >= required) return;
+  }
+}
+
 async function writeQuotaState(filePath, state) {
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   try {
@@ -335,10 +530,65 @@ async function reserveDoubaoSearch({
 
   const resolvedPath = path.resolve(filePath);
   return enqueueQuotaFile(resolvedPath, async () => {
-    const reservation = await reserve(await readQuotaState(resolvedPath));
-    if (reservation.granted) {
-      await writeQuotaState(resolvedPath, reservation.state);
+    const existing = await readQuotaState(resolvedPath);
+    const { baseline, directory } = await ensureQuotaBaseline({
+      filePath: resolvedPath,
+      period,
+      existing,
+      now,
+    });
+    const persisted = existing?.period === period
+      ? Math.min(existing.used, DOUBAO_MONTHLY_SEARCH_LIMIT)
+      : 0;
+    const highest = await readHighestQuotaReservation(directory, baseline);
+    const used = Math.max(baseline, persisted, highest);
+    if (used >= DOUBAO_MONTHLY_SEARCH_LIMIT) {
+      await refreshQuotaSummary({
+        filePath: resolvedPath,
+        period,
+        baseline,
+        directory,
+        now,
+      }).catch(() => undefined);
+      return {
+        granted: false,
+        period,
+        limit: DOUBAO_MONTHLY_SEARCH_LIMIT,
+        used: DOUBAO_MONTHLY_SEARCH_LIMIT,
+        remaining: 0,
+      };
     }
+    const claimed = await claimQuotaReservation(directory, used + 1, now);
+    if (claimed === null) {
+      await refreshQuotaSummary({
+        filePath: resolvedPath,
+        period,
+        baseline,
+        directory,
+        now,
+      }).catch(() => undefined);
+      return {
+        granted: false,
+        period,
+        limit: DOUBAO_MONTHLY_SEARCH_LIMIT,
+        used: DOUBAO_MONTHLY_SEARCH_LIMIT,
+        remaining: 0,
+      };
+    }
+    const reservation = {
+      granted: true,
+      period,
+      limit: DOUBAO_MONTHLY_SEARCH_LIMIT,
+      used: claimed,
+      remaining: DOUBAO_MONTHLY_SEARCH_LIMIT - claimed,
+    };
+    await refreshQuotaSummary({
+      filePath: resolvedPath,
+      period,
+      baseline,
+      directory,
+      now,
+    }).catch(() => undefined);
     return reservation;
   });
 }
@@ -729,7 +979,9 @@ function normalizeDocumentation(data) {
     .slice(0, MAX_DOC_SNIPPETS);
 }
 
-export function createExternalRetrievalTools({
+// 豆包（优先）+ Tavily（回退）联网检索核心。抽成可复用 runner，供写代码的
+// search_web 工具与论文主题检索的「联网发现」通道共用同一实现和同一月度额度台账。
+export function createWebSearchRunner({
   env = process.env,
   fetchImpl = globalThis.fetch,
   timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -745,10 +997,6 @@ export function createExternalRetrievalTools({
   const tavilyApiKey = envSecret(env, [
     "PI_TAVILY_API_KEY",
     "TAVILY_API_KEY",
-  ]);
-  const context7ApiKey = envSecret(env, [
-    "PI_CONTEXT7_API_KEY",
-    "CONTEXT7_API_KEY",
   ]);
   const inMemoryDoubaoQuota = { value: null };
 
@@ -799,7 +1047,7 @@ export function createExternalRetrievalTools({
     }
     return {
       quota,
-      result: toolResult({
+      data: {
         provider: "doubao",
         query: normalizedQuery,
         answer,
@@ -812,7 +1060,7 @@ export function createExternalRetrievalTools({
           used: quota.used,
           remaining: quota.remaining,
         },
-      }),
+      },
     };
   }
 
@@ -834,15 +1082,75 @@ export function createExternalRetrievalTools({
       },
     });
     const results = normalizeWebResults(data, limit);
-    return toolResult({
+    return {
       provider: "tavily",
       query: normalizedQuery,
       results,
       result_count: results.length,
       truncated: Array.isArray(data?.results) && data.results.length > results.length,
       ...(fallbackReason ? { fallback_reason: fallbackReason } : {}),
-    });
+    };
   }
+
+  async function runWebSearch(query, { maxResults } = {}) {
+    const normalizedQuery = requiredString(query, "query", MAX_QUERY_CHARS);
+    assertSafeExternalInput(normalizedQuery);
+    if (!doubaoApiKey && !tavilyApiKey) {
+      throw unavailable(
+        "PROJECT_WORK_WEB_SEARCH_UNAVAILABLE",
+        "网页检索尚未配置豆包或 Tavily API Key",
+      );
+    }
+    const limit = boundedInteger(
+      maxResults,
+      MAX_WEB_RESULTS,
+      1,
+      MAX_WEB_RESULTS,
+    );
+    let fallbackReason = "";
+    if (doubaoApiKey) {
+      try {
+        const primary = await searchDoubao(normalizedQuery, limit);
+        if (primary.data) return primary.data;
+        fallbackReason = "doubao_monthly_limit_reached";
+      } catch (error) {
+        if (!tavilyApiKey) throw error;
+        fallbackReason = "doubao_request_failed";
+      }
+    }
+    if (!tavilyApiKey) {
+      throw unavailable(
+        "PROJECT_WORK_DOUBAO_MONTHLY_LIMIT_REACHED",
+        "豆包本月 500 次搜索额度已用完，且 Tavily 尚未配置",
+      );
+    }
+    return searchTavily(normalizedQuery, limit, fallbackReason);
+  }
+
+  return {
+    runWebSearch,
+    hasWebSearch: Boolean(doubaoApiKey || tavilyApiKey),
+  };
+}
+
+export function createExternalRetrievalTools({
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  doubaoQuotaFilePath,
+  now = () => new Date(),
+} = {}) {
+  const context7ApiKey = envSecret(env, [
+    "PI_CONTEXT7_API_KEY",
+    "CONTEXT7_API_KEY",
+  ]);
+  const { runWebSearch } = createWebSearchRunner({
+    env,
+    fetchImpl,
+    timeoutMs,
+    doubaoQuotaFilePath,
+    now,
+  });
 
   const searchWeb = defineTool({
     name: "search_web",
@@ -856,38 +1164,7 @@ export function createExternalRetrievalTools({
       max_results: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_WEB_RESULTS })),
     }),
     async execute(_toolCallId, { query, max_results: requestedLimit }) {
-      const normalizedQuery = requiredString(query, "query", MAX_QUERY_CHARS);
-      assertSafeExternalInput(normalizedQuery);
-      if (!doubaoApiKey && !tavilyApiKey) {
-        throw unavailable(
-          "PROJECT_WORK_WEB_SEARCH_UNAVAILABLE",
-          "网页检索尚未配置豆包或 Tavily API Key",
-        );
-      }
-      const limit = boundedInteger(
-        requestedLimit,
-        MAX_WEB_RESULTS,
-        1,
-        MAX_WEB_RESULTS,
-      );
-      let fallbackReason = "";
-      if (doubaoApiKey) {
-        try {
-          const primary = await searchDoubao(normalizedQuery, limit);
-          if (primary.result) return primary.result;
-          fallbackReason = "doubao_monthly_limit_reached";
-        } catch (error) {
-          if (!tavilyApiKey) throw error;
-          fallbackReason = "doubao_request_failed";
-        }
-      }
-      if (!tavilyApiKey) {
-        throw unavailable(
-          "PROJECT_WORK_DOUBAO_MONTHLY_LIMIT_REACHED",
-          "豆包本月 500 次搜索额度已用完，且 Tavily 尚未配置",
-        );
-      }
-      return searchTavily(normalizedQuery, limit, fallbackReason);
+      return toolResult(await runWebSearch(query, { maxResults: requestedLimit }));
     },
   });
 

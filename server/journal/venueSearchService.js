@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { createWebSearchRunner } from "../project-work/externalRetrieval.js";
+import { resolveProjectWorkDoubaoQuotaFilePath } from "../project-work/projectWorkPaths.js";
 import { promptRegistry } from "../promptRegistry.js";
 import { searchRegisteredVenues } from "./venueSearch.js";
 
@@ -10,6 +12,11 @@ const MAX_QUESTION_CHARS = 500;
 const MAX_RECOMMEND_INPUTS = 12;
 const MAX_ABSTRACT_CHARS = 500;
 const SEARCH_RESULT_LIMIT = 12;
+const MAX_WEB_RESULTS = 6;
+const MAX_WEB_EXCERPT_CHARS = 400;
+const MAX_CONVERSATIONS = 50;
+const MAX_TITLE_CHARS = 60;
+const DEFAULT_CONVERSATION_TITLE = "新的检索";
 
 export class VenueSearchServiceError extends Error {
   constructor(code, message, status = 409, retryable = false) {
@@ -44,16 +51,12 @@ async function writeJsonAtomic(filePath, value) {
   await rename(temporaryPath, filePath);
 }
 
-function emptyConversation() {
-  return {
-    schema_version: 1,
-    conversation_id: CONVERSATION_ID,
-    turns: [],
-    updated_at: null,
-  };
+function deriveConversationTitle(question) {
+  const text = compact(question, MAX_TITLE_CHARS);
+  return text || DEFAULT_CONVERSATION_TITLE;
 }
 
-function recommendInput(question, projectContext, papers) {
+function recommendInput(question, projectContext, papers, webResults = []) {
   return {
     question: compact(question, MAX_QUESTION_CHARS),
     project: projectContext
@@ -73,6 +76,13 @@ function recommendInput(question, projectContext, papers) {
       cited_by_count: Number.isInteger(paper.cited_by_count) ? paper.cited_by_count : null,
       abstract: compact(paper.abstract, MAX_ABSTRACT_CHARS)
         || "当前来源未提供摘要，仅可依据题录判断。",
+    })),
+    web_references: webResults.map((item) => ({
+      title: compact(item.title, 300),
+      url: item.url,
+      excerpt: compact(item.excerpt, MAX_WEB_EXCERPT_CHARS)
+        || "未提供摘要，仅可依据标题与链接判断。",
+      published_date: item.published_date ?? null,
     })),
   };
 }
@@ -105,12 +115,18 @@ function validateRecommendation(value, papers) {
   return { answer, recommendations };
 }
 
-export function deterministicRecommendation(question, papers) {
+export function deterministicRecommendation(question, papers, webResults = []) {
   const top = papers.slice(0, 5);
+  const webNote = webResults.length > 0
+    ? `另有 ${webResults.length} 条联网发现可作参考。`
+    : "";
   const answer = top.length > 0
     ? `按「${compact(question, 60)}」在注册刊物范围内检索到 ${papers.length} 篇相关论文，`
       + "已按检索相关度与引用记录列出最值得关注的几篇；推荐理由基于题录与摘要，具体结论待全文核验。"
-    : `按「${compact(question, 60)}」在注册刊物范围内没有检索到足够相关的论文，可尝试更具体的英文关键词。`;
+      + webNote
+    : (webResults.length > 0
+      ? `按「${compact(question, 60)}」在注册刊物范围内未检索到相关论文，但联网发现了 ${webResults.length} 条参考资料，可在下方查看来源链接。`
+      : `按「${compact(question, 60)}」在注册刊物与联网范围内都没有检索到足够相关的内容，可尝试更具体的英文关键词。`);
   return {
     answer,
     recommendations: top.map((paper) => ({
@@ -128,11 +144,14 @@ export function deterministicRecommendation(question, papers) {
 
 export function createVenueSearchService({
   dataDir,
+  env = {},
+  doubaoQuotaFilePath = resolveProjectWorkDoubaoQuotaFilePath({ env }),
   fetchImpl = globalThis.fetch,
   modelProviders = null,
   modelMode = "fixture",
   projectContextReader = null,
   venueSearcher = searchRegisteredVenues,
+  webSearcher = null,
   mailto = "",
   now = () => new Date(),
   idFactory = randomUUID,
@@ -140,24 +159,178 @@ export function createVenueSearchService({
   if (typeof dataDir !== "string" || !dataDir.trim()) {
     throw new TypeError("dataDir is required");
   }
-  const statePath = path.resolve(dataDir, "venue-search", "conversation.json");
+  const legacyPath = path.resolve(dataDir, "venue-search", "conversation.json");
+  const storePath = path.resolve(dataDir, "venue-search", "conversations.json");
+  // 联网发现与普通项目工作共用同一份豆包月度额度台账。
+  const runWebSearch = typeof webSearcher === "function"
+    ? webSearcher
+    : createWebSearchRunner({
+        env,
+        fetchImpl,
+        doubaoQuotaFilePath,
+        now,
+      }).runWebSearch;
   let inFlight = null;
 
-  async function readConversation() {
+  function newConversation(title) {
+    const timestamp = now().toISOString();
+    return {
+      conversation_id: `vsc-${idFactory().slice(0, 12)}`,
+      title: title || DEFAULT_CONVERSATION_TITLE,
+      created_at: timestamp,
+      updated_at: timestamp,
+      turns: [],
+    };
+  }
+
+  function emptyStore() {
+    return { schema_version: 2, active_conversation_id: null, conversations: [] };
+  }
+
+  async function readLegacyConversation() {
     try {
-      const state = JSON.parse(await readFile(statePath, "utf8"));
-      if (state?.schema_version === 1 && Array.isArray(state.turns)) return state;
-      return emptyConversation();
-    } catch (error) {
-      if (error?.code === "ENOENT" || error instanceof SyntaxError) {
-        return emptyConversation();
+      const state = JSON.parse(await readFile(legacyPath, "utf8"));
+      if (state?.schema_version === 1 && Array.isArray(state.turns) && state.turns.length > 0) {
+        return state;
       }
+      return null;
+    } catch (error) {
+      if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
       throw error;
     }
   }
 
-  async function getConversation() {
-    return readConversation();
+  async function readStore() {
+    try {
+      const state = JSON.parse(await readFile(storePath, "utf8"));
+      if (state?.schema_version === 2 && Array.isArray(state.conversations)) return state;
+    } catch (error) {
+      if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+    }
+    // 迁移旧的单一 topic-search 对话，避免丢历史记录。
+    const legacy = await readLegacyConversation();
+    if (legacy) {
+      const conv = {
+        conversation_id: CONVERSATION_ID,
+        title: deriveConversationTitle(legacy.turns[0]?.question),
+        created_at: legacy.turns[0]?.created_at ?? legacy.updated_at ?? now().toISOString(),
+        updated_at: legacy.updated_at ?? now().toISOString(),
+        turns: legacy.turns,
+      };
+      return { schema_version: 2, active_conversation_id: conv.conversation_id, conversations: [conv] };
+    }
+    return emptyStore();
+  }
+
+  function writeStore(store) {
+    return writeJsonAtomic(storePath, store);
+  }
+
+  function conversationView(conv) {
+    if (!conv) {
+      return {
+        schema_version: 1,
+        conversation_id: null,
+        title: null,
+        turns: [],
+        created_at: null,
+        updated_at: null,
+      };
+    }
+    return {
+      schema_version: 1,
+      conversation_id: conv.conversation_id,
+      title: conv.title,
+      turns: conv.turns,
+      created_at: conv.created_at ?? null,
+      updated_at: conv.updated_at ?? null,
+    };
+  }
+
+  function conversationMeta(conv) {
+    return {
+      conversation_id: conv.conversation_id,
+      title: conv.title,
+      turn_count: conv.turns.length,
+      created_at: conv.created_at ?? null,
+      updated_at: conv.updated_at ?? null,
+    };
+  }
+
+  function sortedConversations(conversations) {
+    return conversations.slice().sort(
+      (a, b) => (b.updated_at ?? b.created_at ?? "").localeCompare(a.updated_at ?? a.created_at ?? ""),
+    );
+  }
+
+  function resolveTarget(store, conversationId) {
+    if (conversationId) {
+      return store.conversations.find((item) => item.conversation_id === conversationId) ?? null;
+    }
+    return store.conversations.find((item) => item.conversation_id === store.active_conversation_id)
+      ?? sortedConversations(store.conversations)[0]
+      ?? null;
+  }
+
+  async function listConversations() {
+    const store = await readStore();
+    return {
+      schema_version: 2,
+      active_conversation_id: store.active_conversation_id,
+      conversations: sortedConversations(store.conversations).map(conversationMeta),
+    };
+  }
+
+  async function getConversation(conversationId = null) {
+    const store = await readStore();
+    const conv = resolveTarget(store, conversationId);
+    if (conversationId && !conv) {
+      throw new VenueSearchServiceError(
+        "VENUE_SEARCH_CONVERSATION_NOT_FOUND",
+        "检索会话不存在",
+        404,
+      );
+    }
+    return conversationView(conv);
+  }
+
+  async function createConversation({ title } = {}) {
+    const store = await readStore();
+    const conv = newConversation(title ? deriveConversationTitle(title) : null);
+    const conversations = [conv, ...store.conversations].slice(0, MAX_CONVERSATIONS);
+    await writeStore({
+      schema_version: 2,
+      active_conversation_id: conv.conversation_id,
+      conversations,
+    });
+    return conversationView(conv);
+  }
+
+  async function deleteConversation(conversationId) {
+    const store = await readStore();
+    const remaining = store.conversations.filter(
+      (item) => item.conversation_id !== conversationId,
+    );
+    if (remaining.length === store.conversations.length) {
+      throw new VenueSearchServiceError(
+        "VENUE_SEARCH_CONVERSATION_NOT_FOUND",
+        "检索会话不存在",
+        404,
+      );
+    }
+    const activeId = store.active_conversation_id === conversationId
+      ? (sortedConversations(remaining)[0]?.conversation_id ?? null)
+      : store.active_conversation_id;
+    await writeStore({
+      schema_version: 2,
+      active_conversation_id: activeId,
+      conversations: remaining,
+    });
+    return {
+      schema_version: 2,
+      active_conversation_id: activeId,
+      conversations: sortedConversations(remaining).map(conversationMeta),
+    };
   }
 
   async function planQuery(question, projectContext, { providerId, modelId, reasoningEffort }) {
@@ -199,11 +372,32 @@ export function createVenueSearchService({
     }
   }
 
-  async function recommend(question, projectContext, papers, { providerId, modelId, reasoningEffort }) {
+  async function webDiscovery(query) {
+    try {
+      const result = await runWebSearch(query, { maxResults: MAX_WEB_RESULTS });
+      const results = (Array.isArray(result?.results) ? result.results : [])
+        .map((item) => ({
+          title: compact(item?.title, 300),
+          url: typeof item?.url === "string" ? item.url : null,
+          excerpt: compact(item?.excerpt, MAX_WEB_EXCERPT_CHARS),
+          published_date: compact(item?.published_date, 40) || null,
+        }))
+        .filter((item) => item.url && item.title);
+      return { status: "success", provider: result?.provider ?? null, results, error: null };
+    } catch (error) {
+      return { status: "failed", provider: null, results: [], error: publicError(error) };
+    }
+  }
+
+  async function recommend(question, projectContext, papers, webResults, { providerId, modelId, reasoningEffort }) {
     const pool = papers.slice(0, MAX_RECOMMEND_INPUTS);
-    if (modelMode !== "live" || !modelProviders?.completeStructured || pool.length === 0) {
+    if (
+      modelMode !== "live"
+      || !modelProviders?.completeStructured
+      || (pool.length === 0 && webResults.length === 0)
+    ) {
       return {
-        ...deterministicRecommendation(question, pool),
+        ...deterministicRecommendation(question, pool, webResults),
         source: "deterministic",
         usage: null,
       };
@@ -216,7 +410,7 @@ export function createVenueSearchService({
         ...(reasoningEffort ? { reasoningEffort } : {}),
         system: prompt.system,
         prompt: prompt.body,
-        input: recommendInput(question, projectContext, pool),
+        input: recommendInput(question, projectContext, pool, webResults),
         schema: prompt.schema,
       });
       return {
@@ -230,7 +424,7 @@ export function createVenueSearchService({
       };
     } catch (error) {
       return {
-        ...deterministicRecommendation(question, pool),
+        ...deterministicRecommendation(question, pool, webResults),
         source: "deterministic_fallback",
         usage: null,
         error: publicError(error),
@@ -239,6 +433,7 @@ export function createVenueSearchService({
   }
 
   async function submitTurn({
+    conversationId = null,
     question,
     providerId,
     modelId,
@@ -260,11 +455,19 @@ export function createVenueSearchService({
         400,
       );
     }
-    const existing = await readConversation();
-    const replay = existing.turns.find(
+    const existing = await readStore();
+    const existingTarget = resolveTarget(existing, conversationId);
+    if (conversationId && !existingTarget) {
+      throw new VenueSearchServiceError(
+        "VENUE_SEARCH_CONVERSATION_NOT_FOUND",
+        "检索会话不存在",
+        404,
+      );
+    }
+    const replay = existingTarget?.turns.find(
       (turn) => turn.client_request_id === clientRequestId,
     );
-    if (replay) return existing;
+    if (replay) return conversationView(existingTarget);
     if (inFlight) {
       throw new VenueSearchServiceError(
         "VENUE_SEARCH_BUSY",
@@ -286,17 +489,21 @@ export function createVenueSearchService({
         modelId,
         reasoningEffort,
       });
-      const search = await venueSearcher({
-        query: plan.search_query,
-        fromYear: plan.from_year ?? null,
-        limit: SEARCH_RESULT_LIMIT,
-        fetchImpl,
-        mailto,
-      });
+      const [search, web] = await Promise.all([
+        venueSearcher({
+          query: plan.search_query,
+          fromYear: plan.from_year ?? null,
+          limit: SEARCH_RESULT_LIMIT,
+          fetchImpl,
+          mailto,
+        }),
+        webDiscovery(plan.search_query),
+      ]);
       const recommendation = await recommend(
         normalizedQuestion,
         projectContext,
         search.papers,
+        web.results,
         { providerId, modelId, reasoningEffort },
       );
       const turn = {
@@ -323,6 +530,12 @@ export function createVenueSearchService({
           truncated: search.truncated,
         },
         papers: search.papers,
+        web: {
+          status: web.status,
+          provider: web.provider,
+          results: web.results,
+          error: web.error,
+        },
         answer: recommendation.answer,
         recommendations: recommendation.recommendations,
         recommendation_source: recommendation.source,
@@ -332,14 +545,29 @@ export function createVenueSearchService({
         recommendation_error: recommendation.error ?? null,
         added_paper_ids: [],
       };
-      const current = await readConversation();
-      const next = {
-        ...current,
-        turns: [...current.turns, turn].slice(-MAX_TURNS),
+      const current = await readStore();
+      let conv = resolveTarget(current, conversationId);
+      const created = !conv;
+      if (!conv) conv = newConversation(deriveConversationTitle(normalizedQuestion));
+      const updatedConv = {
+        ...conv,
+        title: conv.turns.length === 0
+          ? deriveConversationTitle(normalizedQuestion)
+          : conv.title,
+        turns: [...conv.turns, turn].slice(-MAX_TURNS),
         updated_at: turn.completed_at,
       };
-      await writeJsonAtomic(statePath, next);
-      return next;
+      const conversations = created
+        ? [updatedConv, ...current.conversations].slice(0, MAX_CONVERSATIONS)
+        : current.conversations.map(
+            (item) => item.conversation_id === updatedConv.conversation_id ? updatedConv : item,
+          );
+      await writeStore({
+        schema_version: 2,
+        active_conversation_id: updatedConv.conversation_id,
+        conversations,
+      });
+      return conversationView(updatedConv);
     })();
     try {
       return await inFlight;
@@ -348,11 +576,19 @@ export function createVenueSearchService({
     }
   }
 
-  async function markPapersAdded(turnId, paperIds) {
-    const current = await readConversation();
-    const next = {
-      ...current,
-      turns: current.turns.map((turn) => turn.turn_id === turnId
+  async function markPapersAdded(conversationId, turnId, paperIds) {
+    const store = await readStore();
+    const conv = resolveTarget(store, conversationId);
+    if (!conv) {
+      throw new VenueSearchServiceError(
+        "VENUE_SEARCH_CONVERSATION_NOT_FOUND",
+        "检索会话不存在",
+        404,
+      );
+    }
+    const updatedConv = {
+      ...conv,
+      turns: conv.turns.map((turn) => turn.turn_id === turnId
         ? {
             ...turn,
             added_paper_ids: [...new Set([...(turn.added_paper_ids ?? []), ...paperIds])],
@@ -360,8 +596,15 @@ export function createVenueSearchService({
         : turn),
       updated_at: now().toISOString(),
     };
-    await writeJsonAtomic(statePath, next);
-    return next;
+    const conversations = store.conversations.map(
+      (item) => item.conversation_id === updatedConv.conversation_id ? updatedConv : item,
+    );
+    await writeStore({
+      schema_version: 2,
+      active_conversation_id: store.active_conversation_id,
+      conversations,
+    });
+    return conversationView(updatedConv);
   }
 
   function getTurn(conversation, turnId) {
@@ -377,7 +620,10 @@ export function createVenueSearchService({
   }
 
   return Object.freeze({
+    listConversations,
     getConversation,
+    createConversation,
+    deleteConversation,
     submitTurn,
     markPapersAdded,
     getTurn,

@@ -195,6 +195,11 @@ export function ProjectRail({
   selectedRunId = null,
   topicSearchActive = false,
   onSelectTopicSearch,
+  topicConversations = [],
+  activeTopicConversationId = null,
+  onSelectTopicConversation,
+  onCreateTopicConversation,
+  onDeleteTopicConversation,
   onMouseDownResizer,
   isResizing,
 }) {
@@ -413,18 +418,68 @@ export function ProjectRail({
                     </button>
                   ) : null}
                   {workspaceKind === "paper_reading" && onSelectTopicSearch ? (
-                    <button
-                      className={`capability-row project-run-row${topicSearchActive ? " is-active" : ""}`}
-                      type="button"
-                      aria-label="打开主题检索"
-                      onClick={() => onSelectTopicSearch()}
-                    >
-                      <MagnifyingGlass size={17} weight="regular" aria-hidden="true" />
-                      <span>
-                        <strong>主题检索</strong>
-                        <small>在注册刊物内检索</small>
-                      </span>
-                    </button>
+                    <div className="project-topic-search">
+                      <div className="project-topic-head">
+                        <button
+                          className={`capability-row project-run-row project-topic-open${topicSearchActive ? " is-active" : ""}`}
+                          type="button"
+                          aria-label="打开主题检索"
+                          onClick={() => onSelectTopicSearch()}
+                        >
+                          <MagnifyingGlass size={17} weight="regular" aria-hidden="true" />
+                          <span>
+                            <strong>主题检索</strong>
+                            <small>注册刊物 + 联网检索</small>
+                          </span>
+                        </button>
+                        {onCreateTopicConversation ? (
+                          <button
+                            className="project-topic-new"
+                            type="button"
+                            aria-label="新建检索会话"
+                            title="新建检索会话"
+                            onClick={() => onCreateTopicConversation()}
+                          >
+                            <Plus size={14} weight="bold" aria-hidden="true" />
+                          </button>
+                        ) : null}
+                      </div>
+                      {topicConversations.length > 0 ? (
+                        <ul className="project-topic-list">
+                          {topicConversations.map((conversation) => (
+                            <li
+                              key={conversation.id}
+                              className={`project-topic-item${
+                                topicSearchActive && conversation.id === activeTopicConversationId
+                                  ? " is-active"
+                                  : ""
+                              }`}
+                            >
+                              <button
+                                type="button"
+                                className="project-topic-item-open"
+                                onClick={() => onSelectTopicConversation?.(conversation.id)}
+                                title={conversation.title}
+                              >
+                                <span className="project-topic-item-title">{conversation.title}</span>
+                                <small>{conversation.turnCount} 条检索</small>
+                              </button>
+                              {onDeleteTopicConversation ? (
+                                <button
+                                  type="button"
+                                  className="project-topic-item-delete"
+                                  aria-label="删除该检索会话"
+                                  title="删除该检索会话"
+                                  onClick={() => onDeleteTopicConversation(conversation.id)}
+                                >
+                                  <Trash size={13} weight="regular" aria-hidden="true" />
+                                </button>
+                              ) : null}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                    </div>
                   ) : null}
 
                   <section

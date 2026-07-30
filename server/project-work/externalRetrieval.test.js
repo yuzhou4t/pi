@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import {
   mkdtemp,
   readFile,
@@ -10,6 +11,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   createExternalRetrievalTools,
+  createWebSearchRunner,
   getExternalRetrievalCapabilities,
 } from "./externalRetrieval.js";
 
@@ -379,6 +381,65 @@ test("search_web falls back to Tavily after the durable Doubao monthly limit", a
   assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).used, 500);
 });
 
+test("the shared Doubao quota resets into a separate reservation month", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-doubao-month-reset-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const quotaFile = path.join(directory, "usage.json");
+  await writeFile(quotaFile, JSON.stringify({
+    version: 1,
+    period: "2026-07",
+    used: 500,
+  }));
+  let activeDate = new Date("2026-07-31T23:59:00+08:00");
+  const calls = [];
+  const runner = createWebSearchRunner({
+    env: {
+      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_TAVILY_API_KEY: "tavily-key",
+    },
+    doubaoQuotaFilePath: quotaFile,
+    now: () => activeDate,
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return jsonResponse(
+        url.includes("volces.com")
+          ? {
+              output: [{
+                type: "web_search_call",
+                action: {
+                  sources: [{
+                    title: "August Doubao result",
+                    url: "https://example.com/august-doubao",
+                  }],
+                },
+              }],
+            }
+          : {
+              results: [{
+                title: "July Tavily result",
+                url: "https://example.com/july-tavily",
+                content: "Fallback",
+              }],
+            },
+      );
+    },
+  });
+
+  const july = await runner.runWebSearch("july query");
+  activeDate = new Date("2026-08-01T00:01:00+08:00");
+  const august = await runner.runWebSearch("august query");
+
+  assert.equal(july.provider, "tavily");
+  assert.equal(august.provider, "doubao");
+  assert.equal(august.monthly_quota.used, 1);
+  assert.equal(calls.filter((url) => url.includes("volces.com")).length, 1);
+  assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).period, "2026-08");
+  await readFile(
+    path.join(`${quotaFile}.reservations`, "2026-08", "slot-001.json"),
+    "utf8",
+  );
+});
+
 test("concurrent searches cannot reserve more than the final Doubao monthly slot", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "pi-doubao-concurrent-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -434,6 +495,267 @@ test("concurrent searches cannot reserve more than the final Doubao monthly slot
   assert.equal(calls.filter((url) => url.includes("volces.com")).length, 1);
   assert.equal(calls.filter((url) => url.includes("tavily.com")).length, 1);
   assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).used, 500);
+});
+
+test("an exhausted reservation repairs a stale quota summary before fallback", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-doubao-summary-repair-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const quotaFile = path.join(directory, "usage.json");
+  await writeFile(quotaFile, JSON.stringify({
+    version: 1,
+    period: "2026-07",
+    used: 499,
+  }));
+  const runner = createWebSearchRunner({
+    env: {
+      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_TAVILY_API_KEY: "tavily-key",
+    },
+    doubaoQuotaFilePath: quotaFile,
+    now: () => new Date("2026-07-29T08:00:00+08:00"),
+    fetchImpl: async (url) => jsonResponse(
+      url.includes("volces.com")
+        ? {
+            output: [{
+              type: "web_search_call",
+              action: {
+                sources: [{
+                  title: "Doubao result",
+                  url: "https://example.com/doubao",
+                }],
+              },
+            }],
+          }
+        : {
+            results: [{
+              title: "Tavily result",
+              url: "https://example.com/tavily",
+              content: "Fallback",
+            }],
+          },
+    ),
+  });
+
+  assert.equal((await runner.runWebSearch("claim final slot")).provider, "doubao");
+  await writeFile(quotaFile, JSON.stringify({
+    version: 1,
+    period: "2026-07",
+    used: 499,
+  }));
+  assert.equal((await runner.runWebSearch("repair stale summary")).provider, "tavily");
+  assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).used, 500);
+});
+
+test("separate processes cannot reserve more than the final Doubao monthly slot", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-doubao-process-reservation-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const quotaFile = path.join(directory, "usage.json");
+  await writeFile(quotaFile, JSON.stringify({
+    version: 1,
+    period: "2026-07",
+    used: 499,
+  }));
+  await writeFile(`${quotaFile}.lock`, JSON.stringify({
+    pid: 2_147_483_647,
+    token: "abandoned-legacy-lock",
+  }));
+  const moduleUrl = new URL("./externalRetrieval.js", import.meta.url).href;
+  const workerScript = `
+    import { createWebSearchRunner } from ${JSON.stringify(moduleUrl)};
+    const [quotaFilePath, workerId] = process.argv.slice(1);
+    process.stdout.write("READY\\n");
+    await new Promise((resolve) => process.stdin.once("data", resolve));
+    const runner = createWebSearchRunner({
+      env: {
+        PI_DOUBAO_API_KEY: "doubao-key",
+        PI_TAVILY_API_KEY: "tavily-key",
+      },
+      doubaoQuotaFilePath: quotaFilePath,
+      now: () => new Date("2026-07-29T08:00:00+08:00"),
+      fetchImpl: async (url) => new Response(JSON.stringify(
+        url.includes("volces.com")
+          ? {
+              output: [{
+                type: "web_search_call",
+                action: {
+                  sources: [{
+                    title: "Doubao result",
+                    url: "https://example.com/doubao-" + workerId,
+                  }],
+                },
+              }],
+            }
+          : {
+              results: [{
+                title: "Tavily result",
+                url: "https://example.com/tavily-" + workerId,
+                content: "Fallback",
+              }],
+            }
+      ), { headers: { "content-type": "application/json" } }),
+    });
+    const result = await runner.runWebSearch("worker query " + workerId);
+    process.stdout.write("RESULT:" + result.provider + "\\n");
+  `;
+  const workers = Array.from({ length: 4 }, (_, index) => {
+    const child = spawn(
+      process.execPath,
+      ["--input-type=module", "--eval", workerScript, quotaFile, String(index)],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    let readySettled = false;
+    const ready = new Promise((resolve, reject) => {
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+        if (!readySettled && stdout.includes("READY\n")) {
+          readySettled = true;
+          resolve();
+        }
+      });
+      child.once("error", reject);
+      child.once("close", (code) => {
+        if (!readySettled) reject(new Error(`quota worker exited before ready: ${code}`));
+      });
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    const result = new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code) => {
+        if (code !== 0) {
+          reject(new Error(`quota worker failed (${code}): ${stderr}`));
+          return;
+        }
+        const provider = stdout.match(/RESULT:(doubao|tavily)/)?.[1];
+        if (!provider) {
+          reject(new Error(`quota worker returned no provider: ${stdout}`));
+          return;
+        }
+        resolve(provider);
+      });
+    });
+    return { child, ready, result };
+  });
+  t.after(() => {
+    for (const { child } of workers) child.kill();
+  });
+
+  await Promise.all(workers.map(({ ready }) => ready));
+  for (const { child } of workers) child.stdin.end("go\n");
+  const providers = await Promise.all(workers.map(({ result }) => result));
+
+  assert.equal(providers.filter((provider) => provider === "doubao").length, 1);
+  assert.equal(providers.filter((provider) => provider === "tavily").length, 3);
+  assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).used, 500);
+  await readFile(
+    path.join(`${quotaFile}.reservations`, "2026-07", "slot-500.json"),
+    "utf8",
+  );
+});
+
+test("a process crash after claiming the final slot cannot reopen it", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-doubao-crash-reservation-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const quotaFile = path.join(directory, "usage.json");
+  await writeFile(quotaFile, JSON.stringify({
+    version: 1,
+    period: "2026-07",
+    used: 499,
+  }));
+  const moduleUrl = new URL("./externalRetrieval.js", import.meta.url).href;
+  const workerScript = `
+    import { createWebSearchRunner } from ${JSON.stringify(moduleUrl)};
+    const quotaFilePath = process.argv[1];
+    const runner = createWebSearchRunner({
+      env: { PI_DOUBAO_API_KEY: "doubao-key" },
+      doubaoQuotaFilePath: quotaFilePath,
+      now: () => new Date("2026-07-29T08:00:00+08:00"),
+      fetchImpl: async () => process.exit(0),
+    });
+    await runner.runWebSearch("claim then crash");
+  `;
+  const child = spawn(
+    process.execPath,
+    ["--input-type=module", "--eval", workerScript, quotaFile],
+    { stdio: ["ignore", "ignore", "pipe"] },
+  );
+  t.after(() => child.kill());
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`quota crash worker failed (${code}): ${stderr}`));
+    });
+  });
+
+  const calls = [];
+  const runner = createWebSearchRunner({
+    env: {
+      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_TAVILY_API_KEY: "tavily-key",
+    },
+    doubaoQuotaFilePath: quotaFile,
+    now: () => new Date("2026-07-29T08:00:00+08:00"),
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return jsonResponse({
+        results: [{
+          title: "Tavily result",
+          url: "https://example.com/tavily-after-crash",
+          content: "Fallback",
+        }],
+      });
+    },
+  });
+  const result = await runner.runWebSearch("after crash");
+
+  assert.equal(result.provider, "tavily");
+  assert.equal(calls.filter((url) => url.includes("volces.com")).length, 0);
+  assert.equal(calls.filter((url) => url.includes("tavily.com")).length, 1);
+  assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).used, 500);
+});
+
+test("quota reservation directory failures stay safe and never call Doubao", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-doubao-safe-error-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const quotaFile = path.join(directory, "usage.json");
+  await writeFile(quotaFile, JSON.stringify({
+    version: 1,
+    period: "2026-07",
+    used: 0,
+  }));
+  await writeFile(`${quotaFile}.reservations`, "not a directory");
+  let fetchCalls = 0;
+  const runner = createWebSearchRunner({
+    env: { PI_DOUBAO_API_KEY: "doubao-key" },
+    doubaoQuotaFilePath: quotaFile,
+    now: () => new Date("2026-07-29T08:00:00+08:00"),
+    fetchImpl: async () => {
+      fetchCalls += 1;
+      return jsonResponse({});
+    },
+  });
+
+  await assert.rejects(
+    () => runner.runWebSearch("safe quota error"),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE");
+      assert.equal(error.message, "无法初始化豆包月度搜索额度");
+      assert.doesNotMatch(error.message, new RegExp(directory));
+      return true;
+    },
+  );
+  assert.equal(fetchCalls, 0);
 });
 
 test("search_web has a hard timeout and returns a bounded safe error", async () => {

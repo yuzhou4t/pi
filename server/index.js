@@ -2658,11 +2658,74 @@ export function createApiServer({
       sendJson(
         response,
         200,
-        await journalWorkflowService.getVenueSearchConversation(),
+        await journalWorkflowService.getVenueSearchConversation(
+          url.searchParams.get("conversation_id") || null,
+        ),
         origin,
       );
     } catch (error) {
       sendWorkflowError(response, error, origin, "无法读取主题检索记录");
+    }
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/v1/venue-search/conversations") {
+    try {
+      sendJson(
+        response,
+        200,
+        await journalWorkflowService.listVenueSearchConversations(),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法读取主题检索会话列表");
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/v1/venue-search/conversations") {
+    try {
+      requireJournalMutationOrigin(origin);
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      const allowedKeys = ["schema_version", "title"];
+      if (
+        body?.schema_version !== 1
+        || (body.title != null && typeof body.title !== "string")
+        || Object.keys(body).some((key) => !allowedKeys.includes(key))
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "新建检索会话的请求无效", 400);
+      }
+      sendJson(
+        response,
+        200,
+        await journalWorkflowService.createVenueSearchConversation({ title: body.title ?? null }),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法新建主题检索会话");
+    }
+    return;
+  }
+
+  const venueConversationMatch = url.pathname.match(
+    /^\/api\/v1\/venue-search\/conversations\/([^/]+)$/,
+  );
+  if (request.method === "DELETE" && venueConversationMatch) {
+    try {
+      requireJournalMutationOrigin(origin);
+      sendJson(
+        response,
+        200,
+        await journalWorkflowService.deleteVenueSearchConversation(
+          decodeURIComponent(venueConversationMatch[1]),
+        ),
+        origin,
+      );
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法删除主题检索会话");
     }
     return;
   }
@@ -2676,6 +2739,7 @@ export function createApiServer({
       const body = await readJson(request);
       const allowedKeys = [
         "schema_version",
+        "conversation_id",
         "question",
         "provider_id",
         "model_id",
@@ -2690,6 +2754,7 @@ export function createApiServer({
         throw new CandidateSummaryError("INVALID_REQUEST", "主题检索请求版本或字段无效", 400);
       }
       const conversation = await journalWorkflowService.submitVenueSearchTurn({
+        conversationId: body.conversation_id ?? null,
         question: body.question,
         providerId: body.provider_id,
         modelId: body.model_id,
@@ -2710,7 +2775,7 @@ export function createApiServer({
         throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
       }
       const body = await readJson(request);
-      const allowedKeys = ["schema_version", "turn_id", "paper_ids", "client_request_id"];
+      const allowedKeys = ["schema_version", "conversation_id", "turn_id", "paper_ids", "client_request_id"];
       if (
         body?.schema_version !== 1
         || typeof body?.turn_id !== "string"
@@ -2720,6 +2785,7 @@ export function createApiServer({
         throw new CandidateSummaryError("INVALID_REQUEST", "加入本周推荐的请求无效", 400);
       }
       const result = await journalWorkflowService.addVenueSearchPapersToWeekly({
+        conversationId: body.conversation_id ?? null,
         turnId: body.turn_id,
         paperIds: body.paper_ids,
       });

@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import {
   CircleNotch,
+  Globe,
   MagnifyingGlass,
   PaperPlaneRight,
+  Plus,
   SidebarSimple,
 } from "@phosphor-icons/react";
 import { ProviderMenu } from "./ProviderMenu.jsx";
@@ -104,6 +106,26 @@ function TurnCard({
           {addError ? <p className="topic-search-error" role="alert">{addError}</p> : null}
         </div>
       ) : null}
+      {turn.web?.results?.length > 0 ? (
+        <div className="topic-search-web">
+          <p className="topic-search-web-title">
+            <Globe size={14} weight="regular" aria-hidden="true" />
+            联网发现 · 参考（不进入本周推荐）
+          </p>
+          <ul className="topic-search-web-list">
+            {turn.web.results.map((item) => (
+              <li key={item.url}>
+                <a href={item.url} target="_blank" rel="noreferrer noopener">
+                  {item.title}
+                </a>
+                {item.excerpt ? <p>{item.excerpt.slice(0, 160)}</p> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : turn.web?.status === "failed" ? (
+        <p className="topic-search-web-note">联网发现暂不可用，本次仅展示注册刊物结果。</p>
+      ) : null}
     </article>
   );
 }
@@ -112,6 +134,7 @@ export function TopicSearchWorkspace({
   conversationState,
   onSubmitQuestion,
   onAddToWeekly,
+  onNewConversation,
   submitting,
   submitError,
   addingTurnId,
@@ -173,11 +196,22 @@ export function TopicSearchWorkspace({
               <SidebarSimple size={18} weight="regular" />
             </button>
             <div>
-              <span className="workflow-kicker">在注册刊物范围内检索</span>
-              <h1>主题检索</h1>
+              <span className="workflow-kicker">注册刊物 + 联网检索</span>
+              <h1>{conversationState.conversation?.title || "主题检索"}</h1>
             </div>
           </div>
           <div className="workflow-run-meta" aria-label="模型选择">
+            {onNewConversation ? (
+              <button
+                type="button"
+                className="topic-search-new"
+                onClick={onNewConversation}
+                title="新建检索会话"
+              >
+                <Plus size={14} weight="bold" aria-hidden="true" />
+                新建检索
+              </button>
+            ) : null}
             {providers ? (
               <ProviderMenu
                 open={providerOpen}
@@ -210,7 +244,7 @@ export function TopicSearchWorkspace({
         {conversationState.status === "ready" && turns.length === 0 && !submitting ? (
           <div className="topic-search-empty">
             <MagnifyingGlass size={22} weight="regular" aria-hidden="true" />
-            <p>用自然语言描述想找的内容，会在 11 个注册期刊与会议范围内检索并给出推荐。</p>
+            <p>用自然语言描述想找的内容，会在注册期刊与会议内检索，并联网补充更广的参考发现。</p>
             <small>例如：「有什么关于 LLM Agent 长期记忆的最新论文？」</small>
           </div>
         ) : null}
@@ -228,7 +262,7 @@ export function TopicSearchWorkspace({
         {submitting ? (
           <p className="topic-search-hint" role="status">
             <CircleNotch className="spin" size={15} weight="bold" aria-hidden="true" />
-            正在检索注册刊物并整理推荐…
+            正在检索注册刊物与联网并整理推荐…
           </p>
         ) : null}
         {submitError ? (

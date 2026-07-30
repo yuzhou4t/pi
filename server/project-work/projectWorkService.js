@@ -44,6 +44,10 @@ import { resolveProjectWorkTurn } from "./projectWorkWorkflows.js";
 import { createMacOSProjectPicker } from "./macosProjectPicker.js";
 import { normalizeProjectWorkImages } from "./projectWorkImages.js";
 import {
+  resolveProjectWorkDoubaoQuotaFilePath,
+  resolveProjectWorkStorageRoot,
+} from "./projectWorkPaths.js";
+import {
   bindProjectWorkMessageAttachments,
   createConversationAttachmentService,
   projectWorkAttachmentManifestPrompt,
@@ -1718,15 +1722,6 @@ function safeFolderName(value) {
   return name;
 }
 
-function defaultStorageRoot() {
-  if (process.env.PI_PROJECT_WORK_STORAGE_ROOT) {
-    return path.resolve(process.env.PI_PROJECT_WORK_STORAGE_ROOT);
-  }
-  return process.platform === "darwin"
-    ? path.join(homedir(), "Library", "Application Support", "Pi Agent", "project-work")
-    : path.join(homedir(), ".local", "share", "pi-agent", "project-work");
-}
-
 function defaultDocumentParser() {
   const token = String(process.env.PI_MINERU_API_TOKEN ?? "").trim();
   return token
@@ -2034,7 +2029,7 @@ export function aggregateProjectWorkUsage({
 }
 
 export function createProjectWorkService({
-  storageRoot = defaultStorageRoot(),
+  storageRoot = resolveProjectWorkStorageRoot(),
   sessionFactory,
   documentParser = defaultDocumentParser(),
   documentPollIntervalMs = defaultDocumentPollInterval(),
@@ -2058,10 +2053,9 @@ export function createProjectWorkService({
     ?? createSkillPackageService({ storageRoot: configuredStorageRoot });
   const effectiveSessionFactory = sessionFactory ?? createPiSessionFactory({
     externalRetrievalOptions: {
-      doubaoQuotaFilePath: path.join(
-        configuredStorageRoot,
-        "external-retrieval-usage.json",
-      ),
+      doubaoQuotaFilePath: resolveProjectWorkDoubaoQuotaFilePath({
+        storageRoot: configuredStorageRoot,
+      }),
       now,
     },
     imageGenerationProbe: () => probeCodexImageGeneration(),

@@ -63,7 +63,10 @@ import {
 } from "./api/journalRuns.js";
 import {
   addVenueSearchPapersToWeekly,
+  createVenueSearchConversation,
+  deleteVenueSearchConversation,
   fetchVenueSearchConversation,
+  fetchVenueSearchConversations,
   submitVenueSearchTurn,
 } from "./api/venueSearch.js";
 import { getModelDisplayName, providers, skillCatalog } from "./data.js";
@@ -508,6 +511,11 @@ export function App() {
     conversation: null,
     error: null,
   });
+  const [topicConversations, setTopicConversations] = useState([]);
+  const [activeTopicConversationId, setActiveTopicConversationId] = usePersistentState(
+    "pi-agent-topic-conversation-v1",
+    "",
+  );
   const [topicSearchSubmitting, setTopicSearchSubmitting] = useState(false);
   const [topicSearchSubmitError, setTopicSearchSubmitError] = useState(null);
   const [topicSearchAddingTurnId, setTopicSearchAddingTurnId] = useState(null);
@@ -1802,17 +1810,38 @@ export function App() {
     topicSearchLoadedRef.current = true;
     const controller = new AbortController();
     setTopicSearchState({ status: "loading", conversation: null, error: null });
-    fetchVenueSearchConversation({ signal: controller.signal })
-      .then((conversation) => {
-        setTopicSearchState({ status: "ready", conversation, error: null });
-      })
-      .catch((error) => {
-        if (controller.signal.aborted) return;
-        topicSearchLoadedRef.current = false;
-        setTopicSearchState({ status: "error", conversation: null, error: error.message });
+    (async () => {
+      const list = await fetchVenueSearchConversations({ signal: controller.signal });
+      if (controller.signal.aborted) return;
+      setTopicConversations(list.conversations);
+      const persisted = activeTopicConversationId
+        && list.conversations.some((item) => item.id === activeTopicConversationId)
+        ? activeTopicConversationId
+        : (list.activeConversationId ?? list.conversations[0]?.id ?? null);
+      setActiveTopicConversationId(persisted ?? "");
+      const conversation = await fetchVenueSearchConversation({
+        conversationId: persisted ?? undefined,
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) return;
+      setTopicSearchState({ status: "ready", conversation, error: null });
+    })().catch((error) => {
+      if (controller.signal.aborted) return;
+      topicSearchLoadedRef.current = false;
+      setTopicSearchState({ status: "error", conversation: null, error: error.message });
+    });
     return () => controller.abort();
   }, [topicSearchMode]);
+
+  const refreshTopicConversations = useCallback(async () => {
+    try {
+      const list = await fetchVenueSearchConversations();
+      setTopicConversations(list.conversations);
+      return list;
+    } catch {
+      return null;
+    }
+  }, []);
 
   const openTopicSearch = useCallback(() => {
     setReaderTarget(null);
@@ -1820,29 +1849,92 @@ export function App() {
     setMobileView("run");
   }, [setActiveConversationId]);
 
+  const selectTopicConversation = useCallback(async (conversationId) => {
+    setActiveTopicConversationId(conversationId);
+    setActiveConversationId("topic-search");
+    setReaderTarget(null);
+    setMobileView("run");
+    setTopicSearchState({ status: "loading", conversation: null, error: null });
+    try {
+      const conversation = await fetchVenueSearchConversation({ conversationId });
+      setTopicSearchState({ status: "ready", conversation, error: null });
+    } catch (error) {
+      setTopicSearchState({ status: "error", conversation: null, error: error.message });
+    }
+  }, [setActiveConversationId, setActiveTopicConversationId]);
+
+  const createTopicConversation = useCallback(async () => {
+    setActiveConversationId("topic-search");
+    setReaderTarget(null);
+    setMobileView("run");
+    try {
+      const conversation = await createVenueSearchConversation();
+      setActiveTopicConversationId(conversation.conversationId ?? "");
+      setTopicSearchState({ status: "ready", conversation, error: null });
+      await refreshTopicConversations();
+    } catch (error) {
+      showToast(error.message);
+    }
+  }, [refreshTopicConversations, setActiveConversationId, setActiveTopicConversationId, showToast]);
+
+  const deleteTopicConversation = useCallback(async (conversationId) => {
+    try {
+      const list = await deleteVenueSearchConversation({ conversationId });
+      setTopicConversations(list.conversations);
+      if (activeTopicConversationId === conversationId) {
+        const nextId = list.activeConversationId ?? list.conversations[0]?.id ?? null;
+        setActiveTopicConversationId(nextId ?? "");
+        const conversation = await fetchVenueSearchConversation({
+          conversationId: nextId ?? undefined,
+        });
+        setTopicSearchState({ status: "ready", conversation, error: null });
+      }
+      showToast("已删除该检索会话");
+    } catch (error) {
+      showToast(error.message);
+    }
+  }, [activeTopicConversationId, setActiveTopicConversationId, showToast]);
+
   const submitTopicSearchQuestion = useCallback(async (question) => {
     setTopicSearchSubmitting(true);
     setTopicSearchSubmitError(null);
     try {
       const conversation = await submitVenueSearchTurn({
+        conversationId: activeTopicConversationId || undefined,
         question,
         providerId: selectedProvider?.id,
         modelId: selectedModel,
         thinkingLevel: journalSupportsThinking ? activeJournalThinkingLevel : null,
       });
       setTopicSearchState({ status: "ready", conversation, error: null });
+      if (conversation.conversationId) {
+        setActiveTopicConversationId(conversation.conversationId);
+      }
+      await refreshTopicConversations();
     } catch (error) {
       setTopicSearchSubmitError(error.message);
     } finally {
       setTopicSearchSubmitting(false);
     }
-  }, [selectedModel, selectedProvider?.id, journalSupportsThinking, activeJournalThinkingLevel]);
+  }, [
+    activeTopicConversationId,
+    selectedModel,
+    selectedProvider?.id,
+    journalSupportsThinking,
+    activeJournalThinkingLevel,
+    refreshTopicConversations,
+    setActiveTopicConversationId,
+  ]);
 
   const addTopicSearchPapers = useCallback(async (turnId, paperIds) => {
     setTopicSearchAddingTurnId(turnId);
     setTopicSearchAddErrors((current) => ({ ...current, [turnId]: null }));
     try {
-      const result = await addVenueSearchPapersToWeekly({ turnId, paperIds });
+      const result = await addVenueSearchPapersToWeekly({
+        conversationId: activeTopicConversationId || undefined,
+        turnId,
+        paperIds,
+      });
       setTopicSearchState({ status: "ready", conversation: result.conversation, error: null });
       syncJournalRun(result.run);
       showToast("已加入本周推荐，可从每周追踪准备全文");
@@ -1851,7 +1943,7 @@ export function App() {
     } finally {
       setTopicSearchAddingTurnId(null);
     }
-  }, [showToast, syncJournalRun]);
+  }, [activeTopicConversationId, showToast, syncJournalRun]);
 
   const retryPaperDocument = useCallback(async (paperId) => {
     const runId = journalRunState.run?.id;
@@ -3153,6 +3245,11 @@ export function App() {
             && project.id === workflowFixture.project.id
             ? openTopicSearch
             : undefined}
+          topicConversations={topicConversations}
+          activeTopicConversationId={activeTopicConversationId}
+          onSelectTopicConversation={selectTopicConversation}
+          onCreateTopicConversation={createTopicConversation}
+          onDeleteTopicConversation={deleteTopicConversation}
           providers={journalProviders}
           providerId={selectedProvider.id}
           model={selectedModel}
@@ -3296,6 +3393,7 @@ export function App() {
             conversationState={topicSearchState}
             onSubmitQuestion={submitTopicSearchQuestion}
             onAddToWeekly={addTopicSearchPapers}
+            onNewConversation={createTopicConversation}
             submitting={topicSearchSubmitting}
             submitError={topicSearchSubmitError}
             addingTurnId={topicSearchAddingTurnId}
