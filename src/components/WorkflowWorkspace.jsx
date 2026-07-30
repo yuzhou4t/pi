@@ -657,6 +657,72 @@ function PaperTabs({ papers, activePaperId, onSetActivePaper }) {
   );
 }
 
+function pastRunWeekLabel(run) {
+  const date = String(run.createdAt ?? "").slice(0, 10);
+  return date ? `${date} 那周` : "早先周次";
+}
+
+function pastDecisionLabel(decision) {
+  if (decision === "read") return "已精读";
+  if (decision === "collect") return "已收藏";
+  return "未处理";
+}
+
+function PastWeeksReview({ pastRuns }) {
+  const [open, setOpen] = useState(false);
+  if (!Array.isArray(pastRuns) || pastRuns.length === 0) return null;
+  return (
+    <section className="workflow-past-weeks" aria-label="往周推荐回看">
+      <button
+        type="button"
+        className="workflow-evidence-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {open ? "收起往周推荐" : `回看往周推荐（${pastRuns.length} 周）`}
+      </button>
+      {open ? (
+        <div className="workflow-past-weeks-list">
+          {pastRuns.map((pastRun) => {
+            const decisions = pastRun.paperDecisions ?? {};
+            const candidates = pastRun.candidates ?? [];
+            const handledCount = candidates.filter(
+              (paper) => ["read", "collect"].includes(decisions[paper.id]),
+            ).length;
+            return (
+              <article className="workflow-past-week" key={pastRun.id}>
+                <header>
+                  <strong>{pastRunWeekLabel(pastRun)}</strong>
+                  <small>{candidates.length} 篇推荐 · 处理 {handledCount} 篇</small>
+                </header>
+                <ul>
+                  {candidates.map((paper) => {
+                    const decision = decisions[paper.id];
+                    const date = String(paper.publishedAt ?? "").slice(0, 10);
+                    return (
+                      <li key={`${pastRun.id}-${paper.id}`}>
+                        <span className="workflow-past-paper-title">
+                          {paper.titleZh && paper.titleZh !== paper.title ? paper.titleZh : paper.title}
+                        </span>
+                        <small>
+                          {[paper.venue, date ? `发表于 ${date}` : null].filter(Boolean).join(" · ")}
+                        </small>
+                        <em className={decision ? `is-${decision}` : "is-unread"}>
+                          {pastDecisionLabel(decision)}
+                        </em>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </article>
+            );
+          })}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function CandidateReview({
   run,
   papers,
@@ -670,6 +736,7 @@ function CandidateReview({
   onStartJournalRun,
   onResumeJournalRun,
   onRetryPaperDocument,
+  pastRuns = [],
   readOnly = false,
   readOnlyQuiet = false,
 }) {
@@ -870,6 +937,7 @@ function CandidateReview({
             const evidenceExpanded = expandedEvidenceId === paper.id;
             const mineru = mineruDisplay(paper.mineruStatus, paper.mineruRunStatus);
             const canOpenFullText = paper.isDemo === false && paper.mineruStatus === "ready";
+            const publishedDate = String(paper.publishedAt ?? paper.published_at ?? "").slice(0, 10);
             return (
               <article className={`workflow-candidate${selected ? " is-selected" : ""}`} key={paper.id}>
                 <label className="workflow-candidate-select">
@@ -887,10 +955,16 @@ function CandidateReview({
                 </label>
                 <div className="workflow-candidate-main">
                   <div className="workflow-candidate-title-row">
-                    <h3>{paper.title}</h3>
+                    <h3>{paper.titleZh && paper.titleZh !== paper.title ? paper.titleZh : paper.title}</h3>
                     <span className="workflow-recommendation-badge">{paper.recommendation}</span>
                   </div>
-                  <p className="workflow-authors">{Array.isArray(paper.authors) ? paper.authors.join("、") : paper.authors}</p>
+                  {paper.titleZh && paper.titleZh !== paper.title ? (
+                    <p className="workflow-candidate-original-title">{paper.title}</p>
+                  ) : null}
+                  <p className="workflow-authors">
+                    {Array.isArray(paper.authors) ? paper.authors.join("、") : paper.authors}
+                    {publishedDate ? <span className="workflow-published-date"> · 发表于 {publishedDate}</span> : null}
+                  </p>
                   {paper.isDemo === false ? (
                     <p className="workflow-paper-status-row">
                       <span className={paper.isNew === false || paper.publishedThisWeek === false ? "is-classic" : "is-new"}>
@@ -971,6 +1045,8 @@ function CandidateReview({
           })}
         </div>
       </div>
+
+      {readOnly ? null : <PastWeeksReview pastRuns={pastRuns} />}
 
       {readOnly && readOnlyQuiet ? null : (
         <footer className="workflow-stage-actions">
@@ -2022,6 +2098,7 @@ export function WorkflowWorkspace({
   candidateSummaryState,
   onGenerateCandidateSummaries,
   journalRunState,
+  pastRuns = [],
   guideState,
   readerTarget,
   onOpenPaper,
@@ -2188,7 +2265,7 @@ export function WorkflowWorkspace({
         : JOURNAL_PHASE_LABELS[journalRunState?.run?.phase];
 
   let content = null;
-  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onResumeJournalRun={onResumeJournalRun} onRetryPaperDocument={onRetryPaperDocument} />;
+  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onResumeJournalRun={onResumeJournalRun} onRetryPaperDocument={onRetryPaperDocument} pastRuns={pastRuns} />;
   if (status === "preparing_guides") {
     content = <PreparingGuides run={run} selectedPapers={selectedPapers} journalRunState={journalRunState} />;
   }

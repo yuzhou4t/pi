@@ -67,6 +67,7 @@ function validateRanking(value, papers) {
   const ranks = new Set();
   const normalized = value.items.map((item) => {
     const paperId = typeof item?.paper_id === "string" ? item.paper_id.trim() : "";
+    const titleZh = typeof item?.title_zh === "string" ? item.title_zh.trim() : "";
     const selectionSummary = typeof item?.selection_summary === "string" ? item.selection_summary.trim() : "";
     const projectImpact = typeof item?.project_impact === "string" ? item.project_impact.trim() : "";
     if (
@@ -76,6 +77,8 @@ function validateRanking(value, papers) {
       || item.rank < 1
       || item.rank > expectedCount
       || ranks.has(item.rank)
+      || titleZh.length < 2
+      || titleZh.length > 160
       || selectionSummary.length < 12
       || selectionSummary.length > 220
       || projectImpact.length < 4
@@ -88,6 +91,7 @@ function validateRanking(value, papers) {
     return {
       ...byId.get(paperId),
       rank: item.rank,
+      title_zh: titleZh,
       selection_summary: selectionSummary,
       project_impact: projectImpact,
     };
@@ -99,6 +103,7 @@ export function deterministicCandidateRanking(papers) {
   return prepareRankingPool(papers, 5).map((paper, index) => ({
     ...paper,
     rank: index + 1,
+    title_zh: paper.title_zh ?? null,
     selection_summary: compact(
       paper.selection_summary
         || paper.abstract

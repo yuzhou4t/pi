@@ -4680,6 +4680,38 @@ h4.reader-rail-full-heading {
   color: var(--text);
   font-size: 14.5px;
   line-height: 1.75;
+  animation: reader-agent-answer-in 0.28s ease both;
+}
+
+@keyframes reader-agent-answer-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.reader-agent-thinking {
+  margin-top: 6px;
+  display: grid;
+  gap: 5px;
+}
+
+.reader-agent-thinking-summary {
+  margin: 0;
+  padding: 7px 10px;
+  border-left: 2px solid rgba(15, 118, 110, 0.35);
+  background: rgba(15, 118, 110, 0.05);
+  border-radius: 0 8px 8px 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  animation: reader-agent-answer-in 0.24s ease both;
 }
 
 .reader-agent-answer p,
@@ -14034,6 +14066,105 @@ h4.reader-rail-full-heading {
 .project-topic-open {
   flex: 1;
   min-width: 0;
+}
+
+.project-topic-caret {
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--muted);
+}
+
+.workflow-candidate-original-title {
+  margin: -2px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.workflow-published-date {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.topic-search-paper-original {
+  display: block;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.workflow-past-weeks {
+  margin-top: 14px;
+  display: grid;
+  gap: 10px;
+  justify-items: start;
+}
+
+.workflow-past-weeks-list {
+  width: 100%;
+  display: grid;
+  gap: 10px;
+}
+
+.workflow-past-week {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 10px 12px;
+}
+
+.workflow-past-week header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.workflow-past-week header small {
+  color: var(--muted);
+}
+
+.workflow-past-week ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.workflow-past-week li {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "title decision"
+    "meta decision";
+  column-gap: 10px;
+  align-items: center;
+}
+
+.workflow-past-paper-title {
+  grid-area: title;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.workflow-past-week li small {
+  grid-area: meta;
+  color: var(--muted);
+}
+
+.workflow-past-week li em {
+  grid-area: decision;
+  font-style: normal;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.workflow-past-week li em.is-read,
+.workflow-past-week li em.is-collect {
+  color: var(--accent);
 }
 
 .project-topic-new {

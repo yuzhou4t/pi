@@ -342,6 +342,7 @@ test("live mode uses the model for plan and recommendation and falls back on mod
             answer: "这批命中论文覆盖了 Agent 评估的核心问题，建议优先读第一篇。",
             recommendations: [{
               paper_id: "p1",
+              title_zh: "面向可验证 Agent 评估的系统化协议",
               reason: "系统化提出了可验证的 Agent 评估协议，与你的问题直接对应。",
               project_impact: "可作为项目评估阶段的方法参照。",
             }],

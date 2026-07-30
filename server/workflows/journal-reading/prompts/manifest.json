@@ -6,7 +6,7 @@
     "file": "system.v1.md"
   },
   "active": {
-    "candidate-ranking": "candidate-ranking.v1",
+    "candidate-ranking": "candidate-ranking.v2",
     "candidate-summary": "candidate-summary.v2",
     "five-minute-guide": "five-minute-guide.v3",
     "research-question": "research-question.v2",
@@ -17,12 +17,16 @@
     "reading-chat": "reading-chat.v4",
     "translation": "translation.v1",
     "venue-search-plan": "venue-search-plan.v1",
-    "venue-search-recommend": "venue-search-recommend.v1"
+    "venue-search-recommend": "venue-search-recommend.v2"
   },
   "versions": {
     "candidate-ranking.v1": {
       "file": "candidate-ranking.v1.md",
       "schema": "ranking.v1.json"
+    },
+    "candidate-ranking.v2": {
+      "file": "candidate-ranking.v2.md",
+      "schema": "ranking.v2.json"
     },
     "candidate-summary.v2": {
       "file": "candidate-summary.v2.md",
@@ -115,6 +119,10 @@
     "venue-search-recommend.v1": {
       "file": "venue-search-recommend.v1.md",
       "schema": "venue-search-recommend.v1.json"
+    },
+    "venue-search-recommend.v2": {
+      "file": "venue-search-recommend.v2.md",
+      "schema": "venue-search-recommend.v2.json"
     }
   }
 }

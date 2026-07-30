@@ -708,6 +708,57 @@ export function createReadingService({
   const chatRequestInFlight = new Map();
   const chatGenerationInFlight = new Map();
   const chatMemoryCache = new Map();
+  // 运行中对话回合的实时思考进度（仅内存，供前端轮询）。
+  const chatProgress = new Map();
+  const CHAT_PROGRESS_TTL_MS = 5 * 60 * 1000;
+
+  function chatProgressKey(runId, paperId, clientRequestId) {
+    return `${runId}:${paperId}:${clientRequestId}`;
+  }
+
+  function pruneChatProgress() {
+    const cutoff = Date.now() - CHAT_PROGRESS_TTL_MS;
+    for (const [key, value] of chatProgress) {
+      if (value.updated_at_ms < cutoff) chatProgress.delete(key);
+    }
+  }
+
+  function setChatProgress(runId, paperId, clientRequestId, patch) {
+    if (!clientRequestId) return;
+    pruneChatProgress();
+    const key = chatProgressKey(runId, paperId, clientRequestId);
+    const previous = chatProgress.get(key) ?? {};
+    chatProgress.set(key, {
+      phase: patch.phase ?? previous.phase ?? "preparing",
+      thinking: patch.thinking ?? previous.thinking ?? null,
+      status: patch.status ?? previous.status ?? "running",
+      updated_at_ms: Date.now(),
+    });
+  }
+
+  function getChatProgress(runId, paperId, clientRequestId) {
+    pruneChatProgress();
+    const value = chatProgress.get(chatProgressKey(runId, paperId, clientRequestId));
+    if (!value) return { phase: "unknown", thinking: null, status: "unknown" };
+    return { phase: value.phase, thinking: value.thinking, status: value.status };
+  }
+
+  // 把模型通道的公开事件映射为面向人的阶段。
+  function chatProgressFromModelEvent(event) {
+    switch (event?.type) {
+      case "model_queued":
+        return { phase: "queued" };
+      case "model_started":
+      case "model_connected":
+        return { phase: "connecting" };
+      case "thinking_summary":
+        return { phase: "thinking", thinking: event.text ?? null };
+      case "answer_ready":
+        return { phase: "composing" };
+      default:
+        return null;
+    }
+  }
 
   async function update(runId, patch, event) {
     const run = await runStore.updateRun(runId, patch);
@@ -1903,6 +1954,7 @@ export function createReadingService({
     providerId,
     modelId,
     reasoningEffort = null,
+    onEvent = null,
   }) {
     const scopedProviders = reasoningEffort && typeof modelProviders?.completeStructured === "function"
       ? {
@@ -1919,6 +1971,7 @@ export function createReadingService({
       modelId,
       modelProviders: scopedProviders,
       modelMode,
+      ...(typeof onEvent === "function" ? { onEvent } : {}),
     });
     const artifactBase = {
       schema_version: 1,
@@ -2214,6 +2267,7 @@ export function createReadingService({
     });
     started = true;
 
+    setChatProgress(runId, paperId, requestId, { phase: "preparing", status: "running" });
     try {
       const { artifact, cacheWriteFailed } = await getOrGenerateChatArtifact({
         runId,
@@ -2225,6 +2279,10 @@ export function createReadingService({
         reasoningEffort: providerId === "codex-subscription"
           ? codexReasoningEffortFromThinking(thinkingLevel)
           : null,
+        onEvent: (event) => {
+          const patch = chatProgressFromModelEvent(event);
+          if (patch) setChatProgress(runId, paperId, requestId, patch);
+        },
       });
       const answeredAt = now().toISOString();
       await update(runId, (current) => {
@@ -2257,6 +2315,7 @@ export function createReadingService({
         input_hash: prepared.inputHash,
         cache_write_failed: cacheWriteFailed,
       });
+      setChatProgress(runId, paperId, requestId, { phase: "done", status: "answered" });
       return getReading(runId, paperId);
     } catch (error) {
       if (started) {
@@ -2282,6 +2341,7 @@ export function createReadingService({
           turn_id: turnId,
           error: safeError,
         });
+        setChatProgress(runId, paperId, requestId, { phase: "failed", status: "failed" });
       }
       throw error;
     }
@@ -3233,6 +3293,7 @@ export function createReadingService({
     askQuestion,
     generateStage,
     getReading,
+    getChatProgress,
     pinConclusion,
     promoteConversation,
     restartFromGuide,

@@ -97,11 +97,13 @@ function validateRecommendation(value, papers) {
   const seen = new Set();
   const recommendations = value.recommendations.map((item) => {
     const paperId = compact(item?.paper_id);
+    const titleZh = compact(item?.title_zh, 160);
     const reason = compact(item?.reason);
     const projectImpact = compact(item?.project_impact);
     if (
       !known.has(paperId)
       || seen.has(paperId)
+      || titleZh.length < 2
       || reason.length < 12
       || reason.length > 300
       || projectImpact.length < 4
@@ -110,7 +112,7 @@ function validateRecommendation(value, papers) {
       throw new Error("VENUE_SEARCH_RECOMMENDATIONS_INVALID");
     }
     seen.add(paperId);
-    return { paper_id: paperId, reason, project_impact: projectImpact };
+    return { paper_id: paperId, title_zh: titleZh, reason, project_impact: projectImpact };
   });
   return { answer, recommendations };
 }
@@ -131,6 +133,7 @@ export function deterministicRecommendation(question, papers, webResults = []) {
     answer,
     recommendations: top.map((paper) => ({
       paper_id: paper.paper_id,
+      title_zh: paper.title_zh ?? null,
       reason: compact(
         paper.abstract
           ? `${paper.title}：${paper.abstract}`

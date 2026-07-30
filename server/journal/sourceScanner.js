@@ -1,4 +1,5 @@
 import { buildCandidateBatch } from "./classicFallback.js";
+import { selectResurfaceCandidates } from "./resurfaceCandidates.js";
 import {
   buildSourceScan,
   deduplicatePapers,
@@ -398,8 +399,25 @@ export async function scanJournalSources({
     ),
   })));
   const recentTopicCandidates = topicCandidates.filter((paper) => paper.published_this_week);
+  // 本周新论文不足时，先回补往周未读的推荐，再用经典补位。
+  let resurfacedCandidates = [];
+  if (recentTopicCandidates.length < 5 && typeof runStore.listRuns === "function") {
+    try {
+      const previousRuns = await runStore.listRuns();
+      resurfacedCandidates = selectResurfaceCandidates({
+        previousRuns,
+        currentCandidates: [...recentTopicCandidates, ...topicCandidates],
+        currentRunId: runId,
+        limit: 5 - recentTopicCandidates.length,
+        observedAt,
+      });
+    } catch {
+      // 回补是锦上添花；历史 Run 读取失败不影响本周扫描。
+      resurfacedCandidates = [];
+    }
+  }
   const candidateBatch = buildCandidateBatch({
-    newCandidates: recentTopicCandidates,
+    newCandidates: [...recentTopicCandidates, ...resurfacedCandidates],
     observedAt,
     limit: 5,
   });
@@ -416,6 +434,7 @@ export async function scanJournalSources({
     new_record_count: newRecords.length,
     topic_candidate_count: topicCandidates.length,
     recent_topic_candidate_count: recentTopicCandidates.length,
+    resurfaced_candidate_count: resurfacedCandidates.length,
     historical_discovery_count: topicCandidates.filter((paper) => !paper.published_this_week).length,
     candidate_mode: candidateBatch.mode,
     fallback_reason: candidateBatch.fallback_reason,

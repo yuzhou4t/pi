@@ -3303,6 +3303,26 @@ export function createApiServer({
   const journalReadingChatMatch = url.pathname.match(
     /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/papers\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,119})\/reading\/chat\/messages$/,
   );
+  const journalReadingChatProgressMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/papers\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,119})\/reading\/chat\/progress$/,
+  );
+  if (request.method === "GET" && journalReadingChatProgressMatch) {
+    try {
+      const clientRequestId = url.searchParams.get("client_request_id") || "";
+      if (!isJournalClientRequestId(clientRequestId)) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "进度查询必须提供稳定的请求标识", 400);
+      }
+      const progress = journalWorkflowService.getReadingChatProgress(
+        journalReadingChatProgressMatch[1],
+        journalReadingChatProgressMatch[2],
+        clientRequestId,
+      );
+      sendJson(response, 200, { schema_version: 1, ...progress }, origin);
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法读取对话进度");
+    }
+    return;
+  }
   if (request.method === "POST" && journalReadingChatMatch) {
     try {
       if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {

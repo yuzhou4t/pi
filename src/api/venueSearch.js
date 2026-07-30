@@ -45,6 +45,7 @@ export function mapVenueSearchConversation(body) {
       recommendationSource: turn.recommendation_source ?? "deterministic",
       recommendations: (turn.recommendations ?? []).map((item) => ({
         paperId: item.paper_id,
+        titleZh: item.title_zh ?? null,
         reason: item.reason,
         projectImpact: item.project_impact,
       })),

@@ -46,8 +46,8 @@ async function makeWorkflow(manifest, files = {}) {
 test("default manifest exposes every active journal-reading prompt", () => {
   assert.equal(promptRegistry.workflow_id, "journal-reading-v1");
   assert.deepEqual(promptRegistry.listActivePrompts().sort(), expectedPrompts);
-  assert.equal(promptRegistry.getManifest().active["candidate-ranking"], "candidate-ranking.v1");
-  assert.equal(promptRegistry.loadPrompt("candidate-ranking").version, "candidate-ranking.v1");
+  assert.equal(promptRegistry.getManifest().active["candidate-ranking"], "candidate-ranking.v2");
+  assert.equal(promptRegistry.loadPrompt("candidate-ranking").version, "candidate-ranking.v2");
   assert.equal(promptRegistry.loadPrompt("candidate-summary").version, "candidate-summary.v2");
   assert.equal(promptRegistry.loadPrompt("five-minute-guide").version, "five-minute-guide.v3");
   assert.equal(promptRegistry.loadPrompt("research-question").version, "research-question.v2");

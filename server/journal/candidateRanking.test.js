@@ -51,6 +51,7 @@ test("model ranking sends one bounded prompt and merges only generated display f
             items: inputPapers.map((paper, index) => ({
               paper_id: paper.paper_id,
               rank: index + 1,
+              title_zh: `论文 ${index + 1} 的中文标题`,
               selection_summary: `这是论文 ${index + 1} 的简短选择说明，需要全文继续核验。`,
               project_impact: "用于检验工作流设计。",
             })),
@@ -64,6 +65,7 @@ test("model ranking sends one bounded prompt and merges only generated display f
     },
   });
   assert.equal(result.candidates.length, 5);
+  assert.equal(result.candidates[0].title_zh, "论文 1 的中文标题");
   assert.equal(result.candidates[4].candidate_origin, "classic_review");
   assert.equal(request.input.papers.length, 5);
   assert.equal(request.input.papers[0].abstract.length <= 500, true);
@@ -86,6 +88,7 @@ test("model ranking rejects duplicate or unknown paper ids", async () => {
           items: Array.from({ length: 5 }, (_, index) => ({
             paper_id: "paper-1",
             rank: index + 1,
+            title_zh: "重复论文的中文标题",
             selection_summary: "这是一条足够长的论文选择摘要，需要进一步核验。",
             project_impact: "用于检验工作流设计。",
           })),

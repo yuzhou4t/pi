@@ -17,6 +17,7 @@ import {
 } from "@phosphor-icons/react";
 import { BindProjectDialog } from "./components/BindProjectDialog.jsx";
 import { DeleteConversationDialog } from "./components/DeleteConversationDialog.jsx";
+import { DeleteTopicConversationDialog } from "./components/DeleteTopicConversationDialog.jsx";
 import { ResetPaperReadingDialog } from "./components/ResetPaperReadingDialog.jsx";
 import { ProjectRail } from "./components/ProjectRail.jsx";
 import { RenameConversationDialog } from "./components/RenameConversationDialog.jsx";
@@ -396,7 +397,7 @@ function runToMarkdown(run) {
 
   if (selectedPapers.length === 0) lines.push("- 未选择论文");
   selectedPapers.forEach((paper) => {
-    lines.push(`- **${paper.titleZh}**（${paper.title}）`);
+    lines.push(`- **${paper.titleZh || paper.title}**（${paper.title}）`);
     lines.push(`  - 来源：${paper.venue}`);
     lines.push(`  - 决定：${run.guideChoices[paper.id] === "read" ? "进入精读" : run.guideChoices[paper.id] === "collect" ? "只收藏导读" : "尚未决定"}`);
   });
@@ -501,6 +502,7 @@ export function App() {
   const [conversationToDelete, setConversationToDelete] = useState(null);
   const [conversationToRename, setConversationToRename] = useState(null);
   const [paperToReset, setPaperToReset] = useState(null);
+  const [topicConversationToDelete, setTopicConversationToDelete] = useState(null);
   const [deletingConversationId, setDeletingConversationId] = useState(null);
   const [activeConversationId, setActiveConversationId] = usePersistentState(
     "pi-agent-active-conversation-v1",
@@ -1878,21 +1880,17 @@ export function App() {
   }, [refreshTopicConversations, setActiveConversationId, setActiveTopicConversationId, showToast]);
 
   const deleteTopicConversation = useCallback(async (conversationId) => {
-    try {
-      const list = await deleteVenueSearchConversation({ conversationId });
-      setTopicConversations(list.conversations);
-      if (activeTopicConversationId === conversationId) {
-        const nextId = list.activeConversationId ?? list.conversations[0]?.id ?? null;
-        setActiveTopicConversationId(nextId ?? "");
-        const conversation = await fetchVenueSearchConversation({
-          conversationId: nextId ?? undefined,
-        });
-        setTopicSearchState({ status: "ready", conversation, error: null });
-      }
-      showToast("已删除该检索会话");
-    } catch (error) {
-      showToast(error.message);
+    const list = await deleteVenueSearchConversation({ conversationId });
+    setTopicConversations(list.conversations);
+    if (activeTopicConversationId === conversationId) {
+      const nextId = list.activeConversationId ?? list.conversations[0]?.id ?? null;
+      setActiveTopicConversationId(nextId ?? "");
+      const conversation = await fetchVenueSearchConversation({
+        conversationId: nextId ?? undefined,
+      });
+      setTopicSearchState({ status: "ready", conversation, error: null });
     }
+    showToast("已删除该检索会话");
   }, [activeTopicConversationId, setActiveTopicConversationId, showToast]);
 
   const submitTopicSearchQuestion = useCallback(async (question) => {
@@ -3249,7 +3247,7 @@ export function App() {
           activeTopicConversationId={activeTopicConversationId}
           onSelectTopicConversation={selectTopicConversation}
           onCreateTopicConversation={createTopicConversation}
-          onDeleteTopicConversation={deleteTopicConversation}
+          onDeleteTopicConversation={setTopicConversationToDelete}
           providers={journalProviders}
           providerId={selectedProvider.id}
           model={selectedModel}
@@ -3427,6 +3425,10 @@ export function App() {
           candidateSummaryState={candidateSummaryState}
           onGenerateCandidateSummaries={generateCandidateSummaries}
           journalRunState={journalRunState}
+          pastRuns={journalRunHistory.filter((historyRun) => (
+            historyRun.id !== journalRunState.run?.id
+            && (historyRun.candidates?.length ?? 0) > 0
+          ))}
           readerTarget={readerTarget}
           onOpenPaper={openJournalPaper}
           onOpenCloseReading={(paperId) => openJournalPaper(
@@ -3621,6 +3623,12 @@ export function App() {
         paperConversation={paperToReset}
         onClose={() => setPaperToReset(null)}
         onConfirm={confirmResetPaperReading}
+      />
+
+      <DeleteTopicConversationDialog
+        topicConversation={topicConversationToDelete}
+        onClose={() => setTopicConversationToDelete(null)}
+        onConfirm={(conversation) => deleteTopicConversation(conversation.id)}
       />
 
       <RenameConversationDialog

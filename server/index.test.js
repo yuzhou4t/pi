@@ -2991,6 +2991,10 @@ test("reading HTTP routes preserve request fields and return durable stage state
       calls.chat = { runId, paperId, options };
       return reading;
     },
+    getReadingChatProgress: (runId, paperId, clientRequestId) => {
+      calls.chatProgress = { runId, paperId, clientRequestId };
+      return { phase: "thinking", thinking: "正在对照证据。", status: "running" };
+    },
     createReadingNoteProposal: async (runId, paperId, turnId, options) => {
       calls.noteCreate = { runId, paperId, turnId, options };
       return reading;
@@ -3176,6 +3180,24 @@ test("reading HTTP routes preserve request fields and return durable stage state
   });
 
   calls.chat = null;
+  const chatProgressResponse = await fetch(
+    `${server.baseUrl}/api/v1/journal-runs/journal-test/papers/paper-1/reading/chat/progress?client_request_id=client-chat-1`,
+  );
+  assert.equal(chatProgressResponse.status, 200);
+  const chatProgressBody = await chatProgressResponse.json();
+  assert.equal(chatProgressBody.phase, "thinking");
+  assert.equal(chatProgressBody.status, "running");
+  assert.deepEqual(calls.chatProgress, {
+    runId: "journal-test",
+    paperId: "paper-1",
+    clientRequestId: "client-chat-1",
+  });
+
+  const missingProgressRequestId = await fetch(
+    `${server.baseUrl}/api/v1/journal-runs/journal-test/papers/paper-1/reading/chat/progress`,
+  );
+  assert.equal(missingProgressRequestId.status, 400);
+
   const missingChatRequestId = await fetch(
     `${server.baseUrl}/api/v1/journal-runs/journal-test/papers/paper-1/reading/chat/messages`,
     {

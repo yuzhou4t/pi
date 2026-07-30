@@ -101,7 +101,7 @@ function commandError(code, message, retryable = false) {
   return new CodexSubscriptionError(code, message, retryable);
 }
 
-function runProcess({ args, env, spawnImpl, timeoutMs, stdin = null }) {
+function runProcess({ args, env, spawnImpl, timeoutMs, stdin = null, onStdoutLine = null }) {
   return new Promise((resolve, reject) => {
     const command = typeof env?.PI_CODEX_CLI_PATH === "string" && env.PI_CODEX_CLI_PATH.trim()
       ? env.PI_CODEX_CLI_PATH.trim()
@@ -160,8 +160,22 @@ function runProcess({ args, env, spawnImpl, timeoutMs, stdin = null }) {
       return nextBytes;
     };
 
+    let lineBuffer = "";
     child.stdout.on("data", (chunk) => {
       stdoutBytes = append(stdout, chunk, stdoutBytes, MAX_STDOUT_BYTES, "stdout");
+      if (typeof onStdoutLine !== "function" || settled) return;
+      lineBuffer += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+      let newlineIndex = lineBuffer.indexOf("\n");
+      while (newlineIndex >= 0) {
+        const line = lineBuffer.slice(0, newlineIndex);
+        lineBuffer = lineBuffer.slice(newlineIndex + 1);
+        try {
+          onStdoutLine(line);
+        } catch {
+          // 进度回调失败不得影响模型执行本身。
+        }
+        newlineIndex = lineBuffer.indexOf("\n");
+      }
     });
     child.stderr.on("data", (chunk) => {
       stderrBytes = append(stderr, chunk, stderrBytes, MAX_STDERR_BYTES, "stderr");
@@ -327,6 +341,7 @@ export async function runCodexSubscription({
   env = process.env,
   spawnImpl = spawn,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  onEvent = null,
 } = {}) {
   if (typeof prompt !== "string" || !prompt.trim()) {
     throw commandError("CODEX_INVALID_REQUEST", "prompt 必须是非空字符串", false);
@@ -369,6 +384,52 @@ export async function runCodexSubscription({
 
   let workDir = null;
   let schemaDir = null;
+  const emitPublicEvent = typeof onEvent === "function"
+    ? (event) => {
+        try {
+          onEvent(event);
+        } catch {
+          // 进度监听者抛错不得影响模型执行。
+        }
+      }
+    : null;
+  // 只转发安全的公开生命周期：连接、思考摘要、回答就绪；不透传原始事件。
+  const relayStdoutLine = emitPublicEvent
+    ? (line) => {
+        if (!line.trim()) return;
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (event?.type === "thread.started") {
+          emitPublicEvent({ type: "model_connected" });
+          return;
+        }
+        if (event?.type === "item.completed" && event?.item?.type === "reasoning") {
+          // 优先用 Codex 提供的面向用户思考摘要，避免透传原始思维链。
+          const summary = Array.isArray(event.item.summary)
+            ? event.item.summary.filter((part) => typeof part === "string").join("\n")
+            : typeof event.item.summary === "string"
+              ? event.item.summary
+              : typeof event.item.text === "string"
+                ? event.item.text
+                : "";
+          const trimmed = summary.trim();
+          if (trimmed) {
+            emitPublicEvent({ type: "thinking_summary", text: trimmed.slice(0, 2000) });
+          }
+          return;
+        }
+        if (
+          (event?.type === "item.completed" && event?.item?.type === "agent_message")
+          || event?.type === "agent_message"
+        ) {
+          emitPublicEvent({ type: "answer_ready" });
+        }
+      }
+    : null;
 
   try {
     workDir = await mkdtemp(path.join(os.tmpdir(), "pi-codex-work-"));
@@ -426,6 +487,7 @@ export async function runCodexSubscription({
       spawnImpl,
       timeoutMs: executionTimeoutMs,
       stdin: prompt,
+      onStdoutLine: relayStdoutLine,
     });
     return parseExecution(stdout);
   } catch (error) {

@@ -833,6 +833,7 @@ export function createJournalWorkflowService({
           rank: nextRank,
           candidate_origin: "venue_search",
           display_label: "主题检索推荐 · 非本周新论文",
+          title_zh: recommendation?.title_zh ?? paper.title_zh ?? null,
           selection_summary: recommendation?.reason
             ?? (paper.abstract
               ? paper.abstract.slice(0, 220)
@@ -2736,6 +2737,7 @@ export function createJournalWorkflowService({
     savePaperDecisions: reading.setDecisions,
     saveReadingPosition: reading.savePosition,
     sendReadingChatMessage: reading.sendChatMessage,
+    getReadingChatProgress: reading.getChatProgress,
     startGuides,
     startRun,
     subscribeEvents: runStore.subscribeEvents,

@@ -201,7 +201,6 @@ test("run uses a shell-free ephemeral read-only Codex exec and parses JSONL", as
     spawnImpl,
     timeoutMs: 1000,
   });
-
   assert.deepEqual(result, {
     text: JSON.stringify({ answer: "ok" }),
     operationId: "thread-test",
@@ -418,4 +417,58 @@ test("probe kills a hung status command on timeout", async () => {
   assert.equal(result.available, false);
   assert.equal(result.reasonCode, "CODEX_STATUS_TIMEOUT");
   assert.deepEqual(spawnImpl.calls[0].child.killSignals, ["SIGKILL"]);
+});
+
+test("run relays only safe public lifecycle events as they stream in", async () => {
+  const streamingJsonl = [
+    JSON.stringify({ type: "thread.started", thread_id: "thread-stream" }),
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "reasoning", summary: ["先拆解问题，再对照证据。"], text: "raw-private-chain" },
+    }),
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: JSON.stringify({ answer: "ok" }) },
+    }),
+    JSON.stringify({
+      type: "turn.completed",
+      usage: { input_tokens: 20, cached_input_tokens: 5, output_tokens: 4 },
+    }),
+    "",
+  ].join("\n");
+  const spawnImpl = createSpawnMock([
+    { stdout: "Logged in using ChatGPT" },
+    { stdout: streamingJsonl },
+  ]);
+  const events = [];
+  const result = await runCodexSubscription({
+    prompt: "Return one answer.",
+    schema,
+    env: { PATH: "/usr/bin", HOME: "/tmp/test-home" },
+    spawnImpl,
+    timeoutMs: 1000,
+    onEvent: (event) => events.push(event),
+  });
+  assert.equal(result.text, JSON.stringify({ answer: "ok" }));
+  const types = events.map((event) => event.type);
+  assert.deepEqual(types, ["model_connected", "thinking_summary", "answer_ready"]);
+  const thinking = events.find((event) => event.type === "thinking_summary");
+  // 只转发面向用户的思考摘要，不透传原始思维链。
+  assert.equal(thinking.text, "先拆解问题，再对照证据。");
+  assert.ok(!thinking.text.includes("raw-private-chain"));
+});
+
+test("run without an onEvent listener still resolves normally", async () => {
+  const spawnImpl = createSpawnMock([
+    { stdout: "Logged in using ChatGPT" },
+    { stdout: completedJsonl },
+  ]);
+  const result = await runCodexSubscription({
+    prompt: "Return one answer.",
+    schema,
+    env: { PATH: "/usr/bin", HOME: "/tmp/test-home" },
+    spawnImpl,
+    timeoutMs: 1000,
+  });
+  assert.equal(result.text, JSON.stringify({ answer: "ok" }));
 });

@@ -513,7 +513,7 @@ export function mapJournalRun(run) {
       return {
         id: paper.paper_id,
         title: paper.title,
-        titleZh: paper.title,
+        titleZh: paper.title_zh ?? null,
         authors: paper.authors ?? [],
         venue: paper.venue,
         publishedAt: paper.published_at,
@@ -1066,6 +1066,28 @@ export async function sendJournalReadingChatMessage({
   const body = await jsonResponse(response, "本地论文服务返回了无法解析的对话结果");
   if (!response.ok) throw requestError(response, body, "无法完成当前论文对话");
   return mapJournalPaperReading(body);
+}
+
+export async function fetchJournalReadingChatProgress({
+  runId,
+  paperId,
+  clientRequestId,
+  signal,
+} = {}) {
+  if (typeof clientRequestId !== "string" || !clientRequestId.trim()) return null;
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/papers/${encodeURIComponent(paperId)}/reading/chat/progress`
+      + `?client_request_id=${encodeURIComponent(clientRequestId)}`,
+    { signal },
+  );
+  if (!response.ok) return null;
+  const body = await response.json().catch(() => null);
+  if (!body || typeof body !== "object") return null;
+  return {
+    phase: typeof body.phase === "string" ? body.phase : "unknown",
+    thinking: typeof body.thinking === "string" ? body.thinking : null,
+    status: typeof body.status === "string" ? body.status : "unknown",
+  };
 }
 
 export async function createJournalReadingConversation({

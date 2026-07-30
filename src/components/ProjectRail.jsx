@@ -1,6 +1,8 @@
 import { Fragment, useEffect, useState } from "react";
 import {
   BookOpenText,
+  CaretDown,
+  CaretRight,
   ChatText,
   CircleNotch,
   Code,
@@ -15,6 +17,7 @@ import {
   Trash,
   X,
 } from "@phosphor-icons/react";
+import { usePersistentState } from "../hooks/usePersistentState.js";
 
 function ConversationList({
   conversations,
@@ -204,6 +207,10 @@ export function ProjectRail({
   isResizing,
 }) {
   const [openConversationMenuId, setOpenConversationMenuId] = useState(null);
+  const [topicListOpen, setTopicListOpen] = usePersistentState(
+    "pi-agent-topic-list-open-v1",
+    true,
+  );
   const creatingProjectIds = new Set(creatingConversationProjectIds);
   const normalizedQuery = query.trim().toLowerCase();
   const matchesQuery = (value) => String(value ?? "").toLowerCase().includes(normalizedQuery);
@@ -423,14 +430,27 @@ export function ProjectRail({
                         <button
                           className={`capability-row project-run-row project-topic-open${topicSearchActive ? " is-active" : ""}`}
                           type="button"
-                          aria-label="打开主题检索"
-                          onClick={() => onSelectTopicSearch()}
+                          aria-label={topicListOpen ? "收起检索会话列表" : "展开主题检索"}
+                          aria-expanded={topicListOpen}
+                          onClick={() => {
+                            if (topicListOpen) {
+                              setTopicListOpen(false);
+                              return;
+                            }
+                            setTopicListOpen(true);
+                            onSelectTopicSearch();
+                          }}
                         >
                           <MagnifyingGlass size={17} weight="regular" aria-hidden="true" />
                           <span>
                             <strong>主题检索</strong>
                             <small>注册刊物 + 联网检索</small>
                           </span>
+                          {topicConversations.length > 0 ? (
+                            topicListOpen
+                              ? <CaretDown className="project-topic-caret" size={13} weight="bold" aria-hidden="true" />
+                              : <CaretRight className="project-topic-caret" size={13} weight="bold" aria-hidden="true" />
+                          ) : null}
                         </button>
                         {onCreateTopicConversation ? (
                           <button
@@ -438,13 +458,16 @@ export function ProjectRail({
                             type="button"
                             aria-label="新建检索会话"
                             title="新建检索会话"
-                            onClick={() => onCreateTopicConversation()}
+                            onClick={() => {
+                              setTopicListOpen(true);
+                              onCreateTopicConversation();
+                            }}
                           >
                             <Plus size={14} weight="bold" aria-hidden="true" />
                           </button>
                         ) : null}
                       </div>
-                      {topicConversations.length > 0 ? (
+                      {topicListOpen && topicConversations.length > 0 ? (
                         <ul className="project-topic-list">
                           {topicConversations.map((conversation) => (
                             <li
@@ -470,7 +493,7 @@ export function ProjectRail({
                                   className="project-topic-item-delete"
                                   aria-label="删除该检索会话"
                                   title="删除该检索会话"
-                                  onClick={() => onDeleteTopicConversation(conversation.id)}
+                                  onClick={() => onDeleteTopicConversation(conversation)}
                                 >
                                   <Trash size={13} weight="regular" aria-hidden="true" />
                                 </button>

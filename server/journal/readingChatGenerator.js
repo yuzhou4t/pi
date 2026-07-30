@@ -456,6 +456,7 @@ export async function generateReadingChatMessage({
   modelId,
   modelProviders,
   modelMode = "live",
+  onEvent = null,
   promptRegistry = defaultPromptRegistry,
 } = {}) {
   const request = prepared ?? prepareReadingChatMessage({
@@ -525,6 +526,7 @@ export async function generateReadingChatMessage({
     prompt: request.prompt.body,
     input: request.input,
     schema: request.prompt.schema,
+    ...(typeof onEvent === "function" ? { onEvent } : {}),
   });
   return {
     result: validateOutput(

@@ -86,6 +86,15 @@ export function createModelProviderRegistry({
 
   async function completeStructured(requestValue) {
     const request = validateRequest(requestValue);
+    const onEvent = typeof requestValue?.onEvent === "function"
+      ? (event) => {
+          try {
+            requestValue.onEvent(event);
+          } catch {
+            // 进度监听失败不影响模型调用。
+          }
+        }
+      : null;
     if (!supports(request.providerId, request.modelId)) {
       throw new ModelProviderRegistryError(
         "MODEL_NOT_ALLOWED",
@@ -97,15 +106,21 @@ export function createModelProviderRegistry({
     const combinedSystem = `${request.system.trim()}\n\n${request.prompt.trim()}`;
     let result;
     if (request.providerId === CODEX_PROVIDER_ID) {
-      result = await enqueueCodex(() => codexRunner({
-        prompt: `${combinedSystem}\n\n输入 JSON：\n${input}\n\n只返回符合 schema 的 JSON。`,
-        schema: request.schema,
-        modelId: request.modelId,
-        reasoningEffort: request.reasoningEffort ?? null,
-        env,
-        timeoutMs: Number.parseInt(env.PI_CODEX_TIMEOUT_MS || "90000", 10),
-      }));
+      onEvent?.({ type: "model_queued" });
+      result = await enqueueCodex(() => {
+        onEvent?.({ type: "model_started" });
+        return codexRunner({
+          prompt: `${combinedSystem}\n\n输入 JSON：\n${input}\n\n只返回符合 schema 的 JSON。`,
+          schema: request.schema,
+          modelId: request.modelId,
+          reasoningEffort: request.reasoningEffort ?? null,
+          env,
+          timeoutMs: Number.parseInt(env.PI_CODEX_TIMEOUT_MS || "90000", 10),
+          ...(onEvent ? { onEvent } : {}),
+        });
+      });
     } else {
+      onEvent?.({ type: "model_started" });
       result = await deepseekRunner({
         messages: [
           {

@@ -22,6 +22,7 @@ import {
   pinJournalReadingConclusion,
   promoteJournalReadingConversation,
   sendJournalReadingChatMessage,
+  fetchJournalReadingChatProgress,
   switchJournalReadingConversation,
   unpinJournalReadingConclusion,
 } from "../api/journalRuns.js";
@@ -229,6 +230,22 @@ function chatErrorMessage(error, fallback = "Agent 暂时没有完成这次任�
   if (typeof error === "string" && error.trim()) return error;
   if (typeof error?.message === "string" && error.message.trim()) return error.message;
   return fallback;
+}
+
+function chatPhaseLabel(progress) {
+  switch (progress?.phase) {
+    case "queued":
+      return "排队中，马上开始…";
+    case "connecting":
+      return "正在连接模型…";
+    case "thinking":
+      return "正在思考…";
+    case "composing":
+      return "正在组织回答…";
+    case "preparing":
+    default:
+      return "Agent 正在思考…";
+  }
 }
 
 function createChatRequestId() {
@@ -965,6 +982,8 @@ export function ReaderAgentComposer({
   });
   const [conversationBusy, setConversationBusy] = useState(false);
   const [conversationError, setConversationError] = useState(null);
+  // 当前运行中回合的实时思考进度（阶段 + 思考摘要）。
+  const [turnProgress, setTurnProgress] = useState(null);
   const noteActionRequestIds = useRef(new Map());
   const historyRef = useRef(null);
   const sessionKey = readerContext?.key ?? null;
@@ -1268,6 +1287,42 @@ export function ReaderAgentComposer({
     return () => window.cancelAnimationFrame(frame);
   }, [chatState.status, chatState.turns, sessionKey]);
 
+  const runningTurn = chatState.status === "running"
+    ? visibleChatTurns.find((turn) => turn.status === "running")
+    : null;
+  const runningTurnId = runningTurn?.clientRequestId ?? runningTurn?.id ?? null;
+
+  // 运行中轮询服务端的思考进度，展现分阶段状态与思考摘要。
+  useEffect(() => {
+    if (!runningTurnId || !readerContext?.runId || !readerContext?.paperId) {
+      setTurnProgress(null);
+      return undefined;
+    }
+    let cancelled = false;
+    const controller = new AbortController();
+    setTurnProgress(null);
+    const poll = async () => {
+      try {
+        const progress = await fetchJournalReadingChatProgress({
+          runId: readerContext.runId,
+          paperId: readerContext.paperId,
+          clientRequestId: runningTurnId,
+          signal: controller.signal,
+        });
+        if (!cancelled && progress) setTurnProgress(progress);
+      } catch {
+        // 进度轮询失败不影响回答本身，保持静默。
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 900);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [runningTurnId, readerContext?.runId, readerContext?.paperId]);
+
   const handleNewConversation = async () => {
     if (conversationBusy) return;
     setConversationBusy(true);
@@ -1551,10 +1606,15 @@ export function ReaderAgentComposer({
                 <p>{turn.question}</p>
               </div>
               {turn.status === "running" ? (
-                <p className="reader-agent-turn-state is-thinking">
-                  <span className="reader-agent-typing" aria-hidden="true"><i /><i /><i /></span>
-                  Agent 正在思考…
-                </p>
+                <div className="reader-agent-thinking">
+                  <p className="reader-agent-turn-state is-thinking">
+                    <span className="reader-agent-typing" aria-hidden="true"><i /><i /><i /></span>
+                    {chatPhaseLabel(turnProgress)}
+                  </p>
+                  {turnProgress?.thinking ? (
+                    <p className="reader-agent-thinking-summary">{turnProgress.thinking}</p>
+                  ) : null}
+                </div>
               ) : null}
               {turn.status === "answered" ? (
                 <div className="reader-agent-answer">

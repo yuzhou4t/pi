@@ -73,7 +73,10 @@ function TurnCard({
                     onChange={() => onToggleSelect(turn.turnId, paper.id)}
                   />
                   <span className="topic-search-paper-body">
-                    <strong>{paper.title}</strong>
+                    <strong>{recommendation?.titleZh || paper.title}</strong>
+                    {recommendation?.titleZh ? (
+                      <small className="topic-search-paper-original">{paper.title}</small>
+                    ) : null}
                     <small>{paperMeta(paper)}</small>
                     {recommendation ? (
                       <p className="topic-search-reason">{recommendation.reason}</p>
