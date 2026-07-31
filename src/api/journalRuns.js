@@ -531,6 +531,7 @@ export function mapJournalRun(run) {
         candidateOrigin: paper.candidate_origin,
         isNew: paper.is_new,
         publishedThisMonth: paper.published_this_month ?? paper.published_this_week ?? false,
+        officialUrl: paper.official_url ?? paper.canonical_url ?? null,
         pdfUrl: paper.pdf_url,
         mineruStatus: documentState.status ?? "not_started",
         mineruRunStatus: run.mineru?.status ?? "not_started",

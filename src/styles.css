@@ -517,15 +517,28 @@ button:disabled {
 
 .project-row-copy {
   display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  align-items: center;
   min-width: 0;
   flex: 1;
-  gap: 4px;
+  column-gap: 4px;
+  row-gap: 2px;
   padding: 3px 0;
   cursor: pointer;
   color: inherit;
   background: transparent;
   border: 0;
   text-align: left;
+}
+
+.project-row-copy > .project-row-caret {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.project-row-copy > strong,
+.project-row-copy > small {
+  grid-column: 2;
 }
 
 .project-row-copy strong {
@@ -14378,6 +14391,42 @@ h4.reader-rail-full-heading {
   max-width: 640px;
 }
 
+.journal-library-title {
+  color: inherit;
+  text-decoration: none;
+}
+
+a.journal-library-title:hover strong,
+a.journal-library-title:hover {
+  color: var(--teal-accent, #0f766e);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.project-row-caret {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.project-child-heading-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: 0;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+
+.project-child-heading-toggle > svg {
+  margin-left: auto;
+  color: var(--muted);
+}
+
 .workflow-recent-classics-body {
   width: 100%;
   display: grid;
@@ -14493,6 +14542,7 @@ h4.reader-rail-full-heading {
   grid-template-columns: 1fr auto;
   grid-template-areas:
     "title decision"
+    "original decision"
     "meta decision";
   column-gap: 10px;
   align-items: center;
@@ -14501,6 +14551,13 @@ h4.reader-rail-full-heading {
 .workflow-past-paper-title {
   grid-area: title;
   font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.workflow-past-week li .journal-library-original {
+  grid-area: original;
+  color: var(--weak);
+  font-size: 11px;
   overflow-wrap: anywhere;
 }
 

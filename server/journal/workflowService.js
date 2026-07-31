@@ -623,6 +623,48 @@ export function createJournalWorkflowService({
     }
   }
 
+  // 近年经典的英文标题用 Codex 5.3 Spark 做一道尽力而为的中文翻译；
+  // 失败保留英文原文，不影响栏目本身。
+  async function translateRecentClassicTitles(recentClassics) {
+    if (
+      modelMode !== "live"
+      || !modelProviders?.completeStructured
+      || recentClassics?.status !== "success"
+      || (recentClassics.papers ?? []).length === 0
+    ) {
+      return recentClassics;
+    }
+    const items = recentClassics.papers
+      .map((paper, index) => ({ id: `p${index}`, text: String(paper.title ?? "").slice(0, 300) }))
+      .filter((item) => /[A-Za-z]{4,}/.test(item.text));
+    if (items.length === 0) return recentClassics;
+    try {
+      const prompt = promptRegistry.loadPrompt("venue-search-translate");
+      const generated = await modelProviders.completeStructured({
+        providerId: "codex-subscription",
+        modelId: "gpt-5.3-codex-spark",
+        system: prompt.system,
+        prompt: prompt.body,
+        input: { items },
+        schema: prompt.schema,
+      });
+      const byId = new Map(
+        (generated.value?.translations ?? [])
+          .filter((entry) => typeof entry?.id === "string" && typeof entry?.zh === "string")
+          .map((entry) => [entry.id, entry.zh.trim()]),
+      );
+      return {
+        ...recentClassics,
+        papers: recentClassics.papers.map((paper, index) => ({
+          ...paper,
+          title_zh: byId.get(`p${index}`) || paper.title_zh || null,
+        })),
+      };
+    } catch {
+      return recentClassics;
+    }
+  }
+
   async function executeRun(runId, { providerId, modelId, reasoningEffort = null } = defaults) {
     const rankingProviders = withReasoningEffort(modelProviders, reasoningEffort);
     try {
@@ -695,6 +737,7 @@ export function createJournalWorkflowService({
             dismissedKeys,
           }),
         });
+        recentClassics = await translateRecentClassicTitles(recentClassics);
       } catch (error) {
         recentClassics = {
           schema_version: 1,

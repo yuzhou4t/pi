@@ -216,6 +216,22 @@ export function ProjectRail({
     "pi-agent-topic-list-open-v1",
     true,
   );
+  // 项目行再次点击可收起/展开子入口；收起状态持久化。
+  const [collapsedProjectIds, setCollapsedProjectIds] = usePersistentState(
+    "pi-agent-collapsed-projects-v1",
+    [],
+  );
+  const [paperListOpen, setPaperListOpen] = usePersistentState(
+    "pi-agent-paper-conversations-open-v1",
+    true,
+  );
+  const toggleProjectCollapsed = (projectId) => {
+    setCollapsedProjectIds((current) => (
+      current.includes(projectId)
+        ? current.filter((id) => id !== projectId)
+        : [...current, projectId]
+    ));
+  };
   const creatingProjectIds = new Set(creatingConversationProjectIds);
   const normalizedQuery = query.trim().toLowerCase();
   const matchesQuery = (value) => String(value ?? "").toLowerCase().includes(normalizedQuery);
@@ -362,6 +378,7 @@ export function ProjectRail({
         </div>
         {filteredProjects.map((project) => {
           const selected = project.id === selectedId;
+          const collapsed = collapsedProjectIds.includes(project.id);
           const creatingConversation = creatingProjectIds.has(project.id);
           const projectMatches = matchesQuery(`${project.name} ${project.state} ${project.rootLabel}`);
           const projectConversations = conversations.filter((conversation) => (
@@ -379,9 +396,19 @@ export function ProjectRail({
                   className="project-row-copy"
                   type="button"
                   aria-current={selected ? "page" : undefined}
-                  aria-expanded={selected}
-                  onClick={() => onSelect(project.id)}
+                  aria-expanded={selected && !collapsed}
+                  onClick={() => {
+                    if (selected) {
+                      toggleProjectCollapsed(project.id);
+                      return;
+                    }
+                    if (collapsed) toggleProjectCollapsed(project.id);
+                    onSelect(project.id);
+                  }}
                 >
+                  {selected && !collapsed
+                    ? <CaretDown className="project-row-caret" size={12} weight="bold" aria-hidden="true" />
+                    : <CaretRight className="project-row-caret" size={12} weight="bold" aria-hidden="true" />}
                   <strong>{project.name}</strong>
                   <small>{project.state}</small>
                 </button>
@@ -413,7 +440,7 @@ export function ProjectRail({
                   </button>
                 ) : null}
               </div>
-              {selected ? (
+              {selected && !collapsed ? (
                 <div className="project-children">
                   {workspaceKind === "paper_reading" && activeRun ? (
                     <button
@@ -546,12 +573,22 @@ export function ProjectRail({
                     aria-label={workspaceKind === "paper_reading" ? "论文研读" : "项目会话"}
                   >
                     {workspaceKind === "paper_reading" ? (
-                      <div className="project-child-heading">
+                      <button
+                        className="project-child-heading project-child-heading-toggle"
+                        type="button"
+                        aria-expanded={paperListOpen}
+                        aria-label={paperListOpen ? "收起论文研读列表" : "展开论文研读列表"}
+                        onClick={() => setPaperListOpen((current) => !current)}
+                      >
                         <span>论文研读</span>
                         <small>{projectConversations.length}</small>
-                      </div>
+                        {paperListOpen
+                          ? <CaretDown size={12} weight="bold" aria-hidden="true" />
+                          : <CaretRight size={12} weight="bold" aria-hidden="true" />}
+                      </button>
                     ) : null}
-                    <div className="project-conversation-list">
+                    {workspaceKind !== "paper_reading" || paperListOpen ? (
+                      <div className="project-conversation-list">
                       {creatingConversation ? (
                         <button
                           className={`project-conversation-row${preparingConversationProjectId === project.id ? " is-active" : ""}`}
@@ -584,7 +621,8 @@ export function ProjectRail({
                             : "还没有会话"}
                         </p>
                       ) : null}
-                    </div>
+                      </div>
+                    ) : null}
                   </section>
 
                   {workspaceKind !== "paper_reading" && activeRun ? (

@@ -5,6 +5,7 @@ export const CLASSIC_PAPERS = Object.freeze([
     paper_id: "classic-react-2023",
     dedupe_key: "openreview:WE_vluYUL-X",
     title: "ReAct: Synergizing Reasoning and Acting in Language Models",
+    title_zh: "ReAct：在语言模型中协同推理与行动",
     authors: [
       "Shunyu Yao",
       "Jeffrey Zhao",
@@ -39,6 +40,7 @@ export const CLASSIC_PAPERS = Object.freeze([
     paper_id: "classic-toolformer-2023",
     dedupe_key: "arxiv:2302.04761",
     title: "Toolformer: Language Models Can Teach Themselves to Use Tools",
+    title_zh: "Toolformer：语言模型可以自学使用工具",
     authors: [
       "Timo Schick",
       "Jane Dwivedi-Yu",
@@ -75,6 +77,7 @@ export const CLASSIC_PAPERS = Object.freeze([
     paper_id: "classic-rag-2020",
     dedupe_key: "title:retrieval augmented generation for knowledge intensive nlp tasks:2020",
     title: "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
+    title_zh: "面向知识密集型 NLP 任务的检索增强生成（RAG）",
     authors: [
       "Patrick Lewis",
       "Ethan Perez",
@@ -114,6 +117,7 @@ export const CLASSIC_PAPERS = Object.freeze([
     paper_id: "classic-reflexion-2023",
     dedupe_key: "arxiv:2303.11366",
     title: "Reflexion: Language Agents with Verbal Reinforcement Learning",
+    title_zh: "Reflexion：基于言语强化学习的语言 Agent",
     authors: [
       "Noah Shinn",
       "Federico Cassano",
@@ -146,6 +150,7 @@ export const CLASSIC_PAPERS = Object.freeze([
     paper_id: "classic-chain-of-thought-2022",
     dedupe_key: "openreview:_VjQlMeSB_J",
     title: "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models",
+    title_zh: "思维链提示激发大语言模型的推理能力",
     authors: [
       "Jason Wei",
       "Xuezhi Wang",

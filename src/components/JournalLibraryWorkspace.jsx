@@ -12,6 +12,16 @@ function pastDecisionLabel(decision) {
   return "未处理";
 }
 
+// 标题可点击打开论文官方页面（或 PDF）；没有链接时退回纯文本。
+function PaperTitleLink({ url, className, children }) {
+  if (!url) return <span className={className}>{children}</span>;
+  return (
+    <a className={className} href={url} target="_blank" rel="noreferrer noopener">
+      {children}
+    </a>
+  );
+}
+
 function RecentClassicsView({
   recentClassics,
   canAddToWeekly,
@@ -62,7 +72,9 @@ function RecentClassicsView({
         {papers.map((paper) => (
           <li key={paper.id}>
             <div className="workflow-recent-classic-main">
-              <strong>{paper.titleZh || paper.title}</strong>
+              <PaperTitleLink url={paper.officialUrl ?? paper.pdfUrl} className="journal-library-title">
+                <strong>{paper.titleZh || paper.title}</strong>
+              </PaperTitleLink>
               {paper.titleZh && paper.titleZh !== paper.title ? <small>{paper.title}</small> : null}
               <small>
                 {paper.venue}
@@ -121,9 +133,15 @@ function PastRunsView({ pastRuns }) {
                 const date = String(paper.publishedAt ?? "").slice(0, 10);
                 return (
                   <li key={`${pastRun.id}-${paper.id}`}>
-                    <span className="workflow-past-paper-title">
+                    <PaperTitleLink
+                      url={paper.officialUrl ?? paper.pdfUrl}
+                      className="workflow-past-paper-title journal-library-title"
+                    >
                       {paper.titleZh && paper.titleZh !== paper.title ? paper.titleZh : paper.title}
-                    </span>
+                    </PaperTitleLink>
+                    {paper.titleZh && paper.titleZh !== paper.title ? (
+                      <small className="journal-library-original">{paper.title}</small>
+                    ) : null}
                     <small>
                       {[paper.venue, date ? `发表于 ${date}` : null].filter(Boolean).join(" · ")}
                     </small>
