@@ -53,6 +53,9 @@ import {
   fetchZoteroProposal,
   fetchZoteroTargets,
   addRecentClassicsToWeekly,
+  addPastRunPapersToWeekly,
+  translateJournalRunLibrary,
+  refreshJournalCandidates,
   dismissJournalPaper,
   restartJournalReadingFromGuide,
   resetJournalPaperReading,
@@ -826,8 +829,12 @@ export function App() {
       ? { data: fallback.recentClassics, runId: fallback.id, status: fallback.status }
       : null;
   }, [journalRunState.run, journalRunHistory]);
-  const recentClassicsCanAdd = ["review_ready", "guide_ready", "reading", "draft_ready", "reading_ready"]
-    .includes(recentClassicsSource?.status);
+  const recentClassicsCanAdd = (
+    recentClassicsSource?.runId === journalRunState.run?.id
+    && recentClassicsSource?.status === "review_ready"
+  );
+  // 往期论文加入本月推荐的前提：当月已有进入审阅的 Run。
+  const currentMonthReviewable = journalRunState.run?.status === "review_ready";
   const journalPastRuns = useMemo(() => journalRunHistory.filter((historyRun) => (
     historyRun.id !== journalRunState.run?.id
     && (historyRun.candidates?.length ?? 0) > 0
@@ -2035,6 +2042,36 @@ export function App() {
     if (result.run) syncJournalRun(result.run);
     showToast("已标记不感兴趣，之后不会再推荐这篇论文");
   }, [showToast, syncJournalRun]);
+
+  const addPastRunPaper = useCallback(async (sourceRunId, paperId) => {
+    if (!sourceRunId) throw new Error("往期运行不存在");
+    const nextRun = await addPastRunPapersToWeekly({ sourceRunId, paperIds: [paperId] });
+    syncJournalRun(nextRun);
+    showToast("已加入本月推荐，可从每月追踪准备全文");
+  }, [showToast, syncJournalRun]);
+
+  const refreshCandidates = useCallback(async () => {
+    const runId = journalRunState.run?.id;
+    if (!runId) throw new Error("当前没有可刷新的运行");
+    const nextRun = await refreshJournalCandidates({ runId });
+    syncJournalRun(nextRun);
+    const added = nextRun?.candidateRefresh?.lastAddedCount ?? 0;
+    showToast(added > 0 ? `已刷新，新增 ${added} 篇论文` : "已刷新，暂无新发表的论文");
+  }, [journalRunState.run?.id, showToast, syncJournalRun]);
+
+  // 翻译回填：当前 Run 走完整 sync；往期 Run 只更新历史，不把它切成当前。
+  const translateLibrary = useCallback(async (runId) => {
+    if (!runId) throw new Error("运行不存在");
+    const nextRun = await translateJournalRunLibrary({ runId });
+    if (runId === journalRunState.run?.id) {
+      syncJournalRun(nextRun);
+    } else {
+      setJournalRunHistory((current) => current.map(
+        (runItem) => (runItem.id === nextRun.id ? nextRun : runItem),
+      ));
+    }
+    showToast("已翻译为中文");
+  }, [journalRunState.run?.id, showToast, syncJournalRun]);
 
   const retryPaperDocument = useCallback(async (paperId) => {
     const runId = journalRunState.run?.id;
@@ -3493,10 +3530,16 @@ export function App() {
           <JournalLibraryWorkspace
             view={journalLibraryView}
             recentClassics={recentClassicsSource?.data ?? null}
-            canAddToWeekly={recentClassicsCanAdd}
+            canAddToWeekly={journalLibraryView === "past_runs"
+              ? currentMonthReviewable
+              : recentClassicsCanAdd}
             onAddRecentClassics={(paperIds) => addRecentClassicPapers(recentClassicsSource?.runId ?? null, paperIds)}
             onDismissRecentClassic={(paper) => dismissRecentClassicPaper(recentClassicsSource?.runId ?? null, paper)}
+            onAddPastPaper={addPastRunPaper}
+            onTranslateLibrary={translateLibrary}
+            recentClassicsRunId={recentClassicsSource?.runId ?? null}
             pastRuns={journalPastRuns}
+            weeklyCandidateIds={journalRunState.run?.candidates?.map((paper) => paper.id) ?? []}
             sidebarOpen={sidebarOpen}
             onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
           />
@@ -3555,6 +3598,7 @@ export function App() {
           onRestoreJournalRuns={restoreJournalRuns}
           onResumeJournalRun={resumeCurrentJournalRun}
           onRetryPaperDocument={retryPaperDocument}
+          onRefreshCandidates={refreshCandidates}
           onRestartFromGuide={restartCurrentReadingFromGuide}
           guideState={guideState}
           onTogglePaper={(paperId) => dispatchAction(RUN_ACTIONS.TOGGLE_PAPER, { paperId })}

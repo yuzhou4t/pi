@@ -27,10 +27,15 @@ function RecentClassicsView({
   canAddToWeekly,
   onAddRecentClassics,
   onDismissRecentClassic,
+  onTranslate,
 }) {
   const [busyId, setBusyId] = useState(null);
   const [error, setError] = useState(null);
+  const [translating, setTranslating] = useState(false);
   const papers = recentClassics?.papers ?? [];
+  const needsTranslation = papers.some(
+    (paper) => (paper.title && !paper.titleZh) || (paper.abstract && !paper.abstractZh),
+  );
 
   const runAction = async (paperId, action) => {
     setBusyId(paperId);
@@ -44,6 +49,19 @@ function RecentClassicsView({
     }
   };
 
+  const translate = async () => {
+    if (translating) return;
+    setTranslating(true);
+    setError(null);
+    try {
+      await onTranslate();
+    } catch (actionError) {
+      setError(actionError?.message ?? "翻译未完成，可稍后重试");
+    } finally {
+      setTranslating(false);
+    }
+  };
+
   if (!recentClassics) {
     return (
       <p className="journal-library-empty">
@@ -53,10 +71,22 @@ function RecentClassicsView({
   }
   return (
     <div className="journal-library-body">
-      <p className="workflow-recent-classics-note">
-        {recentClassics.fromYear ? `${recentClassics.fromYear} 年以来、` : ""}
-        与项目主题相关的注册刊物高引论文，已读、已收藏和标过不感兴趣的不会出现。
-      </p>
+      <div className="journal-library-toolbar">
+        <p className="workflow-recent-classics-note">
+          {recentClassics.fromYear ? `${recentClassics.fromYear} 年以来、` : ""}
+          与项目主题相关的注册刊物高引论文，已读、已收藏和标过不感兴趣的不会出现。
+        </p>
+        {needsTranslation && onTranslate ? (
+          <button
+            type="button"
+            className="workflow-evidence-toggle"
+            disabled={translating}
+            onClick={translate}
+          >
+            {translating ? "正在翻译…" : "翻译标题与摘要"}
+          </button>
+        ) : null}
+      </div>
       {recentClassics.status !== "success" ? (
         <p className="workflow-recent-classics-note">
           近年经典暂时无法获取（{recentClassics.error?.message ?? "数据源不可用"}），下次扫描会重试。
@@ -81,7 +111,9 @@ function RecentClassicsView({
                 {paper.publishedAt ? ` · 发表于 ${String(paper.publishedAt).slice(0, 10)}` : ""}
                 {Number.isInteger(paper.citedByCount) ? ` · 引用 ${paper.citedByCount}` : ""}
               </small>
-              {paper.abstract ? <p>{paper.abstract.slice(0, 200)}</p> : null}
+              {(paper.abstractZh || paper.abstract)
+                ? <p>{(paper.abstractZh || paper.abstract).slice(0, 200)}</p>
+                : null}
             </div>
             <div className="workflow-recent-classic-actions">
               <button
@@ -109,28 +141,81 @@ function RecentClassicsView({
   );
 }
 
-function PastRunsView({ pastRuns }) {
+function PastRunsView({
+  pastRuns,
+  canAddToWeekly,
+  onAddPastPaper,
+  onTranslate,
+  weeklyCandidateIds,
+}) {
+  const [busyId, setBusyId] = useState(null);
+  const [error, setError] = useState(null);
+  const [translatingRunId, setTranslatingRunId] = useState(null);
   if (!Array.isArray(pastRuns) || pastRuns.length === 0) {
     return <p className="journal-library-empty">还没有可回看的往期推荐。</p>;
   }
+  const weeklyIds = new Set(weeklyCandidateIds);
+  const addPaper = async (sourceRunId, paperId) => {
+    setBusyId(paperId);
+    setError(null);
+    try {
+      await onAddPastPaper(sourceRunId, paperId);
+    } catch (actionError) {
+      setError(actionError?.message ?? "操作未完成，可稍后重试");
+    } finally {
+      setBusyId(null);
+    }
+  };
+  const translateRun = async (runId) => {
+    if (translatingRunId) return;
+    setTranslatingRunId(runId);
+    setError(null);
+    try {
+      await onTranslate(runId);
+    } catch (actionError) {
+      setError(actionError?.message ?? "翻译未完成，可稍后重试");
+    } finally {
+      setTranslatingRunId(null);
+    }
+  };
   return (
     <div className="workflow-past-weeks-list">
+      {error ? <p className="workflow-recent-classics-error">{error}</p> : null}
       {pastRuns.map((pastRun) => {
         const decisions = pastRun.paperDecisions ?? {};
         const candidates = pastRun.candidates ?? [];
         const handledCount = candidates.filter(
           (paper) => ["read", "collect"].includes(decisions[paper.id]),
         ).length;
+        const needsTranslation = candidates.some(
+          (paper) => paper.title && !paper.titleZh,
+        );
         return (
           <article className="workflow-past-week" key={pastRun.id}>
             <header>
               <strong>{pastRunLabel(pastRun)}</strong>
               <small>{candidates.length} 篇推荐 · 处理 {handledCount} 篇</small>
+              {needsTranslation && onTranslate ? (
+                <button
+                  type="button"
+                  className="workflow-evidence-toggle journal-library-past-translate"
+                  disabled={translatingRunId === pastRun.id}
+                  onClick={() => translateRun(pastRun.id)}
+                >
+                  {translatingRunId === pastRun.id ? "翻译中…" : "翻译标题"}
+                </button>
+              ) : null}
             </header>
             <ul>
               {candidates.map((paper) => {
                 const decision = decisions[paper.id];
                 const date = String(paper.publishedAt ?? "").slice(0, 10);
+                const summary = paper.selectionSummary
+                  || paper.abstractZh
+                  || paper.relevance
+                  || paper.abstract;
+                const handled = ["read", "collect"].includes(decision);
+                const alreadyAdded = weeklyIds.has(paper.id);
                 return (
                   <li key={`${pastRun.id}-${paper.id}`}>
                     <PaperTitleLink
@@ -145,9 +230,25 @@ function PastRunsView({ pastRuns }) {
                     <small>
                       {[paper.venue, date ? `发表于 ${date}` : null].filter(Boolean).join(" · ")}
                     </small>
-                    <em className={decision ? `is-${decision}` : "is-unread"}>
-                      {pastDecisionLabel(decision)}
-                    </em>
+                    {summary ? <p className="journal-library-past-summary">{summary.slice(0, 160)}</p> : null}
+                    <div className="journal-library-past-foot">
+                      <em className={decision ? `is-${decision}` : "is-unread"}>
+                        {pastDecisionLabel(decision)}
+                      </em>
+                      {!handled && alreadyAdded ? (
+                        <em className="is-read">已加入本月</em>
+                      ) : !handled && onAddPastPaper ? (
+                        <button
+                          type="button"
+                          className="workflow-secondary-action"
+                          disabled={busyId === paper.id || !canAddToWeekly}
+                          title={canAddToWeekly ? undefined : "本月候选就绪后可加入"}
+                          onClick={() => addPaper(pastRun.id, paper.id)}
+                        >
+                          加入本月推荐
+                        </button>
+                      ) : null}
+                    </div>
                   </li>
                 );
               })}
@@ -165,7 +266,11 @@ export function JournalLibraryWorkspace({
   canAddToWeekly = false,
   onAddRecentClassics,
   onDismissRecentClassic,
+  onAddPastPaper,
+  onTranslateLibrary,
+  recentClassicsRunId = null,
   pastRuns = [],
+  weeklyCandidateIds = [],
   sidebarOpen,
   onToggleSidebar,
   mobileActive = false,
@@ -201,9 +306,18 @@ export function JournalLibraryWorkspace({
             canAddToWeekly={canAddToWeekly}
             onAddRecentClassics={onAddRecentClassics}
             onDismissRecentClassic={onDismissRecentClassic}
+            onTranslate={recentClassicsRunId && onTranslateLibrary
+              ? () => onTranslateLibrary(recentClassicsRunId)
+              : undefined}
           />
         ) : (
-          <PastRunsView pastRuns={pastRuns} />
+          <PastRunsView
+            pastRuns={pastRuns}
+            canAddToWeekly={canAddToWeekly}
+            onAddPastPaper={onAddPastPaper}
+            onTranslate={onTranslateLibrary}
+            weeklyCandidateIds={weeklyCandidateIds}
+          />
         )}
       </section>
     </main>

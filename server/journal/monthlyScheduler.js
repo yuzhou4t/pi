@@ -8,6 +8,8 @@ import {
 import path from "node:path";
 
 const RETRY_MS = 5 * 60 * 1_000;
+// 本月推荐在月内每周自动刷新一次，把新发表的论文追加进候选。
+const REFRESH_INTERVAL_MS = 7 * 24 * 60 * 60 * 1_000;
 
 function boundedInteger(value, fallback, min, max) {
   const parsed = Number(value);
@@ -107,7 +109,55 @@ export function createMonthlyJournalScheduler({
       const window = monthlyScheduleWindow(currentTime, schedule);
       const previous = await readState(statePath);
       if (previous?.last_started_month_key === window.monthKey) {
-        arm(new Date(window.nextDueAt).getTime() - currentTime.getTime());
+        // 本月 Run 已启动：到点就刷新本月推荐，否则等到下次到期。
+        const refreshBase = Date.parse(
+          previous.last_refresh_at ?? previous.last_started_at ?? window.dueAt,
+        );
+        const refreshDueMs = (Number.isFinite(refreshBase) ? refreshBase : currentTime.getTime())
+          + REFRESH_INTERVAL_MS;
+        if (
+          currentTime.getTime() >= refreshDueMs
+          && typeof workflowService.refreshCurrentMonthCandidates === "function"
+        ) {
+          let next;
+          try {
+            await workflowService.refreshCurrentMonthCandidates();
+            next = {
+              ...previous,
+              last_refresh_at: currentTime.toISOString(),
+              last_refresh_attempt_at: currentTime.toISOString(),
+              last_refresh_error: null,
+            };
+          } catch (error) {
+            next = {
+              ...previous,
+              last_refresh_attempt_at: currentTime.toISOString(),
+              last_refresh_error: {
+                code: typeof error?.code === "string"
+                  ? error.code
+                  : "MONTHLY_REFRESH_FAILED",
+                message: typeof error?.message === "string"
+                  ? error.message.slice(0, 300)
+                  : "本月推荐刷新未能完成",
+                at: currentTime.toISOString(),
+              },
+            };
+          }
+          await writeJsonAtomic(statePath, next);
+          if (next.last_refresh_error) {
+            arm(RETRY_MS);
+            return next;
+          }
+          arm(Math.min(
+            new Date(window.nextDueAt).getTime() - currentTime.getTime(),
+            REFRESH_INTERVAL_MS,
+          ));
+          return next;
+        }
+        arm(Math.min(
+          new Date(window.nextDueAt).getTime() - currentTime.getTime(),
+          Math.max(1, refreshDueMs - currentTime.getTime()),
+        ));
         return previous;
       }
       try {
@@ -118,11 +168,17 @@ export function createMonthlyJournalScheduler({
           last_started_month_key: window.monthKey,
           last_started_run_id: run?.run_id ?? null,
           last_started_at: currentTime.toISOString(),
+          last_refresh_at: null,
+          last_refresh_attempt_at: null,
+          last_refresh_error: null,
           last_error: null,
           next_due_at: window.nextDueAt,
         };
         await writeJsonAtomic(statePath, next);
-        arm(new Date(window.nextDueAt).getTime() - currentTime.getTime());
+        arm(Math.min(
+          new Date(window.nextDueAt).getTime() - currentTime.getTime(),
+          REFRESH_INTERVAL_MS,
+        ));
         return next;
       } catch (error) {
         const failed = {

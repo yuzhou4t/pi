@@ -17,9 +17,11 @@ const MAX_WEB_EXCERPT_CHARS = 400;
 const MAX_CONVERSATIONS = 50;
 const MAX_TITLE_CHARS = 60;
 const DEFAULT_CONVERSATION_TITLE = "新的检索";
-// 英文标题/摘要统一用 Codex 5.3 Spark 翻译，不受当前会话所选模型影响。
+// 标题/摘要的中文翻译走 Codex 订阅，不受当前会话所选模型影响。
+// 默认固定使用当前目录中可选的 GPT-5.3 Codex Spark，
+// 可用 PI_JOURNAL_TRANSLATION_MODEL 显式覆盖。
 const TRANSLATION_PROVIDER_ID = "codex-subscription";
-const TRANSLATION_MODEL_ID = "gpt-5.3-codex-spark";
+const DEFAULT_TRANSLATION_MODEL_ID = "gpt-5.3-codex-spark";
 const MAX_TRANSLATION_ITEMS = 40;
 const MAX_PLAN_QUERIES = 4;
 
@@ -190,6 +192,10 @@ export function createVenueSearchService({
   if (typeof dataDir !== "string" || !dataDir.trim()) {
     throw new TypeError("dataDir is required");
   }
+  const translationModelId = (typeof env.PI_JOURNAL_TRANSLATION_MODEL === "string"
+    && env.PI_JOURNAL_TRANSLATION_MODEL.trim())
+    ? env.PI_JOURNAL_TRANSLATION_MODEL.trim()
+    : DEFAULT_TRANSLATION_MODEL_ID;
   const legacyPath = path.resolve(dataDir, "venue-search", "conversation.json");
   const storePath = path.resolve(dataDir, "venue-search", "conversations.json");
   // 联网发现与普通项目工作共用同一份豆包月度额度台账。
@@ -511,7 +517,7 @@ export function createVenueSearchService({
       const prompt = promptRegistry.loadPrompt("venue-search-translate");
       const generated = await modelProviders.completeStructured({
         providerId: TRANSLATION_PROVIDER_ID,
-        modelId: TRANSLATION_MODEL_ID,
+        modelId: translationModelId,
         reasoningEffort: "low",
         system: prompt.system,
         prompt: prompt.body,

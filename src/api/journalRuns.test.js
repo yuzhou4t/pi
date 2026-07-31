@@ -100,18 +100,27 @@ const runBody = {
     display_label: "经典回顾 · 非本月新论文",
     candidate_origin: "classic_review",
     is_new: false,
+    published_this_month: false,
+    abstract_zh: "一段中文摘要",
     selection_summary: "A summary",
     project_impact: "An impact",
     topic_matches: ["LLM Agent"],
     heat_signals: [],
     evidence_scope: "全文",
   }],
+  candidate_refresh: {
+    last_refreshed_at: "2026-07-23T07:30:00.000Z",
+    last_added_count: 0,
+    last_error: { code: "REFRESH_FAILED", message: "刷新暂时失败" },
+  },
 };
 
 test("journal runs keep classic origin and MinerU state visible", () => {
   const run = mapJournalRun(runBody);
   assert.equal(run.candidates[0].discoveryType, "经典回顾 · 非本月新论文");
   assert.equal(run.candidates[0].isNew, false);
+  assert.equal(run.candidates[0].publishedThisMonth, false);
+  assert.equal(run.candidates[0].abstractZh, "一段中文摘要");
   assert.equal(run.candidates[0].mineruStatus, "ready");
   assert.equal(run.candidates[0].mineruRunStatus, "partial");
   assert.equal(run.candidates[0].guideStatus, "ready");
@@ -126,6 +135,7 @@ test("journal runs keep classic origin and MinerU state visible", () => {
   assert.equal(run.createdAt, "2026-07-23T07:00:00.000Z");
   assert.equal(run.phase, "candidate_review");
   assert.equal(run.scanSummary.source_count, 11);
+  assert.equal(run.candidateRefresh.lastError.message, "刷新暂时失败");
 });
 
 test("journal run summaries keep the active paper conversation for read-only resume", () => {

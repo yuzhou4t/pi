@@ -3018,6 +3018,86 @@ export function createApiServer({
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/api/v1/journal/past-papers/add") {
+    try {
+      requireJournalMutationOrigin(origin);
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      const allowedKeys = ["schema_version", "source_run_id", "paper_ids"];
+      if (
+        body?.schema_version !== 1
+        || typeof body?.source_run_id !== "string"
+        || !body.source_run_id.trim()
+        || !Array.isArray(body?.paper_ids)
+        || Object.keys(body).some((key) => !allowedKeys.includes(key))
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "加入本月推荐的请求无效", 400);
+      }
+      const run = await journalWorkflowService.addPastRunPapersToWeekly({
+        sourceRunId: body.source_run_id,
+        paperIds: body.paper_ids,
+      });
+      sendJson(response, 200, publicRun(run), origin);
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法加入本月推荐");
+    }
+    return;
+  }
+
+  const journalRefreshCandidatesMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/refresh-candidates$/,
+  );
+  if (request.method === "POST" && journalRefreshCandidatesMatch) {
+    try {
+      requireJournalMutationOrigin(origin);
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (
+        body?.schema_version !== 1
+        || Object.keys(body).some((key) => key !== "schema_version")
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "刷新本月推荐的请求无效", 400);
+      }
+      const run = await journalWorkflowService.refreshRunCandidates(
+        journalRefreshCandidatesMatch[1],
+      );
+      sendJson(response, 200, publicRun(run), origin);
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法刷新本月推荐");
+    }
+    return;
+  }
+
+  const journalTranslateLibraryMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/translate-library$/,
+  );
+  if (request.method === "POST" && journalTranslateLibraryMatch) {
+    try {
+      requireJournalMutationOrigin(origin);
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (
+        body?.schema_version !== 1
+        || Object.keys(body).some((key) => key !== "schema_version")
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "翻译请求无效", 400);
+      }
+      const run = await journalWorkflowService.translateJournalRunLibrary(
+        journalTranslateLibraryMatch[1],
+      );
+      sendJson(response, 200, publicRun(run), origin);
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法完成翻译");
+    }
+    return;
+  }
+
   if (request.method === "POST" && url.pathname === "/api/v1/journal/dismissed-papers") {
     try {
       requireJournalMutationOrigin(origin);

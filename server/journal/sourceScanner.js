@@ -3,6 +3,7 @@ import { selectResurfaceCandidates } from "./resurfaceCandidates.js";
 import {
   buildSourceScan,
   deduplicatePapers,
+  filterFieldCandidates,
   filterTopicCandidates,
   normalizePaper,
 } from "./monitorCore.js";
@@ -12,6 +13,8 @@ import { SOURCE_REGISTRY } from "./sourceRegistry.js";
 
 const MAX_PAPERS_PER_SOURCE = 80;
 const MAX_ENRICHMENT_PAPERS = 40;
+// 默认为本月的 5 篇保留最多 2 篇“领域视野”名额，让候选不只是窄主题。
+const DEFAULT_FIELD_SLOTS = 2;
 // 本月新论文的发现窗口：近 30 天 + 1 天容差（时区/索引延迟）。
 const MONTH_WINDOW_MS = 31 * 24 * 60 * 60 * 1000;
 const SOURCE_FETCH_TIMEOUT_MS = 4 * 60 * 1000;
@@ -91,16 +94,35 @@ function committedSourceScans(sourceScans) {
       });
 }
 
-async function readTransaction(runStore, runId) {
+async function readTransaction(runStore, runId, artifactPrefix = "") {
   try {
     return await runStore.readArtifact(
       runId,
-      "inputs/source-scan-transaction.json",
+      `${artifactPrefix}inputs/source-scan-transaction.json`,
     );
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
   }
+}
+
+function scanTransactionNamespace(runId, scanKey) {
+  if (scanKey === null || scanKey === undefined) {
+    return {
+      artifactPrefix: "",
+      transactionId: `source-scan:${runId}`,
+    };
+  }
+  if (
+    typeof scanKey !== "string"
+    || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,119}$/.test(scanKey)
+  ) {
+    throw new Error("SOURCE_SCAN_KEY_INVALID");
+  }
+  return {
+    artifactPrefix: `refresh/${scanKey}/`,
+    transactionId: `source-scan:${runId}:${scanKey}`,
+  };
 }
 
 function candidateBatchFromTransaction(transaction, candidates) {
@@ -119,6 +141,7 @@ async function finalizeTransaction({
   sourceScans,
   summary,
   candidates,
+  artifactPrefix = "",
 }) {
   const commit = await sourceStateStore.commitScanTransaction({
     transactionId: transaction.transaction_id,
@@ -127,8 +150,8 @@ async function finalizeTransaction({
     observedAt: transaction.observed_at,
   });
   const committedScans = committedSourceScans(sourceScans);
-  await runStore.writeArtifact(runId, "inputs/source-scans.json", committedScans);
-  await runStore.writeArtifact(runId, "inputs/source-scan-transaction.json", {
+  await runStore.writeArtifact(runId, `${artifactPrefix}inputs/source-scans.json`, committedScans);
+  await runStore.writeArtifact(runId, `${artifactPrefix}inputs/source-scan-transaction.json`, {
     ...transaction,
     status: "committed",
     committed_source_state_revision: commit.revision,
@@ -136,7 +159,7 @@ async function finalizeTransaction({
   });
   if (transaction.status !== "committed") {
     await runStore.appendEvent(runId, {
-      type: "source_scan_completed",
+      type: transaction.event_type ?? "source_scan_completed",
       at: transaction.observed_at,
       source_state_revision: commit.revision,
       ...summary,
@@ -164,23 +187,27 @@ export async function commitJournalSourceScan({
   runStore,
   sourceStateStore,
   requiredArtifacts = [],
+  scanKey = null,
 } = {}) {
   if (!runId || !runStore || !sourceStateStore) {
     throw new Error("runId, runStore, and sourceStateStore are required");
   }
-  const transaction = await readTransaction(runStore, runId);
+  const { artifactPrefix, transactionId } = scanTransactionNamespace(runId, scanKey);
+  const transaction = await readTransaction(runStore, runId, artifactPrefix);
   if (
     transaction?.schema_version !== 1
-    || transaction.transaction_id !== `source-scan:${runId}`
+    || transaction.transaction_id !== transactionId
     || !["staged", "committed"].includes(transaction.status)
   ) {
     throw new Error("SOURCE_SCAN_TRANSACTION_NOT_READY");
   }
   const [sourceScans, summary, candidates] = await Promise.all([
-    runStore.readArtifact(runId, "inputs/source-scans.json"),
-    runStore.readArtifact(runId, "inputs/scan-summary.json"),
-    runStore.readArtifact(runId, "inputs/ranking-pool.json"),
-    ...requiredArtifacts.map((artifact) => runStore.readArtifact(runId, artifact)),
+    runStore.readArtifact(runId, `${artifactPrefix}inputs/source-scans.json`),
+    runStore.readArtifact(runId, `${artifactPrefix}inputs/scan-summary.json`),
+    runStore.readArtifact(runId, `${artifactPrefix}inputs/ranking-pool.json`),
+    ...requiredArtifacts.map((artifact) => (
+      runStore.readArtifact(runId, `${artifactPrefix}${artifact}`)
+    )),
   ]);
   if (transaction.status === "committed") {
     return {
@@ -198,6 +225,7 @@ export async function commitJournalSourceScan({
     sourceScans,
     summary,
     candidates,
+    artifactPrefix,
   });
 }
 
@@ -232,21 +260,25 @@ export async function scanJournalSources({
   openAlexMailto = "",
   deferCursorCommit = false,
   dismissedKeys = [],
+  // 本月保留多少个“领域视野”名额（拓宽选题面，仍在 11 个刊物内）。
+  fieldSlots = DEFAULT_FIELD_SLOTS,
+  // 刷新扫描：用独立的事务与工件命名空间，不覆盖首次扫描的证据。
+  scanKey = null,
 } = {}) {
   if (!runId || !runStore || !sourceStateStore) {
     throw new Error("runId, runStore, and sourceStateStore are required");
   }
-  const transactionId = `source-scan:${runId}`;
-  const existingTransaction = await readTransaction(runStore, runId);
+  const { artifactPrefix, transactionId } = scanTransactionNamespace(runId, scanKey);
+  const existingTransaction = await readTransaction(runStore, runId, artifactPrefix);
   if (
     existingTransaction?.schema_version === 1
     && existingTransaction.transaction_id === transactionId
     && ["staged", "committed"].includes(existingTransaction.status)
   ) {
     const [persistedScans, summary, candidates] = await Promise.all([
-      runStore.readArtifact(runId, "inputs/source-scans.json"),
-      runStore.readArtifact(runId, "inputs/scan-summary.json"),
-      runStore.readArtifact(runId, "inputs/ranking-pool.json"),
+      runStore.readArtifact(runId, `${artifactPrefix}inputs/source-scans.json`),
+      runStore.readArtifact(runId, `${artifactPrefix}inputs/scan-summary.json`),
+      runStore.readArtifact(runId, `${artifactPrefix}inputs/ranking-pool.json`),
     ]);
     if (existingTransaction.status === "committed") return {
       sourceScans: persistedScans,
@@ -273,11 +305,14 @@ export async function scanJournalSources({
       sourceScans: persistedScans,
       summary,
       candidates,
+      artifactPrefix,
     });
   }
   const stateBeforeScan = await sourceStateStore.load();
 
   async function recordSourceProgress(scan) {
+    // 刷新扫描在后台进行，不覆盖首次扫描的逐来源进度记录。
+    if (scanKey) return;
     await runStore.updateRun(runId, (current) => {
       const previous = current.source_progress ?? {
         total_count: sources.length,
@@ -336,7 +371,7 @@ export async function scanJournalSources({
         dispatch: fetched.dispatch ?? null,
         papers: classified,
       };
-      await runStore.writeArtifact(runId, `sources/${source.source_id}.json`, artifact);
+      await runStore.writeArtifact(runId, `${artifactPrefix}sources/${source.source_id}.json`, artifact);
       const nextCursor = {
         fetched_at: fetched.fetched_at,
         targets: fetched.target_urls,
@@ -383,39 +418,68 @@ export async function scanJournalSources({
       .flatMap((scan) => scan.papers.filter((paper) => paper.is_new)),
   );
   const likelyRelevant = filterTopicCandidates(newRecords);
-  const enrichmentPool = (
-    likelyRelevant.length >= MAX_ENRICHMENT_PAPERS
-      ? likelyRelevant
-      : [...likelyRelevant, ...newRecords.filter((paper) => !likelyRelevant.includes(paper))]
-  ).slice(0, MAX_ENRICHMENT_PAPERS);
+  // 丰富选题面：除了窄主题命中，还优先把“领域视野”命中的论文纳入富化池，
+  // 让它们有机会成为候选；剩余名额再用其他新记录补齐。
+  const fieldRelevant = filterFieldCandidates(newRecords)
+    .filter((paper) => !likelyRelevant.includes(paper));
+  const enrichmentPool = deduplicatePapers([
+    ...likelyRelevant,
+    ...fieldRelevant,
+    ...newRecords.filter(
+      (paper) => !likelyRelevant.includes(paper) && !fieldRelevant.includes(paper),
+    ),
+  ]).slice(0, MAX_ENRICHMENT_PAPERS);
   const enriched = await enrichPapersWithOpenAlex(enrichmentPool, {
     fetchImpl,
     mailto: openAlexMailto,
   });
-  const topicCandidates = deduplicatePapers(filterTopicCandidates(enriched.map((paper) => ({
+  const discovered = enriched.map((paper) => ({
     ...paper,
     ...publicationDiscovery(
       paper.published_at,
       observedAt,
       paper.publication_date_precision,
     ),
-  }))));
-  const recentTopicCandidates = topicCandidates.filter((paper) => paper.published_this_month);
-  // 本月新论文不足时的回补顺序：本月补发现（本次扫描首次发现但非本月发表，
-  // 按发表时间降序）→ 往期未读回补 → 经典池。之前补发现曾被整体丢弃，
-  // 导致候选里全是多年前的经典论文。
-  const historicalDiscoveries = topicCandidates
+  }));
+  const topicCandidates = deduplicatePapers(filterTopicCandidates(discovered));
+  const coreKeys = new Set(topicCandidates.map((paper) => paper.dedupe_key).filter(Boolean));
+  // 领域视野候选：命中更宽领域规则、但不属于窄主题核心的论文，标上“领域视野”。
+  const boundedFieldSlots = Number.isInteger(fieldSlots)
+    ? Math.max(0, Math.min(fieldSlots, 4))
+    : DEFAULT_FIELD_SLOTS;
+  const fieldCandidates = boundedFieldSlots === 0
+    ? []
+    : deduplicatePapers(filterFieldCandidates(discovered))
+      .filter((paper) => !paper.dedupe_key || !coreKeys.has(paper.dedupe_key))
+      .filter((paper) => (paper.topic_matches?.length ?? 0) === 0)
+      .map((paper) => ({
+        ...paper,
+        candidate_scope: "field",
+        display_label: `${paper.display_label} · 领域视野`,
+      }));
+  const recentCore = topicCandidates.filter((paper) => paper.published_this_month);
+  const recentField = fieldCandidates.filter((paper) => paper.published_this_month);
+  // 为本月的 5 篇预留领域名额：核心优先，但至少留出几个位置给领域视野。
+  const fieldReserve = Math.min(boundedFieldSlots, recentField.length, 4);
+  const coreCount = Math.min(recentCore.length, Math.max(0, 5 - fieldReserve));
+  const recentSelected = [
+    ...recentCore.slice(0, coreCount),
+    ...recentField.slice(0, fieldReserve),
+  ];
+  // 本月新论文不足时的回补：核心+领域的历史首次发现（按发表时间降序）
+  // → 往期未读回补 → 经典池。之前补发现曾被整体丢弃，导致候选全是多年前经典。
+  const historicalDiscoveries = [...topicCandidates, ...fieldCandidates]
     .filter((paper) => !paper.published_this_month)
     .sort((left, right) => String(right.published_at ?? "").localeCompare(String(left.published_at ?? "")))
-    .slice(0, Math.max(0, 5 - recentTopicCandidates.length));
+    .slice(0, Math.max(0, 5 - recentSelected.length));
   let resurfacedCandidates = [];
-  const filledCount = recentTopicCandidates.length + historicalDiscoveries.length;
+  const filledCount = recentSelected.length + historicalDiscoveries.length;
   if (filledCount < 5 && typeof runStore.listRuns === "function") {
     try {
       const previousRuns = await runStore.listRuns();
       resurfacedCandidates = selectResurfaceCandidates({
         previousRuns,
-        currentCandidates: [...recentTopicCandidates, ...topicCandidates],
+        currentCandidates: [...recentSelected, ...topicCandidates, ...fieldCandidates],
         currentRunId: runId,
         limit: 5 - filledCount,
         observedAt,
@@ -428,7 +492,7 @@ export async function scanJournalSources({
   }
   const candidateBatch = buildCandidateBatch({
     newCandidates: [
-      ...recentTopicCandidates,
+      ...recentSelected,
       ...historicalDiscoveries,
       ...resurfacedCandidates,
     ],
@@ -447,16 +511,19 @@ export async function scanJournalSources({
     ),
     new_record_count: newRecords.length,
     topic_candidate_count: topicCandidates.length,
-    recent_topic_candidate_count: recentTopicCandidates.length,
+    recent_topic_candidate_count: recentCore.length,
+    field_candidate_count: fieldCandidates.length,
+    recent_field_candidate_count: recentField.length,
+    field_slots_reserved: fieldReserve,
     historical_backfill_count: historicalDiscoveries.length,
     resurfaced_candidate_count: resurfacedCandidates.length,
     historical_discovery_count: topicCandidates.filter((paper) => !paper.published_this_month).length,
     candidate_mode: candidateBatch.mode,
     fallback_reason: candidateBatch.fallback_reason,
   };
-  await runStore.writeArtifact(runId, "inputs/source-scans.json", sourceScans);
-  await runStore.writeArtifact(runId, "inputs/scan-summary.json", summary);
-  await runStore.writeArtifact(runId, "inputs/ranking-pool.json", candidateBatch.candidates);
+  await runStore.writeArtifact(runId, `${artifactPrefix}inputs/source-scans.json`, sourceScans);
+  await runStore.writeArtifact(runId, `${artifactPrefix}inputs/scan-summary.json`, summary);
+  await runStore.writeArtifact(runId, `${artifactPrefix}inputs/ranking-pool.json`, candidateBatch.candidates);
   const transaction = {
     schema_version: 1,
     transaction_id: transactionId,
@@ -466,10 +533,11 @@ export async function scanJournalSources({
     expected_source_state_revision: stateBeforeScan.revision,
     candidate_mode: candidateBatch.mode,
     fallback_reason: candidateBatch.fallback_reason,
+    ...(scanKey ? { scan_key: scanKey, event_type: "refresh_scan_completed" } : {}),
   };
   await runStore.writeArtifact(
     runId,
-    "inputs/source-scan-transaction.json",
+    `${artifactPrefix}inputs/source-scan-transaction.json`,
     transaction,
   );
   if (deferCursorCommit) {
@@ -488,5 +556,6 @@ export async function scanJournalSources({
     sourceScans,
     summary,
     candidates: candidateBatch.candidates,
+    artifactPrefix,
   });
 }

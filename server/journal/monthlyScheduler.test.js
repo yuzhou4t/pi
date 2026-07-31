@@ -101,3 +101,44 @@ test("scheduler persists a retryable startup failure without advancing the month
   assert.equal(scheduledDelay, 5 * 60 * 1_000);
   scheduler.dispose();
 });
+
+test("scheduler retries a failed weekly refresh without delaying it for another week", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-monthly-refresh-retry-"));
+  let current = new Date(2026, 6, 1, 8, 1);
+  let refreshAttempts = 0;
+  let scheduledDelay = null;
+  const scheduler = createMonthlyJournalScheduler({
+    dataDir,
+    now: () => new Date(current),
+    workflowService: {
+      async startRun() {
+        return { run_id: "run-july" };
+      },
+      async refreshCurrentMonthCandidates() {
+        refreshAttempts += 1;
+        if (refreshAttempts === 1) throw new Error("temporary refresh failure");
+        return { run_id: "run-july" };
+      },
+    },
+    setTimer: (_callback, delay) => {
+      scheduledDelay = delay;
+      return { unref() {} };
+    },
+    clearTimer: () => {},
+  });
+
+  await scheduler.start();
+  current = new Date(2026, 6, 8, 8, 2);
+  const failed = await scheduler.tick();
+  assert.equal(refreshAttempts, 1);
+  assert.equal(failed.last_refresh_at, null);
+  assert.equal(failed.last_refresh_error.code, "MONTHLY_REFRESH_FAILED");
+  assert.equal(scheduledDelay, 5 * 60 * 1_000);
+
+  current = new Date(2026, 6, 8, 8, 7);
+  const recovered = await scheduler.tick();
+  assert.equal(refreshAttempts, 2);
+  assert.ok(recovered.last_refresh_at);
+  assert.equal(recovered.last_refresh_error, null);
+  scheduler.dispose();
+});

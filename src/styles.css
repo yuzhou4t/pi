@@ -1801,6 +1801,19 @@ button.header-meta-pill:hover {
   font-size: 12px;
 }
 
+.workflow-refresh-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.workflow-refresh-note {
+  color: var(--weak);
+  font-size: 11.5px;
+}
+
 .workflow-scan-summary {
   display: flex;
   flex-wrap: wrap;
@@ -14379,6 +14392,18 @@ h4.reader-rail-full-heading {
   max-width: 860px;
 }
 
+.journal-library-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.journal-library-past-translate {
+  margin-left: auto;
+}
+
 .journal-library-scroll .workflow-past-weeks-list {
   max-width: 860px;
 }
@@ -14523,6 +14548,7 @@ a.journal-library-title:hover {
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 6px;
+  flex-wrap: wrap;
 }
 
 .workflow-past-week header small {
@@ -14538,36 +14564,49 @@ a.journal-library-title:hover {
 }
 
 .workflow-past-week li {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  grid-template-areas:
-    "title decision"
-    "original decision"
-    "meta decision";
-  column-gap: 10px;
-  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.workflow-past-week li:first-child {
+  border-top: 0;
 }
 
 .workflow-past-paper-title {
-  grid-area: title;
   font-size: 12.5px;
   overflow-wrap: anywhere;
 }
 
 .workflow-past-week li .journal-library-original {
-  grid-area: original;
   color: var(--weak);
   font-size: 11px;
   overflow-wrap: anywhere;
 }
 
 .workflow-past-week li small {
-  grid-area: meta;
   color: var(--muted);
 }
 
+.journal-library-past-summary {
+  margin: 2px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.journal-library-past-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 3px;
+}
+
 .workflow-past-week li em {
-  grid-area: decision;
   font-style: normal;
   font-size: 12px;
   color: var(--muted);

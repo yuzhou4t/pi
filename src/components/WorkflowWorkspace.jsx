@@ -682,6 +682,7 @@ function CandidateReview({
   onStartJournalRun,
   onResumeJournalRun,
   onRetryPaperDocument,
+  onRefreshCandidates,
   readOnly = false,
   readOnlyQuiet = false,
 }) {
@@ -689,6 +690,8 @@ function CandidateReview({
   const displayedPaperIds = new Set(papers.map((paper) => paper.id));
   const selectedCount = selectedPaperIds.filter((paperId) => displayedPaperIds.has(paperId)).length;
   const [expandedEvidenceId, setExpandedEvidenceId] = useState(null);
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const [refreshError, setRefreshError] = useState(null);
   const [documentRetryState, setDocumentRetryState] = useState({
     paperId: null,
     errors: {},
@@ -699,6 +702,7 @@ function CandidateReview({
       : !workflowFixture.guides?.[paper.id]
   )).length;
   const liveRun = journalRunState?.run;
+  const durableRefreshError = liveRun?.candidateRefresh?.lastError?.message ?? null;
   const liveScanStarted = Boolean(liveRun) || ["starting", "running", "ready", "failed", "error"].includes(journalRunState?.status);
   const hasLiveCandidates = Boolean(liveRun?.candidates?.length);
   const hasFixtureCandidates = run?.source === "fixture"
@@ -797,6 +801,39 @@ function CandidateReview({
                 <p className="workflow-week-window">本月发现窗口：{windowLabel}（此区间内发表的算本月新论文）</p>
               ) : null;
             })()}
+            {hasLiveCandidates && !readOnly && onRefreshCandidates ? (
+              <div className="workflow-refresh-row">
+                <button
+                  type="button"
+                  className="workflow-evidence-toggle"
+                  disabled={refreshBusy}
+                  onClick={async () => {
+                    if (refreshBusy) return;
+                    setRefreshBusy(true);
+                    setRefreshError(null);
+                    try {
+                      await onRefreshCandidates();
+                    } catch (error) {
+                      setRefreshError(error?.message ?? "刷新未完成，可稍后重试");
+                    } finally {
+                      setRefreshBusy(false);
+                    }
+                  }}
+                >
+                  {refreshBusy ? "正在刷新新论文…" : "刷新本月推荐"}
+                </button>
+                {liveRun?.candidateRefresh?.lastRefreshedAt ? (
+                  <small className="workflow-refresh-note">
+                    上次刷新 {String(liveRun.candidateRefresh.lastRefreshedAt).slice(0, 10)}
+                  </small>
+                ) : null}
+                {refreshError || durableRefreshError ? (
+                  <small className="workflow-recent-classics-error" role="alert">
+                    {refreshError || durableRefreshError}
+                  </small>
+                ) : null}
+              </div>
+            ) : null}
             {scanSummary ? (
               <p className="workflow-scan-summary">
                 扫描 <strong>{scanMetric(scanSummary, "raw_record_count", "rawCount", 46)}</strong> 条
@@ -918,7 +955,7 @@ function CandidateReview({
                   </p>
                   {paper.isDemo === false ? (
                     <p className="workflow-paper-status-row">
-                      <span className={paper.isNew === false || paper.publishedThisWeek === false ? "is-classic" : "is-new"}>
+                      <span className={paper.isNew === false || paper.publishedThisMonth === false ? "is-classic" : "is-new"}>
                         {paper.discoveryType ?? (paper.isNew === false ? "经典回顾 · 非本月新论文" : "本月新论文")}
                       </span>
                       <span className={`is-${mineru.tone}`}>{mineru.label}</span>
@@ -2059,6 +2096,7 @@ export function WorkflowWorkspace({
   onRestoreJournalRuns,
   onResumeJournalRun,
   onRetryPaperDocument,
+  onRefreshCandidates,
   onRestartFromGuide,
   onTogglePaper,
   onPrepareGuides,
@@ -2126,7 +2164,7 @@ export function WorkflowWorkspace({
   );
   const papers = suppliedPapers
     ?? (run?.source === "fixture" ? workflowFixture.papers ?? [] : []);
-  const reviewPapers = papers.slice(0, 5);
+  const reviewPapers = run?.source === "fixture" ? papers.slice(0, 5) : papers;
   const selectedPaperIds = run?.selectedPaperIds ?? run?.selected_ids ?? [];
   const selectedPapers = papers.filter((paper) => selectedPaperIds.includes(paper.id));
   const readingPapers = selectedPapers.filter((paper) => run?.guideChoices?.[paper.id] === "read");
@@ -2213,7 +2251,7 @@ export function WorkflowWorkspace({
         : JOURNAL_PHASE_LABELS[journalRunState?.run?.phase];
 
   let content = null;
-  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onResumeJournalRun={onResumeJournalRun} onRetryPaperDocument={onRetryPaperDocument} />;
+  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onResumeJournalRun={onResumeJournalRun} onRetryPaperDocument={onRetryPaperDocument} onRefreshCandidates={onRefreshCandidates} />;
   if (status === "preparing_guides") {
     content = <PreparingGuides run={run} selectedPapers={selectedPapers} journalRunState={journalRunState} />;
   }

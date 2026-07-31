@@ -30,6 +30,70 @@ after(async () => {
   await (await sharedViteServerPromise).close();
 });
 
+test("live candidate review shows appended papers and a durable refresh failure", async () => {
+  const vite = await createServer({
+    root: process.cwd(),
+    appType: "custom",
+    logLevel: "silent",
+    server: { middlewareMode: true },
+  });
+  try {
+    const { WorkflowWorkspace } = await vite.ssrLoadModule(
+      "/src/components/WorkflowWorkspace.jsx",
+    );
+    const papers = Array.from({ length: 6 }, (_, index) => ({
+      id: `paper-live-${index + 1}`,
+      title: index === 5 ? "Newly appended sixth paper" : `Paper ${index + 1}`,
+      authors: ["Author"],
+      venue: "ACL",
+      isDemo: false,
+      isNew: true,
+      publishedThisMonth: index !== 5,
+      discoveryType: index === 5
+        ? "本月补发现 · 非本月新论文"
+        : "本月新论文",
+      mineruStatus: "pdf_not_prepared",
+      selectionSummary: "候选摘要",
+      projectImpact: "项目关系待核验",
+    }));
+    const html = renderToStaticMarkup(React.createElement(WorkflowWorkspace, {
+      papers,
+      run: {
+        source: "live",
+        runId: "run-live-six",
+        status: "review_ready",
+        selectedPaperIds: [],
+        selectablePaperIds: [],
+        proposals: [],
+      },
+      journalRunState: {
+        status: "ready",
+        run: {
+          status: "review_ready",
+          phase: "candidate_review",
+          candidates: papers,
+          candidateRefresh: {
+            lastError: { message: "后台刷新失败，请稍后重试" },
+          },
+          scanSummary: {
+            raw_record_count: 20,
+            topic_candidate_count: 6,
+          },
+        },
+      },
+      candidateSummaryState: { items: [] },
+      onRefreshCandidates() {},
+    }));
+
+    assert.match(html, /Newly appended sixth paper/);
+    assert.match(html, /<strong>6<\/strong> 条重点候选/);
+    assert.match(html, /后台刷新失败，请稍后重试/);
+    assert.match(html, /is-classic[^>]*>本月补发现 · 非本月新论文/);
+  } finally {
+    await vite.close();
+  }
+});
+
 test("failed guide generation keeps the paper selected and exposes a clear retry state", async () => {
   const vite = await createServer({
     root: process.cwd(),

@@ -305,6 +305,387 @@ test("workflow runs scan, ranks five papers, submits one MinerU batch, and becom
   assert.equal(resultDownloads, 5);
 });
 
+test("refreshRunCandidates appends this-month papers and records refresh state", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-refresh-");
+  const sourceStateStore = createSourceStateStore({ dataDir });
+  let commitCalls = 0;
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore,
+    sourceScanner: async ({ scanKey, deferCursorCommit }) => {
+      assert.ok(scanKey, "refresh scan must pass a scanKey");
+      assert.equal(deferCursorCommit, true);
+      return {
+        summary: { source_count: 11, successful_source_count: 11, failed_source_ids: [] },
+        candidateBatch: {
+          mode: "new_papers",
+          candidates: [
+            {
+              paper_id: "fresh-1",
+              dedupe_key: "key-fresh-1",
+              title: "A Fresh Monthly Paper",
+              authors: ["A. Author"],
+              venue: "ACL",
+              published_at: "2026-07-20",
+              abstract: "Fresh abstract.",
+              topic_matches: ["LLM Agent"],
+              published_this_month: true,
+              candidate_scope: "field",
+              display_label: "本月新论文 · 领域视野",
+              pdf_url: "https://papers.example/fresh-1.pdf",
+            },
+            {
+              paper_id: "paper-1",
+              dedupe_key: "key-paper-1",
+              title: "Paper 1",
+              published_this_month: true,
+            },
+          ],
+        },
+        cursor_commit_pending: true,
+      };
+    },
+    sourceScanCommitter: async ({ scanKey, requiredArtifacts }) => {
+      commitCalls += 1;
+      assert.ok(scanKey);
+      assert.deepEqual(requiredArtifacts, ["outputs/candidates-applied.json"]);
+      const appliedRun = await runStore.getRun(runId);
+      assert.ok(appliedRun.candidates.some((paper) => paper.paper_id === "fresh-1"));
+      const marker = await runStore.readArtifact(
+        runId,
+        `refresh/${scanKey}/outputs/candidates-applied.json`,
+      );
+      assert.deepEqual(marker.paper_ids, ["fresh-1"]);
+    },
+  });
+
+  const refreshed = await service.refreshRunCandidates(runId);
+  const freshIds = refreshed.candidates.map((paper) => paper.paper_id);
+  assert.ok(freshIds.includes("fresh-1"));
+  assert.equal(freshIds.filter((id) => id === "paper-1").length, 1);
+  assert.equal(refreshed.candidate_refresh.last_added_count, 1);
+  assert.ok(refreshed.candidate_refresh.last_refreshed_at);
+  assert.equal(
+    refreshed.candidates.find((paper) => paper.paper_id === "fresh-1").display_label,
+    "本月新论文 · 领域视野",
+  );
+  assert.equal(commitCalls, 1);
+});
+
+test("refreshRunCandidates does not append after the run leaves candidate review", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-refresh-race-");
+  let commitCalls = 0;
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    sourceScanner: async () => {
+      await runStore.updateRun(runId, { status: "guide_ready", phase: "guide_review" });
+      return {
+        summary: {},
+        candidateBatch: {
+          mode: "new_papers",
+          candidates: [{
+            paper_id: "too-late",
+            dedupe_key: "key-too-late",
+            title: "A Paper That Arrived Too Late",
+            published_this_month: true,
+          }],
+        },
+        cursor_commit_pending: true,
+      };
+    },
+    sourceScanCommitter: async () => {
+      commitCalls += 1;
+    },
+  });
+
+  await assert.rejects(
+    service.refreshRunCandidates(runId),
+    (error) => error.code === "WEEKLY_RUN_NOT_READY" && error.status === 409,
+  );
+  const current = await runStore.getRun(runId);
+  assert.equal(current.status, "guide_ready");
+  assert.equal(current.candidates.some((paper) => paper.paper_id === "too-late"), false);
+  assert.equal(current.candidate_refresh, undefined);
+  assert.equal(commitCalls, 0);
+});
+
+test("refreshRunCandidates resumes a failed cursor commit without rescanning or duplicating", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-refresh-resume-");
+  let scanCalls = 0;
+  let translationCalls = 0;
+  let commitCalls = 0;
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "live" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    modelProviders: {
+      completeStructured: async ({ input }) => {
+        translationCalls += 1;
+        return {
+          value: {
+            translations: input.items.map((item) => ({ id: item.id, zh: `中文:${item.text}` })),
+          },
+        };
+      },
+    },
+    sourceScanner: async () => {
+      scanCalls += 1;
+      return {
+        summary: {},
+        candidateBatch: {
+          mode: "new_papers",
+          candidates: [{
+            paper_id: "recoverable-paper",
+            dedupe_key: "key-recoverable-paper",
+            title: "A Recoverable Refresh Paper",
+            abstract: "A durable refresh result.",
+            published_this_month: true,
+            display_label: "本月新论文",
+          }],
+        },
+        cursor_commit_pending: true,
+      };
+    },
+    sourceScanCommitter: async ({ scanKey }) => {
+      commitCalls += 1;
+      await runStore.readArtifact(
+        runId,
+        `refresh/${scanKey}/outputs/candidates-applied.json`,
+      );
+      if (commitCalls === 1) {
+        const error = new Error("FINALIZATION_INTERRUPTED");
+        error.code = "FINALIZATION_INTERRUPTED";
+        error.retryable = true;
+        throw error;
+      }
+    },
+  });
+
+  await assert.rejects(service.refreshRunCandidates(runId), /FINALIZATION_INTERRUPTED/);
+  const interrupted = await runStore.getRun(runId);
+  assert.equal(interrupted.candidate_refresh.last_added_count, 1);
+  assert.ok(interrupted.candidate_refresh.last_applied_at);
+  assert.equal(interrupted.candidate_refresh.last_refreshed_at, undefined);
+  assert.equal(interrupted.candidates.filter(
+    (paper) => paper.paper_id === "recoverable-paper",
+  ).length, 1);
+
+  const recovered = await service.refreshRunCandidates(runId);
+  assert.ok(recovered.candidate_refresh.last_refreshed_at);
+  assert.equal(recovered.candidate_refresh.last_error, null);
+  assert.equal(recovered.candidates.filter(
+    (paper) => paper.paper_id === "recoverable-paper",
+  ).length, 1);
+  assert.equal(scanCalls, 1);
+  assert.equal(translationCalls, 1);
+  assert.equal(commitCalls, 2);
+});
+
+test("refreshRunCandidates honors a paper dismissed while translation is running", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-refresh-dismiss-");
+  let dismissedKeys = [];
+  let releaseTranslation;
+  const translationStarted = new Promise((resolve) => {
+    releaseTranslation = resolve;
+  });
+  let continueTranslation;
+  const translationBarrier = new Promise((resolve) => {
+    continueTranslation = resolve;
+  });
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "live" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    dismissedPapersStore: {
+      listKeys: async () => [...dismissedKeys],
+    },
+    modelProviders: {
+      completeStructured: async ({ input }) => {
+        releaseTranslation();
+        await translationBarrier;
+        return {
+          value: {
+            translations: input.items.map((item) => ({ id: item.id, zh: `中文:${item.text}` })),
+          },
+        };
+      },
+    },
+    sourceScanner: async () => ({
+      summary: {},
+      candidateBatch: {
+        mode: "new_papers",
+        candidates: [{
+          paper_id: "dismissed-during-refresh",
+          dedupe_key: "key-dismissed-during-refresh",
+          title: "Dismiss This Paper",
+          published_this_month: true,
+        }],
+      },
+      cursor_commit_pending: true,
+    }),
+    sourceScanCommitter: async ({ scanKey }) => {
+      const marker = await runStore.readArtifact(
+        runId,
+        `refresh/${scanKey}/outputs/candidates-applied.json`,
+      );
+      assert.equal(marker.added_count, 0);
+    },
+  });
+
+  const refresh = service.refreshRunCandidates(runId);
+  await translationStarted;
+  dismissedKeys = ["key-dismissed-during-refresh"];
+  continueTranslation();
+  const refreshed = await refresh;
+  assert.equal(refreshed.candidate_refresh.last_added_count, 0);
+  assert.equal(refreshed.candidates.some(
+    (paper) => paper.paper_id === "dismissed-during-refresh",
+  ), false);
+});
+
+test("translateJournalRunLibrary backfills Chinese titles and abstracts via Codex 5.3 Spark", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-translate-lib-");
+  await runStore.updateRun(runId, {
+    recent_classics: {
+      schema_version: 1,
+      status: "success",
+      papers: [{
+        paper_id: "rc-1",
+        dedupe_key: "key-rc-1",
+        title: "A Novel Benchmark for Urban Scene Understanding",
+        abstract: "We introduce a new dataset for 2D and 3D scene understanding.",
+      }],
+    },
+  });
+  const sourceStateStore = createSourceStateStore({ dataDir });
+  let usedModelId = null;
+  let usedReasoningEffort = null;
+  let translationCalls = 0;
+  let insertedConcurrentCandidate = false;
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "live" },
+    dataDir,
+    runStore,
+    sourceStateStore,
+    modelRegistry: supportedModelRegistry(),
+    modelProviders: {
+      supports: () => true,
+      completeStructured: async ({ input, modelId, reasoningEffort }) => {
+        translationCalls += 1;
+        usedModelId = modelId;
+        usedReasoningEffort = reasoningEffort;
+        if (!insertedConcurrentCandidate) {
+          insertedConcurrentCandidate = true;
+          const current = await runStore.getRun(runId);
+          await runStore.updateRun(runId, {
+            candidates: [{
+              paper_id: "late-candidate",
+              dedupe_key: "key-late-candidate",
+              title: "Inserted While Translation Was Running",
+            }, ...(current.candidates ?? [])],
+          });
+        }
+        return {
+          value: { translations: input.items.map((item) => ({ id: item.id, zh: `中文:${item.text.slice(0, 8)}` })) },
+          provider_id: "codex-subscription",
+          model_id: modelId,
+          operation_id: "op-tr",
+          usage: null,
+        };
+      },
+    },
+  });
+
+  const [translated, duplicate] = await Promise.all([
+    service.translateJournalRunLibrary(runId),
+    service.translateJournalRunLibrary(runId),
+  ]);
+  assert.equal(usedModelId, "gpt-5.3-codex-spark");
+  assert.equal(usedReasoningEffort, "low");
+  assert.equal(translationCalls, 1);
+  assert.equal(duplicate.updated_at, translated.updated_at);
+  assert.ok(translated.recent_classics.papers[0].title_zh?.startsWith("中文:"));
+  assert.ok(translated.recent_classics.papers[0].abstract_zh?.startsWith("中文:"));
+  assert.equal(
+    translated.candidates.find((paper) => paper.paper_id === "late-candidate")?.title_zh,
+    null,
+  );
+  assert.ok(translated.candidates
+    .filter((paper) => paper.paper_id !== "late-candidate")
+    .every((paper) => paper.title_zh?.startsWith("中文:")));
+});
+
+test("addPastRunPapersToWeekly moves an unread past paper into the current-month run", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-past-add-");
+  const sourceStateStore = createSourceStateStore({ dataDir });
+  const sourceRun = await runStore.createRun();
+  await runStore.updateRun(sourceRun.run_id, {
+    status: "completed",
+    candidates: [{
+      paper_id: "past-1",
+      dedupe_key: "key-past-1",
+      title: "An Unread Past Paper",
+      authors: ["A. Author"],
+      venue: "NeurIPS",
+      published_at: "2026-05-01",
+      abstract: "Past abstract.",
+      rank: 1,
+    }],
+  });
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore,
+  });
+
+  const updated = await service.addPastRunPapersToWeekly({
+    sourceRunId: sourceRun.run_id,
+    paperIds: ["past-1"],
+  });
+  assert.equal(updated.run_id, runId);
+  const added = updated.candidates.find((paper) => paper.paper_id === "past-1");
+  assert.ok(added);
+  assert.equal(added.candidate_origin, "resurfaced_unread");
+  assert.equal(updated.mineru.papers["past-1"].status, "pdf_not_prepared");
+});
+
+test("addPastRunPapersToWeekly rejects a paper already read in the source run", async () => {
+  const { dataDir, runStore } = await createReadyGuideRun("pi-agent-past-handled-");
+  const sourceStateStore = createSourceStateStore({ dataDir });
+  const sourceRun = await runStore.createRun();
+  await runStore.updateRun(sourceRun.run_id, {
+    status: "completed",
+    candidates: [{
+      paper_id: "past-read-1",
+      dedupe_key: "key-past-read-1",
+      title: "An Already Read Paper",
+    }],
+    paper_decisions: { "past-read-1": "read" },
+  });
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore,
+  });
+
+  await assert.rejects(
+    service.addPastRunPapersToWeekly({
+      sourceRunId: sourceRun.run_id,
+      paperIds: ["past-read-1"],
+    }),
+    (error) => error.code === "PAST_PAPER_ALREADY_HANDLED",
+  );
+});
+
 test("live workflow fails closed before ranking or cursor commit when project state is missing", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-live-context-"));
   const runStore = createRunStore({ dataDir });

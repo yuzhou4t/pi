@@ -521,6 +521,7 @@ export function mapJournalRun(run) {
         firstSeenAt: paper.first_seen_at,
         discoveryType: paper.display_label,
         abstract: paper.abstract || "当前来源没有提供摘要，完整内容以正文解析结果为准。",
+        abstractZh: paper.abstract_zh ?? null,
         relevance: paper.project_impact,
         recommendation: Number(paper.rank) <= 2 ? "优先精读" : "候选",
         topicMatches: paper.topic_matches ?? [],
@@ -558,11 +559,21 @@ export function mapJournalRun(run) {
             publishedAt: paper.published_at,
             citedByCount: paper.cited_by_count ?? null,
             abstract: paper.abstract || "",
+            abstractZh: paper.abstract_zh ?? null,
             discoveryType: paper.display_label,
             topicMatches: paper.topic_matches ?? [],
             officialUrl: paper.official_url ?? paper.canonical_url ?? null,
             pdfUrl: paper.pdf_url ?? null,
           })),
+        }
+      : null,
+    candidateRefresh: run.candidate_refresh && typeof run.candidate_refresh === "object"
+      ? {
+          lastRefreshedAt: run.candidate_refresh.last_refreshed_at ?? null,
+          lastAddedCount: Number.isInteger(run.candidate_refresh.last_added_count)
+            ? run.candidate_refresh.last_added_count
+            : 0,
+          lastError: run.candidate_refresh.last_error ?? null,
         }
       : null,
   };
@@ -889,6 +900,48 @@ export async function addRecentClassicsToWeekly({ runId, paperIds, signal } = {}
   );
   const body = await jsonResponse(response, "本地期刊服务返回了无法解析的结果");
   if (!response.ok) throw requestError(response, body, "无法加入本月推荐");
+  return mapJournalRun(body);
+}
+
+export async function addPastRunPapersToWeekly({ sourceRunId, paperIds, signal } = {}) {
+  const response = await fetch("/api/v1/journal/past-papers/add", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ schema_version: 1, source_run_id: sourceRunId, paper_ids: paperIds }),
+    signal,
+  });
+  const body = await jsonResponse(response, "本地期刊服务返回了无法解析的结果");
+  if (!response.ok) throw requestError(response, body, "无法加入本月推荐");
+  return mapJournalRun(body);
+}
+
+export async function translateJournalRunLibrary({ runId, signal } = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/translate-library`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ schema_version: 1 }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地期刊服务返回了无法解析的结果");
+  if (!response.ok) throw requestError(response, body, "无法完成翻译");
+  return mapJournalRun(body);
+}
+
+export async function refreshJournalCandidates({ runId, signal } = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/refresh-candidates`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ schema_version: 1 }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地期刊服务返回了无法解析的结果");
+  if (!response.ok) throw requestError(response, body, "无法刷新本月推荐");
   return mapJournalRun(body);
 }
 

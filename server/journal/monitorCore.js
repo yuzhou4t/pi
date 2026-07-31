@@ -43,6 +43,52 @@ export const DEFAULT_TOPIC_RULES = Object.freeze([
   },
 ]);
 
+// 领域视野规则：比窄主题更宽的 AI/ML 领域主题，用于在同样的 11 个刊物里
+// 接触更多不同类型的好文章，避免只盯着项目窄主题而“坐井观天”。
+// 仍然是确定性过滤：命中这些主题才算领域候选，完全无关的论文不会进来。
+export const FIELD_TOPIC_RULES = Object.freeze([
+  {
+    label: "推理与思维链",
+    patterns: [/\breasoning\b/i, /\bchain[- ]of[- ]thought\b/i, /\bmathematical reasoning\b/i, /\bself[- ]consistency\b/i, /推理|思维链/u],
+  },
+  {
+    label: "多模态与视觉语言",
+    patterns: [/\bmultimodal\b/i, /\bvision[- ]language\b/i, /\bimage[- ]text\b/i, /\bvideo understanding\b/i, /\bVLM\b/, /多模态|视觉语言/u],
+  },
+  {
+    label: "生成模型",
+    patterns: [/\bdiffusion model/i, /\btext[- ]to[- ](?:image|video)\b/i, /\bgenerative model/i, /\bimage generation\b/i, /生成模型|扩散模型/u],
+  },
+  {
+    label: "训练与效率",
+    patterns: [/\bpre[- ]?training\b/i, /\bfine[- ]tuning\b/i, /\bquantization\b/i, /\bdistillation\b/i, /\bmixture[- ]of[- ]experts\b/i, /\bparameter[- ]efficient\b/i, /预训练|微调|模型压缩/u],
+  },
+  {
+    label: "表征与自监督",
+    patterns: [/\brepresentation learning\b/i, /\bself[- ]supervised\b/i, /\bcontrastive learning\b/i, /表征学习|自监督/u],
+  },
+  {
+    label: "强化学习",
+    patterns: [/\breinforcement learning\b/i, /\bRLHF\b/, /\bpolicy optimization\b/i, /强化学习/u],
+  },
+  {
+    label: "安全、对齐与鲁棒性",
+    patterns: [/\balignment\b/i, /\bAI safety\b/i, /\brobustness\b/i, /\badversarial\b/i, /\bfairness\b/i, /对齐|安全性|鲁棒性/u],
+  },
+  {
+    label: "图与结构学习",
+    patterns: [/\bgraph neural network/i, /\bGNN\b/, /\bgraph representation\b/i, /图神经网络/u],
+  },
+  {
+    label: "语音与音频",
+    patterns: [/\bspeech recognition\b/i, /\btext[- ]to[- ]speech\b/i, /\baudio\b/i, /语音|音频/u],
+  },
+  {
+    label: "优化与学习理论",
+    patterns: [/\boptimization\b/i, /\bgeneralization\b/i, /\bconvergence\b/i, /\blearning theory\b/i, /优化理论|泛化/u],
+  },
+]);
+
 function compactString(value) {
   return typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
 }
@@ -154,6 +200,20 @@ export function matchTopics(paper, rules = DEFAULT_TOPIC_RULES) {
     .filter((rule) => Array.isArray(rule.patterns) && rule.patterns.some((pattern) => pattern.test(text)))
     .map((rule) => rule.label);
   return uniqueStrings([...explicit, ...detected]);
+}
+
+// 领域主题匹配：只看更宽的领域规则（不含窄主题的 explicit 复用），
+// 用于挑“领域视野”候选。
+export function matchFieldTopics(paper, rules = FIELD_TOPIC_RULES) {
+  const text = [
+    paper?.title,
+    paper?.abstract,
+    ...(Array.isArray(paper?.keywords) ? paper.keywords : []),
+  ].map(compactString).filter(Boolean).join("\n");
+  const detected = rules
+    .filter((rule) => Array.isArray(rule.patterns) && rule.patterns.some((pattern) => pattern.test(text)))
+    .map((rule) => rule.label);
+  return uniqueStrings(detected);
 }
 
 export function paperIdentityKeys(paper) {
@@ -358,6 +418,13 @@ export function filterTopicCandidates(papers, rules = DEFAULT_TOPIC_RULES) {
   return papers
     .map((paper) => ({ ...paper, topic_matches: matchTopics(paper, rules) }))
     .filter((paper) => paper.topic_matches.length > 0);
+}
+
+// 领域视野候选：命中更宽的领域规则即可，标注 field_matches。
+export function filterFieldCandidates(papers, rules = FIELD_TOPIC_RULES) {
+  return papers
+    .map((paper) => ({ ...paper, field_matches: matchFieldTopics(paper, rules) }))
+    .filter((paper) => paper.field_matches.length > 0);
 }
 
 export function decideCursorCommit({

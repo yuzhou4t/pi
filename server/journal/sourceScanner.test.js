@@ -125,6 +125,159 @@ test("source cap keeps title-matched papers even when they appear after the raw 
   assert.equal(result.candidateBatch.candidates[0].title, "An LLM Agent with Tool Use");
 });
 
+test("field-diversity reserves monthly slots for broader-field papers within the venues", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-field-slots-"));
+  const runStore = createRunStore({ dataDir });
+  const sourceStateStore = createSourceStateStore({ dataDir });
+  const run = await runStore.createRun({ sourceIds: ["source-ok"] });
+  // 四篇窄主题（LLM Agent）+ 两篇领域视野（扩散生成、图神经网络），均为本月发表。
+  const papers = [
+    ...Array.from({ length: 4 }, (_, index) => ({
+      title: `An LLM Agent method ${index}`,
+      authors: ["A. Author"],
+      venue: "ACL",
+      published_at: "2026-07-20",
+      official_id: `conf/acl/Agent${index}`,
+      official_url: `https://aclanthology.org/2026.acl.agent${index}/`,
+      pdf_url: `https://aclanthology.org/2026.acl.agent${index}.pdf`,
+      abstract: "An LLM agent with planning and tool use.",
+    })),
+    {
+      title: "A diffusion model for image generation",
+      authors: ["B. Author"],
+      venue: "ACL",
+      published_at: "2026-07-19",
+      official_id: "conf/acl/Diffusion",
+      official_url: "https://aclanthology.org/2026.acl.diffusion/",
+      pdf_url: "https://aclanthology.org/2026.acl.diffusion.pdf",
+      abstract: "We propose a diffusion model and generative model for image generation.",
+    },
+    {
+      title: "A graph neural network for representation learning",
+      authors: ["C. Author"],
+      venue: "ACL",
+      published_at: "2026-07-18",
+      official_id: "conf/acl/GNN",
+      official_url: "https://aclanthology.org/2026.acl.gnn/",
+      pdf_url: "https://aclanthology.org/2026.acl.gnn.pdf",
+      abstract: "A graph neural network with contrastive learning for representation learning.",
+    },
+  ];
+  const result = await scanJournalSources({
+    runId: run.run_id,
+    runStore,
+    sourceStateStore,
+    sources: [sources[0]],
+    fetchSource: async () => ({
+      fetched_at: "2026-07-30T08:00:00.000Z",
+      index_url: "https://dblp.org/db/conf/acl/index.xml",
+      target_urls: ["https://dblp.org/db/conf/acl/acl2026.xml"],
+      papers,
+    }),
+    fetchImpl: async () => new Response(JSON.stringify({ results: [] }), { status: 200 }),
+    observedAt: "2026-07-30T08:00:00.000Z",
+    fieldSlots: 2,
+  });
+  const candidates = result.candidateBatch.candidates;
+  assert.equal(candidates.length, 5);
+  const fieldPicks = candidates.filter((paper) => paper.candidate_scope === "field");
+  // 保留了 2 个领域视野名额，且其余仍是窄主题。
+  assert.equal(fieldPicks.length, 2);
+  assert.ok(fieldPicks.every((paper) => paper.display_label.includes("领域视野")));
+  assert.equal(result.summary.field_slots_reserved, 2);
+});
+
+test("a refresh scan commits its cursor only after the applied marker is durable", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-refresh-scan-"));
+  const runStore = createRunStore({ dataDir });
+  const sourceStateStore = createSourceStateStore({ dataDir });
+  const run = await runStore.createRun({ sourceIds: ["source-ok"] });
+  const scanArgs = {
+    runId: run.run_id,
+    runStore,
+    sourceStateStore,
+    sources: [sources[0]],
+    fetchSource: async () => ({
+      fetched_at: "2026-07-23T08:00:00.000Z",
+      index_url: "https://dblp.org/db/conf/acl/index.xml",
+      target_urls: ["https://dblp.org/db/conf/acl/acl2026.xml"],
+      papers: [{
+        title: "An LLM Agent with Tool Use",
+        authors: ["A. Author"],
+        venue: "ACL",
+        published_at: "2026-07-20",
+        official_id: "conf/acl/Fresh",
+        official_url: "https://aclanthology.org/2026.acl.fresh/",
+        pdf_url: "https://aclanthology.org/2026.acl.fresh.pdf",
+        abstract: "",
+      }],
+    }),
+    fetchImpl: async () => new Response(JSON.stringify({ results: [] }), { status: 200 }),
+    observedAt: "2026-07-23T08:00:00.000Z",
+  };
+  await scanJournalSources({ ...scanArgs });
+  const refresh = await scanJournalSources({
+    ...scanArgs,
+    scanKey: "refresh-2026-07-30",
+    deferCursorCommit: true,
+  });
+  assert.equal(refresh.cursor_commit_pending, true);
+  assert.equal((await sourceStateStore.load()).revision, 1);
+  // 刷新扫描的事务写在独立的 refresh/ 命名空间，不覆盖首次扫描的工件。
+  let refreshTransaction = await runStore.readArtifact(
+    run.run_id,
+    "refresh/refresh-2026-07-30/inputs/source-scan-transaction.json",
+  );
+  assert.equal(refreshTransaction.scan_key, "refresh-2026-07-30");
+  assert.equal(refreshTransaction.status, "staged");
+  await assert.rejects(commitJournalSourceScan({
+    runId: run.run_id,
+    runStore,
+    sourceStateStore,
+    scanKey: "refresh-2026-07-30",
+    requiredArtifacts: ["outputs/candidates-applied.json"],
+  }), (error) => error?.code === "ENOENT");
+  assert.equal((await sourceStateStore.load()).revision, 1);
+  await runStore.writeArtifact(
+    run.run_id,
+    "refresh/refresh-2026-07-30/outputs/candidates-applied.json",
+    { schema_version: 1, run_id: run.run_id, scan_key: "refresh-2026-07-30" },
+  );
+  const committed = await commitJournalSourceScan({
+    runId: run.run_id,
+    runStore,
+    sourceStateStore,
+    scanKey: "refresh-2026-07-30",
+    requiredArtifacts: ["outputs/candidates-applied.json"],
+  });
+  assert.equal(committed.cursor_commit_pending, false);
+  assert.equal((await sourceStateStore.load()).revision, 2);
+  refreshTransaction = await runStore.readArtifact(
+    run.run_id,
+    "refresh/refresh-2026-07-30/inputs/source-scan-transaction.json",
+  );
+  assert.equal(refreshTransaction.status, "committed");
+  const baseTransaction = await runStore.readArtifact(
+    run.run_id,
+    "inputs/source-scan-transaction.json",
+  );
+  assert.equal(baseTransaction.scan_key, undefined);
+});
+
+test("refresh scan keys cannot escape their artifact namespace", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-refresh-key-"));
+  const runStore = createRunStore({ dataDir });
+  const sourceStateStore = createSourceStateStore({ dataDir });
+  const run = await runStore.createRun({ sourceIds: ["source-ok"] });
+  await assert.rejects(scanJournalSources({
+    runId: run.run_id,
+    runStore,
+    sourceStateStore,
+    sources: [sources[0]],
+    scanKey: "../outside",
+  }), /SOURCE_SCAN_KEY_INVALID/);
+});
+
 test("historical first discoveries backfill candidates before the classic pool", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-source-backfill-"));
   const runStore = createRunStore({ dataDir });

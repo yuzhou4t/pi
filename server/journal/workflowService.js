@@ -255,9 +255,14 @@ export function createJournalWorkflowService({
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 } = {}) {
   const inFlight = new Map();
+  // 候选刷新的并发护栏：同一个 Run 同时只跑一次刷新扫描。
+  const refreshInFlight = new Map();
+  // 只有候选审阅阶段仍能安全追加论文；进入导读后候选视图只读。
+  const CANDIDATE_MUTABLE_RUN_STATUSES = ["review_ready"];
   const guideInFlight = new Map();
   const guideStartLocks = new Map();
   const translationInFlight = new Map();
+  const libraryTranslationInFlight = new Map();
   const documentRetryInFlight = new Map();
   const archiveCommitJobs = new Map();
   const archiveStartLocks = new Map();
@@ -623,46 +628,72 @@ export function createJournalWorkflowService({
     }
   }
 
-  // 近年经典的英文标题用 Codex 5.3 Spark 做一道尽力而为的中文翻译；
-  // 失败保留英文原文，不影响栏目本身。
-  async function translateRecentClassicTitles(recentClassics) {
+  // 标题/摘要的中文翻译走 Codex 订阅，固定使用当前目录中可选的
+  // GPT-5.3 Codex Spark；可用 PI_JOURNAL_TRANSLATION_MODEL 显式覆盖。
+  const translationModelId = (typeof env.PI_JOURNAL_TRANSLATION_MODEL === "string"
+    && env.PI_JOURNAL_TRANSLATION_MODEL.trim())
+    ? env.PI_JOURNAL_TRANSLATION_MODEL.trim()
+    : "gpt-5.3-codex-spark";
+  // 本月保留的“领域视野”名额（拓宽选题面），可用 PI_JOURNAL_FIELD_SLOTS 调整，0 则关闭。
+  const journalFieldSlots = Number.isInteger(Number(env.PI_JOURNAL_FIELD_SLOTS))
+    ? Math.max(0, Math.min(Number(env.PI_JOURNAL_FIELD_SLOTS), 4))
+    : undefined;
+  async function translateTextsWithSpark(items) {
     if (
       modelMode !== "live"
       || !modelProviders?.completeStructured
-      || recentClassics?.status !== "success"
-      || (recentClassics.papers ?? []).length === 0
+      || !Array.isArray(items)
+      || items.length === 0
     ) {
-      return recentClassics;
+      return new Map();
     }
-    const items = recentClassics.papers
-      .map((paper, index) => ({ id: `p${index}`, text: String(paper.title ?? "").slice(0, 300) }))
-      .filter((item) => /[A-Za-z]{4,}/.test(item.text));
-    if (items.length === 0) return recentClassics;
+    const translatable = items
+      .filter((item) => /[A-Za-z]{4,}/.test(item.text))
+      .slice(0, 40);
+    if (translatable.length === 0) return new Map();
     try {
       const prompt = promptRegistry.loadPrompt("venue-search-translate");
       const generated = await modelProviders.completeStructured({
         providerId: "codex-subscription",
-        modelId: "gpt-5.3-codex-spark",
+        modelId: translationModelId,
+        reasoningEffort: "low",
         system: prompt.system,
         prompt: prompt.body,
-        input: { items },
+        input: { items: translatable },
         schema: prompt.schema,
       });
-      const byId = new Map(
+      return new Map(
         (generated.value?.translations ?? [])
           .filter((entry) => typeof entry?.id === "string" && typeof entry?.zh === "string")
           .map((entry) => [entry.id, entry.zh.trim()]),
       );
-      return {
-        ...recentClassics,
-        papers: recentClassics.papers.map((paper, index) => ({
-          ...paper,
-          title_zh: byId.get(`p${index}`) || paper.title_zh || null,
-        })),
-      };
     } catch {
+      return new Map();
+    }
+  }
+
+  // 近年经典：标题和摘要都翻成中文，让栏目和每月追踪一样能看懂大概内容。
+  async function translateRecentClassicTitles(recentClassics) {
+    if (
+      recentClassics?.status !== "success"
+      || (recentClassics.papers ?? []).length === 0
+    ) {
       return recentClassics;
     }
+    const items = recentClassics.papers.flatMap((paper, index) => [
+      { id: `p${index}`, text: String(paper.title ?? "").slice(0, 300) },
+      { id: `a${index}`, text: String(paper.abstract ?? "").slice(0, 500) },
+    ]).filter((item) => item.text);
+    const byId = await translateTextsWithSpark(items);
+    if (byId.size === 0) return recentClassics;
+    return {
+      ...recentClassics,
+      papers: recentClassics.papers.map((paper, index) => ({
+        ...paper,
+        title_zh: byId.get(`p${index}`) || paper.title_zh || null,
+        abstract_zh: byId.get(`a${index}`) || paper.abstract_zh || null,
+      })),
+    };
   }
 
   async function executeRun(runId, { providerId, modelId, reasoningEffort = null } = defaults) {
@@ -676,6 +707,7 @@ export function createJournalWorkflowService({
         openAlexMailto: env.PI_OPENALEX_MAILTO || "",
         deferCursorCommit: true,
         dismissedKeys: await dismissedPapersStore.listKeys().catch(() => []),
+        ...(journalFieldSlots === undefined ? {} : { fieldSlots: journalFieldSlots }),
       });
       await update(runId, {
         status: "ranking",
@@ -874,7 +906,7 @@ export function createJournalWorkflowService({
     const windowKey = journalMonthWindowKey(new Date().toISOString());
     const targetRun = runs.find((run) => (
       (run.window_key || journalMonthWindowKey(run.created_at)) === windowKey
-      && ["review_ready", "guide_ready", "reading", "draft_ready", "reading_ready"].includes(run.status)
+      && CANDIDATE_MUTABLE_RUN_STATUSES.includes(run.status)
     ));
     if (!targetRun) {
       throw artifactError(
@@ -887,6 +919,13 @@ export function createJournalWorkflowService({
       (turn.recommendations ?? []).map((item) => [item.paper_id, item]),
     );
     const updatedRun = await update(targetRun.run_id, (current) => {
+      if (!CANDIDATE_MUTABLE_RUN_STATUSES.includes(current.status)) {
+        throw artifactError(
+          "WEEKLY_RUN_NOT_READY",
+          "本月候选已进入下一阶段，不能再加入论文",
+          409,
+        );
+      }
       const existingIds = new Set(
         (current.candidates ?? []).map((paper) => paper.paper_id),
       );
@@ -958,7 +997,7 @@ export function createJournalWorkflowService({
     }
     const run = await runStore.getRun(runId);
     if (!run) throw artifactError("RUN_NOT_FOUND", "运行不存在", 404);
-    if (!["review_ready", "guide_ready", "reading", "draft_ready", "reading_ready"].includes(run.status)) {
+    if (!CANDIDATE_MUTABLE_RUN_STATUSES.includes(run.status)) {
       throw artifactError(
         "WEEKLY_RUN_NOT_READY",
         "本月运行还没有进入候选审阅，请先完成本月扫描",
@@ -978,6 +1017,13 @@ export function createJournalWorkflowService({
       }
     }
     return update(runId, (current) => {
+      if (!CANDIDATE_MUTABLE_RUN_STATUSES.includes(current.status)) {
+        throw artifactError(
+          "WEEKLY_RUN_NOT_READY",
+          "本月候选已进入下一阶段，不能再加入论文",
+          409,
+        );
+      }
       const existingIds = new Set(
         (current.candidates ?? []).map((paper) => paper.paper_id),
       );
@@ -1034,6 +1080,478 @@ export function createJournalWorkflowService({
       type: "recent_classics_added",
       paper_ids: paperIds,
     });
+  }
+
+  // 回填翻译：把已落盘 Run 里还是英文的近年经典（标题+摘要）与候选（标题）补上中文；
+  // 显式用户动作才会调用模型，已有中文的不重复翻译，失败保留英文。
+  async function performJournalRunLibraryTranslation(runId) {
+    const run = await runStore.getRun(runId);
+    if (!run) throw artifactError("RUN_NOT_FOUND", "运行不存在", 404);
+    const classicPapers = run.recent_classics?.papers ?? [];
+    const candidatePapers = run.candidates ?? [];
+    const requests = [];
+    const addRequest = (kind, paper, field, limit) => {
+      const text = String(paper[field] ?? "").slice(0, limit);
+      if (!text) return;
+      const id = `${kind}${createHash("sha256")
+        .update(`${paper.paper_id}\0${field}\0${text}`)
+        .digest("hex")
+        .slice(0, 19)}`;
+      requests.push({ id, paperId: paper.paper_id, field, text });
+    };
+    classicPapers.forEach((paper) => {
+      if (!paper.title_zh && paper.title) addRequest("t", paper, "title", 300);
+      if (!paper.abstract_zh && paper.abstract) addRequest("a", paper, "abstract", 500);
+    });
+    candidatePapers.forEach((paper) => {
+      if (!paper.title_zh && paper.title) addRequest("c", paper, "title", 300);
+    });
+    if (requests.length === 0) return run;
+    const byId = await translateTextsWithSpark(
+      requests.map(({ id, text }) => ({ id, text })),
+    );
+    if (byId.size === 0) {
+      throw artifactError(
+        "TRANSLATION_UNAVAILABLE",
+        "翻译服务暂时不可用，请稍后重试",
+        503,
+      );
+    }
+    const translatedRequests = new Map(
+      requests
+        .filter((request) => byId.has(request.id))
+        .map((request) => [
+          `${request.paperId}\0${request.field}`,
+          { ...request, translated: byId.get(request.id) },
+        ]),
+    );
+    return update(runId, (current) => {
+      const patch = {};
+      const currentClassics = current.recent_classics?.papers ?? [];
+      if (currentClassics.length > 0) {
+        patch.recent_classics = {
+          ...current.recent_classics,
+          papers: currentClassics.map((paper) => {
+            const title = translatedRequests.get(`${paper.paper_id}\0title`);
+            const abstract = translatedRequests.get(`${paper.paper_id}\0abstract`);
+            return {
+              ...paper,
+              title_zh: paper.title_zh
+                || (title && String(paper.title ?? "").slice(0, 300) === title.text
+                  ? title.translated
+                  : null),
+              abstract_zh: paper.abstract_zh
+                || (abstract && String(paper.abstract ?? "").slice(0, 500) === abstract.text
+                  ? abstract.translated
+                  : null),
+            };
+          }),
+        };
+      }
+      const currentCandidates = current.candidates ?? [];
+      if (currentCandidates.length > 0) {
+        patch.candidates = currentCandidates.map((paper) => {
+          const title = translatedRequests.get(`${paper.paper_id}\0title`);
+          return {
+            ...paper,
+            title_zh: paper.title_zh
+              || (title && String(paper.title ?? "").slice(0, 300) === title.text
+                ? title.translated
+                : null),
+          };
+        });
+      }
+      return patch;
+    }, { type: "library_translated" });
+  }
+
+  function translateJournalRunLibrary(runId) {
+    const existing = libraryTranslationInFlight.get(runId);
+    if (existing) return existing;
+    const task = performJournalRunLibraryTranslation(runId)
+      .finally(() => {
+        if (libraryTranslationInFlight.get(runId) === task) {
+          libraryTranslationInFlight.delete(runId);
+        }
+      });
+    libraryTranslationInFlight.set(runId, task);
+    return task;
+  }
+
+  // 把往期回看里未处理的推荐加入本月候选；按稳定论文身份去重。
+  async function addPastRunPapersToWeekly({ sourceRunId, paperIds } = {}) {
+    if (!Array.isArray(paperIds) || paperIds.length === 0) {
+      throw artifactError(
+        "PAST_PAPER_IDS_REQUIRED",
+        "请先选择要加入本月推荐的往期论文",
+        400,
+      );
+    }
+    const sourceRun = await runStore.getRun(sourceRunId);
+    if (!sourceRun) throw artifactError("RUN_NOT_FOUND", "往期运行不存在", 404);
+    const byId = new Map(
+      (sourceRun.candidates ?? []).map((paper) => [paper.paper_id, paper]),
+    );
+    for (const paperId of paperIds) {
+      if (!byId.has(paperId)) {
+        throw artifactError(
+          "PAST_PAPER_NOT_FOUND",
+          "所选论文不在该期推荐中",
+          404,
+        );
+      }
+      if (["read", "collect"].includes(sourceRun.paper_decisions?.[paperId])) {
+        throw artifactError(
+          "PAST_PAPER_ALREADY_HANDLED",
+          "已读或已收藏的往期论文不能重新加入本月推荐",
+          409,
+        );
+      }
+    }
+    const runs = await runStore.listRuns();
+    const windowKey = journalMonthWindowKey(new Date().toISOString());
+    const targetRun = runs.find((run) => (
+      (run.window_key || journalMonthWindowKey(run.created_at)) === windowKey
+      && CANDIDATE_MUTABLE_RUN_STATUSES.includes(run.status)
+    ));
+    if (!targetRun) {
+      throw artifactError(
+        "WEEKLY_RUN_NOT_READY",
+        "本月运行还没有进入候选审阅，请先完成本月扫描",
+        409,
+      );
+    }
+    if (targetRun.run_id === sourceRunId) {
+      throw artifactError(
+        "PAST_RUN_IS_CURRENT",
+        "这一期就是当前正在审阅的推荐",
+        409,
+      );
+    }
+    return update(targetRun.run_id, (current) => {
+      if (!CANDIDATE_MUTABLE_RUN_STATUSES.includes(current.status)) {
+        throw artifactError(
+          "WEEKLY_RUN_NOT_READY",
+          "本月候选已进入下一阶段，不能再加入论文",
+          409,
+        );
+      }
+      const existingIds = new Set(
+        (current.candidates ?? []).map((paper) => paper.paper_id),
+      );
+      const existingKeys = new Set(
+        (current.candidates ?? []).map((paper) => paper.dedupe_key).filter(Boolean),
+      );
+      let nextRank = (current.candidates ?? []).reduce(
+        (max, paper) => Math.max(max, Number(paper.rank) || 0),
+        0,
+      );
+      const added = [];
+      for (const paperId of paperIds) {
+        const paper = byId.get(paperId);
+        if (existingIds.has(paperId) || (paper.dedupe_key && existingKeys.has(paper.dedupe_key))) {
+          continue;
+        }
+        nextRank += 1;
+        added.push({
+          ...paper,
+          rank: nextRank,
+          candidate_origin: "resurfaced_unread",
+          display_label: "往期未读回补 · 非本月新论文",
+          resurfaced_from_run_id: sourceRunId,
+          selection_summary: paper.selection_summary
+            ?? (paper.abstract
+              ? paper.abstract.slice(0, 220)
+              : `${paper.title}：来自往期推荐，价值待全文核验。`),
+          project_impact: paper.project_impact ?? "对项目的具体作用待核验。",
+        });
+        existingIds.add(paperId);
+        if (paper.dedupe_key) existingKeys.add(paper.dedupe_key);
+      }
+      if (added.length === 0) return {};
+      return {
+        candidates: [...(current.candidates ?? []), ...added],
+        mineru: {
+          ...current.mineru,
+          papers: {
+            ...(current.mineru?.papers ?? {}),
+            ...Object.fromEntries(added.map((paper) => [
+              paper.paper_id,
+              { status: "pdf_not_prepared", error: null },
+            ])),
+          },
+        },
+      };
+    }, {
+      type: "past_run_papers_added",
+      source_run_id: sourceRunId,
+      paper_ids: paperIds,
+    });
+  }
+
+  // 刷新本月推荐：重跑一次增量扫描（独立事务/工件命名空间），
+  // 只把窗口内新发表、未重复、未被排除的论文追加进候选；每天同一把钥匙幂等。
+  async function refreshRunCandidates(runId) {
+    const scanKey = `refresh-${new Date().toISOString().slice(0, 10)}`;
+    const run = await runStore.getRun(runId);
+    if (!run) throw artifactError("RUN_NOT_FOUND", "运行不存在", 404);
+    const existingRefresh = run.candidate_refresh ?? {};
+    if (
+      existingRefresh.last_scan_key === scanKey
+      && existingRefresh.last_refreshed_at
+      && !existingRefresh.last_error
+    ) {
+      return run;
+    }
+    const recoveringAppliedRefresh = (
+      existingRefresh.last_scan_key === scanKey
+      && Boolean(existingRefresh.last_applied_at)
+    );
+    if (
+      !CANDIDATE_MUTABLE_RUN_STATUSES.includes(run.status)
+      && !recoveringAppliedRefresh
+    ) {
+      throw artifactError(
+        "WEEKLY_RUN_NOT_READY",
+        "本月运行还没有进入候选审阅，暂不能刷新推荐",
+        409,
+      );
+    }
+    if (refreshInFlight.has(runId)) return refreshInFlight.get(runId);
+    const task = (async () => {
+      const attemptedAt = new Date().toISOString();
+      try {
+        let appliedRefresh = recoveringAppliedRefresh ? existingRefresh : null;
+        if (!appliedRefresh) {
+          const dismissedKeys = await dismissedPapersStore.listKeys().catch(() => []);
+          const scan = await sourceScanner({
+            runId,
+            runStore,
+            sourceStateStore,
+            fetchImpl,
+            openAlexMailto: env.PI_OPENALEX_MAILTO || "",
+            deferCursorCommit: true,
+            dismissedKeys,
+            scanKey,
+            ...(journalFieldSlots === undefined ? {} : { fieldSlots: journalFieldSlots }),
+          });
+          const afterScan = await runStore.getRun(runId);
+          if (
+            afterScan?.candidate_refresh?.last_scan_key === scanKey
+            && afterScan.candidate_refresh.last_applied_at
+          ) {
+            appliedRefresh = afterScan.candidate_refresh;
+          } else {
+            if (!CANDIDATE_MUTABLE_RUN_STATUSES.includes(afterScan?.status)) {
+              throw artifactError(
+                "WEEKLY_RUN_NOT_READY",
+                "本月候选已进入下一阶段，不能再刷新推荐",
+                409,
+              );
+            }
+            const latestDismissed = new Set(
+              await dismissedPapersStore.listKeys().catch(() => dismissedKeys),
+            );
+            const existingIds = new Set(
+              (afterScan.candidates ?? []).map((paper) => paper.paper_id),
+            );
+            const existingKeys = new Set(
+              (afterScan.candidates ?? []).map((paper) => paper.dedupe_key).filter(Boolean),
+            );
+            const fresh = (scan.candidateBatch?.candidates ?? [])
+              .filter((paper) => paper.published_this_month === true)
+              .filter((paper) => !paper.dedupe_key || !latestDismissed.has(paper.dedupe_key))
+              .filter((paper) => (
+                !existingIds.has(paper.paper_id)
+                && (!paper.dedupe_key || !existingKeys.has(paper.dedupe_key))
+              ));
+            const translationRequests = fresh.map((paper) => {
+              const text = String(paper.title ?? "").slice(0, 300);
+              return {
+                id: `r${createHash("sha256")
+                  .update(`${paper.paper_id}\0${text}`)
+                  .digest("hex")
+                  .slice(0, 19)}`,
+                paperId: paper.paper_id,
+                text,
+              };
+            });
+            const titleMap = await translateTextsWithSpark(
+              translationRequests.map(({ id, text }) => ({ id, text })),
+            );
+            const translatedTitles = new Map(
+              translationRequests
+                .filter((request) => titleMap.has(request.id))
+                .map((request) => [request.paperId, titleMap.get(request.id)]),
+            );
+            const appliedAt = new Date().toISOString();
+            const appliedRun = await update(runId, async (current) => {
+              if (!CANDIDATE_MUTABLE_RUN_STATUSES.includes(current.status)) {
+                throw artifactError(
+                  "WEEKLY_RUN_NOT_READY",
+                  "本月候选已进入下一阶段，不能再刷新推荐",
+                  409,
+                );
+              }
+              const dismissedAtCommit = new Set(
+                await dismissedPapersStore.listKeys().catch(() => [...latestDismissed]),
+              );
+              const currentIds = new Set(
+                (current.candidates ?? []).map((paper) => paper.paper_id),
+              );
+              const currentKeys = new Set(
+                (current.candidates ?? []).map((paper) => paper.dedupe_key).filter(Boolean),
+              );
+              let nextRank = (current.candidates ?? []).reduce(
+                (max, paper) => Math.max(max, Number(paper.rank) || 0),
+                0,
+              );
+              const added = [];
+              fresh.forEach((paper) => {
+                if (added.length >= 5) return;
+                if (
+                  (paper.dedupe_key && dismissedAtCommit.has(paper.dedupe_key))
+                  || currentIds.has(paper.paper_id)
+                  || (paper.dedupe_key && currentKeys.has(paper.dedupe_key))
+                ) {
+                  return;
+                }
+                nextRank += 1;
+                added.push({
+                  ...paper,
+                  rank: nextRank,
+                  title_zh: translatedTitles.get(paper.paper_id) ?? paper.title_zh ?? null,
+                  display_label: paper.display_label ?? "本月新论文",
+                  selection_summary: paper.abstract
+                    ? paper.abstract.slice(0, 220)
+                    : `${paper.title}：本次刷新新增，价值待全文核验。`,
+                  project_impact: "对项目的具体作用待核验。",
+                });
+                currentIds.add(paper.paper_id);
+                if (paper.dedupe_key) currentKeys.add(paper.dedupe_key);
+              });
+              const refreshRecord = {
+                ...(current.candidate_refresh ?? {}),
+                last_attempt_at: attemptedAt,
+                last_applied_at: appliedAt,
+                last_scan_key: scanKey,
+                last_added_count: added.length,
+                last_added_paper_ids: added.map((paper) => paper.paper_id),
+                last_error: null,
+              };
+              if (added.length === 0) return { candidate_refresh: refreshRecord };
+              return {
+                candidates: [...(current.candidates ?? []), ...added],
+                candidate_refresh: refreshRecord,
+                mineru: {
+                  ...current.mineru,
+                  papers: {
+                    ...(current.mineru?.papers ?? {}),
+                    ...Object.fromEntries(added.map((paper) => [
+                      paper.paper_id,
+                      { status: "pdf_not_prepared", error: null },
+                    ])),
+                  },
+                },
+              };
+            }, {
+              type: "candidate_refresh_applied",
+              scan_key: scanKey,
+            });
+            appliedRefresh = appliedRun.candidate_refresh;
+          }
+          if (scan.cursor_commit_pending) {
+            await runStore.writeArtifact(
+              runId,
+              `refresh/${scanKey}/outputs/candidates-applied.json`,
+              {
+                schema_version: 1,
+                run_id: runId,
+                scan_key: scanKey,
+                applied_at: appliedRefresh.last_applied_at,
+                added_count: appliedRefresh.last_added_count ?? 0,
+                paper_ids: appliedRefresh.last_added_paper_ids ?? [],
+              },
+            );
+            await sourceScanCommitter({
+              runId,
+              runStore,
+              sourceStateStore,
+              scanKey,
+              requiredArtifacts: ["outputs/candidates-applied.json"],
+            });
+          }
+        } else {
+          await runStore.writeArtifact(
+            runId,
+            `refresh/${scanKey}/outputs/candidates-applied.json`,
+            {
+              schema_version: 1,
+              run_id: runId,
+              scan_key: scanKey,
+              applied_at: appliedRefresh.last_applied_at,
+              added_count: appliedRefresh.last_added_count ?? 0,
+              paper_ids: appliedRefresh.last_added_paper_ids ?? [],
+            },
+          );
+          await sourceScanCommitter({
+            runId,
+            runStore,
+            sourceStateStore,
+            scanKey,
+            requiredArtifacts: ["outputs/candidates-applied.json"],
+          });
+        }
+        const refreshedAt = new Date().toISOString();
+        return update(runId, (current) => ({
+          candidate_refresh: {
+            ...(current.candidate_refresh ?? appliedRefresh),
+            last_attempt_at: attemptedAt,
+            last_refreshed_at: refreshedAt,
+            last_error: null,
+          },
+        }), {
+          type: "candidates_refreshed",
+          scan_key: scanKey,
+        });
+      } catch (error) {
+        await update(runId, (current) => {
+          const currentRefresh = current.candidate_refresh ?? {};
+          const appliedThisScan = (
+            currentRefresh.last_scan_key === scanKey
+            && Boolean(currentRefresh.last_applied_at)
+          );
+          if (
+            !CANDIDATE_MUTABLE_RUN_STATUSES.includes(current.status)
+            && !appliedThisScan
+          ) {
+            return {};
+          }
+          return {
+            candidate_refresh: {
+              ...currentRefresh,
+              last_attempt_at: attemptedAt,
+              last_error: publicError(error),
+            },
+          };
+        }, { type: "candidates_refresh_failed" }).catch(() => undefined);
+        throw error;
+      }
+    })().finally(() => refreshInFlight.delete(runId));
+    refreshInFlight.set(runId, task);
+    return task;
+  }
+
+  // 调度器入口：找到当月已进入审阅的 Run 并刷新；没有则返回 null。
+  async function refreshCurrentMonthCandidates() {
+    const runs = await runStore.listRuns();
+    const windowKey = journalMonthWindowKey(new Date().toISOString());
+    const target = runs.find((run) => (
+      (run.window_key || journalMonthWindowKey(run.created_at)) === windowKey
+      && CANDIDATE_MUTABLE_RUN_STATUSES.includes(run.status)
+    ));
+    if (!target) return null;
+    return refreshRunCandidates(target.run_id);
   }
 
   // 「不感兴趣」：持久排除；若论文还在当前 Run 的近年经典栏目里，同步移除。
@@ -2921,6 +3439,10 @@ export function createJournalWorkflowService({
     getVenueSearchTurnProgress,
     addVenueSearchPapersToWeekly,
     addRecentClassicsToWeekly,
+    addPastRunPapersToWeekly,
+    translateJournalRunLibrary,
+    refreshRunCandidates,
+    refreshCurrentMonthCandidates,
     dismissJournalPaper,
     listDismissedJournalPapers,
     restoreDismissedJournalPaper,
