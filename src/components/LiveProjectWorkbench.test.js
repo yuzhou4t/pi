@@ -2288,7 +2288,9 @@ test("change evidence keeps Git read-only and offers one confirmed apply undo", 
     assert.match(html, /src\/changed\.js/);
     assert.match(html, /未跟踪/);
     assert.match(html, /src\/new\.js/);
-    assert.match(html, /这里只读查看，不会暂存、提交或推送/);
+    assert.match(html, /状态读取保持只读；只有下方精确确认才会创建本地提交/);
+    assert.match(html, /不会使用 git add \./);
+    assert.match(html, /不会 push、建 PR 或改写历史/);
     assert.match(html, /文件应用记录/);
     assert.match(html, /已应用并核验/);
     assert.match(html, /撤销这次应用/);

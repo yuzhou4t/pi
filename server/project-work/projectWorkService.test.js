@@ -306,7 +306,7 @@ test("project-work usage includes durable GPT Image 2 subscription generations",
 });
 
 function createFakePreviewSupervisor({ startError = null } = {}) {
-  const active = new Set();
+  const active = new Map();
   const starts = [];
   const stops = [];
   return {
@@ -315,8 +315,7 @@ function createFakePreviewSupervisor({ startError = null } = {}) {
     async start(input) {
       starts.push(structuredClone(input));
       if (startError) throw startError;
-      active.add(input.key);
-      return {
+      const started = {
         status: "ready",
         url: `http://127.0.0.1:48080${input.request.route}`,
         title: input.request.title,
@@ -327,9 +326,18 @@ function createFakePreviewSupervisor({ startError = null } = {}) {
         startedAt: "2026-07-27T02:00:00.000Z",
         openedAt: "2026-07-27T02:00:01.000Z",
       };
+      active.set(input.key, {
+        ownershipToken: `owned:${input.key}`,
+        url: started.url,
+        origin: "http://127.0.0.1:48080",
+      });
+      return started;
     },
     has(key) {
       return active.has(key);
+    },
+    getOwnedPreview(key) {
+      return active.get(key) ?? null;
     },
     async stop(key) {
       stops.push(key);
@@ -419,6 +427,110 @@ function createFakeSessionFactory({
       async abort() {
         record.aborts += 1;
       },
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createPlanningSessionFactory() {
+  const sessions = [];
+  const factory = async (options) => {
+    let subscriber = null;
+    const record = {
+      activeToolCalls: [],
+      prompts: [],
+    };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt(prompt) {
+        record.prompts.push(prompt);
+        await options.onPlan({
+          explanation: "只读理解项目并给出实施计划。",
+          steps: [
+            { id: "inspect", text: "检查现有实现", status: "completed" },
+            { id: "plan", text: "整理实施与验收步骤", status: "completed" },
+          ],
+        });
+        subscriber?.({ type: "agent_settled" });
+      },
+      setActiveToolsByName(names) {
+        record.activeToolCalls.push([...names]);
+        return [...names];
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createCapabilityRequestSessionFactory({
+  verificationRequest = null,
+  previewRequest = null,
+  gitCloseoutRequest = null,
+} = {}) {
+  const sessions = [];
+  const factory = async (options) => {
+    let subscriber = null;
+    const record = {
+      activeToolCalls: [],
+      prompts: [],
+    };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt(prompt) {
+        record.prompts.push(prompt);
+        await options.onPlan({
+          explanation: "只登记本轮需要人工确认的受控能力。",
+          steps: [
+            { id: "request", text: "登记受控能力", status: "completed" },
+          ],
+        });
+        if (verificationRequest) {
+          await options.onVerificationRequest(verificationRequest);
+        }
+        if (previewRequest) {
+          await options.onPreviewRequest(previewRequest);
+        }
+        if (gitCloseoutRequest) {
+          await options.onGitCloseoutRequest(gitCloseoutRequest);
+        }
+        subscriber?.({ type: "agent_settled" });
+      },
+      setActiveToolsByName(names) {
+        record.activeToolCalls.push([...names]);
+        return [...names];
+      },
+      async steer() {},
+      async abort() {},
       async compact() {},
       async setModel() {},
       dispose() {},
@@ -583,8 +695,7 @@ function createConcurrentImageGenerationSessionFactory() {
 
 function createVerificationRepairSessionFactory({
   command = {
-    file: "node",
-    args: ["--test"],
+    recipeId: "node.test",
     checks: ["项目测试应通过"],
   },
   repairMode = "pass",
@@ -659,7 +770,7 @@ function createVerificationRepairSessionFactory({
           const packageJson = JSON.parse(
             await readFile(path.join(options.projectRoot, "package.json"), "utf8"),
           );
-          packageJson.scripts.verify = "node --test changed";
+          packageJson.scripts.test = "node --test changed";
           await writeFile(
             path.join(options.workspaceRoot, "package.json"),
             `${JSON.stringify(packageJson, null, 2)}\n`,
@@ -1370,6 +1481,648 @@ async function eventually(read, predicate, message) {
   }
   assert.fail(message);
 }
+
+test("planning workflow settles without creating changes, verification, or preview work", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-planning-workflow-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "export const value = 1;\n");
+  const sessionFactory = createPlanningSessionFactory();
+  const previewSupervisor = createFakePreviewSupervisor();
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    previewSupervisor,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("planning"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, {
+    text: "先理解项目并给我一份实施计划",
+    workflowId: "planning",
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "planning workflow did not settle",
+  );
+
+  assert.equal(settled.conversation.activeChangeSet, null);
+  assert.deepEqual(settled.conversation.verifications, []);
+  assert.deepEqual(settled.conversation.previewRequests ?? [], []);
+  assert.equal(settled.events.some((event) => event.type === "change_set.ready"), false);
+  assert.equal(settled.events.some((event) => (
+    event.type === "loop.lifecycle"
+    && event.data?.state === "awaiting_review"
+  )), false);
+  assert.deepEqual(previewSupervisor.starts, []);
+  assert.equal(
+    await readFile(path.join(projectRoot, "app.js"), "utf8"),
+    "export const value = 1;\n",
+  );
+  const selectedTools = sessionFactory.sessions[0].activeToolCalls[0];
+  for (const forbidden of [
+    "edit",
+    "write",
+    "request_verification",
+    "request_preview",
+    "request_git_closeout",
+  ]) {
+    assert.equal(selectedTools.includes(forbidden), false);
+  }
+});
+
+test("a verification-only turn waits for review without reporting completion", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-verification-only-review-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const source = "export const value = 1;\n";
+  await mkdir(projectRoot);
+  await Promise.all([
+    writeFile(path.join(projectRoot, "app.js"), source),
+    writeFile(
+      path.join(projectRoot, "package.json"),
+      JSON.stringify({ scripts: { test: "node --test" } }),
+    ),
+  ]);
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createCapabilityRequestSessionFactory({
+      verificationRequest: {
+        recipeId: "node.test",
+        checks: ["项目测试应通过"],
+      },
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async () => ({
+      exitCode: 0,
+      durationMs: 1,
+      stdout: "ok",
+      stderr: "",
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      isolation: "pi-agent-verification.v1",
+    }),
+    idFactory: incrementalId("verification-only"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, { text: "只准备测试，不修改文件" });
+  const awaiting = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "awaiting_confirmation"
+      && snapshot.conversation.verifications.some(
+        (verification) => verification.status === "requested",
+      )
+    ),
+    "verification-only turn did not wait for review",
+  );
+  assert.equal(awaiting.conversation.activeChangeSet.status, "clean");
+  assert.deepEqual(awaiting.conversation.activeChangeSet.files, []);
+  const lifecycles = awaiting.events.filter(
+    (event) => event.type === "loop.lifecycle",
+  );
+  assert.equal(lifecycles.at(-1)?.data.state, "awaiting_review");
+  assert.equal(lifecycles.at(-1)?.data.artifactId, "run_result");
+  assert.equal(
+    lifecycles.some((event) => event.data.state === "completed"),
+    false,
+  );
+  const request = awaiting.conversation.verifications.find(
+    (verification) => verification.status === "requested",
+  );
+  assert.equal(
+    (await service.runVerification(conversation.id, {
+      requestId: request.id,
+    })).status,
+    "passed",
+  );
+  const verified = await service.getConversation(conversation.id);
+  assert.equal(verified.conversation.status, "idle");
+  assert.equal(
+    verified.events.filter(
+      (event) => event.type === "loop.lifecycle",
+    ).at(-1)?.data.state,
+    "completed",
+  );
+  assert.equal(await readFile(path.join(projectRoot, "app.js"), "utf8"), source);
+});
+
+test("a preview-only turn waits for review without reporting completion", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-preview-only-review-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const source = "export const value = 1;\n";
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), source);
+  const previewSupervisor = createFakePreviewSupervisor();
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createCapabilityRequestSessionFactory({
+      previewRequest: {
+        runtime: "static",
+        cwd: ".",
+        route: "/",
+        title: "静态页面",
+      },
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    previewSupervisor,
+    idFactory: incrementalId("preview-only"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, { text: "只准备页面预览，不修改文件" });
+  const awaiting = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "awaiting_confirmation"
+      && snapshot.conversation.preview?.status === "requested"
+    ),
+    "preview-only turn did not wait for review",
+  );
+  assert.equal(awaiting.conversation.activeChangeSet.status, "clean");
+  assert.deepEqual(awaiting.conversation.activeChangeSet.files, []);
+  const lifecycles = awaiting.events.filter(
+    (event) => event.type === "loop.lifecycle",
+  );
+  assert.equal(lifecycles.at(-1)?.data.state, "awaiting_review");
+  assert.equal(lifecycles.at(-1)?.data.artifactId, "preview");
+  assert.equal(
+    lifecycles.some((event) => event.data.state === "completed"),
+    false,
+  );
+  const started = await service.startPreview(conversation.id, {
+    previewId: awaiting.conversation.preview.id,
+    requestHash: awaiting.conversation.preview.requestHash,
+  });
+  assert.equal(started.conversation.preview.status, "ready");
+  assert.equal(started.conversation.status, "idle");
+  assert.equal(
+    started.events.filter(
+      (event) => event.type === "loop.lifecycle",
+    ).at(-1)?.data.state,
+    "completed",
+  );
+  assert.equal(previewSupervisor.starts.length, 1);
+  assert.equal(await readFile(path.join(projectRoot, "app.js"), "utf8"), source);
+});
+
+test("a Git-closeout-only turn retains its applied binding and waits for review", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-git-only-review-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const source = "export const value = 2;\n";
+  const afterHash = `sha256:${createHash("sha256").update(source).digest("hex")}`;
+  const baseHash = `sha256:${"a".repeat(64)}`;
+  const changeSetHash = `sha256:${"b".repeat(64)}`;
+  const commandBindingHash = `sha256:${"c".repeat(64)}`;
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), source);
+  const gitCloseoutService = {
+    async requestGitCloseout(input) {
+      return {
+        schemaVersion: 1,
+        id: "git-closeout-review",
+        conversationId: input.conversationId,
+        turnId: input.turnId,
+        changeSetId: input.changeSetId,
+        changeSetHash: input.changeSetHash,
+        status: "ready",
+        proposalHash: `sha256:${"d".repeat(64)}`,
+        branch: "main",
+        head: "e".repeat(40),
+        commitMessage: input.commitMessage,
+        files: [{
+          path: "app.js",
+          hash: afterHash,
+          exists: true,
+          mode: 0o644,
+          ...input.baseFiles[0],
+        }],
+        verificationEvidence: input.verificationEvidence,
+        commitHash: null,
+        createdAt: "2026-07-30T08:00:00.000Z",
+        updatedAt: "2026-07-30T08:00:00.000Z",
+      };
+    },
+  };
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createCapabilityRequestSessionFactory({
+      gitCloseoutRequest: {
+        commitMessage: "fix: preserve reviewed change",
+        paths: ["app.js"],
+      },
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    gitCloseoutService,
+    idFactory: incrementalId("git-only"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const conversation = await service.createConversation(project.id);
+  const statePath = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+    "conversation.json",
+  );
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.activeChangeSet = {
+    id: "changes-applied",
+    hash: changeSetHash,
+    status: "applied",
+    files: [{
+      id: "file-app",
+      path: "app.js",
+      status: "applied",
+      baseHash,
+      afterHash,
+    }],
+  };
+  state.applyJournal = [{
+    schemaVersion: 1,
+    id: "apply-applied",
+    status: "applied",
+    changeSetId: "changes-applied",
+    changeSetHash,
+    finalizedAt: "2026-07-30T07:58:00.000Z",
+    files: [{
+      fileId: "file-app",
+      path: "app.js",
+      baseHash,
+      afterHash,
+      projectBeforeMode: 0o644,
+    }],
+  }];
+  state.verifications = [{
+    id: "verification-applied",
+    commandId: "verification-request-applied",
+    status: "passed",
+    exitCode: 0,
+    changeSetId: "changes-applied",
+    changeSetHash,
+    commandBindingHash,
+    completedAt: "2026-07-30T07:59:00.000Z",
+  }];
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  await service.sendMessage(conversation.id, {
+    text: "只准备 Git 收尾，不修改文件",
+  });
+  const awaiting = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "awaiting_confirmation"
+      && snapshot.conversation.gitCloseouts.some(
+        (record) => record.status === "ready",
+      )
+    ),
+    "Git-closeout-only turn did not wait for review",
+  );
+  assert.equal(awaiting.conversation.activeChangeSet.id, "changes-applied");
+  assert.equal(awaiting.conversation.activeChangeSet.hash, changeSetHash);
+  const lifecycles = awaiting.events.filter(
+    (event) => event.type === "loop.lifecycle",
+  );
+  assert.equal(lifecycles.at(-1)?.data.state, "awaiting_review");
+  assert.equal(lifecycles.at(-1)?.data.artifactId, "changes");
+  assert.equal(
+    lifecycles.some((event) => event.data.state === "completed"),
+    false,
+  );
+  assert.equal(await readFile(path.join(projectRoot, "app.js"), "utf8"), source);
+});
+
+test("durable code evidence keeps the latest repeated read ordering", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-code-evidence-order-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "export const value = 1;\n");
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createPlanningSessionFactory(),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("evidence-order"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  const statePath = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+    "conversation.json",
+  );
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  const hashA = `sha256:${"a".repeat(64)}`;
+  const hashB = `sha256:${"b".repeat(64)}`;
+  state.messages = [{
+    id: "assistant-evidence",
+    role: "assistant",
+    text: "app.js:1",
+    status: "completed",
+    codeEvidence: [
+      { path: "app.js", contentHash: hashA, startLine: 1, endLine: 1 },
+      { path: "app.js", contentHash: hashB, startLine: 1, endLine: 1 },
+      { path: "app.js", contentHash: hashA, startLine: 1, endLine: 1 },
+    ],
+  }];
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const restored = await service.getConversation(conversation.id);
+  assert.deepEqual(
+    restored.conversation.messages[0].codeEvidence.map(
+      (item) => item.contentHash,
+    ),
+    [hashB, hashA],
+  );
+});
+
+test("Git closeout recovery is listed and emitted only for its owning conversation", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-git-closeout-owner-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  const calls = [];
+  let ownerConversationId = null;
+  const recoveryRecord = () => ({
+    schemaVersion: 1,
+    id: "git-closeout-owned",
+    conversationId: ownerConversationId,
+    turnId: "turn-owned",
+    changeSetId: "changes-owned",
+    changeSetHash: `sha256:${"c".repeat(64)}`,
+    status: "recovery_blocked",
+    proposalHash: `sha256:${"a".repeat(64)}`,
+    branch: "main",
+    head: "b".repeat(40),
+    commitMessage: "fix: owned",
+    files: [],
+    verificationEvidence: [],
+    createdAt: "2026-07-30T08:00:00.000Z",
+    updatedAt: "2026-07-30T08:01:00.000Z",
+    error: {
+      code: "GIT_CLOSEOUT_RECOVERY_STATE_CHANGED",
+      message: "需要人工检查",
+      retryable: false,
+    },
+  });
+  const gitCloseoutService = {
+    async recoverGitCloseouts(input) {
+      calls.push(["recover", input.conversationId]);
+      return input.conversationId === ownerConversationId
+        ? [recoveryRecord()]
+        : [];
+    },
+    async listGitCloseouts(input) {
+      calls.push(["list", input.conversationId]);
+      return input.conversationId === ownerConversationId
+        ? [recoveryRecord()]
+        : [];
+    },
+  };
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({
+      verificationRequest: null,
+      previewRequest: null,
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    gitCloseoutService,
+    idFactory: incrementalId("git-owner"),
+  });
+  t.after(() => service.dispose());
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const owner = await service.createConversation(project.id);
+  const other = await service.createConversation(project.id);
+  ownerConversationId = owner.id;
+
+  assert.deepEqual(await service.listGitCloseouts(other.id), []);
+  assert.equal(
+    (await service.getConversation(other.id)).events.some(
+      (event) => event.type === "git_closeout.recovery_blocked",
+    ),
+    false,
+  );
+  assert.equal((await service.listGitCloseouts(owner.id))[0].id, "git-closeout-owned");
+  const ownerState = await service.getConversation(owner.id);
+  assert.equal(
+    ownerState.events.some((event) => (
+      event.type === "git_closeout.recovery_blocked"
+      && event.data.turnId === "turn-owned"
+      && event.data.changeSetId === "changes-owned"
+    )),
+    true,
+  );
+  assert.deepEqual(calls, [
+    ["recover", other.id],
+    ["list", other.id],
+    ["recover", owner.id],
+    ["list", owner.id],
+  ]);
+});
+
+test("Git closeout confirmation revalidates conversation and change-set ownership", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-git-confirm-owner-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  const changeSetHash = `sha256:${"c".repeat(64)}`;
+  const baseFileHash = `sha256:${"0".repeat(64)}`;
+  const fileHash = `sha256:${"f".repeat(64)}`;
+  const proposalHash = `sha256:${"a".repeat(64)}`;
+  const verification = {
+    id: "verification-owned",
+    commandId: "verification-command",
+    status: "passed",
+    exitCode: 0,
+    changeSetId: "changes-owned",
+    changeSetHash,
+    commandBindingHash: `sha256:${"d".repeat(64)}`,
+    completedAt: "2026-07-30T08:00:00.000Z",
+  };
+  let ownerConversationId = null;
+  let confirmCalls = 0;
+  const proposal = () => ({
+    schemaVersion: 1,
+    id: "git-closeout-ready",
+    conversationId: ownerConversationId,
+    turnId: "turn-owned",
+    changeSetId: "changes-owned",
+    changeSetHash,
+    status: "ready",
+    proposalHash,
+    branch: "main",
+    head: "b".repeat(40),
+    commitMessage: "fix: owned",
+    files: [{
+      path: "app.js",
+      hash: fileHash,
+      exists: true,
+      mode: 0o644,
+      baseHash: baseFileHash,
+      baseExists: true,
+      baseMode: 0o644,
+    }],
+    verificationEvidence: [verification],
+    commitHash: null,
+    createdAt: "2026-07-30T08:00:00.000Z",
+    updatedAt: "2026-07-30T08:00:00.000Z",
+  });
+  const gitCloseoutService = {
+    async getGitCloseout() {
+      return proposal();
+    },
+    async confirmGitCloseout() {
+      confirmCalls += 1;
+      return {
+        ...proposal(),
+        status: "committed",
+        commitHash: "e".repeat(40),
+      };
+    },
+  };
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({
+      verificationRequest: null,
+      previewRequest: null,
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    gitCloseoutService,
+    idFactory: incrementalId("git-confirm"),
+  });
+  t.after(() => service.dispose());
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const owner = await service.createConversation(project.id);
+  const other = await service.createConversation(project.id);
+  ownerConversationId = owner.id;
+  const ownerStatePath = path.join(
+    storageRoot,
+    "conversations",
+    owner.id,
+    "conversation.json",
+  );
+  const ownerState = JSON.parse(await readFile(ownerStatePath, "utf8"));
+  ownerState.activeChangeSet = {
+    id: "changes-owned",
+    hash: changeSetHash,
+    status: "applied",
+    files: [{
+      path: "app.js",
+      status: "applied",
+      baseHash: baseFileHash,
+      afterHash: fileHash,
+    }],
+  };
+  ownerState.verifications = [verification];
+  ownerState.applyJournal = [{
+    schemaVersion: 1,
+    id: "apply-owned",
+    status: "applied",
+    changeSetId: "changes-owned",
+    changeSetHash,
+    finalizedAt: "2026-07-30T08:00:00.000Z",
+    files: [{
+      fileId: "file-app",
+      path: "app.js",
+      baseHash: baseFileHash,
+      afterHash: fileHash,
+      projectBeforeMode: 0o644,
+    }],
+  }];
+  await writeFile(
+    ownerStatePath,
+    `${JSON.stringify(ownerState, null, 2)}\n`,
+    "utf8",
+  );
+  const confirmation = {
+    proposalId: "git-closeout-ready",
+    proposalHash,
+    conversationId: owner.id,
+    turnId: "turn-owned",
+    changeSetId: "changes-owned",
+    changeSetHash,
+    branch: "main",
+    head: "b".repeat(40),
+    commitMessage: "fix: owned",
+    files: [{
+      path: "app.js",
+      hash: fileHash,
+      exists: true,
+      mode: 0o644,
+      baseHash: baseFileHash,
+      baseExists: true,
+      baseMode: 0o644,
+    }],
+    verificationEvidence: [verification],
+  };
+
+  await assert.rejects(
+    service.confirmGitCloseout(other.id, confirmation),
+    (error) => error?.code === "GIT_CLOSEOUT_CHANGESET_BINDING_STALE",
+  );
+  assert.equal(confirmCalls, 0);
+  const committed = await service.confirmGitCloseout(owner.id, confirmation);
+  assert.equal(committed.conversation.gitCloseouts[0].status, "committed");
+  assert.equal(committed.conversation.status, "applied");
+  assert.equal(
+    committed.events.filter(
+      (event) => event.type === "loop.lifecycle",
+    ).at(-1)?.data.state,
+    "completed",
+  );
+  assert.equal(confirmCalls, 1);
+
+  const staleState = JSON.parse(await readFile(ownerStatePath, "utf8"));
+  staleState.activeChangeSet.hash = `sha256:${"9".repeat(64)}`;
+  await writeFile(
+    ownerStatePath,
+    `${JSON.stringify(staleState, null, 2)}\n`,
+    "utf8",
+  );
+  await assert.rejects(
+    service.confirmGitCloseout(owner.id, confirmation),
+    (error) => error?.code === "GIT_CLOSEOUT_CHANGESET_BINDING_STALE",
+  );
+  assert.equal(confirmCalls, 1);
+});
 
 test("thinking strength is model-aware, persisted, and applied to each Pi turn", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-thinking-level-"));
@@ -2836,6 +3589,17 @@ test("conversation file reads prefer overlay content and can open overlay-only f
   const modified = await service.readConversationFile(conversation.id, {
     filePath: "app.js",
   });
+  const boundModified = await service.readConversationFile(conversation.id, {
+    filePath: "app.js",
+    expectedContentHash: modified.hash,
+  });
+  await assert.rejects(
+    service.readConversationFile(conversation.id, {
+      filePath: "app.js",
+      expectedContentHash: `sha256:${"0".repeat(64)}`,
+    }),
+    { code: "PROJECT_WORK_CODE_EVIDENCE_STALE" },
+  );
   const created = await service.readConversationFile(conversation.id, {
     filePath: "src/generated.js",
   });
@@ -2855,6 +3619,7 @@ test("conversation file reads prefer overlay content and can open overlay-only f
   });
 
   assert.match(modified.content, /source = 'overlay'/);
+  assert.equal(boundModified.hash, modified.hash);
   assert.match(created.content, /generated = true/);
   assert.notEqual(modified.hash, live.hash);
   assert.equal(
@@ -2968,7 +3733,13 @@ test("verification never runs from a truncated or skipped project materializatio
   const storageRoot = path.join(temporaryRoot, "private-state");
   await mkdir(projectRoot);
   const source = "export const version = 1;\n";
-  await writeFile(path.join(projectRoot, "app.js"), source);
+  await Promise.all([
+    writeFile(path.join(projectRoot, "app.js"), source),
+    writeFile(
+      path.join(projectRoot, "package.json"),
+      JSON.stringify({ scripts: { test: "node --test" } }),
+    ),
+  ]);
   const reports = [
     {
       files: 1,
@@ -2995,7 +3766,13 @@ test("verification never runs from a truncated or skipped project materializatio
   let runnerCalls = 0;
   const service = createProjectWorkService({
     storageRoot,
-    sessionFactory: createFakeSessionFactory({ changedContent: source }),
+    sessionFactory: createFakeSessionFactory({
+      changedContent: source,
+      verificationRequest: {
+        recipeId: "node.test",
+        checks: ["项目测试应通过"],
+      },
+    }),
     snapshotter: async ({ baseRoot, workspaceRoot }) => {
       await Promise.all([
         mkdir(baseRoot, { recursive: true }),
@@ -3031,7 +3808,7 @@ test("verification never runs from a truncated or skipped project materializatio
   const settled = await eventually(
     () => service.getConversation(conversation.id),
     (snapshot) => (
-      snapshot.conversation.status === "idle"
+      snapshot.conversation.status === "awaiting_confirmation"
       && snapshot.conversation.verifications.some((item) => item.status === "requested")
     ),
     "verification request was not prepared",
@@ -3052,6 +3829,202 @@ test("verification never runs from a truncated or skipped project materializatio
   assert.equal(reports.length, 0);
 });
 
+test("verification recipes materialize local Node dependencies and binary assets in a private copy", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-verification-node-copy-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(path.join(projectRoot, "node_modules", ".bin"), {
+    recursive: true,
+  });
+  await Promise.all([
+    writeFile(path.join(projectRoot, "app.js"), "export const version = 1;\n"),
+    writeFile(
+      path.join(projectRoot, "package.json"),
+      JSON.stringify({ scripts: { test: "vitest" } }),
+    ),
+    writeFile(
+      path.join(projectRoot, "asset.png"),
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    ),
+    writeFile(
+      path.join(projectRoot, "node_modules", ".bin", "vitest"),
+      "#!/usr/bin/env node\n",
+      { mode: 0o755 },
+    ),
+  ]);
+  const runnerCalls = [];
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({
+      changedContent: "export const version = 1;\n",
+      verificationRequest: {
+        recipeId: "node.test",
+        checks: ["Node 测试应通过"],
+      },
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async (request) => {
+      runnerCalls.push(request);
+      assert.notEqual(request.cwd, projectRoot);
+      assert.deepEqual(
+        await readFile(path.join(request.cwd, "asset.png")),
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      );
+      assert.match(
+        await readFile(
+          path.join(request.cwd, "node_modules", ".bin", "vitest"),
+          "utf8",
+        ),
+        /usr\/bin\/env node/,
+      );
+      await writeFile(path.join(request.cwd, "verification-only.txt"), "private\n");
+      return {
+        exitCode: 0,
+        durationMs: 2,
+        stdout: "ok",
+        stderr: "",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        isolation: "pi-agent-verification.v1",
+      };
+    },
+    idFactory: incrementalId("node-copy"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, {
+    text: "运行受控 Node 验证配方",
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "awaiting_confirmation"
+      && snapshot.conversation.verifications.some(
+        (verification) => verification.status === "requested",
+      )
+    ),
+    "Node verification recipe was not prepared",
+  );
+  const request = settled.conversation.verifications.find(
+    (verification) => verification.status === "requested",
+  );
+  assert.deepEqual(request.command.args, ["run", "test"]);
+
+  const passed = await service.runVerification(conversation.id, {
+    requestId: request.id,
+  });
+  assert.equal(passed.status, "passed");
+  assert.equal(passed.isolation, "pi-agent-verification.v1");
+  assert.equal(runnerCalls.length, 1);
+  await assert.rejects(
+    access(path.join(projectRoot, "verification-only.txt")),
+    { code: "ENOENT" },
+  );
+});
+
+test("verification recipes resolve from project manifests and become stale when a manifest changes", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-verification-recipe-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await Promise.all([
+    writeFile(path.join(projectRoot, "app.js"), "export const version = 1;\n"),
+    writeFile(path.join(projectRoot, "go.mod"), "module example.test/first\n"),
+  ]);
+  const runnerCalls = [];
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({
+      changedContent: "export const version = 1;\n",
+      verificationRequest: {
+        recipeId: "go.test",
+        checks: ["Go 测试应通过"],
+      },
+    }),
+    picker: async () => ({ rootPath: projectRoot }),
+    runner: async (request) => {
+      runnerCalls.push(request);
+      return {
+        exitCode: 0,
+        durationMs: 2,
+        stdout: "ok",
+        stderr: "",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+      };
+    },
+    idFactory: incrementalId("recipe"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, {
+    text: "运行受控 Go 验证配方",
+  });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "awaiting_confirmation"
+      && snapshot.conversation.verifications.some(
+        (verification) => verification.status === "requested",
+      )
+    ),
+    "verification recipe was not prepared",
+  );
+  const request = settled.conversation.verifications.find(
+    (verification) => verification.status === "requested",
+  );
+  assert.equal(request.recipeId, "go.test");
+  assert.deepEqual(request.command, {
+    file: "go",
+    args: ["test", "./..."],
+    cwd: "",
+    environment: {
+      GOPROXY: "off",
+      GOSUMDB: "off",
+      GOTOOLCHAIN: "local",
+    },
+  });
+
+  const passed = await service.runVerification(conversation.id, {
+    requestId: request.id,
+  });
+  assert.equal(passed.status, "passed");
+  assert.equal(runnerCalls.length, 1);
+  assert.deepEqual(runnerCalls[0].environment, {
+    GOPROXY: "off",
+    GOSUMDB: "off",
+    GOTOOLCHAIN: "local",
+  });
+
+  await writeFile(
+    path.join(projectRoot, "go.mod"),
+    "module example.test/second\n",
+  );
+  const stale = await service.runVerification(conversation.id, {
+    requestId: request.id,
+  });
+  assert.equal(stale.status, "failed");
+  assert.equal(
+    stale.errorCode,
+    "PROJECT_WORK_VERIFICATION_BINDING_CHANGED",
+  );
+  assert.equal(runnerCalls.length, 1);
+});
+
 test("real project-work chain binds context and changes, applies by hash, and preserves verification attempts", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-project-chain-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
@@ -3063,8 +4036,18 @@ test("real project-work chain binds context and changes, applies by hash, and pr
     "export const version = 1;\n",
     "utf8",
   );
+  await writeFile(
+    path.join(projectRoot, "package.json"),
+    `${JSON.stringify({ scripts: { test: "node --test" } }, null, 2)}\n`,
+    "utf8",
+  );
 
-  const sessionFactory = createFakeSessionFactory();
+  const sessionFactory = createFakeSessionFactory({
+    verificationRequest: {
+      recipeId: "node.test",
+      checks: ["项目测试应通过"],
+    },
+  });
   const runnerCalls = [];
   const longVerificationOutput = `${"verification progress\n".repeat(4_000)}final evidence`;
   let verificationAttempt = 0;
@@ -3300,6 +4283,10 @@ test("a confirmed failed verification is repaired once and rerun against the sam
     "export const verificationState = \"original\";\n",
     "utf8",
   );
+  await writeFile(
+    path.join(projectRoot, "package.json"),
+    JSON.stringify({ scripts: { test: "node --test" } }),
+  );
   const sessionFactory = createVerificationRepairSessionFactory();
   const runnerCalls = [];
   const compactedRepairOutput = "stderr:\nverification failed at <workspace>/app.js";
@@ -3430,6 +4417,10 @@ test("stop during verification compaction stays stopped and never starts repair"
     "export const verificationState = \"original\";\n",
     "utf8",
   );
+  await writeFile(
+    path.join(projectRoot, "package.json"),
+    JSON.stringify({ scripts: { test: "node --test" } }),
+  );
   const sessionFactory = createVerificationRepairSessionFactory();
   let notifyCompactorStarted;
   const compactorStarted = new Promise((resolve) => {
@@ -3514,6 +4505,10 @@ test("verification repair stops after two failed repair attempts", async (t) => 
     "export const verificationState = \"original\";\n",
     "utf8",
   );
+  await writeFile(
+    path.join(projectRoot, "package.json"),
+    JSON.stringify({ scripts: { test: "node --test" } }),
+  );
   const sessionFactory = createVerificationRepairSessionFactory({
     repairMode: "fail",
   });
@@ -3591,7 +4586,7 @@ test("verification repair blocks when a package script changes the confirmed com
       path.join(projectRoot, "package.json"),
       `${JSON.stringify({
         scripts: {
-          verify: "node --test",
+          test: "node --test",
         },
       }, null, 2)}\n`,
       "utf8",
@@ -3599,8 +4594,7 @@ test("verification repair blocks when a package script changes the confirmed com
   ]);
   const sessionFactory = createVerificationRepairSessionFactory({
     command: {
-      file: "npm",
-      args: ["run", "verify"],
+      recipeId: "node.test",
       checks: ["项目测试应通过"],
     },
     repairMode: "change_binding",
@@ -3664,7 +4658,7 @@ test("verification repair blocks when a package script changes the confirmed com
     JSON.parse(await readFile(path.join(projectRoot, "package.json"), "utf8")),
     {
       scripts: {
-        verify: "node --test",
+        test: "node --test",
       },
     },
   );
@@ -3680,6 +4674,10 @@ test("restart interrupts verification repair without a paid repeat and explicit 
     path.join(projectRoot, "app.js"),
     "export const verificationState = \"original\";\n",
     "utf8",
+  );
+  await writeFile(
+    path.join(projectRoot, "package.json"),
+    JSON.stringify({ scripts: { test: "node --test" } }),
   );
   const firstFactory = createVerificationRepairSessionFactory();
   const firstService = createProjectWorkService({
@@ -4172,10 +5170,19 @@ test("auto review applies a safe change and runs verification in an isolated sna
     "export const version = 1;\n",
     "utf8",
   );
+  await writeFile(
+    path.join(projectRoot, "package.json"),
+    JSON.stringify({ scripts: { test: "node --test" } }),
+  );
   const runnerCalls = [];
   const service = createProjectWorkService({
     storageRoot: path.join(temporaryRoot, "private-state"),
-    sessionFactory: createFakeSessionFactory(),
+    sessionFactory: createFakeSessionFactory({
+      verificationRequest: {
+        recipeId: "node.test",
+        checks: ["项目测试应通过"],
+      },
+    }),
     picker: async () => ({ rootPath: projectRoot }),
     runner: async (command) => {
       runnerCalls.push(command);
@@ -4432,10 +5439,74 @@ test("manual review persists a static preview and starts it only with the exact 
   });
 
   await service.dispose();
+  const browserQaCalls = [];
+  let releaseBrowserQa;
+  const browserQaGate = new Promise((resolve) => {
+    releaseBrowserQa = resolve;
+  });
+  const desktopCapture = Buffer.from("desktop-capture");
+  const mobileCapture = Buffer.from("mobile-capture");
+  const browserQaService = {
+    async run(input) {
+      browserQaCalls.push(structuredClone(input));
+      await browserQaGate;
+      return {
+        adapterId: "controlled-browser-test",
+        preview: {
+          origin: "http://127.0.0.1:48080",
+          path: "/",
+        },
+        captures: [
+          {
+            profile: {
+              id: "desktop",
+              label: "桌面",
+              width: 1440,
+              height: 1024,
+              isMobile: false,
+            },
+            screenshot: {
+              mimeType: "image/png",
+              byteLength: desktopCapture.length,
+              sha256: `sha256:${createHash("sha256").update(desktopCapture).digest("hex")}`,
+              bytes: desktopCapture,
+            },
+            dom: { nodeCount: 10 },
+            accessibility: { checkedNodeCount: 10, issues: [] },
+          },
+          {
+            profile: {
+              id: "mobile",
+              label: "移动",
+              width: 390,
+              height: 844,
+              isMobile: true,
+            },
+            screenshot: {
+              mimeType: "image/png",
+              byteLength: mobileCapture.length,
+              sha256: `sha256:${createHash("sha256").update(mobileCapture).digest("hex")}`,
+              bytes: mobileCapture,
+            },
+            dom: { nodeCount: 8 },
+            accessibility: { checkedNodeCount: 8, issues: [] },
+          },
+        ],
+        console: { entries: [], truncated: false },
+        failedRequests: { entries: [], truncated: false },
+        security: {
+          blockedRequests: 0,
+          blockedNavigations: 0,
+        },
+        completedAt: "2026-07-30T12:00:00.000Z",
+      };
+    },
+  };
   const restoredService = createProjectWorkService({
     storageRoot,
     sessionFactory: createFakeSessionFactory({ verificationRequest: null }),
     previewSupervisor,
+    browserQaService,
     idFactory: incrementalId("manual-preview-restored"),
   });
   t.after(() => restoredService.dispose());
@@ -4475,6 +5546,136 @@ test("manual review persists a static preview and starts it only with the exact 
     event.type === "preview.confirmed"
     && event.data.requestHash === pending.conversation.preview.requestHash
   )));
+
+  const browserQaRequest = {
+    clientRequestId: "project-browser-qa:manual-preview",
+  };
+  const firstAudit = restoredService.runBrowserQa(
+    conversation.id,
+    browserQaRequest,
+  );
+  const duplicateAudit = restoredService.runBrowserQa(
+    conversation.id,
+    browserQaRequest,
+  );
+  await assert.rejects(
+    restoredService.runBrowserQa(conversation.id, {
+      clientRequestId: "project-browser-qa:competing-request",
+    }),
+    { code: "PROJECT_BROWSER_QA_BUSY" },
+  );
+  await eventually(
+    async () => browserQaCalls.length,
+    (count) => count === 1,
+    "browser QA did not start",
+  );
+  const blockedWhileBrowserQaRuns = [
+    ["send", () => restoredService.sendMessage(conversation.id, {
+      text: "页面验收期间不能启动新回合",
+      clientRequestId: "message:during-browser-qa",
+    })],
+    ["retry", () => restoredService.retryLastTurn(conversation.id, {
+      clientRequestId: "retry:during-browser-qa",
+    })],
+    ["stop", () => restoredService.abortConversation(conversation.id)],
+    ["restart preview", () => restoredService.startPreview(conversation.id, {
+      previewId: pending.conversation.preview.id,
+      requestHash: pending.conversation.preview.requestHash,
+    })],
+    ["apply", () => restoredService.applyChangeSet(conversation.id, {
+      changeSetId: "change-set-during-browser-qa",
+      changeSetHash: `sha256:${"a".repeat(64)}`,
+      files: [],
+    })],
+    ["undo", () => restoredService.undoApply(
+      conversation.id,
+      "apply-during-browser-qa",
+      { undoHash: `sha256:${"b".repeat(64)}` },
+    )],
+    ["verify", () => restoredService.runVerification(conversation.id, {
+      requestId: "verification-during-browser-qa",
+    })],
+    ["resume repair", () => restoredService.resumeVerificationRepair(
+      conversation.id,
+      {
+        operationId: "repair-during-browser-qa",
+        clientRequestId: "repair-resume:during-browser-qa",
+      },
+    )],
+  ];
+  for (const [label, operation] of blockedWhileBrowserQaRuns) {
+    await assert.rejects(
+      operation(),
+      (error) => {
+        assert.equal(error.code, "PROJECT_BROWSER_QA_BUSY", label);
+        assert.equal(error.status, 409, label);
+        return true;
+      },
+    );
+  }
+  const lockedSnapshot = await restoredService.getConversation(conversation.id);
+  assert.equal(
+    lockedSnapshot.conversation.messages.some(
+      (message) => message.text === "页面验收期间不能启动新回合",
+    ),
+    false,
+  );
+  const siblingConversation = await restoredService.createConversation(project.id);
+  await assert.rejects(
+    restoredService.sendMessage(siblingConversation.id, {
+      text: "同一项目的另一个会话也不能改动验收中的页面",
+      clientRequestId: "message:sibling-during-browser-qa",
+    }),
+    { code: "PROJECT_BROWSER_QA_BUSY" },
+  );
+  await assert.rejects(
+    restoredService.applyChangeSet(siblingConversation.id, {
+      changeSetId: "sibling-change-set-during-browser-qa",
+      changeSetHash: `sha256:${"c".repeat(64)}`,
+      files: [],
+    }),
+    { code: "PROJECT_BROWSER_QA_BUSY" },
+  );
+  releaseBrowserQa();
+  const [audited, duplicate] = await Promise.all([
+    firstAudit,
+    duplicateAudit,
+  ]);
+  assert.deepEqual(browserQaCalls, [{ key: conversation.id }]);
+  assert.equal(
+    duplicate.conversation.browserQaRuns[0].id,
+    audited.conversation.browserQaRuns[0].id,
+  );
+  assert.equal(audited.conversation.browserQaRuns[0].status, "completed");
+  assert.equal(audited.conversation.browserQaRuns[0].verdict, "passed");
+  assert.equal(
+    audited.conversation.browserQaRuns[0].clientRequestId,
+    browserQaRequest.clientRequestId,
+  );
+  assert.equal(audited.conversation.browserQaRuns[0].captures.length, 2);
+  assert.equal(
+    "bytes" in audited.conversation.browserQaRuns[0].captures[0].screenshot,
+    false,
+  );
+  const screenshot = await restoredService.readBrowserQaScreenshot(
+    conversation.id,
+    audited.conversation.browserQaRuns[0].id,
+    "desktop",
+  );
+  assert.deepEqual(screenshot.bytes, desktopCapture);
+  assert.ok(audited.events.some((event) => (
+    event.type === "browser_qa.completed"
+    && event.data.verdict === "passed"
+  )));
+  const replayed = await restoredService.runBrowserQa(
+    conversation.id,
+    browserQaRequest,
+  );
+  assert.equal(
+    replayed.conversation.browserQaRuns[0].id,
+    audited.conversation.browserQaRuns[0].id,
+  );
+  assert.equal(browserQaCalls.length, 1);
 
   await assert.rejects(
     restoredService.startPreview(conversation.id, {
@@ -4612,7 +5813,7 @@ test("auto review makes an out-of-policy change inspectable but permanently non-
   );
 });
 
-test("auto review denies an unsafe verification without starting the runner", async (t) => {
+test("auto review blocks a legacy free verification command before policy or runner", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-auto-review-deny-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const projectRoot = path.join(temporaryRoot, "project");
@@ -4673,12 +5874,75 @@ test("auto review denies an unsafe verification without starting the runner", as
   const blocked = settled.conversation.verifications.find(
     (verification) => verification.status === "blocked",
   );
-  assert.equal(blocked.blockedReason, "verification_command_not_auto_safe");
+  assert.equal(blocked.command, null);
+  assert.equal(blocked.blockedReason, "verification_recipe_required");
   assert.ok(settled.events.some((event) => (
+    event.type === "verification.blocked"
+    && event.data.reasonCode === "verification_recipe_required"
+  )));
+  assert.equal(settled.events.some((event) => (
     event.type === "auto_review.decision"
     && event.data.actionType === "verification"
-    && event.data.decision === "deny"
-  )));
+  )), false);
+});
+
+test("a persisted legacy verification request cannot execute after restart", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-verification-legacy-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "export const value = 1;\n");
+  const firstService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({ verificationRequest: null }),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("legacy-first"),
+  });
+  const selection = await firstService.pickProjectRoot({ mode: "existing" });
+  const project = await firstService.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await firstService.createConversation(project.id);
+  await firstService.dispose();
+
+  const statePath = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+    "conversation.json",
+  );
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.verifications = [{
+    id: "legacy-free-command",
+    status: "requested",
+    command: {
+      file: "node",
+      args: ["--eval", "process.exit(0)"],
+      cwd: "",
+    },
+    checks: [],
+  }];
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+  let runnerCalls = 0;
+  const restoredService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory({ verificationRequest: null }),
+    runner: async () => {
+      runnerCalls += 1;
+      throw new Error("legacy verification must never execute");
+    },
+    idFactory: incrementalId("legacy-restored"),
+  });
+  t.after(() => restoredService.dispose());
+  await assert.rejects(
+    restoredService.runVerification(conversation.id, {
+      requestId: "legacy-free-command",
+    }),
+    { code: "PROJECT_WORK_VERIFICATION_LEGACY_BLOCKED" },
+  );
+  assert.equal(runnerCalls, 0);
 });
 
 test("partial apply keeps unselected files reviewable and verifies the pending overlay privately", async (t) => {
@@ -4688,6 +5952,10 @@ test("partial apply keeps unselected files reviewable and verifies the pending o
   await mkdir(projectRoot);
   await writeFile(path.join(projectRoot, "app.js"), "app v1\n", "utf8");
   await writeFile(path.join(projectRoot, "other.js"), "other v1\n", "utf8");
+  await writeFile(
+    path.join(projectRoot, "package.json"),
+    JSON.stringify({ scripts: { test: "node --test" } }),
+  );
 
   const verificationObserved = [];
   const service = createProjectWorkService({
@@ -4698,6 +5966,10 @@ test("partial apply keeps unselected files reviewable and verifies the pending o
         path: "other.js",
         content: "other v2\n",
       }],
+      verificationRequest: {
+        recipeId: "node.test",
+        checks: ["项目测试应通过"],
+      },
     }),
     picker: async () => ({ rootPath: projectRoot }),
     runner: async (command) => {

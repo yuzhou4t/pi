@@ -1669,6 +1669,7 @@ export function createApiServer({
           endLine: url.searchParams.has("end_line")
             ? Number(url.searchParams.get("end_line"))
             : undefined,
+          expectedContentHash: url.searchParams.get("content_hash") ?? undefined,
         });
         sendJson(response, 200, file, origin);
         return;
@@ -2361,6 +2362,105 @@ export function createApiServer({
         return;
       }
 
+      const gitCloseoutsMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/git-closeouts$/,
+      );
+      if (gitCloseoutsMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(gitCloseoutsMatch[1]);
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          gitCloseouts: await projectWorkService.listGitCloseouts(
+            conversationId,
+          ),
+        }, origin);
+        return;
+      }
+
+      const gitCloseoutConfirmMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/git-closeouts\/([^/]+)\/confirm$/,
+      );
+      if (gitCloseoutConfirmMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          gitCloseoutConfirmMatch[1],
+        );
+        const proposalId = decodeProjectWorkSegment(
+          gitCloseoutConfirmMatch[2],
+        );
+        const payload = await readProjectWorkJson(request);
+        if (
+          payload?.schema_version !== 1
+          || payload?.proposal_id !== proposalId
+          || Object.keys(payload).some((key) => ![
+            "schema_version",
+            "proposal_id",
+            "proposal_hash",
+            "conversation_id",
+            "turn_id",
+            "change_set_id",
+            "change_set_hash",
+            "branch",
+            "head",
+            "commit_message",
+            "files",
+            "verification_evidence",
+          ].includes(key))
+        ) {
+          throw projectWorkError(
+            "GIT_CLOSEOUT_CONFIRMATION_INVALID",
+            "Git 收尾确认请求无效",
+            400,
+          );
+        }
+        sendJson(
+          response,
+          200,
+          publicProjectWorkConversationState(
+            await projectWorkService.confirmGitCloseout(
+              conversationId,
+              {
+                proposalId,
+                proposalHash: payload.proposal_hash,
+                conversationId: payload.conversation_id,
+                turnId: payload.turn_id,
+                changeSetId: payload.change_set_id,
+                changeSetHash: payload.change_set_hash,
+                branch: payload.branch,
+                head: payload.head,
+                commitMessage: payload.commit_message,
+                files: Array.isArray(payload.files)
+                  ? payload.files.map((file) => ({
+                      path: file.path,
+                      hash: file.hash,
+                      exists: file.exists === true,
+                      mode: file.mode,
+                      baseHash: file.base_hash,
+                      baseExists: file.base_exists === true,
+                      baseMode: file.base_mode,
+                    }))
+                  : payload.files,
+                verificationEvidence: Array.isArray(
+                  payload.verification_evidence,
+                )
+                  ? payload.verification_evidence.map((evidence) => ({
+                      id: evidence.id,
+                      commandId: evidence.command_id,
+                      status: evidence.status,
+                      exitCode: evidence.exit_code,
+                      changeSetId: evidence.change_set_id,
+                      changeSetHash: evidence.change_set_hash,
+                      commandBindingHash: evidence.command_binding_hash,
+                      completedAt: evidence.completed_at,
+                    }))
+                  : payload.verification_evidence,
+              },
+            ),
+          ),
+          origin,
+        );
+        return;
+      }
+
       const applyJournalMatch = url.pathname.match(
         /^\/api\/v1\/project-work\/conversations\/([^/]+)\/applies$/,
       );
@@ -2465,6 +2565,70 @@ export function createApiServer({
               previewId,
               requestHash: payload.request_hash,
             }),
+          ),
+          origin,
+        );
+        return;
+      }
+
+      const browserQaMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/browser-qa$/,
+      );
+      if (browserQaMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(browserQaMatch[1]);
+        const payload = await readProjectWorkJson(request);
+        if (
+          typeof payload?.client_request_id !== "string"
+          || !projectWorkClientRequestIdPattern.test(payload.client_request_id)
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_CLIENT_REQUEST_ID_INVALID",
+            "页面验收必须提供稳定的请求标识",
+            400,
+          );
+        }
+        if (
+          payload.schema_version !== 1
+          || Object.keys(payload).some(
+            (key) => !["schema_version", "client_request_id"].includes(key),
+          )
+        ) {
+          throw projectWorkError(
+            "PROJECT_BROWSER_QA_REQUEST_INVALID",
+            "页面验收请求无效",
+            400,
+          );
+        }
+        sendJson(
+          response,
+          200,
+          publicProjectWorkConversationState(
+            await projectWorkService.runBrowserQa(conversationId, {
+              clientRequestId: payload.client_request_id,
+            }),
+          ),
+          origin,
+        );
+        return;
+      }
+
+      const browserQaScreenshotMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/browser-qa\/([^/]+)\/(desktop|mobile)\/screenshot$/,
+      );
+      if (browserQaScreenshotMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(
+          browserQaScreenshotMatch[1],
+        );
+        const runId = decodeProjectWorkSegment(
+          browserQaScreenshotMatch[2],
+        );
+        sendProjectWorkImage(
+          response,
+          await projectWorkService.readBrowserQaScreenshot(
+            conversationId,
+            runId,
+            browserQaScreenshotMatch[3],
           ),
           origin,
         );

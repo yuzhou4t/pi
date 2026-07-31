@@ -51,6 +51,11 @@ test("project-work model catalog exposes safe external capability status", async
         PI_TAVILY_API_KEY: "must-not-appear-in-catalog",
       },
     },
+    githubReadOptions: {
+      env: {
+        PI_GITHUB_TOKEN: "github-token-must-not-appear-in-catalog",
+      },
+    },
     imageGenerationProbe: async () => ({
       available: true,
       status: "ready",
@@ -70,6 +75,23 @@ test("project-work model catalog exposes safe external capability status", async
     image_generation: {
       available: true,
       reason: "GPT Image 2 · ChatGPT 订阅已连接",
+    },
+    github_read: {
+      id: "github_read",
+      label: "GitHub 只读",
+      available: true,
+      enabledForTurn: false,
+      defaultEnabled: false,
+      activation: "per_turn",
+      access: "read_only",
+      effects: ["network_read"],
+      toolNames: [
+        "github_read_issue",
+        "github_read_pull_request",
+        "github_read_check_runs",
+        "github_read_review_comments",
+      ],
+      reason: "GitHub 只读连接已配置，需逐回合启用",
     },
   });
   assert.doesNotMatch(JSON.stringify(catalog), /must-not-appear-in-catalog/);
@@ -361,6 +383,18 @@ test("verification repair exposes only contained overlay tools and a hidden boun
   assert.match(source, /display: false/);
   assert.match(source, /triggerTurn: true/);
   assert.doesNotMatch(source, /child_process.*repairVerification/s);
+});
+
+test("verification tool exposes recipe ids without arbitrary command arguments", async () => {
+  const source = await readFile(new URL("./piSessionHost.js", import.meta.url), "utf8");
+  const toolSource = source.slice(
+    source.indexOf('name: "request_verification"'),
+    source.indexOf("const generateImage"),
+  );
+  assert.match(toolSource, /recipeId:\s*Type\.Union/);
+  assert.match(toolSource, /additionalProperties:\s*false/);
+  assert.doesNotMatch(toolSource, /\bfile:\s*Type\.String/);
+  assert.doesNotMatch(toolSource, /\bargs:\s*Type\./);
 });
 
 test("project-work turn guidance modifies only the current system prompt", async () => {
@@ -701,6 +735,59 @@ test("controlled Uvicorn, Vite, and static previews use closed schemas and stay 
   );
 });
 
+test("Git closeout tool can only request one exact reviewed proposal", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-git-closeout-tool-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const baseRoot = path.join(temporaryRoot, "base");
+  const workspaceRoot = path.join(temporaryRoot, "workspace");
+  await Promise.all([
+    mkdir(projectRoot),
+    mkdir(baseRoot),
+    mkdir(workspaceRoot),
+  ]);
+  const requests = [];
+  const tools = await createProjectWorkTools({
+    projectRoot,
+    baseRoot,
+    workspaceRoot,
+    onPlan: async () => {},
+    onVerificationRequest: async () => ({ id: "verification-1" }),
+    onGitCloseoutRequest: async (request) => {
+      requests.push(request);
+      return {
+        id: "git-closeout-1",
+        proposalHash: `sha256:${"a".repeat(64)}`,
+        branch: "main",
+        head: "1".repeat(40),
+        files: request.paths.map((filePath) => ({ path: filePath })),
+      };
+    },
+  });
+  const requestGitCloseout = toolByName(tools, "request_git_closeout");
+  const result = await requestGitCloseout.execute("git-closeout-call", {
+    commitMessage: "fix: exact task",
+    paths: ["src/task.js"],
+  });
+  assert.deepEqual(requests, [{
+    commitMessage: "fix: exact task",
+    paths: ["src/task.js"],
+  }]);
+  assert.match(result.content[0].text, /No commit or push has occurred/);
+  assert.equal(
+    requestGitCloseout.parameters.additionalProperties,
+    false,
+  );
+  assert.deepEqual(
+    Object.keys(requestGitCloseout.parameters.properties).sort(),
+    ["commitMessage", "paths"],
+  );
+  assert.equal(
+    PROJECT_WORK_DEFAULT_TOOL_NAMES.includes("request_git_closeout"),
+    true,
+  );
+});
+
 test("ask_user returns durable answered and cancelled outcomes without implying approval", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-ask-user-tool-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
@@ -827,6 +914,10 @@ test("contained project tools read live files and keep writes in the sparse revi
   ]);
   await writeFile(path.join(projectRoot, "app.js"), "export const value = 1;\n");
   await writeFile(path.join(projectRoot, "race.js"), "export const value = 'A';\n");
+  await writeFile(
+    path.join(projectRoot, "discrete-evidence.js"),
+    "MATCH\none\ntwo\nthree\nfour\nMATCH\n",
+  );
 
   const tools = await createProjectWorkTools({
     projectRoot,
@@ -849,6 +940,13 @@ test("contained project tools read live files and keep writes in the sparse revi
     path: "created-after-session.js",
   });
   assert.match(liveRead.content[0].text, /late = true/);
+  assert.match(liveRead.details.contentHash, /^sha256:[a-f0-9]{64}$/);
+  assert.deepEqual(liveRead.details.evidence, [{
+    path: "created-after-session.js",
+    contentHash: liveRead.details.contentHash,
+    startLine: 1,
+    endLine: 2,
+  }]);
   assert.match(
     (await read.execute("read-interrupted-capture", {
       path: "capture-interrupted.js",
@@ -917,13 +1015,35 @@ test("contained project tools read live files and keep writes in the sparse revi
     "export const value = 2;\n",
   );
   assert.match((await read.execute("read-overlay", { path: "app.js" })).content[0].text, /value = 2/);
-  assert.match(
-    (await grep.execute("grep-overlay", {
-      pattern: "value = 2",
-      path: "",
-      literal: true,
-    })).content[0].text,
-    /app\.js:1/,
+  const grepOverlay = await grep.execute("grep-overlay", {
+    pattern: "value = 2",
+    path: "",
+    literal: true,
+  });
+  assert.match(grepOverlay.content[0].text, /app\.js:1/);
+  assert.deepEqual(grepOverlay.details.evidence, [{
+    path: "app.js",
+    contentHash: (await read.execute(
+      "read-overlay-evidence",
+      { path: "app.js" },
+    )).details.contentHash,
+    startLine: 1,
+    endLine: 1,
+  }]);
+  const discreteEvidence = await grep.execute("grep-discrete-evidence", {
+    pattern: "MATCH",
+    path: "discrete-evidence.js",
+    literal: true,
+  });
+  assert.deepEqual(
+    discreteEvidence.details.evidence.map(({ startLine, endLine }) => ({
+      startLine,
+      endLine,
+    })),
+    [
+      { startLine: 1, endLine: 1 },
+      { startLine: 6, endLine: 6 },
+    ],
   );
 
   await write.execute("write-new", {

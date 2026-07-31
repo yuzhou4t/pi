@@ -2,6 +2,7 @@ import {
   isFilteredProjectPath,
   normalizeProjectPath,
 } from "./workspace.js";
+import { isSafeResolvedVerificationRecipe } from "./verificationRecipes.js";
 
 export const AUTO_REVIEW_POLICY_VERSION = 1;
 export const EXECUTION_POLICY_MODES = Object.freeze([
@@ -163,11 +164,16 @@ export function reviewAutoVerification(verification, {
     return decision("deny", "verification_not_current_turn");
   }
   if (
-    !safeNodeTest(verification.command)
-    && !safePackageVerification(
-      verification.command,
-      verification.resolvedScript,
-    )
+    verification.recipeId
+      ? !isSafeResolvedVerificationRecipe(verification.recipe)
+        || verification.recipeId !== verification.recipe.id
+        || JSON.stringify(verification.command)
+          !== JSON.stringify(verification.recipe.command)
+      : !safeNodeTest(verification.command)
+        && !safePackageVerification(
+          verification.command,
+          verification.resolvedScript,
+        )
   ) {
     return decision("deny", "verification_command_not_auto_safe");
   }

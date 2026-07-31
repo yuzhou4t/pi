@@ -38,9 +38,15 @@ function formatDownloads(value) {
   return `${count.toLocaleString("zh-CN")}/月`;
 }
 
-function packageStateLine(skill) {
+export function packageStateLine(skill) {
   if (skill.kind === "workflow") return "内置流程，仅在当前一轮选择后使用";
   if (!skill.installSupported) return skill.unsupportedReason;
+  if (skill.runtimeCompatible === false) {
+    if (skill.enabledPreference) {
+      return `已配置启用，但当前不会加载；${skill.compatibilityReason}`;
+    }
+    return skill.compatibilityReason || "当前运行时不兼容";
+  }
   if (!skill.installed) {
     return skill.bundled
       ? "Pi Agent 内置受审 Skill，安装前会核对精确内容"
@@ -51,8 +57,25 @@ function packageStateLine(skill) {
     : "已安装，当前停用";
 }
 
-function SkillInstallReview({ preview, status, error, onConfirm, onCancel }) {
+function runtimeRequirementText(preview) {
+  if (!preview.requiredRuntimeCapabilities?.length) return "不要求额外 Runtime 工具";
+  return preview.requiredRuntimeCapabilities
+    .map((capability) => capability.label || capability.id)
+    .join("、");
+}
+
+export function SkillInstallReview({
+  preview,
+  status,
+  error,
+  onConfirm,
+  onCancel,
+}) {
   if (!preview) return null;
+  const isUpgrade = preview.reviewMode === "upgrade";
+  const reviewItems = isUpgrade
+    ? preview.skillDiffs || []
+    : preview.skillDocuments || [];
   return (
     <div
       className="skill-review-backdrop"
@@ -71,27 +94,43 @@ function SkillInstallReview({ preview, status, error, onConfirm, onCancel }) {
       >
         <header>
           <div>
-            <span className="eyebrow">安装预览</span>
+            <span className="eyebrow">{isUpgrade ? "升级预览" : "安装预览"}</span>
             <h3 id="skill-install-review-title">{preview.name}</h3>
-            <p>{preview.version} · {preview.skillCount} 个 Skill</p>
+            <p>
+              {isUpgrade ? `${preview.installedVersion} → ` : ""}
+              {preview.version} · {preview.skillCount} 个 Skill
+            </p>
           </div>
           <button className="icon-button" type="button" aria-label="关闭安装预览" onClick={onCancel}>
             <X size={17} aria-hidden="true" />
           </button>
         </header>
 
-        <div className="skill-review-safe">
-          <ShieldCheck size={18} weight="fill" aria-hidden="true" />
-          <div>
-            <strong>已通过纯 Skill 静态检查</strong>
-            <span>不含 Extension、安装脚本或运行时依赖；安装后默认停用。</span>
+        {preview.runtimeCompatible ? (
+          <div className="skill-review-safe">
+            <ShieldCheck size={18} weight="fill" aria-hidden="true" />
+            <div>
+              <strong>包检查与运行时要求均已通过</strong>
+              <span>不含 Extension、安装脚本或运行时依赖；安装后默认停用。</span>
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="skill-catalog-error" role="status">
+            <WarningCircle size={18} weight="fill" aria-hidden="true" />
+            <span>
+              <strong>当前运行时不兼容。</strong>
+              {" "}
+              {preview.compatibilityReason}
+              你仍可检查并安装，但它不会被启用或加载。
+            </span>
+          </div>
+        )}
 
         <dl className="skill-review-facts">
           <div><dt>来源</dt><dd>{preview.source}</dd></div>
           <div><dt>归档</dt><dd>{preview.archiveFileCount} 个文件 · {(preview.archiveBytes / 1024).toFixed(1)} KB</dd></div>
           <div><dt>完整性</dt><dd>{preview.integrity?.split("-")[0] || "已校验"}</dd></div>
+          <div><dt>运行能力</dt><dd>{runtimeRequirementText(preview)}</dd></div>
         </dl>
 
         <div className="skill-review-files">
@@ -100,6 +139,45 @@ function SkillInstallReview({ preview, status, error, onConfirm, onCancel }) {
             <span key={file}><FileText size={14} aria-hidden="true" />{file}</span>
           ))}
         </div>
+
+        <div className="skill-review-files">
+          <strong>效果范围</strong>
+          {preview.effectScopes?.length ? preview.effectScopes.map((effect) => (
+            <span key={effect.id}>
+              <ShieldCheck size={14} aria-hidden="true" />
+              {effect.label}
+              {effect.confirmationRequired ? " · 需要明确确认" : ""}
+            </span>
+          )) : (
+            <span>
+              <WarningCircle size={14} aria-hidden="true" />
+              尚未建立受审效果范围
+            </span>
+          )}
+        </div>
+
+        <details className="workflow-proposal-exact">
+          <summary>
+            {isUpgrade ? "查看完整升级差异" : "查看完整 SKILL.md"}
+          </summary>
+          <div>
+            {reviewItems.length ? reviewItems.map((item) => (
+              <section key={item.path}>
+                <h4>
+                  {item.path}
+                  {isUpgrade && item.changeKind ? ` · ${item.changeKind}` : ""}
+                </h4>
+                <pre className="workflow-markdown-preview">
+                  <code>{isUpgrade ? item.patch : item.content}</code>
+                </pre>
+              </section>
+            )) : (
+              <section>
+                <h4>{isUpgrade ? "Skill 内容没有变化" : "未返回可审查内容"}</h4>
+              </section>
+            )}
+          </div>
+        </details>
 
         {error ? <div className="skill-action-error" role="alert">{error}</div> : null}
 
@@ -114,7 +192,9 @@ function SkillInstallReview({ preview, status, error, onConfirm, onCancel }) {
             {status === "installing"
               ? <SpinnerGap className="spin" size={15} aria-hidden="true" />
               : <DownloadSimple size={15} aria-hidden="true" />}
-            {status === "installing" ? "正在安装" : "确认安装"}
+            {status === "installing"
+              ? isUpgrade ? "正在升级" : "正在安装"
+              : isUpgrade ? "确认升级" : "确认安装"}
           </button>
         </footer>
       </section>
@@ -225,11 +305,19 @@ export function SkillCenter({
         !normalized
         || `${skill.name} ${skill.description}`.toLowerCase().includes(normalized)
       ))
-      .map((skill) => ({
-        ...skill,
-        ...installedByName.get(skill.name),
-        kind: "package",
-      }));
+      .map((skill) => {
+        const installed = installedByName.get(skill.name);
+        return {
+          ...skill,
+          installed: Boolean(installed),
+          installedVersion: installed?.version ?? null,
+          installedAt: installed?.installedAt ?? null,
+          enabled: installed?.enabled === true,
+          enabledPreference: installed?.enabledPreference === true,
+          active: installed?.active === true,
+          kind: "package",
+        };
+      });
   }, [
     catalogState.packages,
     installedByName,
@@ -273,7 +361,7 @@ export function SkillCenter({
     try {
       await projectWorkApi.setSkillEnabled({
         name: skill.name,
-        enabled: !skill.enabled,
+        enabled: !(skill.enabledPreference ?? skill.enabled),
       });
       setAction({ id: null, status: "idle", preview: null, error: null });
       await loadInstalled();
@@ -346,6 +434,13 @@ export function SkillCenter({
           {visibleSkills.map((skill) => {
             const installing = action.id === skill.id && action.status === "inspecting";
             const toggling = action.id === skill.id && action.status === "toggling";
+            const enabledPreference = skill.enabledPreference ?? skill.enabled;
+            const canUpgrade = Boolean(
+              skill.installed
+              && skill.version
+              && skill.installedVersion
+              && skill.version !== skill.installedVersion,
+            );
             const actionError = action.id === skill.id && action.status === "idle"
               ? action.error
               : null;
@@ -359,6 +454,7 @@ export function SkillCenter({
                   <div className="skill-row-title">
                     <h3>{skill.name}</h3>
                     <span>{skill.kind === "workflow" ? skill.category : "Skill"}</span>
+                    {skill.runtimeCompatible === false ? <span>不兼容</span> : null}
                     <small>
                       {skill.kind === "workflow"
                         ? skill.source
@@ -379,29 +475,59 @@ export function SkillCenter({
                       </a>
                     ) : null}
                   </div>
+                  {skill.effectScopes?.length ? (
+                    <div className="skill-state-line">
+                      <ShieldCheck size={14} aria-hidden="true" />
+                      <span>
+                        效果：
+                        {skill.effectScopes.map((effect) => effect.label).join("；")}
+                      </span>
+                    </div>
+                  ) : null}
                   {actionError ? <div className="skill-action-error" role="alert">{actionError}</div> : null}
                 </div>
                 <div className="skill-row-action">
                   {skill.kind === "workflow" ? (
                     <span className="skill-builtin-label">按需</span>
                   ) : skill.installed ? (
-                    <button
-                      className={`switch-control${skill.enabled ? " is-on" : ""}`}
-                      type="button"
-                      role="switch"
-                      aria-checked={skill.enabled}
-                      aria-label={`${skill.enabled ? "停用" : "启用"}${skill.name}`}
-                      onClick={() => toggle(skill)}
-                      disabled={toggling}
-                    >
-                      <span>
-                        {toggling
-                          ? <SpinnerGap className="spin" size={11} aria-hidden="true" />
-                          : skill.enabled
-                            ? <Check size={12} weight="bold" aria-hidden="true" />
-                            : null}
-                      </span>
-                    </button>
+                    <>
+                      {canUpgrade ? (
+                        <button
+                          className="download-button"
+                          type="button"
+                          onClick={() => inspect(skill)}
+                          disabled={installing}
+                        >
+                          {installing
+                            ? <SpinnerGap className="spin" size={15} aria-hidden="true" />
+                            : <DownloadSimple size={15} weight="bold" aria-hidden="true" />}
+                          {installing ? "检查中" : "检查升级"}
+                        </button>
+                      ) : null}
+                      <button
+                        className={`switch-control${enabledPreference ? " is-on" : ""}`}
+                        type="button"
+                        role="switch"
+                        aria-checked={enabledPreference}
+                        aria-label={`${enabledPreference ? "停用" : "启用"}${skill.name}`}
+                        onClick={() => toggle(skill)}
+                        disabled={
+                          toggling
+                          || (skill.runtimeCompatible === false && !enabledPreference)
+                        }
+                        title={skill.runtimeCompatible === false
+                          ? skill.compatibilityReason
+                          : undefined}
+                      >
+                        <span>
+                          {toggling
+                            ? <SpinnerGap className="spin" size={11} aria-hidden="true" />
+                            : enabledPreference
+                              ? <Check size={12} weight="bold" aria-hidden="true" />
+                              : null}
+                        </span>
+                      </button>
+                    </>
                   ) : (
                     <button
                       className="download-button"

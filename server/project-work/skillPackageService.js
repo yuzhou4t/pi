@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  lstat,
   mkdir,
   readFile,
+  realpath,
   rename,
   writeFile,
 } from "node:fs/promises";
@@ -12,6 +14,7 @@ import {
   DefaultPackageManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { createTwoFilesPatch } from "diff";
 import { projectWorkError } from "./errors.js";
 
 const CATALOG_BASE_URL = "https://pi.dev/packages";
@@ -44,12 +47,140 @@ const BUNDLED_SKILL_PACKAGES = Object.freeze({
     description: "先核对项目规则、入口、技术栈和运行边界，再安全开始当前工作。",
   }),
   "@pi-agent/git-closeout": Object.freeze({
-    version: "1.0.0",
+    version: "1.1.0",
     directory: "git-closeout",
     skillName: "git-closeout",
-    description: "审查任务变更、验证证据和暂存范围，经明确确认后完成本地 Git 提交。",
+    description: "审查任务变更、验证证据和暂存范围；仅在受控 Git 收尾事务可用时，经明确确认完成本地提交。",
   }),
 });
+const DEFAULT_RUNTIME_CAPABILITIES = Object.freeze([
+  "project_read",
+  "project_change_proposal",
+]);
+const RUNTIME_CAPABILITY_LABELS = Object.freeze({
+  project_read: "受控读取项目文件",
+  project_change_proposal: "生成受审批的项目文件更改",
+  git_closeout_transaction: "受控本地 Git 收尾事务",
+});
+const REVIEWED_SKILL_RUNTIME_CONTRACTS = Object.freeze({
+  "@counterposition/skill-pi": Object.freeze({
+    requiredRuntimeCapabilities: Object.freeze([]),
+    effectScopes: Object.freeze([
+      Object.freeze({
+        id: "conversation_guidance",
+        label: "在 Agent 对话中提供 Pi SDK 与运行时指导",
+        kind: "conversation",
+        confirmationRequired: false,
+      }),
+    ]),
+  }),
+  "@firstpick/pi-skill-html-report": Object.freeze({
+    requiredRuntimeCapabilities: Object.freeze([
+      "project_read",
+      "project_change_proposal",
+    ]),
+    effectScopes: Object.freeze([
+      Object.freeze({
+        id: "project_html_change_proposal",
+        label: "提议创建或更新项目内自包含 HTML 报告",
+        kind: "project_write_proposal",
+        confirmationRequired: true,
+      }),
+    ]),
+  }),
+  "@pi-agent/project-orientation": Object.freeze({
+    requiredRuntimeCapabilities: Object.freeze(["project_read"]),
+    effectScopes: Object.freeze([
+      Object.freeze({
+        id: "project_orientation",
+        label: "只读核对项目规则、入口、技术栈与验证路径",
+        kind: "project_read",
+        confirmationRequired: false,
+      }),
+      Object.freeze({
+        id: "conversation_project_map",
+        label: "在 Agent 对话中输出项目地图",
+        kind: "conversation",
+        confirmationRequired: false,
+      }),
+    ]),
+  }),
+  "@pi-agent/git-closeout": Object.freeze({
+    requiredRuntimeCapabilities: Object.freeze([
+      "project_read",
+      "git_closeout_transaction",
+    ]),
+    effectScopes: Object.freeze([
+      Object.freeze({
+        id: "git_index_write",
+        label: "经精确预览与确认后写入 Git 索引",
+        kind: "git_write",
+        confirmationRequired: true,
+      }),
+      Object.freeze({
+        id: "git_local_commit",
+        label: "经确认后创建本地提交；默认不推送",
+        kind: "git_write",
+        confirmationRequired: true,
+      }),
+    ]),
+  }),
+});
+
+function normalizeRuntimeCapabilities(value) {
+  const values = value instanceof Set
+    ? [...value]
+    : Array.isArray(value)
+      ? value
+      : [];
+  return new Set(values.filter((item) => (
+    typeof item === "string" && Object.hasOwn(RUNTIME_CAPABILITY_LABELS, item)
+  )));
+}
+
+function publicRuntimeCapability(id) {
+  return {
+    id,
+    label: RUNTIME_CAPABILITY_LABELS[id] ?? id,
+  };
+}
+
+export function describeSkillRuntimeContract(
+  name,
+  runtimeCapabilities = DEFAULT_RUNTIME_CAPABILITIES,
+) {
+  const contract = REVIEWED_SKILL_RUNTIME_CONTRACTS[name];
+  if (!contract) {
+    return {
+      contractVersion: 1,
+      reviewed: false,
+      runtimeCompatible: false,
+      compatibilityStatus: "unreviewed",
+      compatibilityReason: "这个纯 Skill 尚未建立 Pi Agent 受审运行时契约，不能启用",
+      requiredRuntimeCapabilities: [],
+      missingRuntimeCapabilities: [],
+      effectScopes: [],
+    };
+  }
+  const available = normalizeRuntimeCapabilities(runtimeCapabilities);
+  const missing = contract.requiredRuntimeCapabilities.filter((id) => !available.has(id));
+  return {
+    contractVersion: 1,
+    reviewed: true,
+    runtimeCompatible: missing.length === 0,
+    compatibilityStatus: missing.length === 0 ? "compatible" : "incompatible",
+    compatibilityReason: missing.length === 0
+      ? "当前运行时已满足这个 Skill 的全部能力要求"
+      : `当前运行时缺少：${missing.map((id) => (
+        RUNTIME_CAPABILITY_LABELS[id] ?? id
+      )).join("、")}`,
+    requiredRuntimeCapabilities: contract.requiredRuntimeCapabilities.map(
+      publicRuntimeCapability,
+    ),
+    missingRuntimeCapabilities: missing.map(publicRuntimeCapability),
+    effectScopes: contract.effectScopes.map((effect) => ({ ...effect })),
+  };
+}
 
 function decodeHtml(value = "") {
   return value
@@ -78,17 +209,39 @@ function firstMatch(value, pattern) {
   return match ? textFromHtml(match[1]) : "";
 }
 
-function publicInstalledPackage(value) {
+function publicInstalledPackage(
+  value,
+  runtimeCapabilities,
+  contentIntegrity = null,
+) {
+  const runtime = describeSkillRuntimeContract(value.name, runtimeCapabilities);
+  const integrityVerified = contentIntegrity?.status === "verified";
+  const effectiveRuntime = integrityVerified
+    ? runtime
+    : {
+        ...runtime,
+        runtimeCompatible: false,
+        compatibilityStatus: "content_mismatch",
+        compatibilityReason: contentIntegrity?.reason
+          ?? "已安装的 SKILL.md 未通过内容完整性校验，不能加载",
+      };
+  const enabledPreference = value.enabled === true;
   return {
     id: value.name,
     name: value.name,
     version: value.version,
     source: value.source,
     description: typeof value.description === "string" ? value.description : "",
-    enabled: value.enabled === true,
+    enabled: enabledPreference && effectiveRuntime.runtimeCompatible,
+    enabledPreference,
+    active: enabledPreference && effectiveRuntime.runtimeCompatible,
     installedAt: value.installedAt,
     skillCount: Array.isArray(value.skillFiles) ? value.skillFiles.length : 0,
     skillFiles: Array.isArray(value.skillFiles) ? [...value.skillFiles] : [],
+    contentIntegrityStatus: contentIntegrity?.status ?? "content_mismatch",
+    contentIntegrityReason: contentIntegrity?.reason
+      ?? "已安装的 SKILL.md 未通过内容完整性校验",
+    ...effectiveRuntime,
   };
 }
 
@@ -210,6 +363,20 @@ function parseTarEntries(buffer) {
 
 function manifestArray(value) {
   return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+}
+
+function decodeSkillDocument(entry) {
+  try {
+    const content = new TextDecoder("utf-8", { fatal: true }).decode(entry.content);
+    if (content.includes("\0")) throw new TypeError("NUL byte");
+    return content;
+  } catch {
+    throw projectWorkError(
+      "PROJECT_WORK_SKILL_FILE_INVALID",
+      "包内 SKILL.md 必须是有效的 UTF-8 文本",
+      422,
+    );
+  }
 }
 
 export function inspectSkillTarball(tarball, {
@@ -352,6 +519,14 @@ export function inspectSkillTarball(tarball, {
     entry.path.slice("package/".length),
     `sha256:${createHash("sha256").update(entry.content).digest("hex")}`,
   ]));
+  const skillDocuments = skillEntries.map((entry) => {
+    const file = entry.path.slice("package/".length);
+    return {
+      path: file,
+      content: decodeSkillDocument(entry),
+      digest: skillFileDigests[file],
+    };
+  });
   return {
     name: manifest.name,
     version: manifest.version,
@@ -359,6 +534,7 @@ export function inspectSkillTarball(tarball, {
     integrity: integrity ?? `sha256-${createHash("sha256").update(tarball).digest("base64")}`,
     skillFiles,
     skillFileDigests,
+    skillDocuments,
     archiveFileCount: entries.length,
     archiveBytes: tarball.length,
   };
@@ -406,11 +582,256 @@ async function fetchBuffer(fetchImpl, url, {
   }
 }
 
+function safeInstalledSkillPath(installedPath, skillFile) {
+  const root = path.resolve(installedPath);
+  const absolutePath = path.resolve(root, skillFile);
+  const relative = path.relative(root, absolutePath);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw projectWorkError(
+      "PROJECT_WORK_SKILL_INSTALL_INVALID",
+      "Skill 安装路径越界",
+      500,
+    );
+  }
+  return absolutePath;
+}
+
+async function inspectInstalledSkillContent(
+  installed,
+  { acceptMissingDigests = false } = {},
+) {
+  const mismatch = (reason) => ({
+    status: "content_mismatch",
+    reason,
+    skillFileDigests: {},
+  });
+  if (
+    !installed
+    || typeof installed.installedPath !== "string"
+    || !Array.isArray(installed.skillFiles)
+    || installed.skillFiles.length < 1
+  ) {
+    return mismatch("已安装 Skill 的文件记录不完整，不能加载");
+  }
+  let rootStat;
+  let canonicalRoot;
+  try {
+    [rootStat, canonicalRoot] = await Promise.all([
+      lstat(installed.installedPath),
+      realpath(installed.installedPath),
+    ]);
+  } catch {
+    return mismatch("已安装 Skill 的目录不存在，不能加载");
+  }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    return mismatch("已安装 Skill 的目录类型已变化，不能加载");
+  }
+  const expectedDigests = (
+    installed.skillFileDigests
+    && typeof installed.skillFileDigests === "object"
+    && !Array.isArray(installed.skillFileDigests)
+  )
+    ? installed.skillFileDigests
+    : {};
+  const computedDigests = {};
+  for (const skillFile of installed.skillFiles) {
+    let absolutePath;
+    let fileStat;
+    let canonicalPath;
+    let content;
+    try {
+      absolutePath = safeInstalledSkillPath(installed.installedPath, skillFile);
+      fileStat = await lstat(absolutePath);
+    } catch {
+      return mismatch("已安装的 SKILL.md 不存在或无法读取，不能加载");
+    }
+    if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
+      return mismatch("已安装的 SKILL.md 路径已变化，不能加载");
+    }
+    try {
+      canonicalPath = await realpath(absolutePath);
+    } catch {
+      return mismatch("已安装的 SKILL.md 不存在或无法读取，不能加载");
+    }
+    const relative = path.relative(canonicalRoot, canonicalPath);
+    if (
+      relative.startsWith("..")
+      || path.isAbsolute(relative)
+    ) {
+      return mismatch("已安装的 SKILL.md 路径已变化，不能加载");
+    }
+    try {
+      content = await readFile(absolutePath);
+    } catch {
+      return mismatch("已安装的 SKILL.md 不存在或无法读取，不能加载");
+    }
+    if (content.length > MAX_SKILL_FILE_BYTES) {
+      return mismatch("已安装的 SKILL.md 超过受审大小上限，不能加载");
+    }
+    const digest = `sha256:${createHash("sha256")
+      .update(content)
+      .digest("hex")}`;
+    computedDigests[skillFile] = digest;
+    const expected = expectedDigests[skillFile];
+    if (!expected && !acceptMissingDigests) {
+      return mismatch("已安装的 SKILL.md 缺少受审摘要，不能加载");
+    }
+    if (expected && expected !== digest) {
+      return mismatch("已安装的 SKILL.md 内容已变化，不能加载");
+    }
+  }
+  if (
+    Object.keys(expectedDigests).some(
+      (skillFile) => !installed.skillFiles.includes(skillFile),
+    )
+  ) {
+    return mismatch("已安装 Skill 的摘要范围与文件清单不一致，不能加载");
+  }
+  return {
+    status: "verified",
+    reason: "已安装的 SKILL.md 与受审内容一致",
+    skillFileDigests: computedDigests,
+  };
+}
+
+async function readInstalledSkillDocuments(installed) {
+  if (
+    !installed
+    || typeof installed.installedPath !== "string"
+    || !Array.isArray(installed.skillFiles)
+  ) {
+    return [];
+  }
+  let canonicalRoot;
+  try {
+    const rootStat = await lstat(installed.installedPath);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return [];
+    canonicalRoot = await realpath(installed.installedPath);
+  } catch {
+    return [];
+  }
+  const documents = [];
+  for (const skillFile of installed.skillFiles) {
+    const absolutePath = safeInstalledSkillPath(installed.installedPath, skillFile);
+    try {
+      const fileStat = await lstat(absolutePath);
+      if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
+        documents.push({
+          path: skillFile,
+          content: "",
+          digest: null,
+          unsafe: true,
+        });
+        continue;
+      }
+      const canonicalPath = await realpath(absolutePath);
+      const relative = path.relative(canonicalRoot, canonicalPath);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) {
+        documents.push({
+          path: skillFile,
+          content: "",
+          digest: null,
+          unsafe: true,
+        });
+        continue;
+      }
+      const content = await readFile(absolutePath);
+      if (content.length > MAX_SKILL_FILE_BYTES) {
+        throw projectWorkError(
+          "PROJECT_WORK_SKILL_FILE_TOO_LARGE",
+          "已安装的 Skill 文件超过当前安全限制",
+          413,
+        );
+      }
+      documents.push({
+        path: skillFile,
+        content: new TextDecoder("utf-8", { fatal: true }).decode(content),
+        digest: `sha256:${createHash("sha256").update(content).digest("hex")}`,
+      });
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        documents.push({
+          path: skillFile,
+          content: "",
+          digest: null,
+          missing: true,
+        });
+        continue;
+      }
+      if (error instanceof TypeError) {
+        throw projectWorkError(
+          "PROJECT_WORK_SKILL_FILE_INVALID",
+          "已安装的 SKILL.md 不是有效的 UTF-8 文本",
+          422,
+        );
+      }
+      throw error;
+    }
+  }
+  return documents;
+}
+
+function createUpgradeReview(installed, installedDocuments, candidateDocuments) {
+  if (!installed) {
+    return {
+      reviewMode: "install",
+      installedVersion: null,
+      installedSkillFileDigests: {},
+      skillDocuments: candidateDocuments.map((document) => ({ ...document })),
+      skillDiffs: [],
+    };
+  }
+  const installedByPath = new Map(
+    installedDocuments.map((document) => [document.path, document]),
+  );
+  const candidateByPath = new Map(
+    candidateDocuments.map((document) => [document.path, document]),
+  );
+  const paths = [...new Set([
+    ...installedByPath.keys(),
+    ...candidateByPath.keys(),
+  ])].sort();
+  const skillDiffs = paths.flatMap((skillFile) => {
+    const before = installedByPath.get(skillFile);
+    const after = candidateByPath.get(skillFile);
+    const beforeContent = before?.content ?? "";
+    const afterContent = after?.content ?? "";
+    if (beforeContent === afterContent && Boolean(before) === Boolean(after)) {
+      return [];
+    }
+    return [{
+      path: skillFile,
+      changeKind: before ? after ? "modified" : "removed" : "added",
+      beforeDigest: before?.digest ?? null,
+      afterDigest: after?.digest ?? null,
+      patch: createTwoFilesPatch(
+        `${skillFile}@${installed.version}`,
+        `${skillFile}@candidate`,
+        beforeContent,
+        afterContent,
+        installed.version,
+        "candidate",
+        { context: 3 },
+      ),
+    }];
+  });
+  return {
+    reviewMode: "upgrade",
+    installedVersion: installed.version,
+    installedSkillFileDigests: Object.fromEntries(
+      installedDocuments.map((document) => [document.path, document.digest]),
+    ),
+    skillDocuments: [],
+    skillDiffs,
+  };
+}
+
 export function createSkillPackageService({
   storageRoot,
   fetchImpl = globalThis.fetch,
   packageManager,
   bundledSkillRoot = DEFAULT_BUNDLED_SKILL_ROOT,
+  runtimeCapabilityProvider = () => DEFAULT_RUNTIME_CAPABILITIES,
   now = () => new Date(),
   idFactory = randomUUID,
 } = {}) {
@@ -420,8 +841,16 @@ export function createSkillPackageService({
   let effectivePackageManager = packageManager;
   let packageManagerPromise = null;
   let mutationQueue = Promise.resolve();
+  let integrityMigrationPromise = null;
   const catalogCache = new Map();
   const previews = new Map();
+
+  async function loadRuntimeCapabilities() {
+    const value = typeof runtimeCapabilityProvider === "function"
+      ? await runtimeCapabilityProvider()
+      : runtimeCapabilityProvider;
+    return normalizeRuntimeCapabilities(value);
+  }
 
   async function getPackageManager() {
     if (effectivePackageManager) return effectivePackageManager;
@@ -479,22 +908,97 @@ export function createSkillPackageService({
     return operation;
   }
 
+  async function ensureLegacyIntegrityDigests() {
+    if (!integrityMigrationPromise) {
+      integrityMigrationPromise = mutate(async () => {
+        const state = await readState();
+        let changed = false;
+        const packages = [];
+        for (const item of state.packages) {
+          if (
+            item.skillFileDigests
+            && typeof item.skillFileDigests === "object"
+            && !Array.isArray(item.skillFileDigests)
+          ) {
+            packages.push(item);
+            continue;
+          }
+          const inspected = await inspectInstalledSkillContent(item, {
+            acceptMissingDigests: true,
+          });
+          if (inspected.status !== "verified") {
+            packages.push(item);
+            continue;
+          }
+          changed = true;
+          packages.push({
+            ...item,
+            skillFileDigests: inspected.skillFileDigests,
+            integrityRecordedAt: now().toISOString(),
+            integrityTrust: "legacy_tofu",
+          });
+        }
+        if (changed) {
+          await writeState({
+            schemaVersion: 1,
+            revision: state.revision + 1,
+            packages,
+          });
+          catalogCache.clear();
+        }
+      }).catch((error) => {
+        integrityMigrationPromise = null;
+        throw error;
+      });
+    }
+    await integrityMigrationPromise;
+  }
+
+  async function inspectInstalledPackages(packages) {
+    return new Map(await Promise.all(packages.map(async (item) => (
+      [item.name, await inspectInstalledSkillContent(item)]
+    ))));
+  }
+
   async function listInstalled() {
-    const state = await readState();
+    await ensureLegacyIntegrityDigests();
+    const [state, runtimeCapabilities] = await Promise.all([
+      readState(),
+      loadRuntimeCapabilities(),
+    ]);
+    const integrityByName = await inspectInstalledPackages(state.packages);
     return {
       schemaVersion: 1,
       revision: state.revision,
-      packages: state.packages.map(publicInstalledPackage),
+      packages: state.packages.map((item) => (
+        publicInstalledPackage(
+          item,
+          runtimeCapabilities,
+          integrityByName.get(item.name),
+        )
+      )),
     };
   }
 
   async function listCatalog({ query = "", sort = "downloads" } = {}) {
+    await ensureLegacyIntegrityDigests();
     const normalizedQuery = typeof query === "string" ? query.trim().slice(0, 80) : "";
     const normalizedSort = SORTS.has(sort) ? sort : "downloads";
+    const runtimeCapabilities = await loadRuntimeCapabilities();
     const bundled = BUNDLED_SKILL_PACKAGES[normalizedQuery];
     if (bundled) {
       const installed = await readState();
       const current = installed.packages.find((item) => item.name === normalizedQuery);
+      const currentIntegrity = current
+        ? await inspectInstalledSkillContent(current)
+        : null;
+      const currentRuntime = describeSkillRuntimeContract(
+        normalizedQuery,
+        runtimeCapabilities,
+      );
+      const contentMismatch = Boolean(
+        current && currentIntegrity?.status !== "verified",
+      );
       return {
         schemaVersion: 1,
         source: "pi-agent",
@@ -517,8 +1021,19 @@ export function createSkillPackageService({
           unsupportedReason: null,
           bundled: true,
           installed: Boolean(current),
-          enabled: current?.enabled === true,
+          enabled: current?.enabled === true
+            && currentIntegrity?.status === "verified"
+            && currentRuntime.runtimeCompatible,
+          enabledPreference: current?.enabled === true,
           installedVersion: current?.version ?? null,
+          contentIntegrityStatus: currentIntegrity?.status ?? null,
+          contentIntegrityReason: currentIntegrity?.reason ?? null,
+          ...currentRuntime,
+          ...(contentMismatch ? {
+            runtimeCompatible: false,
+            compatibilityStatus: "content_mismatch",
+            compatibilityReason: currentIntegrity.reason,
+          } : {}),
         }],
       };
     }
@@ -530,10 +1045,46 @@ export function createSkillPackageService({
         true,
       );
     }
+    const installed = await readState();
+    const installedByName = new Map(
+      installed.packages.map((item) => [item.name, item]),
+    );
+    const integrityByName = await inspectInstalledPackages(installed.packages);
+    const decorateCatalogItem = (item) => {
+      const current = installedByName.get(item.name);
+      const contentIntegrity = integrityByName.get(item.name);
+      const runtime = describeSkillRuntimeContract(
+        item.name,
+        runtimeCapabilities,
+      );
+      const contentMismatch = Boolean(
+        current && contentIntegrity?.status !== "verified",
+      );
+      return {
+        ...item,
+        installed: Boolean(current),
+        enabled: current?.enabled === true
+          && !contentMismatch
+          && runtime.runtimeCompatible,
+        enabledPreference: current?.enabled === true,
+        installedVersion: current?.version ?? null,
+        contentIntegrityStatus: contentIntegrity?.status ?? null,
+        contentIntegrityReason: contentIntegrity?.reason ?? null,
+        ...runtime,
+        ...(contentMismatch ? {
+          runtimeCompatible: false,
+          compatibilityStatus: "content_mismatch",
+          compatibilityReason: contentIntegrity.reason,
+        } : {}),
+      };
+    };
     const cacheKey = `${normalizedQuery}\n${normalizedSort}`;
     const cached = catalogCache.get(cacheKey);
     if (cached && cached.expiresAt > now().getTime()) {
-      return structuredClone(cached.value);
+      return structuredClone({
+        ...cached.value,
+        packages: cached.value.packages.map(decorateCatalogItem),
+      });
     }
     const url = new URL(CATALOG_BASE_URL);
     url.searchParams.set("type", "skill");
@@ -542,24 +1093,13 @@ export function createSkillPackageService({
     const html = (
       await fetchBuffer(fetchImpl, url, { maxBytes: MAX_CATALOG_BYTES })
     ).toString("utf8");
-    const [catalog, installed] = await Promise.all([
-      Promise.resolve(parsePiSkillCatalog(html)),
-      readState(),
-    ]);
-    const installedByName = new Map(
-      installed.packages.map((item) => [item.name, item]),
-    );
+    const catalog = parsePiSkillCatalog(html);
     const value = {
       schemaVersion: 1,
       source: "pi.dev",
       query: normalizedQuery,
       sort: normalizedSort,
-      packages: catalog.map((item) => ({
-        ...item,
-        installed: installedByName.has(item.name),
-        enabled: installedByName.get(item.name)?.enabled === true,
-        installedVersion: installedByName.get(item.name)?.version ?? null,
-      })),
+      packages: catalog.map(decorateCatalogItem),
     };
     catalogCache.set(cacheKey, {
       expiresAt: now().getTime() + CATALOG_CACHE_TTL_MS,
@@ -569,6 +1109,7 @@ export function createSkillPackageService({
   }
 
   async function inspectPackage({ name, version } = {}) {
+    await ensureLegacyIntegrityDigests();
     if (!PACKAGE_NAME_PATTERN.test(name ?? "")) {
       throw projectWorkError(
         "PROJECT_WORK_SKILL_PACKAGE_INVALID",
@@ -576,6 +1117,13 @@ export function createSkillPackageService({
         400,
       );
     }
+    const [state, runtimeCapabilities] = await Promise.all([
+      readState(),
+      loadRuntimeCapabilities(),
+    ]);
+    const existing = state.packages.find((item) => item.name === name);
+    const installedDocuments = await readInstalledSkillDocuments(existing);
+    const runtime = describeSkillRuntimeContract(name, runtimeCapabilities);
     const bundled = BUNDLED_SKILL_PACKAGES[name];
     if (bundled) {
       if (version && version !== bundled.version) {
@@ -610,6 +1158,16 @@ export function createSkillPackageService({
       }
       const skillFile = `skills/${bundled.skillName}/SKILL.md`;
       const digest = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+      const skillDocuments = [{
+        path: skillFile,
+        content: new TextDecoder("utf-8", { fatal: true }).decode(content),
+        digest,
+      }];
+      const review = createUpgradeReview(
+        existing,
+        installedDocuments,
+        skillDocuments,
+      );
       const source = `bundled:${name}@${bundled.version}`;
       const integrity = `sha256-${createHash("sha256").update(content).digest("base64")}`;
       const previewHash = `sha256:${createHash("sha256").update(JSON.stringify({
@@ -617,6 +1175,9 @@ export function createSkillPackageService({
         integrity,
         skillFiles: [skillFile],
         skillFileDigests: { [skillFile]: digest },
+        installedVersion: review.installedVersion,
+        installedSkillFileDigests: review.installedSkillFileDigests,
+        contractVersion: runtime.contractVersion,
       })).digest("hex")}`;
       const previewId = `skill-preview-${idFactory()}`;
       const preview = {
@@ -635,6 +1196,8 @@ export function createSkillPackageService({
         archiveBytes: content.length,
         defaultEnabled: false,
         bundled: true,
+        ...review,
+        ...runtime,
         expiresAt: new Date(now().getTime() + PREVIEW_TTL_MS).toISOString(),
       };
       previews.set(previewId, preview);
@@ -667,12 +1230,20 @@ export function createSkillPackageService({
       expectedVersion: selectedVersion,
       integrity: manifest.dist.integrity,
     });
+    const review = createUpgradeReview(
+      existing,
+      installedDocuments,
+      inspected.skillDocuments,
+    );
     const source = `npm:${name}@${selectedVersion}`;
     const previewHash = `sha256:${createHash("sha256").update(JSON.stringify({
       source,
       integrity: inspected.integrity,
       skillFiles: inspected.skillFiles,
       skillFileDigests: inspected.skillFileDigests,
+      installedVersion: review.installedVersion,
+      installedSkillFileDigests: review.installedSkillFileDigests,
+      contractVersion: runtime.contractVersion,
     })).digest("hex")}`;
     const previewId = `skill-preview-${idFactory()}`;
     const preview = {
@@ -690,6 +1261,8 @@ export function createSkillPackageService({
       archiveFileCount: inspected.archiveFileCount,
       archiveBytes: inspected.archiveBytes,
       defaultEnabled: false,
+      ...review,
+      ...runtime,
       expiresAt: new Date(now().getTime() + PREVIEW_TTL_MS).toISOString(),
     };
     previews.set(previewId, preview);
@@ -697,6 +1270,7 @@ export function createSkillPackageService({
   }
 
   async function installPackage({ previewId, previewHash } = {}) {
+    await ensureLegacyIntegrityDigests();
     return mutate(async () => {
       const preview = previews.get(previewId);
       if (
@@ -714,7 +1288,44 @@ export function createSkillPackageService({
       }
       const state = await readState();
       const existing = state.packages.find((item) => item.name === preview.name);
-      if (existing?.version === preview.version) {
+      const existingIntegrity = existing
+        ? await inspectInstalledSkillContent(existing)
+        : null;
+      if (
+        (preview.reviewMode === "install" && existing)
+        || (
+          preview.reviewMode === "upgrade"
+          && existing?.version !== preview.installedVersion
+        )
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_SKILL_PREVIEW_STALE",
+          "已安装的 Skill 版本在确认前发生了变化，请重新检查",
+          409,
+          true,
+        );
+      }
+      if (preview.reviewMode === "upgrade") {
+        const currentDocuments = await readInstalledSkillDocuments(existing);
+        const currentDigests = Object.fromEntries(
+          currentDocuments.map((document) => [document.path, document.digest]),
+        );
+        if (
+          JSON.stringify(currentDigests)
+          !== JSON.stringify(preview.installedSkillFileDigests)
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_SKILL_PREVIEW_STALE",
+            "已安装的 Skill 内容在确认前发生了变化，请重新检查",
+            409,
+            true,
+          );
+        }
+      }
+      if (
+        existing?.version === preview.version
+        && existingIntegrity?.status === "verified"
+      ) {
         previews.delete(previewId);
         if (
           !existing.description
@@ -733,9 +1344,17 @@ export function createSkillPackageService({
             )),
           });
           catalogCache.clear();
-          return publicInstalledPackage(updated);
+          return publicInstalledPackage(
+            updated,
+            await loadRuntimeCapabilities(),
+            existingIntegrity,
+          );
         }
-        return publicInstalledPackage(existing);
+        return publicInstalledPackage(
+          existing,
+          await loadRuntimeCapabilities(),
+          existingIntegrity,
+        );
       }
       let installedPath;
       if (preview.bundled === true) {
@@ -780,15 +1399,7 @@ export function createSkillPackageService({
         );
       }
       for (const skillFile of preview.skillFiles) {
-        const absolutePath = path.resolve(installedPath, skillFile);
-        const relative = path.relative(installedPath, absolutePath);
-        if (relative.startsWith("..") || path.isAbsolute(relative)) {
-          throw projectWorkError(
-            "PROJECT_WORK_SKILL_INSTALL_INVALID",
-            "Skill 安装路径越界",
-            500,
-          );
-        }
+        const absolutePath = safeInstalledSkillPath(installedPath, skillFile);
         const installedContent = await readFile(absolutePath);
         const installedDigest = `sha256:${createHash("sha256")
           .update(installedContent)
@@ -810,6 +1421,9 @@ export function createSkillPackageService({
         integrity: preview.integrity,
         installedPath,
         skillFiles: [...preview.skillFiles],
+        skillFileDigests: { ...preview.skillFileDigests },
+        integrityRecordedAt: now().toISOString(),
+        integrityTrust: "review_confirmed",
         enabled: false,
         installedAt: now().toISOString(),
       };
@@ -824,11 +1438,16 @@ export function createSkillPackageService({
       await writeState(nextState);
       previews.delete(previewId);
       catalogCache.clear();
-      return publicInstalledPackage(installed);
+      return publicInstalledPackage(
+        installed,
+        await loadRuntimeCapabilities(),
+        await inspectInstalledSkillContent(installed),
+      );
     });
   }
 
   async function setEnabled(name, enabled) {
+    await ensureLegacyIntegrityDigests();
     return mutate(async () => {
       const state = await readState();
       const current = state.packages.find((item) => item.name === name);
@@ -840,7 +1459,31 @@ export function createSkillPackageService({
         );
       }
       const nextEnabled = enabled === true;
-      if (current.enabled === nextEnabled) return publicInstalledPackage(current);
+      const runtimeCapabilities = await loadRuntimeCapabilities();
+      const runtime = describeSkillRuntimeContract(name, runtimeCapabilities);
+      const contentIntegrity = await inspectInstalledSkillContent(current);
+      if (nextEnabled && !runtime.runtimeCompatible) {
+        throw projectWorkError(
+          "PROJECT_WORK_SKILL_RUNTIME_INCOMPATIBLE",
+          runtime.compatibilityReason,
+          409,
+        );
+      }
+      if (nextEnabled && contentIntegrity.status !== "verified") {
+        throw projectWorkError(
+          "PROJECT_WORK_SKILL_CONTENT_MISMATCH",
+          contentIntegrity.reason,
+          409,
+          true,
+        );
+      }
+      if (current.enabled === nextEnabled) {
+        return publicInstalledPackage(
+          current,
+          runtimeCapabilities,
+          contentIntegrity,
+        );
+      }
       const next = {
         ...current,
         enabled: nextEnabled,
@@ -851,20 +1494,40 @@ export function createSkillPackageService({
         packages: state.packages.map((item) => item.name === name ? next : item),
       });
       catalogCache.clear();
-      return publicInstalledPackage(next);
+      return publicInstalledPackage(
+        next,
+        runtimeCapabilities,
+        contentIntegrity,
+      );
     });
   }
 
   async function getEnabledSkillPaths() {
-    const state = await readState();
-    return state.packages.flatMap((item) => (
-      item.enabled === true
-        ? item.skillFiles.map((skillFile) => path.resolve(item.installedPath, skillFile))
-        : []
-    ));
+    await ensureLegacyIntegrityDigests();
+    const [state, runtimeCapabilities] = await Promise.all([
+      readState(),
+      loadRuntimeCapabilities(),
+    ]);
+    const integrityByName = await inspectInstalledPackages(state.packages);
+    return state.packages.flatMap((item) => {
+      const contentIntegrity = integrityByName.get(item.name);
+      return (
+        item.enabled === true
+        && contentIntegrity?.status === "verified"
+        && describeSkillRuntimeContract(
+          item.name,
+          runtimeCapabilities,
+        ).runtimeCompatible
+      )
+        ? item.skillFiles.map((skillFile) => (
+            safeInstalledSkillPath(item.installedPath, skillFile)
+          ))
+        : [];
+    });
   }
 
   async function getRevision() {
+    await ensureLegacyIntegrityDigests();
     return (await readState()).revision;
   }
 

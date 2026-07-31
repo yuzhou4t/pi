@@ -6,6 +6,7 @@ const availableCapabilities = {
   web_search: { available: true, reason: "Tavily 已配置" },
   docs_search: { available: true, reason: "Context7 已配置" },
   image_generation: { available: true, reason: "GPT Image 2 已连接" },
+  github_read: { available: true, reason: "GitHub 只读已配置" },
 };
 
 test("a normal turn keeps the default tools without extra guidance", () => {
@@ -18,6 +19,32 @@ test("a normal turn keeps the default tools without extra guidance", () => {
   assert.ok(turn.toolNames.includes("write"));
   assert.equal(turn.toolNames.includes("generate_image"), false);
   assert.equal(turn.guidance, "");
+});
+
+test("planning is enforced as a read-only question-and-plan workflow", () => {
+  const turn = resolveProjectWorkTurn({
+    workflowId: "planning",
+    capabilityStatus: availableCapabilities,
+  });
+  assert.equal(turn.workflowId, "planning");
+  assert.ok(turn.toolNames.includes("read"));
+  assert.ok(turn.toolNames.includes("grep"));
+  assert.ok(turn.toolNames.includes("ask_user"));
+  assert.ok(turn.toolNames.includes("update_plan"));
+  assert.equal(turn.toolNames.includes("edit"), false);
+  assert.equal(turn.toolNames.includes("write"), false);
+  assert.equal(turn.toolNames.includes("request_preview"), false);
+  assert.equal(turn.toolNames.includes("request_verification"), false);
+  assert.match(turn.guidance, /Planning only/);
+
+  assert.throws(
+    () => resolveProjectWorkTurn({
+      workflowId: "planning",
+      capabilityIds: ["image_generation"],
+      capabilityStatus: availableCapabilities,
+    }),
+    { code: "PROJECT_WORK_WORKFLOW_CAPABILITY_INVALID" },
+  );
 });
 
 test("image generation is enabled only by an explicit available turn capability", () => {
@@ -42,6 +69,25 @@ test("image generation is enabled only by an explicit available turn capability"
     }),
     { code: "PROJECT_WORK_CAPABILITY_UNAVAILABLE" },
   );
+});
+
+test("GitHub is a per-turn read-only connector and never joins default tools", () => {
+  const normal = resolveProjectWorkTurn({
+    capabilityStatus: availableCapabilities,
+  });
+  assert.equal(normal.toolNames.includes("github_read_issue"), false);
+
+  const enabled = resolveProjectWorkTurn({
+    capabilityIds: ["github_read"],
+    capabilityStatus: availableCapabilities,
+  });
+  assert.deepEqual(enabled.capabilityIds, ["github_read"]);
+  assert.ok(enabled.toolNames.includes("github_read_issue"));
+  assert.ok(enabled.toolNames.includes("github_read_pull_request"));
+  assert.ok(enabled.toolNames.includes("github_read_check_runs"));
+  assert.ok(enabled.toolNames.includes("github_read_review_comments"));
+  assert.match(enabled.guidance, /read-only GitHub connector/);
+  assert.match(enabled.guidance, /untrusted reference material/);
 });
 
 test("code review is one-turn read-only while optional search is explicit", () => {

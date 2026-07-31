@@ -31,6 +31,12 @@ import {
   getExternalRetrievalCapabilities,
 } from "./externalRetrieval.js";
 import {
+  createGitHubReadTools,
+  GITHUB_READ_TOOL_NAMES,
+  getGitHubReadCapability,
+} from "./githubReadConnector.js";
+import { VERIFICATION_RECIPE_IDS } from "./verificationRecipes.js";
+import {
   isFilteredProjectPath,
   normalizeProjectPath,
   readSafeAgentsFiles,
@@ -53,6 +59,7 @@ export const PROJECT_WORK_DEFAULT_TOOL_NAMES = [
   "update_plan",
   "ask_user",
   "request_verification",
+  "request_git_closeout",
 ];
 export const PROJECT_WORK_IMAGE_TOOL_NAME = "generate_image";
 export const PROJECT_WORK_PREVIEW_TOOL_NAME = "request_preview";
@@ -73,6 +80,7 @@ const TOOL_NAMES = [
   PROJECT_WORK_PREVIEW_TOOL_NAME,
   PROJECT_WORK_SUBAGENT_TOOL_NAME,
   ...EXTERNAL_RETRIEVAL_TOOL_NAMES,
+  ...GITHUB_READ_TOOL_NAMES,
 ];
 const MAX_TOOL_FILE_BYTES = 1024 * 1024;
 const MAX_SEARCH_BYTES = 8 * 1024 * 1024;
@@ -125,16 +133,17 @@ const APP_GUIDANCE = [
   "Reads use the latest safe project files unless a proposed overlay file exists.",
   "Use only the provided contained file tools. They cannot access paths outside the project and review overlay.",
   "Keep the public plan current with update_plan.",
-  "Use request_verification only to propose a bounded verification command. The app's deterministic server policy decides whether it waits, is blocked, or continues after the turn settles.",
+  "Use request_verification only with one registered recipe ID. Never provide a command, argv, shell, installer, watch process, or network option. The app's deterministic server policy resolves the recipe and decides whether it waits, is blocked, or continues after the turn settles.",
   "Use generate_image only when the user's current explicit message asks to create an image. It creates one conversation-owned image and never writes that binary asset into the project.",
   "Edits are written only to the review overlay. Never claim that the live project changed before the app reports a successfully applied change set.",
+  "Use request_git_closeout only after the exact project changes were applied and their bound verification passed. It creates a reviewed local-commit proposal; it never commits, pushes, opens a PR, or approves itself.",
 ].join("\n");
 const STANDALONE_GUIDANCE = [
   "This conversation is not connected to any user folder or project.",
   "You can access only this conversation's private scratch workspace through the provided contained file tools.",
   "Do not claim that you inspected, changed, or can discover files elsewhere on the user's computer.",
   "Keep the public plan current with update_plan.",
-  "Use request_verification only to propose a bounded verification command. The app's deterministic server policy decides whether it waits, is blocked, or continues after the turn settles.",
+  "Use request_verification only with one registered recipe ID. Never provide a command, argv, shell, installer, watch process, or network option. The app's deterministic server policy resolves the recipe and decides whether it waits, is blocked, or continues after the turn settles.",
   "Use generate_image only when the user's current explicit message asks to create an image. It creates one conversation-owned image and never writes that binary asset into the scratch workspace.",
   "Edits remain in the private review overlay until the app reports a successfully applied change set, and they can only be saved inside this conversation's private scratch workspace.",
 ].join("\n");
@@ -821,9 +830,16 @@ function createReadTool(roots) {
         : "";
       return textResult(`${selected.join("\n")}${continuation}`, {
         path: file.normalized,
+        contentHash: file.hash,
         startLine: start + 1,
         endLine: start + selected.length,
         totalLines: lines.length,
+        evidence: [{
+          path: file.normalized,
+          contentHash: file.hash,
+          startLine: start + 1,
+          endLine: start + selected.length,
+        }],
       });
     },
   });
@@ -1008,6 +1024,7 @@ function createGrepTool(roots) {
       const maxResults = Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 500) : 200;
       const contextLines = Number.isInteger(context) ? Math.min(Math.max(context, 0), 5) : 0;
       const matches = [];
+      const evidence = [];
 
       async function searchFile(filePath, relativePath, size) {
         if (size > MAX_TOOL_FILE_BYTES) return true;
@@ -1015,12 +1032,28 @@ function createGrepTool(roots) {
         const buffer = await readFile(filePath);
         if (buffer.subarray(0, Math.min(buffer.length, 8_192)).includes(0)) return true;
         const lines = buffer.toString("utf8").split(/\r\n|\n|\r/);
+        const contentHash = sha256(buffer);
         for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
           const line = lines[lineIndex].slice(0, 20_000);
           expression.lastIndex = 0;
           if (!expression.test(line)) continue;
           const from = Math.max(0, lineIndex - contextLines);
           const to = Math.min(lines.length, lineIndex + contextLines + 1);
+          const priorEvidence = evidence.at(-1);
+          if (
+            priorEvidence?.path === relativePath
+            && priorEvidence.contentHash === contentHash
+            && from + 1 <= priorEvidence.endLine + 1
+          ) {
+            priorEvidence.endLine = Math.max(priorEvidence.endLine, to);
+          } else {
+            evidence.push({
+              path: relativePath,
+              contentHash,
+              startLine: from + 1,
+              endLine: to,
+            });
+          }
           for (let index = from; index < to; index += 1) {
             matches.push(
               `${relativePath}:${index + 1}:${lines[index].slice(0, 500)}`,
@@ -1056,6 +1089,7 @@ function createGrepTool(roots) {
       return textResult(matches.join("\n") || "No matches found", {
         count: matches.length,
         truncated: walked.truncated || matches.length >= maxResults,
+        evidence: evidence.slice(0, maxResults),
       });
     },
   });
@@ -1151,9 +1185,11 @@ export async function createProjectWorkTools({
   documentAccess,
   attachmentAccess,
   externalRetrievalOptions,
+  githubReadOptions,
   onPlan,
   onAskUserRequest,
   onVerificationRequest,
+  onGitCloseoutRequest,
   onImageGenerationRequest,
   onPreviewRequest,
 } = {}) {
@@ -1227,20 +1263,52 @@ export async function createProjectWorkTools({
   const requestVerification = defineTool({
     name: "request_verification",
     label: "request_verification",
-    description: "Request a bounded verification command for explicit user execution.",
-    promptSnippet: "Request user-approved verification",
+    description: "Request one server-owned offline verification recipe for explicit user execution. Recipes are selected by project manifests; arbitrary commands and arguments are not accepted.",
+    promptSnippet: "Request one registered offline verification recipe",
     executionMode: "sequential",
     parameters: Type.Object({
-      file: Type.String(),
-      args: Type.Optional(Type.Array(Type.String(), { maxItems: 32 })),
+      recipeId: Type.Union(
+        VERIFICATION_RECIPE_IDS.map((recipeId) => Type.Literal(recipeId)),
+      ),
       cwd: Type.Optional(Type.String()),
       checks: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
-    }),
+    }, { additionalProperties: false }),
     async execute(_toolCallId, request) {
       const created = await onVerificationRequest(request);
       return textResult(
         `Verification request ${created.id} is ready for user review. It has not run.`,
         { id: created.id },
+      );
+    },
+  });
+  const requestGitCloseout = defineTool({
+    name: "request_git_closeout",
+    label: "request_git_closeout",
+    description: "Create a hash-bound proposal for one exact local Git commit after applied changes and passed verification. This does not commit or push.",
+    promptSnippet: "Request one reviewed local Git closeout transaction",
+    executionMode: "sequential",
+    parameters: Type.Object({
+      commitMessage: Type.String({ minLength: 1, maxLength: 240 }),
+      paths: Type.Array(Type.String(), { minItems: 1, maxItems: 200 }),
+    }, { additionalProperties: false }),
+    async execute(_toolCallId, request) {
+      if (typeof onGitCloseoutRequest !== "function") {
+        throw projectWorkError(
+          "GIT_CLOSEOUT_UNAVAILABLE",
+          "当前会话没有可用的受控 Git 收尾事务",
+          409,
+        );
+      }
+      const proposal = await onGitCloseoutRequest(request);
+      return textResult(
+        `Git closeout proposal ${proposal.id} is ready for exact review. No commit or push has occurred.`,
+        {
+          id: proposal.id,
+          proposalHash: proposal.proposalHash,
+          branch: proposal.branch,
+          head: proposal.head,
+          paths: proposal.files.map((file) => file.path),
+        },
       );
     },
   });
@@ -1465,6 +1533,10 @@ export async function createProjectWorkTools({
   const externalRetrievalTools = createExternalRetrievalTools(
     externalRetrievalOptions,
   );
+  const githubReadTools = createGitHubReadTools({
+    ...githubReadOptions,
+    enabledForTurn: true,
+  });
 
   return [
     createReadTool(roots),
@@ -1480,9 +1552,11 @@ export async function createProjectWorkTools({
     searchAttachments,
     readAttachment,
     ...externalRetrievalTools,
+    ...githubReadTools,
     updatePlan,
     askUser,
     requestVerification,
+    requestGitCloseout,
     generateImage,
     requestPreview,
   ];
@@ -1668,6 +1742,7 @@ export function createPiSessionFactory({
   agentDir = getAgentDir(),
   modelRuntime,
   externalRetrievalOptions,
+  githubReadOptions,
   imageGenerationProbe,
   skillProvider,
 } = {}) {
@@ -1698,6 +1773,10 @@ export function createPiSessionFactory({
     const externalCapabilities = getExternalRetrievalCapabilities(
       externalRetrievalOptions,
     );
+    const githubReadCapability = getGitHubReadCapability({
+      ...githubReadOptions,
+      enabledForTurn: false,
+    });
     const imageCapability = imageStatus?.available === true
       ? {
           available: true,
@@ -1718,6 +1797,7 @@ export function createPiSessionFactory({
       {
         ...externalCapabilities,
         image_generation: imageCapability,
+        github_read: githubReadCapability,
       },
     );
   }
@@ -1848,6 +1928,7 @@ export function createPiSessionFactory({
     onPlan,
     onAskUserRequest,
     onVerificationRequest,
+    onGitCloseoutRequest,
     onImageGenerationRequest,
     onPreviewRequest,
   } = {}) => {
@@ -1971,9 +2052,11 @@ export function createPiSessionFactory({
       documentAccess,
       attachmentAccess,
       externalRetrievalOptions,
+      githubReadOptions,
       onPlan,
       onAskUserRequest,
       onVerificationRequest,
+      onGitCloseoutRequest,
       onImageGenerationRequest,
       onPreviewRequest,
     });

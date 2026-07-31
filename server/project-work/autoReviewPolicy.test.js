@@ -7,6 +7,7 @@ import {
   reviewAutoPreview,
   reviewAutoVerification,
 } from "./autoReviewPolicy.js";
+import { resolveVerificationRecipe } from "./verificationRecipes.js";
 
 const HASH_A = `sha256:${"a".repeat(64)}`;
 const HASH_B = `sha256:${"b".repeat(64)}`;
@@ -116,6 +117,44 @@ test("auto verification stays blocked without isolation and keeps a strict comma
       isolated: true,
     }).decision,
     "allow",
+  );
+});
+
+test("auto verification accepts an intact server-owned recipe and rejects tampering", async () => {
+  const recipe = await resolveVerificationRecipe({
+    recipeId: "go.test",
+    readTextFile: async (filePath) => {
+      if (filePath === "go.mod") return "module example.test/sample\n";
+      throw new Error("not found");
+    },
+  });
+  const verification = {
+    status: "requested",
+    turnId: "turn-recipe",
+    recipeId: recipe.id,
+    recipe,
+    command: recipe.command,
+    resolvedScript: recipe.resolvedScript,
+  };
+  assert.equal(
+    reviewAutoVerification(verification, {
+      turnId: "turn-recipe",
+      isolated: true,
+    }).decision,
+    "allow",
+  );
+  assert.equal(
+    reviewAutoVerification({
+      ...verification,
+      command: {
+        ...verification.command,
+        args: ["test", "./...", "-exec", "curl"],
+      },
+    }, {
+      turnId: "turn-recipe",
+      isolated: true,
+    }).reasonCode,
+    "verification_command_not_auto_safe",
   );
 });
 

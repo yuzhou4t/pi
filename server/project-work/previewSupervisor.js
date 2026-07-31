@@ -405,6 +405,14 @@ export function createProjectPreviewSupervisor({
     const record = {
       key,
       child,
+      ownershipToken: Symbol(`preview:${key}`),
+      status: "starting",
+      url,
+      origin: new URL(url).origin,
+      title: normalized.title,
+      runtime: normalized.runtime,
+      route: normalized.route,
+      startedAt,
       stdout: Buffer.alloc(0),
       stderr: Buffer.alloc(0),
       logsTruncated: false,
@@ -474,6 +482,8 @@ export function createProjectPreviewSupervisor({
 
       await openImpl(url);
       const openedAt = new Date(now()).toISOString();
+      record.status = "ready";
+      record.openedAt = openedAt;
       return {
         status: "ready",
         url,
@@ -506,6 +516,21 @@ export function createProjectPreviewSupervisor({
     start,
     stop,
     has: (key) => active.has(key),
+    getOwnedPreview: (key) => {
+      const record = active.get(key);
+      if (!record || record.exited || record.status !== "ready") return null;
+      return Object.freeze({
+        key: record.key,
+        ownershipToken: record.ownershipToken,
+        url: record.url,
+        origin: record.origin,
+        title: record.title,
+        runtime: record.runtime,
+        route: record.route,
+        startedAt: record.startedAt,
+        openedAt: record.openedAt,
+      });
+    },
     dispose,
   };
 }

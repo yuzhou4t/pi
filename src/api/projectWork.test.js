@@ -4,6 +4,7 @@ import {
   answerProjectWorkAskUserRequest,
   cancelProjectWorkAskUserRequest,
   clearProjectWorkFollowUps,
+  confirmProjectWorkGitCloseout,
   configureProjectWorkConversation,
   configureProjectWorkExecutionPolicy,
   createStandaloneProjectWorkConversation,
@@ -11,6 +12,7 @@ import {
   enqueueProjectWorkFollowUp,
   fetchProjectWorkFile,
   fetchProjectWorkGitEvidence,
+  fetchProjectWorkGitCloseouts,
   fetchProjectWorkModels,
   fetchProjectWorkProviderConnections,
   fetchProjectWorkSkillCatalog,
@@ -27,6 +29,7 @@ import {
   mapProjectWorkConversation,
   mapProjectWorkUsage,
   projectWorkGeneratedImageUrl,
+  projectWorkBrowserQaScreenshotUrl,
   projectWorkImageUrl,
   removeProjectWorkFollowUp,
   removeProjectWorkPdf,
@@ -35,6 +38,7 @@ import {
   resumeProjectWorkVerificationRepair,
   retryProjectWorkLastTurn,
   retryProjectWorkPdf,
+  runProjectWorkBrowserQa,
   sendProjectWorkMessage,
   saveProjectWorkProviderApiKey,
   projectWorkDroppedFileKind,
@@ -562,6 +566,114 @@ test("workspace, Git evidence, apply history, and undo use safe scoped routes", 
   assert.deepEqual(JSON.parse(calls[3].options.body), {
     schema_version: 1,
     undo_hash: "sha256:undo",
+  });
+});
+
+test("Git closeout client preserves conversation, turn, and change-set bindings", async () => {
+  const calls = [];
+  const proposal = {
+    id: "git-closeout-1",
+    conversationId: "conversation-1",
+    turnId: "turn-1",
+    changeSetId: "changes-1",
+    changeSetHash: `sha256:${"c".repeat(64)}`,
+    status: "ready",
+    proposalHash: `sha256:${"a".repeat(64)}`,
+    branch: "main",
+    head: "b".repeat(40),
+    commitMessage: "fix: exact",
+    files: [{
+      path: "src/app.js",
+      hash: `sha256:${"f".repeat(64)}`,
+      exists: true,
+      mode: 0o644,
+      baseHash: `sha256:${"0".repeat(64)}`,
+      baseExists: true,
+      baseMode: 0o644,
+    }],
+    verificationEvidence: [{
+      id: "verification-1",
+      commandId: "command-1",
+      status: "passed",
+      exitCode: 0,
+      changeSetId: "changes-1",
+      changeSetHash: `sha256:${"c".repeat(64)}`,
+      commandBindingHash: `sha256:${"d".repeat(64)}`,
+      completedAt: "2026-07-30T08:00:00.000Z",
+    }],
+  };
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, options });
+    if ((options.method ?? "GET") === "GET") {
+      return jsonResponse({
+        git_closeouts: [{
+          proposal_id: proposal.id,
+          conversation_id: proposal.conversationId,
+          turn_id: proposal.turnId,
+          change_set_id: proposal.changeSetId,
+          change_set_hash: proposal.changeSetHash,
+          status: proposal.status,
+          proposal_hash: proposal.proposalHash,
+          branch: proposal.branch,
+          head: proposal.head,
+          commit_message: proposal.commitMessage,
+          files: proposal.files.map((file) => ({
+            path: file.path,
+            hash: file.hash,
+            exists: file.exists,
+            mode: file.mode,
+            base_hash: file.baseHash,
+            base_exists: file.baseExists,
+            base_mode: file.baseMode,
+          })),
+          verification_evidence: proposal.verificationEvidence,
+        }],
+      });
+    }
+    return jsonResponse({
+      conversation: {
+        id: "conversation-1",
+        project_id: "project-1",
+        git_closeouts: [],
+      },
+      events: [],
+    });
+  };
+
+  const [mapped] = await fetchProjectWorkGitCloseouts({
+    conversationId: "conversation-1",
+    fetchImpl,
+  });
+  assert.equal(mapped.conversationId, "conversation-1");
+  assert.equal(mapped.turnId, "turn-1");
+  assert.equal(mapped.changeSetId, "changes-1");
+  assert.equal(mapped.changeSetHash, proposal.changeSetHash);
+  assert.equal(mapped.files[0].baseHash, proposal.files[0].baseHash);
+  await confirmProjectWorkGitCloseout({
+    conversationId: "conversation-1",
+    proposal,
+    fetchImpl,
+  });
+  const body = JSON.parse(calls[1].options.body);
+  assert.deepEqual({
+    conversationId: body.conversation_id,
+    turnId: body.turn_id,
+    changeSetId: body.change_set_id,
+    changeSetHash: body.change_set_hash,
+  }, {
+    conversationId: "conversation-1",
+    turnId: "turn-1",
+    changeSetId: "changes-1",
+    changeSetHash: proposal.changeSetHash,
+  });
+  assert.deepEqual(body.files[0], {
+    path: "src/app.js",
+    hash: proposal.files[0].hash,
+    exists: true,
+    mode: 0o644,
+    base_hash: proposal.files[0].baseHash,
+    base_exists: true,
+    base_mode: 0o644,
   });
 });
 
@@ -2016,6 +2128,9 @@ test("conversation file reads use the sparse overlay endpoint", async () => {
     projectId: "project-ignored",
     conversationId: "conversation/with spaces",
     path: "src/generated file.js",
+    expectedContentHash: `sha256:${"a".repeat(64)}`,
+    startLine: 7,
+    endLine: 9,
     fetchImpl: async (url, options) => {
       calls.push({ url, options });
       return jsonResponse({
@@ -2032,7 +2147,7 @@ test("conversation file reads use the sparse overlay endpoint", async () => {
 
   assert.equal(
     calls[0].url,
-    "/api/v1/project-work/conversations/conversation%2Fwith%20spaces/file?path=src%2Fgenerated+file.js",
+    `/api/v1/project-work/conversations/conversation%2Fwith%20spaces/file?path=src%2Fgenerated+file.js&content_hash=sha256%3A${"a".repeat(64)}&start_line=7&end_line=9`,
   );
   assert.equal(calls[0].options.method, "GET");
   assert.equal(file.contentHash, "sha256:overlay");
@@ -2446,4 +2561,131 @@ test("removing a PDF uses a bodyless conversation-owned delete", async () => {
   assert.equal(calls[0].options.method, "DELETE");
   assert.equal(calls[0].options.body, undefined);
   assert.deepEqual(snapshot.documents, []);
+});
+
+test("browser QA maps bounded captures and uses the conversation-owned route", async () => {
+  const calls = [];
+  const snapshot = await runProjectWorkBrowserQa({
+    conversationId: "conversation-browser-1",
+    clientRequestId: "project-browser-qa:test-1",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        conversation: {
+          id: "conversation-browser-1",
+          project_id: "project-1",
+          browserQaRuns: [{
+            id: "browser-qa-1",
+            clientRequestId: "project-browser-qa:test-1",
+            status: "completed",
+            verdict: "issues",
+            issueSummary: {
+              consoleErrorCount: 1,
+              failedRequestCount: 1,
+              accessibilityIssueCount: 1,
+            },
+            adapterId: "controlled-chromium",
+            captures: [{
+              profile: {
+                id: "desktop",
+                label: "桌面",
+                width: 1440,
+                height: 1024,
+                isMobile: false,
+              },
+              screenshot: {
+                mimeType: "image/png",
+                byteLength: 123,
+                sha256: `sha256:${"a".repeat(64)}`,
+              },
+              dom: {
+                title: "Pi Agent",
+                language: "zh-CN",
+                nodeCount: 20,
+                landmarkCount: 3,
+                headingCount: 2,
+                interactiveCount: 5,
+                imageCount: 1,
+                tableCount: 0,
+                formCount: 1,
+              },
+              accessibility: {
+                checkedNodeCount: 20,
+                issueCount: 1,
+                issues: [{
+                  id: "image-alt",
+                  severity: "serious",
+                  count: 1,
+                  message: "图片缺少替代文本",
+                }],
+              },
+            }],
+            console: {
+              entries: [{ level: "error", text: "boom" }],
+              truncated: false,
+            },
+            failedRequests: {
+              entries: [{
+                method: "GET",
+                resourceType: "image",
+                reason: "net::ERR_FAILED",
+              }],
+              truncated: false,
+            },
+          }],
+        },
+      });
+    },
+  });
+
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/conversations/conversation-browser-1/browser-qa",
+  );
+  assert.equal(calls[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
+    client_request_id: "project-browser-qa:test-1",
+  });
+  assert.equal(
+    snapshot.browserQaRuns[0].clientRequestId,
+    "project-browser-qa:test-1",
+  );
+  assert.equal(snapshot.browserQaRuns[0].verdict, "issues");
+  assert.equal(
+    snapshot.browserQaRuns[0].issueSummary.consoleErrorCount,
+    1,
+  );
+  assert.equal(snapshot.browserQaRuns[0].captures[0].profile.width, 1440);
+  assert.equal(snapshot.browserQaRuns[0].captures[0].accessibility.issueCount, 1);
+  assert.equal(snapshot.browserQaRuns[0].console.entries[0].level, "error");
+  await assert.rejects(
+    runProjectWorkBrowserQa({
+      conversationId: "conversation-browser-1",
+      clientRequestId: "invalid request id",
+      fetchImpl: async () => {
+        throw new Error("must not fetch");
+      },
+    }),
+    /clientRequestId 格式无效/,
+  );
+});
+
+test("browser QA screenshot URL accepts only registered profiles", () => {
+  assert.equal(
+    projectWorkBrowserQaScreenshotUrl({
+      conversationId: "conversation browser",
+      runId: "run/1",
+      profileId: "mobile",
+    }),
+    "/api/v1/project-work/conversations/conversation%20browser/browser-qa/run%2F1/mobile/screenshot",
+  );
+  assert.throws(
+    () => projectWorkBrowserQaScreenshotUrl({
+      conversationId: "conversation-1",
+      runId: "run-1",
+      profileId: "tablet",
+    }),
+    /desktop 或 mobile/,
+  );
 });

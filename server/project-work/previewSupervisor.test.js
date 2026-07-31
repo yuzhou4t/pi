@@ -108,8 +108,15 @@ test("preview supervisor starts project-local uvicorn without a shell and opens 
   assert.equal(result.cwd, "backend");
   assert.equal(result.app, "app.main:app");
   assert.equal(result.route, "/reader/");
+  const owned = supervisor.getOwnedPreview("conversation-1");
+  assert.equal(owned.url, result.url);
+  assert.equal(owned.origin, "http://127.0.0.1:48081");
+  assert.equal(owned.runtime, "python_uvicorn");
+  assert.equal(typeof owned.ownershipToken, "symbol");
+  assert.equal(Object.isFrozen(owned), true);
 
   child.emit("close", 0, null);
+  assert.equal(supervisor.getOwnedPreview("conversation-1"), null);
   await supervisor.dispose();
 });
 

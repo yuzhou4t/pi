@@ -125,6 +125,63 @@ test("source cap keeps title-matched papers even when they appear after the raw 
   assert.equal(result.candidateBatch.candidates[0].title, "An LLM Agent with Tool Use");
 });
 
+test("historical first discoveries backfill candidates before the classic pool", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-source-backfill-"));
+  const runStore = createRunStore({ dataDir });
+  const sourceStateStore = createSourceStateStore({ dataDir });
+  const run = await runStore.createRun({ sourceIds: ["source-ok"] });
+  // 两篇今年早些时候发表、本周才首次被发现的主题相关论文；没有本周新论文。
+  const result = await scanJournalSources({
+    runId: run.run_id,
+    runStore,
+    sourceStateStore,
+    sources: [sources[0]],
+    fetchSource: async () => ({
+      fetched_at: "2026-07-29T08:00:00.000Z",
+      index_url: "https://dblp.org/db/conf/acl/index.xml",
+      target_urls: ["https://dblp.org/db/conf/acl/acl2026.xml"],
+      papers: [
+        {
+          title: "LLM Agent Planning in March",
+          authors: ["A. Author"],
+          venue: "ACL",
+          published_at: "2026-03-14",
+          official_id: "conf/acl/March26",
+          official_url: "https://aclanthology.org/2026.acl.march/",
+          pdf_url: "https://aclanthology.org/2026.acl.march.pdf",
+          abstract: "An agent planning study.",
+        },
+        {
+          title: "LLM Agent Memory in May",
+          authors: ["B. Writer"],
+          venue: "ACL",
+          published_at: "2026-05-02",
+          official_id: "conf/acl/May26",
+          official_url: "https://aclanthology.org/2026.acl.may/",
+          pdf_url: "https://aclanthology.org/2026.acl.may.pdf",
+          abstract: "An agent memory study.",
+        },
+      ],
+    }),
+    fetchImpl: async () => new Response(JSON.stringify({ results: [] }), { status: 200 }),
+    observedAt: "2026-07-29T08:00:00.000Z",
+  });
+
+  assert.equal(result.summary.recent_topic_candidate_count, 0);
+  assert.equal(result.summary.historical_backfill_count, 2);
+  const titles = result.candidateBatch.candidates.map((paper) => paper.title);
+  // 补发现按发表时间降序排在前，剩余名额才由经典补位。
+  assert.equal(titles[0], "LLM Agent Memory in May");
+  assert.equal(titles[1], "LLM Agent Planning in March");
+  const backfill = result.candidateBatch.candidates[0];
+  assert.equal(backfill.published_this_week, false);
+  assert.equal(backfill.display_label, "本周补发现 · 非本周新论文");
+  const classicCount = result.candidateBatch.candidates.filter(
+    (paper) => paper.candidate_origin === "classic_review",
+  ).length;
+  assert.equal(classicCount, 3);
+});
+
 test("source scanner persists reliable results, keeps failed sources visible, and avoids a second new batch", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-source-scanner-"));
   const now = () => new Date("2026-07-23T08:00:00.000Z");

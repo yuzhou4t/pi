@@ -17,9 +17,25 @@ export const PROJECT_WORK_CAPABILITIES = [
     description: "本轮允许使用 GPT Image 2 生成一张会话图片。",
     toolNames: ["generate_image"],
   },
+  {
+    id: "github_read",
+    label: "GitHub 只读",
+    description: "本轮读取指定 Issue、PR、CI 和审查意见，不执行写操作。",
+    toolNames: [
+      "github_read_issue",
+      "github_read_pull_request",
+      "github_read_check_runs",
+      "github_read_review_comments",
+    ],
+  },
 ];
 
 export const PROJECT_WORK_WORKFLOWS = [
+  {
+    id: "planning",
+    label: "规划方案",
+    description: "只读理解项目、澄清边界并形成可执行计划，不产生修改或预览。",
+  },
   {
     id: "code_review",
     label: "代码审查",

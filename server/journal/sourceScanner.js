@@ -390,25 +390,32 @@ export async function scanJournalSources({
     fetchImpl,
     mailto: openAlexMailto,
   });
-  const topicCandidates = filterTopicCandidates(enriched.map((paper) => ({
+  const topicCandidates = deduplicatePapers(filterTopicCandidates(enriched.map((paper) => ({
     ...paper,
     ...publicationDiscovery(
       paper.published_at,
       observedAt,
       paper.publication_date_precision,
     ),
-  })));
+  }))));
   const recentTopicCandidates = topicCandidates.filter((paper) => paper.published_this_week);
-  // 本周新论文不足时，先回补往周未读的推荐，再用经典补位。
+  // 本周新论文不足时的回补顺序：本周补发现（本次扫描首次发现但非本周发表，
+  // 按发表时间降序）→ 往周未读回补 → 经典池。之前本周补发现被整体丢弃，
+  // 导致候选里全是多年前的经典论文。
+  const historicalDiscoveries = topicCandidates
+    .filter((paper) => !paper.published_this_week)
+    .sort((left, right) => String(right.published_at ?? "").localeCompare(String(left.published_at ?? "")))
+    .slice(0, Math.max(0, 5 - recentTopicCandidates.length));
   let resurfacedCandidates = [];
-  if (recentTopicCandidates.length < 5 && typeof runStore.listRuns === "function") {
+  const filledCount = recentTopicCandidates.length + historicalDiscoveries.length;
+  if (filledCount < 5 && typeof runStore.listRuns === "function") {
     try {
       const previousRuns = await runStore.listRuns();
       resurfacedCandidates = selectResurfaceCandidates({
         previousRuns,
         currentCandidates: [...recentTopicCandidates, ...topicCandidates],
         currentRunId: runId,
-        limit: 5 - recentTopicCandidates.length,
+        limit: 5 - filledCount,
         observedAt,
       });
     } catch {
@@ -417,7 +424,11 @@ export async function scanJournalSources({
     }
   }
   const candidateBatch = buildCandidateBatch({
-    newCandidates: [...recentTopicCandidates, ...resurfacedCandidates],
+    newCandidates: [
+      ...recentTopicCandidates,
+      ...historicalDiscoveries,
+      ...resurfacedCandidates,
+    ],
     observedAt,
     limit: 5,
   });
@@ -434,6 +445,7 @@ export async function scanJournalSources({
     new_record_count: newRecords.length,
     topic_candidate_count: topicCandidates.length,
     recent_topic_candidate_count: recentTopicCandidates.length,
+    historical_backfill_count: historicalDiscoveries.length,
     resurfaced_candidate_count: resurfacedCandidates.length,
     historical_discovery_count: topicCandidates.filter((paper) => !paper.published_this_week).length,
     candidate_mode: candidateBatch.mode,

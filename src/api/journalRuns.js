@@ -449,6 +449,7 @@ export function mapJournalRun(run) {
       : "idle",
     status: run.status,
     phase: run.phase,
+    windowKey: run.window_key ?? null,
     pausedReason: run.paused_reason ?? null,
     createdAt: run.created_at ?? null,
     updatedAt: run.updated_at,

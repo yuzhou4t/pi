@@ -478,6 +478,40 @@ function mapMessage(raw) {
     capabilities: asArray(raw.capabilities).filter(
       (capability) => typeof capability === "string" && capability,
     ),
+    codeEvidence: asArray(
+      pick(raw, "code_evidence", "codeEvidence", []),
+    ).flatMap((evidence) => {
+      if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+        return [];
+      }
+      const path = pick(evidence, "path", "path");
+      const contentHash = pick(
+        evidence,
+        "content_hash",
+        "contentHash",
+      );
+      const startLine = Number(
+        pick(evidence, "start_line", "startLine"),
+      );
+      const endLine = Number(
+        pick(evidence, "end_line", "endLine"),
+      );
+      return typeof path === "string"
+        && path
+        && typeof contentHash === "string"
+        && contentHash
+        && Number.isSafeInteger(startLine)
+        && startLine > 0
+        && Number.isSafeInteger(endLine)
+        && endLine >= startLine
+        ? [{
+            path,
+            contentHash,
+            startLine,
+            endLine,
+          }]
+        : [];
+    }),
     providerId: pick(raw, "provider_id", "providerId"),
     modelId: pick(raw, "model_id", "modelId"),
     thinkingLevel: pick(raw, "thinking_level", "thinkingLevel"),
@@ -717,6 +751,23 @@ function mapEvent(raw) {
       "reasonCode",
       pick(data, "reason_code", "reasonCode"),
     ),
+    lifecycleState: pick(
+      raw,
+      "lifecycle_state",
+      "lifecycleState",
+      data.state ?? null,
+    ),
+    sourceEventSeq: nullableNumber(
+      data,
+      "source_event_seq",
+      "sourceEventSeq",
+    ),
+    dedupeKey: pick(
+      raw,
+      "dedupe_key",
+      "dedupeKey",
+      data.dedupeKey ?? null,
+    ),
     createdAt: pick(raw, "created_at", "createdAt", pick(raw, "at", "at")),
   };
   if (type !== "message.partial") return event;
@@ -860,6 +911,247 @@ export function mapProjectWorkGitEvidence(raw) {
     untracked: paths("untracked"),
     truncated: raw.truncated === true,
     reason: typeof raw.reason === "string" ? raw.reason : null,
+  };
+}
+
+export function mapProjectWorkGitCloseout(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const id = pick(raw, "proposal_id", "proposalId", raw.id);
+  if (typeof id !== "string" || !id) return null;
+  return {
+    id,
+    conversationId: pick(raw, "conversation_id", "conversationId"),
+    turnId: pick(raw, "turn_id", "turnId"),
+    changeSetId: pick(raw, "change_set_id", "changeSetId"),
+    changeSetHash: pick(raw, "change_set_hash", "changeSetHash"),
+    status: pick(raw, "status", "status", "failed"),
+    proposalHash: pick(raw, "proposal_hash", "proposalHash"),
+    branch: pick(raw, "branch", "branch"),
+    head: pick(raw, "head", "head"),
+    commitMessage: pick(raw, "commit_message", "commitMessage", ""),
+    files: asArray(raw.files).flatMap((file) => {
+      const filePath = safeProjectRelativePath(file?.path);
+      const hash = pick(file, "hash", "hash");
+      const exists = file?.exists === true;
+      const mode = pick(file, "mode", "mode");
+      const baseHash = pick(file, "base_hash", "baseHash", null);
+      const baseExists = pick(file, "base_exists", "baseExists", false) === true;
+      const baseMode = pick(file, "base_mode", "baseMode", null);
+      return (
+        filePath
+        && (
+          (exists && typeof hash === "string" && hash && Number.isInteger(mode))
+          || (!exists && hash === null && mode === null)
+        )
+        && (
+          (
+            baseExists
+            && typeof baseHash === "string"
+            && baseHash
+            && Number.isInteger(baseMode)
+          )
+          || (!baseExists && baseHash === null && baseMode === null)
+        )
+      )
+        ? [{
+            path: filePath,
+            hash,
+            exists,
+            mode,
+            baseHash,
+            baseExists,
+            baseMode,
+          }]
+        : [];
+    }),
+    verificationEvidence: asArray(
+      pick(raw, "verification_evidence", "verificationEvidence", []),
+    ).map((evidence) => ({
+      id: pick(evidence, "id", "id"),
+      commandId: pick(evidence, "command_id", "commandId"),
+      status: pick(evidence, "status", "status"),
+      exitCode: pick(evidence, "exit_code", "exitCode"),
+      changeSetId: pick(evidence, "change_set_id", "changeSetId"),
+      changeSetHash: pick(evidence, "change_set_hash", "changeSetHash"),
+      commandBindingHash: pick(
+        evidence,
+        "command_binding_hash",
+        "commandBindingHash",
+      ),
+      completedAt: pick(evidence, "completed_at", "completedAt"),
+    })),
+    commitHash: pick(raw, "commit_hash", "commitHash"),
+    error: pick(raw, "error", "error"),
+    createdAt: pick(raw, "created_at", "createdAt"),
+    updatedAt: pick(raw, "updated_at", "updatedAt"),
+    committedAt: pick(raw, "committed_at", "committedAt"),
+    recoveredAt: pick(raw, "recovered_at", "recoveredAt"),
+  };
+}
+
+function mapProjectWorkBrowserQaCapture(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const profile = raw.profile && typeof raw.profile === "object"
+    ? raw.profile
+    : {};
+  const profileId = pick(profile, "id", "id");
+  if (!["desktop", "mobile"].includes(profileId)) return null;
+  const screenshot = raw.screenshot && typeof raw.screenshot === "object"
+    ? raw.screenshot
+    : {};
+  const dom = raw.dom && typeof raw.dom === "object" ? raw.dom : {};
+  const accessibility = raw.accessibility
+    && typeof raw.accessibility === "object"
+    ? raw.accessibility
+    : {};
+  return {
+    profile: {
+      id: profileId,
+      label: pick(profile, "label", "label", profileId === "desktop" ? "桌面" : "移动"),
+      width: Number(pick(profile, "width", "width")) || null,
+      height: Number(pick(profile, "height", "height")) || null,
+      isMobile: pick(profile, "is_mobile", "isMobile", false) === true,
+    },
+    screenshot: {
+      mimeType: pick(screenshot, "mime_type", "mimeType"),
+      byteLength: Number(
+        pick(screenshot, "byte_length", "byteLength"),
+      ) || null,
+      sha256: pick(screenshot, "sha256", "sha256"),
+    },
+    dom: {
+      title: pick(dom, "title", "title", ""),
+      language: pick(dom, "language", "language", ""),
+      nodeCount: Number(pick(dom, "node_count", "nodeCount", 0)) || 0,
+      landmarkCount: Number(
+        pick(dom, "landmark_count", "landmarkCount", 0),
+      ) || 0,
+      headingCount: Number(
+        pick(dom, "heading_count", "headingCount", 0),
+      ) || 0,
+      interactiveCount: Number(
+        pick(dom, "interactive_count", "interactiveCount", 0),
+      ) || 0,
+      imageCount: Number(pick(dom, "image_count", "imageCount", 0)) || 0,
+      tableCount: Number(pick(dom, "table_count", "tableCount", 0)) || 0,
+      formCount: Number(pick(dom, "form_count", "formCount", 0)) || 0,
+    },
+    accessibility: {
+      checkedNodeCount: Number(
+        pick(accessibility, "checked_node_count", "checkedNodeCount", 0),
+      ) || 0,
+      issueCount: Number(
+        pick(accessibility, "issue_count", "issueCount", 0),
+      ) || 0,
+      issues: asArray(accessibility.issues).map((issue) => ({
+        id: pick(issue, "id", "id"),
+        severity: pick(issue, "severity", "severity", "moderate"),
+        count: Number(pick(issue, "count", "count", 0)) || 0,
+        message: pick(issue, "message", "message", ""),
+      })),
+    },
+  };
+}
+
+function mapProjectWorkBrowserQaEntryCollection(raw, mapEntry) {
+  const source = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? raw
+    : {};
+  return {
+    entries: asArray(source.entries).map(mapEntry),
+    truncated: source.truncated === true,
+  };
+}
+
+export function mapProjectWorkBrowserQaRun(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const id = pick(raw, "id", "id");
+  if (typeof id !== "string" || !id) return null;
+  const issueSummary = pick(raw, "issue_summary", "issueSummary");
+  return {
+    id,
+    clientRequestId: pick(raw, "client_request_id", "clientRequestId"),
+    status: pick(raw, "status", "status", "failed"),
+    verdict: pick(raw, "verdict", "verdict"),
+    issueSummary: issueSummary && typeof issueSummary === "object"
+      ? {
+          consoleErrorCount: Number(pick(
+            issueSummary,
+            "console_error_count",
+            "consoleErrorCount",
+            0,
+          )) || 0,
+          failedRequestCount: Number(pick(
+            issueSummary,
+            "failed_request_count",
+            "failedRequestCount",
+            0,
+          )) || 0,
+          accessibilityIssueCount: Number(pick(
+            issueSummary,
+            "accessibility_issue_count",
+            "accessibilityIssueCount",
+            0,
+          )) || 0,
+          blockedRequestCount: Number(pick(
+            issueSummary,
+            "blocked_request_count",
+            "blockedRequestCount",
+            0,
+          )) || 0,
+          blockedNavigationCount: Number(pick(
+            issueSummary,
+            "blocked_navigation_count",
+            "blockedNavigationCount",
+            0,
+          )) || 0,
+          blockedActionCount: Number(pick(
+            issueSummary,
+            "blocked_action_count",
+            "blockedActionCount",
+            0,
+          )) || 0,
+        }
+      : null,
+    adapterId: pick(raw, "adapter_id", "adapterId"),
+    preview: raw.preview && typeof raw.preview === "object"
+      ? {
+          origin: pick(raw.preview, "origin", "origin"),
+          path: pick(raw.preview, "path", "path", "/"),
+        }
+      : null,
+    captures: asArray(raw.captures)
+      .map(mapProjectWorkBrowserQaCapture)
+      .filter(Boolean),
+    console: mapProjectWorkBrowserQaEntryCollection(
+      raw.console,
+      (entry) => ({
+        level: pick(entry, "level", "level", "log"),
+        text: pick(entry, "text", "text", ""),
+        source: pick(entry, "source", "source"),
+      }),
+    ),
+    failedRequests: mapProjectWorkBrowserQaEntryCollection(
+      pick(raw, "failed_requests", "failedRequests", {}),
+      (entry) => ({
+        method: pick(entry, "method", "method", "GET"),
+        resourceType: pick(entry, "resource_type", "resourceType", "other"),
+        reason: pick(entry, "reason", "reason", ""),
+        source: pick(entry, "source", "source"),
+      }),
+    ),
+    security: raw.security && typeof raw.security === "object"
+      ? raw.security
+      : null,
+    error: raw.error && typeof raw.error === "object"
+      ? {
+          code: pick(raw.error, "code", "code"),
+          message: pick(raw.error, "message", "message"),
+          retryable: pick(raw.error, "retryable", "retryable", false) === true,
+        }
+      : null,
+    createdAt: pick(raw, "created_at", "createdAt"),
+    completedAt: pick(raw, "completed_at", "completedAt"),
   };
 }
 
@@ -1087,6 +1379,8 @@ function mapVerificationRun(raw) {
         }
       : null,
     truncated: Boolean(raw.truncated),
+    isolation: pick(raw, "isolation", "isolation"),
+    errorCode: pick(raw, "error_code", "errorCode"),
     startedAt: pick(raw, "started_at", "startedAt"),
     completedAt: pick(raw, "completed_at", "completedAt"),
   };
@@ -1407,6 +1701,12 @@ export function mapProjectWorkConversation(raw) {
     pendingChangeFileCount,
     verificationCommand,
     verificationRuns,
+    gitCloseouts: asArray(
+      pick(source, "git_closeouts", "gitCloseouts", []),
+    ).map(mapProjectWorkGitCloseout).filter(Boolean),
+    browserQaRuns: asArray(
+      pick(source, "browser_qa_runs", "browserQaRuns", []),
+    ).map(mapProjectWorkBrowserQaRun).filter(Boolean),
     workspaceSnapshot: mapWorkspaceSnapshot(
       pick(source, "workspace_snapshot", "workspaceSnapshot"),
     ),
@@ -1560,10 +1860,54 @@ function mapSkillPackage(raw) {
     unsupportedReason: pick(raw, "unsupported_reason", "unsupportedReason"),
     installed: Boolean(pick(raw, "installed", "installed", false)),
     enabled: Boolean(pick(raw, "enabled", "enabled", false)),
+    enabledPreference: Boolean(
+      pick(
+        raw,
+        "enabled_preference",
+        "enabledPreference",
+        pick(raw, "enabled", "enabled", false),
+      ),
+    ),
+    active: Boolean(
+      pick(raw, "active", "active", pick(raw, "enabled", "enabled", false)),
+    ),
     installedVersion: pick(raw, "installed_version", "installedVersion"),
     installedAt: pick(raw, "installed_at", "installedAt"),
     skillCount: Number(pick(raw, "skill_count", "skillCount", 0)) || 0,
     skillFiles: asArray(pick(raw, "skill_files", "skillFiles", [])),
+    reviewed: Boolean(pick(raw, "reviewed", "reviewed", false)),
+    runtimeCompatible: Boolean(
+      pick(raw, "runtime_compatible", "runtimeCompatible", false),
+    ),
+    compatibilityStatus: pick(
+      raw,
+      "compatibility_status",
+      "compatibilityStatus",
+      "unreviewed",
+    ),
+    compatibilityReason: pick(
+      raw,
+      "compatibility_reason",
+      "compatibilityReason",
+      "",
+    ),
+    requiredRuntimeCapabilities: asArray(
+      pick(
+        raw,
+        "required_runtime_capabilities",
+        "requiredRuntimeCapabilities",
+        [],
+      ),
+    ),
+    missingRuntimeCapabilities: asArray(
+      pick(
+        raw,
+        "missing_runtime_capabilities",
+        "missingRuntimeCapabilities",
+        [],
+      ),
+    ),
+    effectScopes: asArray(pick(raw, "effect_scopes", "effectScopes", [])),
   };
 }
 
@@ -1636,6 +1980,45 @@ export async function inspectProjectWorkSkillPackage({
     defaultEnabled: Boolean(
       pick(payload, "default_enabled", "defaultEnabled", false),
     ),
+    reviewMode: pick(payload, "review_mode", "reviewMode", "install"),
+    installedVersion: pick(payload, "installed_version", "installedVersion"),
+    skillDocuments: asArray(
+      pick(payload, "skill_documents", "skillDocuments", []),
+    ),
+    skillDiffs: asArray(pick(payload, "skill_diffs", "skillDiffs", [])),
+    reviewed: Boolean(pick(payload, "reviewed", "reviewed", false)),
+    runtimeCompatible: Boolean(
+      pick(payload, "runtime_compatible", "runtimeCompatible", false),
+    ),
+    compatibilityStatus: pick(
+      payload,
+      "compatibility_status",
+      "compatibilityStatus",
+      "unreviewed",
+    ),
+    compatibilityReason: pick(
+      payload,
+      "compatibility_reason",
+      "compatibilityReason",
+      "",
+    ),
+    requiredRuntimeCapabilities: asArray(
+      pick(
+        payload,
+        "required_runtime_capabilities",
+        "requiredRuntimeCapabilities",
+        [],
+      ),
+    ),
+    missingRuntimeCapabilities: asArray(
+      pick(
+        payload,
+        "missing_runtime_capabilities",
+        "missingRuntimeCapabilities",
+        [],
+      ),
+    ),
+    effectScopes: asArray(pick(payload, "effect_scopes", "effectScopes", [])),
     expiresAt: pick(payload, "expires_at", "expiresAt"),
   };
 }
@@ -2926,6 +3309,9 @@ export async function fetchProjectWorkFile({
   projectId,
   conversationId,
   path,
+  startLine: requestedStartLine,
+  endLine: requestedEndLine,
+  expectedContentHash,
   signal,
   fetchImpl,
 } = {}) {
@@ -2936,6 +3322,26 @@ export async function fetchProjectWorkFile({
   }
   requiredId(path, "path");
   const query = new URLSearchParams({ path });
+  if (expectedContentHash !== undefined && expectedContentHash !== null) {
+    if (
+      typeof expectedContentHash !== "string"
+      || !SHA256_PATTERN.test(expectedContentHash)
+    ) {
+      throw new TypeError("expectedContentHash 必须是有效的内容哈希");
+    }
+    query.set("content_hash", expectedContentHash);
+  }
+  if (Number.isSafeInteger(requestedStartLine) && requestedStartLine > 0) {
+    query.set("start_line", String(requestedStartLine));
+  }
+  if (
+    Number.isSafeInteger(requestedEndLine)
+    && requestedEndLine >= (
+      Number.isSafeInteger(requestedStartLine) ? requestedStartLine : 1
+    )
+  ) {
+    query.set("end_line", String(requestedEndLine));
+  }
   const scope = conversationId
     ? `conversations/${encodeURIComponent(conversationId)}`
     : `projects/${encodeURIComponent(projectId)}`;
@@ -3071,6 +3477,123 @@ export async function fetchProjectWorkGitEvidence({
   return mapProjectWorkGitEvidence(payload?.git);
 }
 
+export async function fetchProjectWorkGitCloseouts({
+  conversationId,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/git-closeouts`,
+    { signal, fetchImpl },
+  );
+  return asArray(
+    pick(payload, "git_closeouts", "gitCloseouts", []),
+  ).map(mapProjectWorkGitCloseout).filter(Boolean);
+}
+
+export async function confirmProjectWorkGitCloseout({
+  conversationId,
+  proposal,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  const proposalId = requiredId(proposal?.id, "proposal.id");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${
+      encodeURIComponent(conversationId)
+    }/git-closeouts/${encodeURIComponent(proposalId)}/confirm`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        proposal_id: proposalId,
+        proposal_hash: proposal.proposalHash,
+        conversation_id: proposal.conversationId,
+        turn_id: proposal.turnId,
+        change_set_id: proposal.changeSetId,
+        change_set_hash: proposal.changeSetHash,
+        branch: proposal.branch,
+        head: proposal.head,
+        commit_message: proposal.commitMessage,
+        files: asArray(proposal.files).map((file) => ({
+          path: file.path,
+          hash: file.hash,
+          exists: file.exists === true,
+          mode: file.mode,
+          base_hash: file.baseHash,
+          base_exists: file.baseExists === true,
+          base_mode: file.baseMode,
+        })),
+        verification_evidence: asArray(
+          proposal.verificationEvidence,
+        ).map((evidence) => ({
+          id: evidence.id,
+          command_id: evidence.commandId,
+          status: evidence.status,
+          exit_code: evidence.exitCode,
+          change_set_id: evidence.changeSetId,
+          change_set_hash: evidence.changeSetHash,
+          command_binding_hash: evidence.commandBindingHash,
+          completed_at: evidence.completedAt,
+        })),
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
+}
+
+export async function runProjectWorkBrowserQa({
+  conversationId,
+  clientRequestId = createRequestId("project-browser-qa"),
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  const normalizedClientRequestId = requiredId(
+    clientRequestId,
+    "clientRequestId",
+  ).trim();
+  if (!PROJECT_WORK_CLIENT_REQUEST_ID_PATTERN.test(normalizedClientRequestId)) {
+    throw new TypeError("clientRequestId 格式无效");
+  }
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${
+      encodeURIComponent(conversationId)
+    }/browser-qa`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        client_request_id: normalizedClientRequestId,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
+}
+
+export function projectWorkBrowserQaScreenshotUrl({
+  conversationId,
+  runId,
+  profileId,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(runId, "runId");
+  if (!["desktop", "mobile"].includes(profileId)) {
+    throw new TypeError("profileId 必须是 desktop 或 mobile");
+  }
+  return `${PROJECT_WORK_API_ROOT}/conversations/${
+    encodeURIComponent(conversationId)
+  }/browser-qa/${encodeURIComponent(runId)}/${
+    encodeURIComponent(profileId)
+  }/screenshot`;
+}
+
 export async function listProjectWorkApplyJournal({
   conversationId,
   signal,
@@ -3188,6 +3711,10 @@ export const projectWorkApi = {
   startPreview: startProjectWorkPreview,
   fetchWorkspace: fetchProjectWorkWorkspace,
   fetchGitEvidence: fetchProjectWorkGitEvidence,
+  fetchGitCloseouts: fetchProjectWorkGitCloseouts,
+  confirmGitCloseout: confirmProjectWorkGitCloseout,
+  runBrowserQa: runProjectWorkBrowserQa,
+  browserQaScreenshotUrl: projectWorkBrowserQaScreenshotUrl,
   listApplyJournal: listProjectWorkApplyJournal,
   undoApply: undoProjectWorkApply,
   runVerification: runProjectWorkVerification,

@@ -51,12 +51,22 @@ import {
   mergeIncrementalConversationSnapshot,
 } from "../project-work/liveProjectWorkState.js";
 import {
+  parseCodeEvidenceHref,
+  remarkCodeEvidence,
+} from "../project-work/codeEvidence.js";
+import {
   PROJECT_WORK_CAPABILITIES,
   PROJECT_WORK_WORKFLOWS,
   projectWorkCapability,
   projectWorkWorkflow,
 } from "../../shared/projectWorkCapabilities.js";
 import { AgentArtifactLayout } from "./AgentArtifactLayout.jsx";
+import {
+  ProjectLoopCloseoutCard,
+  ProjectLoopNotificationControl,
+} from "./ProjectLoopNotifications.jsx";
+import { ProjectGitCloseout } from "./ProjectGitCloseout.jsx";
+import { ProjectBrowserQaResults } from "./ProjectBrowserQaResults.jsx";
 import {
   ProviderMenu,
   THINKING_LEVEL_LABELS,
@@ -171,6 +181,7 @@ const TOOL_LABELS = {
   query_docs: "查询技术文档",
   update_plan: "更新计划",
   request_verification: "保存验证命令",
+  request_git_closeout: "准备 Git 收尾",
   generate_image: "生成图片",
   request_preview: "登记本机预览",
   subagent: "并行子智能体",
@@ -201,6 +212,7 @@ const RESEARCH_TOOL_GROUPS = {
 const HIDDEN_TOOL_ACTIVITY = new Set([
   "update_plan",
   "request_verification",
+  "request_git_closeout",
   "request_preview",
 ]);
 
@@ -242,21 +254,6 @@ const QUIET_EVENT_TYPES = new Set([
 
 const ARTIFACT_STORAGE_KEY = "pi-agent-project-work-artifacts-v1";
 const TRANSPARENT_MODE_STORAGE_KEY = "pi-agent-project-work-transparent-mode-v1";
-const PROJECT_MARKDOWN_COMPONENTS = {
-  a: ({ node: _node, href, children, ...props }) => {
-    const opensNewTab = /^https?:\/\//i.test(href ?? "");
-    return (
-      <a
-        {...props}
-        href={href}
-        {...(opensNewTab ? { target: "_blank", rel: "noreferrer" } : {})}
-      >
-        {children}
-      </a>
-    );
-  },
-};
-
 function readLastArtifact(conversationId, fallback = "files") {
   if (!conversationId || typeof window === "undefined") return fallback;
   try {
@@ -456,12 +453,45 @@ export function latestStreamingAssistant(events, messages, running) {
   return latest;
 }
 
-function ProjectAgentMarkdown({ children }) {
+function ProjectAgentMarkdown({
+  children,
+  codeEvidence = [],
+  onOpenCodeEvidence,
+}) {
+  const components = useMemo(() => ({
+    a: ({ node: _node, href, children: linkChildren, ...props }) => {
+      const reference = parseCodeEvidenceHref(href);
+      const opensNewTab = /^https?:\/\//i.test(href ?? "");
+      return (
+        <a
+          {...props}
+          href={href}
+          {...(opensNewTab ? { target: "_blank", rel: "noreferrer" } : {})}
+          {...(reference ? {
+            onClick: (event) => {
+              event.preventDefault();
+              onOpenCodeEvidence?.(reference);
+            },
+            title: `打开 ${reference.path} 第 ${reference.startLine} 行`,
+          } : {})}
+        >
+          {linkChildren}
+        </a>
+      );
+    },
+  }), [onOpenCodeEvidence]);
+  const remarkPlugins = useMemo(
+    () => [
+      remarkGfm,
+      [remarkCodeEvidence, { evidence: codeEvidence }],
+    ],
+    [codeEvidence],
+  );
   return (
     <div className="project-agent-markdown">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={PROJECT_MARKDOWN_COMPONENTS}
+        remarkPlugins={remarkPlugins}
+        components={components}
         skipHtml
       >
         {children}
@@ -2144,6 +2174,7 @@ export function ProjectAgentPane({
   onRemoveFollowUp,
   onClearFollowUps,
   onOpenArtifact,
+  onOpenCodeEvidence,
   generatedImageUrl,
   action,
   error,
@@ -2424,7 +2455,12 @@ export function ProjectAgentPane({
                   {message.role === "assistant" ? (
                     <>
                       {text ? (
-                        <ProjectAgentMarkdown>{text}</ProjectAgentMarkdown>
+                        <ProjectAgentMarkdown
+                          codeEvidence={message.codeEvidence}
+                          onOpenCodeEvidence={onOpenCodeEvidence}
+                        >
+                          {text}
+                        </ProjectAgentMarkdown>
                       ) : null}
                       <GeneratedImageCards
                         conversationId={conversation.id}
@@ -2498,6 +2534,11 @@ export function ProjectAgentPane({
           />
         ) : null}
         <ActionError error={error ?? conversation.error} />
+        <ProjectLoopCloseoutCard
+          events={conversation.events}
+          conversationStatus={conversation.status}
+          onOpenArtifact={onOpenArtifact}
+        />
 
         {conversation.pendingChangeSet?.status && [
           "pending",
@@ -2824,6 +2865,8 @@ function FileArtifact({
   api,
   selectedPath,
   requestedPath,
+  requestedLine,
+  requestedHash,
   onRequestedPathHandled,
   onAddContext,
   onRetryDocument,
@@ -2897,8 +2940,11 @@ function FileArtifact({
     }
   }, [api, conversationId, reportError]);
 
-  const loadFile = useCallback(async (path) => {
-    if (!conversationId || !path) return;
+  const loadFile = useCallback(async (
+    path,
+    { line = null, expectedHash = null } = {},
+  ) => {
+    if (!conversationId || !path) return null;
     setActiveDocumentId("");
     setActiveGeneratedImageId("");
     setActivePath(path);
@@ -2909,7 +2955,20 @@ function FileArtifact({
       setError(null);
       return;
     }
-    if (fileCache[path]) return;
+    const cached = fileCache[path];
+    if (
+      cached
+      && !expectedHash
+      && (
+        !Number.isSafeInteger(line)
+        || (
+          line >= (cached.startLine ?? 1)
+          && line <= (cached.endLine ?? cached.totalLines ?? 1)
+        )
+      )
+    ) {
+      return cached;
+    }
     fileAbort.current?.abort();
     const controller = new AbortController();
     fileAbort.current = controller;
@@ -2919,9 +2978,15 @@ function FileArtifact({
       const file = await api.fetchFile({
         conversationId,
         path,
+        ...(Number.isSafeInteger(line) ? {
+          startLine: Math.max(1, line - 120),
+          endLine: Math.max(1, line - 120) + PROJECT_FILE_VISIBLE_LINE_LIMIT - 1,
+        } : {}),
+        ...(expectedHash ? { expectedContentHash: expectedHash } : {}),
         signal: controller.signal,
       });
       setFileCache((current) => ({ ...current, [path]: file }));
+      return file;
     } catch (nextError) {
       if (nextError?.name !== "AbortError") reportError(nextError);
     } finally {
@@ -2999,9 +3064,32 @@ function FileArtifact({
 
   useEffect(() => {
     if (!requestedPath) return;
-    loadFile(requestedPath);
-    onRequestedPathHandled?.();
-  }, [loadFile, onRequestedPathHandled, requestedPath]);
+    let active = true;
+    void loadFile(requestedPath, {
+      line: requestedLine,
+      expectedHash: requestedHash,
+    }).then((file) => {
+      if (!active || !file || !Number.isSafeInteger(requestedLine)) return;
+      const index = requestedLine - (file.startLine ?? 1);
+      if (index < 0 || index >= (file.lines?.length ?? 0)) return;
+      setActiveLineIndex(index);
+      window.requestAnimationFrame(() => {
+        document.getElementById(`project-code-line-${index}`)
+          ?.scrollIntoView({ block: "center" });
+      });
+    }).finally(() => {
+      if (active) onRequestedPathHandled?.();
+    });
+    return () => {
+      active = false;
+    };
+  }, [
+    loadFile,
+    onRequestedPathHandled,
+    requestedLine,
+    requestedPath,
+    requestedHash,
+  ]);
 
   const visibleEntries = searchQuery
     ? searchEntries
@@ -3548,6 +3636,12 @@ export function ChangeEvidencePanel({
   gitEvidence,
   gitStatus = "idle",
   onRefreshGit,
+  gitCloseouts,
+  gitCloseoutStatus,
+  onRefreshGitCloseouts,
+  onConfirmGitCloseout,
+  gitCloseoutConfirming,
+  gitCloseoutError,
   workspace,
   applyJournal = [],
   onUndoApply,
@@ -3609,8 +3703,18 @@ export function ChangeEvidencePanel({
         {gitEvidence?.truncated ? (
           <p className="project-change-evidence-state">改动较多，当前仅显示安全范围内的结果。</p>
         ) : null}
-        <small>这里只读查看，不会暂存、提交或推送。</small>
+        <small>状态读取保持只读；只有下方精确确认才会创建本地提交。</small>
       </div>
+
+      <ProjectGitCloseout
+        records={gitCloseouts}
+        status={gitCloseoutStatus}
+        onRefresh={onRefreshGitCloseouts}
+        onConfirm={onConfirmGitCloseout}
+        confirming={gitCloseoutConfirming}
+        running={running}
+        error={gitCloseoutError}
+      />
 
       <div className="project-apply-history">
         <header>
@@ -3686,6 +3790,12 @@ export function ChangeArtifact({
   gitEvidence,
   gitStatus,
   onRefreshGit,
+  gitCloseouts,
+  gitCloseoutStatus,
+  onRefreshGitCloseouts,
+  onConfirmGitCloseout,
+  gitCloseoutConfirming,
+  gitCloseoutError,
   onUndoApply,
   undoingApplyId,
   undoError,
@@ -3718,6 +3828,12 @@ export function ChangeArtifact({
         gitEvidence={gitEvidence}
         gitStatus={gitStatus}
         onRefreshGit={onRefreshGit}
+        gitCloseouts={gitCloseouts}
+        gitCloseoutStatus={gitCloseoutStatus}
+        onRefreshGitCloseouts={onRefreshGitCloseouts}
+        onConfirmGitCloseout={onConfirmGitCloseout}
+        gitCloseoutConfirming={gitCloseoutConfirming}
+        gitCloseoutError={gitCloseoutError}
         workspace={conversation.workspace}
         applyJournal={conversation.applyJournal}
         onUndoApply={onUndoApply}
@@ -3849,6 +3965,8 @@ export function PreviewArtifact({
   onStart,
   starting = false,
   error = null,
+  onRunBrowserQa,
+  browserQaRunning = false,
 }) {
   const status = preview?.status ?? "empty";
   const previewUrl = status === "ready"
@@ -3886,15 +4004,30 @@ export function PreviewArtifact({
           <small>{statusLabel}</small>
         </div>
         {previewUrl ? (
-          <a
-            className="project-preview-open"
-            href={previewUrl}
-            target="_blank"
-            rel="noreferrer"
-          >
-            <GlobeSimple size={14} aria-hidden="true" />
-            在浏览器打开
-          </a>
+          <div className="project-preview-actions">
+            <button
+              className="project-preview-open"
+              type="button"
+              disabled={browserQaRunning}
+              onClick={onRunBrowserQa}
+            >
+              {browserQaRunning ? (
+                <CircleNotch className="spin" size={14} aria-hidden="true" />
+              ) : (
+                <ShieldCheck size={14} weight="fill" aria-hidden="true" />
+              )}
+              {browserQaRunning ? "正在验收" : "验收页面"}
+            </button>
+            <a
+              className="project-preview-open"
+              href={previewUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              <GlobeSimple size={14} aria-hidden="true" />
+              在浏览器打开
+            </a>
+          </div>
         ) : null}
       </header>
       {previewUrl ? (
@@ -3995,6 +4128,9 @@ function RunArtifact({
   resumingOperationId,
   running,
   error,
+  browserQaRunning,
+  browserQaError,
+  browserQaScreenshotUrl,
 }) {
   const command = conversation.verificationCommand;
   const interruptedRepairs = (conversation.operations ?? []).filter(
@@ -4045,6 +4181,13 @@ function RunArtifact({
           <small>点击后会在隔离工作区运行；待审阅修改不会提前写入真实项目。</small>
         </section>
       ) : null}
+      <ProjectBrowserQaResults
+        conversationId={conversation.id}
+        runs={conversation.browserQaRuns ?? []}
+        screenshotUrl={browserQaScreenshotUrl}
+        running={browserQaRunning}
+        error={browserQaError}
+      />
       {interruptedRepairs.map((operation) => (
         <section
           className="project-verification-repair-resume"
@@ -4196,16 +4339,24 @@ function ArtifactPane({
   onUndoApply,
   undoingApplyId,
   undoError,
+  onConfirmGitCloseout,
+  gitCloseoutConfirming,
+  gitCloseoutError,
   conversationRunning,
   onStartPreview,
   previewStarting,
   previewError,
+  onRunBrowserQa,
+  browserQaRunning,
+  browserQaError,
   onRunVerification,
   onResumeVerificationRepair,
   resumingOperationId,
   verificationError,
   verificationRunning,
   requestedFilePath,
+  requestedFileLine,
+  requestedFileHash,
   onRequestedFilePathHandled,
   onAddContext,
   onRetryDocument,
@@ -4223,8 +4374,16 @@ function ArtifactPane({
     data: null,
   });
   const gitEvidenceAbort = useRef(null);
+  const gitCloseoutAbort = useRef(null);
+  const [gitCloseoutState, setGitCloseoutState] = useState({
+    status: "idle",
+    data: [],
+  });
   const applyJournalRevision = (conversation.applyJournal ?? [])
     .map((record) => `${record.id}:${record.status}:${record.undo?.status ?? ""}`)
+    .join("|");
+  const gitCloseoutRevision = (conversation.gitCloseouts ?? [])
+    .map((record) => `${record.id}:${record.status}:${record.updatedAt ?? ""}`)
     .join("|");
 
   const loadGitEvidence = useCallback(async () => {
@@ -4272,23 +4431,68 @@ function ArtifactPane({
     }
   }, [api, conversation.id]);
 
+  const loadGitCloseouts = useCallback(async () => {
+    if (typeof api.fetchGitCloseouts !== "function") {
+      setGitCloseoutState({ status: "ready", data: [] });
+      return;
+    }
+    gitCloseoutAbort.current?.abort();
+    const controller = new AbortController();
+    gitCloseoutAbort.current = controller;
+    setGitCloseoutState((current) => ({
+      status: current.data.length > 0 ? "refreshing" : "loading",
+      data: current.data,
+    }));
+    try {
+      const data = await api.fetchGitCloseouts({
+        conversationId: conversation.id,
+        signal: controller.signal,
+      });
+      if (!controller.signal.aborted) {
+        setGitCloseoutState({ status: "ready", data });
+      }
+    } catch {
+      if (!controller.signal.aborted) {
+        setGitCloseoutState((current) => ({
+          status: "error",
+          data: current.data,
+        }));
+      }
+    } finally {
+      if (gitCloseoutAbort.current === controller) {
+        gitCloseoutAbort.current = null;
+      }
+    }
+  }, [api, conversation.id]);
+
   useEffect(() => {
     gitEvidenceAbort.current?.abort();
+    gitCloseoutAbort.current?.abort();
     setGitEvidenceState({ status: "idle", data: null });
+    setGitCloseoutState({ status: "idle", data: [] });
   }, [conversation.id]);
 
   useEffect(() => {
     if (activeArtifactId !== "changes") return undefined;
     void loadGitEvidence();
-    return () => gitEvidenceAbort.current?.abort();
+    void loadGitCloseouts();
+    return () => {
+      gitEvidenceAbort.current?.abort();
+      gitCloseoutAbort.current?.abort();
+    };
   }, [
     activeArtifactId,
     applyJournalRevision,
     conversation.pendingChangeSet?.status,
+    gitCloseoutRevision,
     loadGitEvidence,
+    loadGitCloseouts,
   ]);
 
-  useEffect(() => () => gitEvidenceAbort.current?.abort(), []);
+  useEffect(() => () => {
+    gitEvidenceAbort.current?.abort();
+    gitCloseoutAbort.current?.abort();
+  }, []);
 
   return (
     <>
@@ -4318,6 +4522,8 @@ function ArtifactPane({
               generatedImages={conversation.generatedImages ?? []}
               api={api}
               requestedPath={requestedFilePath}
+              requestedLine={requestedFileLine}
+              requestedHash={requestedFileHash}
               onRequestedPathHandled={onRequestedFilePathHandled}
               onAddContext={onAddContext}
               onRetryDocument={onRetryDocument}
@@ -4337,6 +4543,12 @@ function ArtifactPane({
               gitEvidence={gitEvidenceState.data}
               gitStatus={gitEvidenceState.status}
               onRefreshGit={loadGitEvidence}
+              gitCloseouts={gitCloseoutState.data}
+              gitCloseoutStatus={gitCloseoutState.status}
+              onRefreshGitCloseouts={loadGitCloseouts}
+              onConfirmGitCloseout={onConfirmGitCloseout}
+              gitCloseoutConfirming={gitCloseoutConfirming}
+              gitCloseoutError={gitCloseoutError}
               onUndoApply={onUndoApply}
               undoingApplyId={undoingApplyId}
               undoError={undoError}
@@ -4348,6 +4560,8 @@ function ArtifactPane({
               onStart={onStartPreview}
               starting={previewStarting}
               error={previewError}
+              onRunBrowserQa={onRunBrowserQa}
+              browserQaRunning={browserQaRunning}
             />
           ) : (
             <RunArtifact
@@ -4357,6 +4571,9 @@ function ArtifactPane({
               resumingOperationId={resumingOperationId}
               running={verificationRunning}
               error={verificationError}
+              browserQaRunning={browserQaRunning}
+              browserQaError={browserQaError}
+              browserQaScreenshotUrl={api.browserQaScreenshotUrl}
             />
           )}
         </div>
@@ -4433,12 +4650,16 @@ export function LiveProjectWorkbench({
     ),
   );
   const [requestedFilePath, setRequestedFilePath] = useState("");
+  const [requestedFileLine, setRequestedFileLine] = useState(null);
+  const [requestedFileHash, setRequestedFileHash] = useState("");
   const [selectedChangeFileIds, setSelectedChangeFileIds] = useState([]);
   const [action, setAction] = useState(null);
   const [actionError, setActionError] = useState(null);
   const [applyError, setApplyError] = useState(null);
   const [undoError, setUndoError] = useState(null);
+  const [gitCloseoutError, setGitCloseoutError] = useState(null);
   const [previewError, setPreviewError] = useState(null);
+  const [browserQaError, setBrowserQaError] = useState(null);
   const [verificationError, setVerificationError] = useState(null);
   const [uploadingPdf, setUploadingPdf] = useState(null);
   const [olderTurns, setOlderTurns] = useState([]);
@@ -5037,12 +5258,51 @@ export function LiveProjectWorkbench({
     });
   }, [action, api, replacePendingAttachments, snapshot?.id]);
 
-  const openArtifact = useCallback((artifactId, path = "") => {
+  const openArtifact = useCallback((
+    artifactId,
+    path = "",
+    line = null,
+    contentHash = "",
+  ) => {
     if (!ARTIFACTS.some((artifact) => artifact.id === artifactId)) return;
     setActiveArtifactId(artifactId);
     setArtifactOpen(true);
-    if (artifactId === "files" && path) setRequestedFilePath(path);
+    if (artifactId === "files" && path) {
+      setRequestedFilePath(path);
+      setRequestedFileLine(Number.isSafeInteger(line) ? line : null);
+      setRequestedFileHash(typeof contentHash === "string" ? contentHash : "");
+    }
   }, []);
+
+  const openCodeEvidence = useCallback(async (reference) => {
+    const conversationId = snapshotRef.current?.id;
+    if (!conversationId || !reference?.path || !reference?.contentHash) return;
+    try {
+      const current = await api.fetchFile({
+        conversationId,
+        path: reference.path,
+        startLine: reference.startLine,
+        endLine: reference.startLine,
+      });
+      if (current.contentHash !== reference.contentHash) {
+        const staleError = new Error(
+          `引用已过期：${reference.path} 在本轮读取后已经变化，未跳转到可能错误的内容。`,
+        );
+        staleError.code = "PROJECT_WORK_CODE_EVIDENCE_STALE";
+        throw staleError;
+      }
+      setActionError(null);
+      openArtifact(
+        "files",
+        reference.path,
+        reference.startLine,
+        reference.contentHash,
+      );
+    } catch (error) {
+      setActionError(error);
+      errorRef.current?.(error);
+    }
+  }, [api, openArtifact]);
 
   const uploadPdf = useCallback(async (file) => {
     if (!snapshot?.id || uploadingPdf || typeof api.uploadPdf !== "function") return;
@@ -5214,6 +5474,24 @@ export function LiveProjectWorkbench({
     );
   }, [api, executeAction, snapshot?.id]);
 
+  const confirmGitCloseout = useCallback((proposal) => {
+    if (
+      !proposal?.id
+      || proposal.status !== "ready"
+      || typeof api.confirmGitCloseout !== "function"
+    ) {
+      return;
+    }
+    executeAction(
+      `git-closeout:${proposal.id}`,
+      () => api.confirmGitCloseout({
+        conversationId: snapshot.id,
+        proposal,
+      }),
+      setGitCloseoutError,
+    );
+  }, [api, executeAction, snapshot?.id]);
+
   const runVerification = useCallback(() => {
     const command = snapshot?.verificationCommand;
     if (!command) return;
@@ -5267,6 +5545,21 @@ export function LiveProjectWorkbench({
       requestHash: preview.requestHash,
     }), setPreviewError);
   }, [api, executeAction, snapshot]);
+
+  const runBrowserQa = useCallback(() => {
+    if (
+      snapshot?.preview?.status !== "ready"
+      || typeof api.runBrowserQa !== "function"
+    ) {
+      return;
+    }
+    openArtifact("run_result");
+    executeAction(
+      "browser-qa",
+      () => api.runBrowserQa({ conversationId: snapshot.id }),
+      setBrowserQaError,
+    );
+  }, [api, executeAction, openArtifact, snapshot]);
 
   const compactContext = useCallback(() => (
     executeAction("compact", () => api.compactConversation({
@@ -5538,6 +5831,7 @@ export function LiveProjectWorkbench({
       />
       {snapshot ? (
         <>
+          <ProjectLoopNotificationControl conversation={snapshot} />
           <button
             className={`header-meta-pill project-insight-toggle${transparentMode ? " is-active" : ""}`}
             type="button"
@@ -5684,6 +5978,7 @@ export function LiveProjectWorkbench({
           onRemoveFollowUp={removeFollowUp}
           onClearFollowUps={clearFollowUps}
           onOpenArtifact={openArtifact}
+          onOpenCodeEvidence={openCodeEvidence}
           generatedImageUrl={api.generatedImageUrl}
           action={action}
           error={actionError}
@@ -5759,10 +6054,17 @@ export function LiveProjectWorkbench({
           onUndoApply={undoAppliedChanges}
           undoingApplyId={undoingApplyId}
           undoError={undoError}
+          onConfirmGitCloseout={confirmGitCloseout}
+          gitCloseoutConfirming={String(action ?? "").startsWith("git-closeout:")}
+          gitCloseoutError={gitCloseoutError}
           conversationRunning={conversationRunning}
           onStartPreview={startPreview}
           previewStarting={action === "preview-start"}
           previewError={previewError}
+          onRunBrowserQa={runBrowserQa}
+          browserQaRunning={action === "browser-qa"
+            || snapshot.browserQaRuns?.some((run) => run.status === "running")}
+          browserQaError={browserQaError}
           onRunVerification={runVerification}
           onResumeVerificationRepair={resumeVerificationRepair}
           resumingOperationId={resumingVerificationRepairId}
@@ -5771,7 +6073,13 @@ export function LiveProjectWorkbench({
             || Boolean(resumingVerificationRepairId)
             || snapshot.verificationRuns.some((run) => run.status === "running")}
           requestedFilePath={requestedFilePath}
-          onRequestedFilePathHandled={() => setRequestedFilePath("")}
+          requestedFileLine={requestedFileLine}
+          requestedFileHash={requestedFileHash}
+          onRequestedFilePathHandled={() => {
+            setRequestedFilePath("");
+            setRequestedFileLine(null);
+            setRequestedFileHash("");
+          }}
           onAddContext={addContext}
           onRetryDocument={retryDocument}
           retryingDocumentId={retryingDocumentId}

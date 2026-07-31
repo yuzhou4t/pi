@@ -1782,6 +1782,12 @@ button.header-meta-pill:hover {
   line-height: 1.65;
 }
 
+.workflow-week-window {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .workflow-scan-summary {
   display: flex;
   flex-wrap: wrap;
@@ -11312,6 +11318,17 @@ h4.reader-rail-full-heading {
   background: rgba(15, 118, 110, 0.09);
 }
 
+.project-preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.project-preview-actions button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
 .project-preview-confirmation {
   display: grid;
   width: min(calc(100% - 48px), 680px);
@@ -11627,6 +11644,181 @@ h4.reader-rail-full-heading {
   display: grid;
   gap: 10px;
   padding: 16px;
+}
+
+.project-browser-qa-results {
+  display: grid;
+  gap: 10px;
+  padding: 16px 16px 0;
+}
+
+.project-browser-qa-results > header,
+.project-browser-qa-results > header > div {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.project-browser-qa-results > header {
+  justify-content: space-between;
+}
+
+.project-browser-qa-results > header > div {
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+.project-browser-qa-results > header strong {
+  font-size: 12px;
+}
+
+.project-browser-qa-results > header small {
+  color: var(--weak);
+  font-size: 10.5px;
+}
+
+.project-browser-qa-results > header > span,
+.project-browser-qa-error {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.project-browser-qa-error {
+  margin: 0;
+  color: var(--risk);
+}
+
+.project-browser-qa-results > article {
+  display: grid;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+
+.project-browser-qa-results > article.is-passed {
+  border-color: var(--teal-border);
+}
+
+.project-browser-qa-results > article.is-issues {
+  border-color: rgba(124, 58, 45, 0.35);
+}
+
+.project-browser-qa-results > article.is-failed {
+  border-color: rgba(124, 58, 45, 0.2);
+}
+
+.project-browser-qa-results > article > header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+}
+
+.project-browser-qa-results > article > header > svg {
+  margin-top: 1px;
+  color: var(--teal-accent);
+}
+
+.project-browser-qa-results > article.is-issues > header > svg,
+.project-browser-qa-results > article.is-failed > header > svg {
+  color: var(--risk);
+}
+
+.project-browser-qa-results > article > header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.project-browser-qa-results > article > header strong {
+  font-size: 12px;
+}
+
+.project-browser-qa-results > article > header small,
+.project-browser-qa-results > article > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.project-browser-qa-captures {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.project-browser-qa-captures figure {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.project-browser-qa-captures img {
+  display: block;
+  width: 100%;
+  max-height: 230px;
+  object-fit: contain;
+  background: #efede7;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-browser-qa-captures figcaption {
+  display: grid;
+  gap: 2px;
+  padding: 8px 9px;
+}
+
+.project-browser-qa-captures figcaption strong {
+  font-size: 11px;
+}
+
+.project-browser-qa-captures figcaption span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.project-browser-qa-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.project-browser-qa-summary > div {
+  display: grid;
+  gap: 2px;
+  padding: 7px 9px;
+  border-right: 1px solid var(--border);
+}
+
+.project-browser-qa-summary > div:last-child {
+  border-right: 0;
+}
+
+.project-browser-qa-summary dt,
+.project-browser-qa-summary dd {
+  margin: 0;
+  font-size: 10px;
+}
+
+.project-browser-qa-summary dt {
+  color: var(--weak);
+}
+
+.project-browser-qa-summary dd {
+  color: var(--text);
+  font-weight: 650;
 }
 
 .project-run-history article {

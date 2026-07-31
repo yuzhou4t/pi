@@ -33,6 +33,15 @@ import {
 } from "./errors.js";
 import { inspectGitEvidence } from "./gitEvidence.js";
 import {
+  createGitCloseoutBinding,
+  createGitCloseoutService,
+} from "./gitCloseoutService.js";
+import {
+  assessBrowserQaEvidence,
+  createPreviewBrowserQaService,
+} from "./browserQaService.js";
+import { deriveLoopLifecycleEvent } from "./loopLifecycle.js";
+import {
   createPiSessionFactory,
   PROJECT_WORK_DEFAULT_TOOL_NAMES,
   PROJECT_WORK_PREVIEW_TOOL_NAME,
@@ -64,8 +73,12 @@ import { createSkillPackageService } from "./skillPackageService.js";
 import { normalizeTurnUsage } from "./turnEvidence.js";
 import { createVerificationRunner } from "./verificationRunner.js";
 import {
+  createVerificationProjectSnapshot,
+} from "./verificationWorkspace.js";
+import {
   createVerificationOutputCompactor,
 } from "./verificationOutputCompactor.js";
+import { resolveVerificationRecipe } from "./verificationRecipes.js";
 import {
   applyBoundFileTransitions,
   applySelectedChangeSet,
@@ -91,8 +104,6 @@ const LEGACY_THINKING_LEVELS = [
   "medium",
   "high",
 ];
-const SAFE_VERIFICATION_FILES = new Set(["npm", "pnpm", "yarn", "bun", "node"]);
-const PACKAGE_COMMANDS = new Set(["test", "run", "lint", "check", "typecheck"]);
 const DEFAULT_CONVERSATION_TITLE = "新工作会话";
 const STANDALONE_ROOT_LABEL = "未连接文件夹";
 const BUSY_CONVERSATION_STATUSES = new Set([
@@ -379,6 +390,45 @@ function publicTurnEvidence(evidence) {
   };
 }
 
+function normalizedCodeEvidence(items) {
+  if (!Array.isArray(items)) return [];
+  const normalized = new Map();
+  for (const item of items) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    let evidencePath;
+    try {
+      evidencePath = normalizeProjectPath(item.path);
+    } catch {
+      continue;
+    }
+    const contentHash = compactText(item.contentHash, 80);
+    const startLine = Number(item.startLine);
+    const endLine = Number(item.endLine);
+    if (
+      !evidencePath
+      || !SHA256_PATTERN.test(contentHash)
+      || !Number.isSafeInteger(startLine)
+      || startLine < 1
+      || !Number.isSafeInteger(endLine)
+      || endLine < startLine
+    ) {
+      continue;
+    }
+    const key = `${evidencePath}:${contentHash}:${startLine}:${endLine}`;
+    normalized.delete(key);
+    normalized.set(key, {
+      path: evidencePath,
+      contentHash,
+      startLine,
+      endLine,
+    });
+    if (normalized.size > 500) {
+      normalized.delete(normalized.keys().next().value);
+    }
+  }
+  return [...normalized.values()];
+}
+
 function publicConversationMessage(message) {
   return {
     id: message.id,
@@ -431,6 +481,7 @@ function publicConversationMessage(message) {
     capabilities: Array.isArray(message.capabilities)
       ? [...message.capabilities]
       : [],
+    codeEvidence: normalizedCodeEvidence(message.codeEvidence),
     turnEvidence: publicTurnEvidence(message.turnEvidence),
     createdAt: message.createdAt,
   };
@@ -517,6 +568,194 @@ function publicVerification(verification) {
   const publicRecord = structuredClone(verification);
   delete publicRecord.modelOutput;
   return publicRecord;
+}
+
+function publicGitCloseout(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    return null;
+  }
+  const id = compactText(record.id, 180);
+  if (!id) return null;
+  return {
+    schemaVersion: 1,
+    id,
+    conversationId: compactText(record.conversationId, 180) || null,
+    turnId: compactText(record.turnId, 180) || null,
+    changeSetId: compactText(record.changeSetId, 180) || null,
+    changeSetHash: SHA256_PATTERN.test(String(record.changeSetHash ?? ""))
+      ? record.changeSetHash
+      : null,
+    status: compactText(record.status, 80, "failed"),
+    proposalHash: SHA256_PATTERN.test(String(record.proposalHash ?? ""))
+      ? record.proposalHash
+      : null,
+    branch: compactText(record.branch, 180) || null,
+    head: compactText(record.head, 80) || null,
+    commitMessage: compactText(record.commitMessage, 240),
+    files: Array.isArray(record.files)
+      ? record.files.flatMap((file) => {
+          const filePath = compactText(file?.path, 1_000);
+          const exists = file?.exists === true;
+          const hash = file?.hash ?? null;
+          const baseExists = file?.baseExists === true;
+          const baseHash = file?.baseHash ?? null;
+          const mode = file?.mode ?? null;
+          const baseMode = file?.baseMode ?? null;
+          return (
+            filePath
+            && (
+              (
+                exists
+                && SHA256_PATTERN.test(String(hash))
+                && Number.isInteger(mode)
+              )
+              || (!exists && hash === null && mode === null)
+            )
+            && (
+              (
+                baseExists
+                && SHA256_PATTERN.test(String(baseHash))
+                && Number.isInteger(baseMode)
+              )
+              || (!baseExists && baseHash === null && baseMode === null)
+            )
+          )
+            ? [{
+                path: filePath,
+                hash,
+                exists,
+                mode: exists && Number.isInteger(mode) ? mode : null,
+                baseHash,
+                baseExists,
+                baseMode,
+              }]
+            : [];
+        })
+      : [],
+    verificationEvidence: Array.isArray(record.verificationEvidence)
+      ? record.verificationEvidence.map((evidence) => ({
+          id: compactText(evidence?.id, 180),
+          commandId: compactText(evidence?.commandId, 180) || null,
+          status: evidence?.status === "passed" ? "passed" : "failed",
+          exitCode: Number.isInteger(evidence?.exitCode)
+            ? evidence.exitCode
+            : null,
+          changeSetId: compactText(evidence?.changeSetId, 180) || null,
+          changeSetHash: compactText(evidence?.changeSetHash, 180) || null,
+          commandBindingHash: compactText(
+            evidence?.commandBindingHash,
+            180,
+          ) || null,
+          completedAt: typeof evidence?.completedAt === "string"
+            ? evidence.completedAt
+            : null,
+        }))
+      : [],
+    commitHash: compactText(record.commitHash, 80) || null,
+    createdAt: typeof record.createdAt === "string" ? record.createdAt : null,
+    updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : null,
+    committedAt: typeof record.committedAt === "string"
+      ? record.committedAt
+      : null,
+    recoveredAt: typeof record.recoveredAt === "string"
+      ? record.recoveredAt
+      : null,
+    error: record.error && typeof record.error === "object"
+      ? {
+          code: compactText(record.error.code, 120, "GIT_CLOSEOUT_FAILED"),
+          message: compactText(
+            record.error.message,
+            300,
+            "Git 收尾没有完成",
+          ),
+          retryable: record.error.retryable === true,
+        }
+      : null,
+  };
+}
+
+function publicBrowserQaRun(run) {
+  if (!run || typeof run !== "object" || Array.isArray(run)) return null;
+  const id = compactText(run.id, 180);
+  if (!id) return null;
+  return {
+    id,
+    clientRequestId: compactText(run.clientRequestId, 180) || null,
+    status: ["running", "completed", "failed"].includes(run.status)
+      ? run.status
+      : "failed",
+    verdict: ["passed", "issues"].includes(run.verdict)
+      ? run.verdict
+      : null,
+    issueSummary: run.issueSummary && typeof run.issueSummary === "object"
+      ? structuredClone(run.issueSummary)
+      : null,
+    adapterId: compactText(run.adapterId, 120) || null,
+    preview: run.preview && typeof run.preview === "object"
+      ? {
+          origin: compactText(run.preview.origin, 200) || null,
+          path: compactText(run.preview.path, 1_000) || "/",
+        }
+      : null,
+    captures: Array.isArray(run.captures)
+      ? run.captures.map((capture) => ({
+          profile: capture.profile && typeof capture.profile === "object"
+            ? {
+                id: compactText(capture.profile.id, 80),
+                label: compactText(capture.profile.label, 80),
+                width: Number(capture.profile.width) || null,
+                height: Number(capture.profile.height) || null,
+                isMobile: capture.profile.isMobile === true,
+              }
+            : null,
+          screenshot: capture.screenshot && typeof capture.screenshot === "object"
+            ? {
+                mimeType: capture.screenshot.mimeType === "image/png"
+                  ? "image/png"
+                  : null,
+                byteLength: Number(capture.screenshot.byteLength) || null,
+                sha256: SHA256_PATTERN.test(
+                  String(capture.screenshot.sha256 ?? ""),
+                )
+                  ? capture.screenshot.sha256
+                  : null,
+              }
+            : null,
+          dom: capture.dom && typeof capture.dom === "object"
+            ? structuredClone(capture.dom)
+            : null,
+          accessibility: capture.accessibility
+            && typeof capture.accessibility === "object"
+            ? structuredClone(capture.accessibility)
+            : null,
+        }))
+      : [],
+    console: run.console && typeof run.console === "object"
+      ? structuredClone(run.console)
+      : { entries: [], truncated: false },
+    failedRequests: run.failedRequests
+      && typeof run.failedRequests === "object"
+      ? structuredClone(run.failedRequests)
+      : { entries: [], truncated: false },
+    security: run.security && typeof run.security === "object"
+      ? structuredClone(run.security)
+      : null,
+    error: run.error && typeof run.error === "object"
+      ? {
+          code: compactText(run.error.code, 120, "PROJECT_BROWSER_QA_FAILED"),
+          message: compactText(
+            run.error.message,
+            300,
+            "页面验收没有完成",
+          ),
+          retryable: run.error.retryable === true,
+        }
+      : null,
+    createdAt: typeof run.createdAt === "string" ? run.createdAt : null,
+    completedAt: typeof run.completedAt === "string"
+      ? run.completedAt
+      : null,
+  };
 }
 
 function publicConversationOperation(operation) {
@@ -1230,6 +1469,12 @@ function publicConversationState(conversation, lastEventSeq, {
     verifications: (conversation.verifications ?? [])
       .map(publicVerification)
       .filter(Boolean),
+    gitCloseouts: (conversation.gitCloseouts ?? [])
+      .map(publicGitCloseout)
+      .filter(Boolean),
+    browserQaRuns: (conversation.browserQaRuns ?? [])
+      .map(publicBrowserQaRun)
+      .filter(Boolean),
     workspaceSnapshot: conversation.workspaceSnapshot
       ? structuredClone(conversation.workspaceSnapshot)
       : null,
@@ -1341,135 +1586,18 @@ function extractMessageText(message) {
     .join("");
 }
 
-function executableName(value) {
-  const file = String(value ?? "").trim();
-  if (
-    !/^[A-Za-z0-9._-]+$/.test(file)
-    || !SAFE_VERIFICATION_FILES.has(file)
-  ) {
-    throw projectWorkError(
-      "PROJECT_WORK_VERIFICATION_COMMAND_BLOCKED",
-      "该验证程序不在允许范围内",
-      400,
-    );
-  }
-  return file;
-}
-
-function safeArgument(value) {
-  const result = String(value ?? "");
-  if (
-    !result
-    || result.length > 400
-    || /[\0\r\n]/.test(result)
-  ) {
-    throw projectWorkError(
-      "PROJECT_WORK_VERIFICATION_COMMAND_INVALID",
-      "验证命令参数无效",
-      400,
-    );
-  }
-  return result;
-}
-
-function assertPackageCommand(file, args) {
-  const command = args[0] ?? "test";
-  if (!PACKAGE_COMMANDS.has(command)) {
-    throw projectWorkError(
-      "PROJECT_WORK_VERIFICATION_COMMAND_BLOCKED",
-      `${file} 验证只允许 test、run、lint、check 或 typecheck`,
-      400,
-    );
-  }
-  if (command === "run") {
-    const script = args[1];
-    if (!script || !/^[A-Za-z0-9:._-]{1,120}$/.test(script)) {
-      throw projectWorkError(
-        "PROJECT_WORK_VERIFICATION_COMMAND_INVALID",
-        "run 验证必须指定安全的脚本名称",
-        400,
-      );
-    }
-  }
-  const blocked = args.some((argument) => (
-    /^(?:--?(?:cwd|dir|prefix|global|shell|script-shell))(?:=|$)/.test(argument)
-    || ["exec", "install", "add", "remove", "uninstall", "publish", "link"].includes(argument)
-  ));
-  if (blocked) {
-    throw projectWorkError(
-      "PROJECT_WORK_VERIFICATION_COMMAND_BLOCKED",
-      "验证命令包含不允许的参数",
-      400,
-    );
-  }
-}
-
-function assertNodeCommand(args) {
-  if (args.some((argument) => (
-    ["-e", "--eval", "-p", "--print", "-r", "--require", "--import"].includes(argument)
-    || argument.startsWith("--eval=")
-    || argument.startsWith("--require=")
-    || argument.startsWith("--import=")
-  ))) {
-    throw projectWorkError(
-      "PROJECT_WORK_VERIFICATION_COMMAND_BLOCKED",
-      "node 验证不允许执行内联代码或预加载模块",
-      400,
-    );
-  }
-  for (const argument of args) {
-    if (argument.startsWith("-")) continue;
-    normalizeProjectPath(argument);
-  }
-  if (args.length === 0 || (args.every((argument) => argument.startsWith("-")) && !args.includes("--test"))) {
-    throw projectWorkError(
-      "PROJECT_WORK_VERIFICATION_COMMAND_INVALID",
-      "node 验证必须指定 --test 或项目内脚本",
-      400,
-    );
-  }
-}
-
-function normalizeVerificationRequest(request) {
-  const file = executableName(request?.file);
-  const args = Array.isArray(request?.args)
-    ? request.args.map(safeArgument)
-    : file === "node"
-      ? ["--test"]
-      : ["test"];
-  if (args.length > 32 || args.join("").length > 8_000) {
-    throw projectWorkError(
-      "PROJECT_WORK_VERIFICATION_COMMAND_INVALID",
-      "验证命令参数过多",
-      400,
-    );
-  }
-  if (file === "node") assertNodeCommand(args);
-  else assertPackageCommand(file, args);
-  const cwd = request?.cwd
-    ? normalizeProjectPath(request.cwd)
-    : "";
-  const checks = Array.isArray(request?.checks)
-    ? request.checks
-      .map((check) => compactText(check, 200))
-      .filter(Boolean)
-      .slice(0, 20)
-    : [];
-  return {
-    command: { file, args, cwd },
-    checks,
-  };
-}
-
-function verificationBindingHash({ command, resolvedScript }) {
+function verificationBindingHash({ command, resolvedScript, recipe = null }) {
   return sha256({
     schemaVersion: 1,
     command: {
       file: command?.file ?? null,
       args: Array.isArray(command?.args) ? command.args : [],
       cwd: command?.cwd ?? "",
+      environment: command?.environment ?? {},
     },
     resolvedScript: resolvedScript ?? null,
+    recipeId: recipe?.id ?? null,
+    recipeBindingHash: recipe?.bindingHash ?? null,
   });
 }
 
@@ -1629,39 +1757,6 @@ function previewRecipeSummary(request) {
     route: normalized.route,
     command,
   };
-}
-
-async function resolvePackageScript({
-  projectRoot,
-  baseRoot,
-  workspaceRoot,
-}, command) {
-  if (!["npm", "pnpm", "yarn"].includes(command.file)) return null;
-  const scriptName = command.args[0] === "run"
-    ? command.args[1]
-    : command.args[0] === "test"
-      ? "test"
-      : null;
-  if (!scriptName) return null;
-  const packagePath = [
-    command.cwd,
-    "package.json",
-  ].filter(Boolean).join("/");
-  try {
-    const packageJson = JSON.parse(
-      (await readProjectWorkOverlayTextFile({
-        projectRoot,
-        baseRoot,
-        workspaceRoot,
-        filePath: packagePath,
-        endLine: Number.MAX_SAFE_INTEGER,
-      })).content,
-    );
-    const script = packageJson?.scripts?.[scriptName];
-    return typeof script === "string" ? script.slice(0, 2_000) : null;
-  } catch {
-    return null;
-  }
 }
 
 async function resolveVerificationCwd(workspaceRoot, relativePath) {
@@ -2037,20 +2132,34 @@ export function createProjectWorkService({
     documentPollIntervalMs,
   ),
   snapshotter = createFilteredProjectSnapshot,
+  verificationSnapshotter,
   changeApplier = applySelectedChangeSet,
   gitInspector = inspectGitEvidence,
+  gitCloseoutService,
   picker = createMacOSProjectPicker(),
   runner = createVerificationRunner(),
   verificationOutputCompactor = createVerificationOutputCompactor(),
   imageGenerator = generateCodexSubscriptionImage,
   previewSupervisor = createProjectPreviewSupervisor(),
+  browserQaService,
   skillPackageService,
   now = () => new Date(),
   idFactory = randomUUID,
 } = {}) {
   const configuredStorageRoot = path.resolve(storageRoot);
+  const effectiveGitCloseoutService = gitCloseoutService
+    ?? createGitCloseoutService({ storageRoot: configuredStorageRoot });
+  const effectiveBrowserQaService = browserQaService
+    ?? createPreviewBrowserQaService({ previewSupervisor });
   const effectiveSkillPackageService = skillPackageService
-    ?? createSkillPackageService({ storageRoot: configuredStorageRoot });
+    ?? createSkillPackageService({
+      storageRoot: configuredStorageRoot,
+      runtimeCapabilityProvider: () => [
+        "project_read",
+        "project_change_proposal",
+        "git_closeout_transaction",
+      ],
+    });
   const effectiveSessionFactory = sessionFactory ?? createPiSessionFactory({
     externalRetrievalOptions: {
       doubaoQuotaFilePath: resolveProjectWorkDoubaoQuotaFilePath({
@@ -2062,6 +2171,12 @@ export function createProjectWorkService({
     skillProvider: () => effectiveSkillPackageService.getEnabledSkillPaths(),
   });
   const createSnapshot = snapshotter;
+  const createVerificationSnapshot = verificationSnapshotter
+    ?? (
+      snapshotter === createFilteredProjectSnapshot
+        ? createVerificationProjectSnapshot
+        : snapshotter
+    );
   const registry = createProjectRegistry({
     storageRoot: configuredStorageRoot,
     now,
@@ -2074,6 +2189,8 @@ export function createProjectWorkService({
   const runtimes = new Map();
   const activeMessageClaims = new Map();
   const verificationControllers = new Map();
+  const browserQaRuns = new Map();
+  const browserQaProjectRuns = new Map();
   const applyQueues = new Map();
   const followUpMutationQueues = new Map();
   const askUserWaiters = new Map();
@@ -2129,6 +2246,23 @@ export function createProjectWorkService({
       throw projectWorkError(
         "PROJECT_WORK_CONVERSATION_DELETE_IN_PROGRESS",
         "工作会话正在删除",
+        409,
+        true,
+      );
+    }
+  }
+
+  function assertBrowserQaNotRunning(conversationId, conversation = null) {
+    if (
+      browserQaRuns.has(conversationId)
+      || (
+        typeof conversation?.projectId === "string"
+        && browserQaProjectRuns.has(conversation.projectId)
+      )
+    ) {
+      throw projectWorkError(
+        "PROJECT_BROWSER_QA_BUSY",
+        "当前页面验收仍在运行，请等待证据采集完成",
         409,
         true,
       );
@@ -2202,6 +2336,7 @@ export function createProjectWorkService({
     if (
       BUSY_CONVERSATION_STATUSES.has(conversation.status)
       || verificationControllers.has(conversation.id)
+      || browserQaRuns.has(conversation.id)
       || Boolean(runtime?.completion)
       || (documentOperationCounts.get(conversation.id) ?? 0) > 0
       || hasActiveConversationDocuments(conversation)
@@ -2278,11 +2413,20 @@ export function createProjectWorkService({
   }
 
   async function appendEvent(conversationId, type, data = {}) {
-    return conversationStore.appendEvent(conversationId, {
+    const event = await conversationStore.appendEvent(conversationId, {
       type,
       at: timestamp(),
       data,
     });
+    const lifecycle = deriveLoopLifecycleEvent(event);
+    if (lifecycle) {
+      await conversationStore.appendEvent(conversationId, {
+        type: "loop.lifecycle",
+        at: timestamp(),
+        data: lifecycle,
+      });
+    }
+    return event;
   }
 
   async function sanitizeConversationPaths(conversationId, value) {
@@ -2321,22 +2465,66 @@ export function createProjectWorkService({
     }));
   }
 
-  function stableStatusAfterOperation(current, resumeStatus = "idle") {
+  function hasPendingVerificationReview(current) {
+    const attemptedRequestIds = new Set(
+      (current.verifications ?? [])
+        .map((verification) => verification.commandId)
+        .filter((commandId) => typeof commandId === "string" && commandId),
+    );
+    return (current.verifications ?? []).some((verification) => (
+      verification.status === "requested"
+      && typeof verification.id === "string"
+      && verification.id
+      && !attemptedRequestIds.has(verification.id)
+    ));
+  }
+
+  function pendingReviewArtifactId(current) {
     if (
       current.activeChangeSet?.status === "ready"
       && Array.isArray(current.activeChangeSet.files)
       && current.activeChangeSet.files.length > 0
     ) {
+      return "changes";
+    }
+    if ((current.gitCloseouts ?? []).some((record) => record.status === "ready")) {
+      return "changes";
+    }
+    if (hasPendingVerificationReview(current)) {
+      return "run_result";
+    }
+    if (
+      current.preview?.status === "requested"
+      && current.preview.executionPolicyMode === "manual_review"
+    ) {
+      return "preview";
+    }
+    return null;
+  }
+
+  function stableStatusAfterOperation(current, resumeStatus = "idle") {
+    if (pendingReviewArtifactId(current)) {
       return "awaiting_confirmation";
     }
     if (
       typeof resumeStatus === "string"
       && !BUSY_CONVERSATION_STATUSES.has(resumeStatus)
       && resumeStatus !== "awaiting_user"
+      && resumeStatus !== "awaiting_confirmation"
     ) {
       return resumeStatus;
     }
     return "idle";
+  }
+
+  function agentStatusEventData(current, status = current?.status) {
+    const artifactId = status === "awaiting_confirmation"
+      ? pendingReviewArtifactId(current)
+      : null;
+    return {
+      status,
+      ...(artifactId ? { artifactId } : {}),
+    };
   }
 
   async function updateConversationOperation(
@@ -2743,25 +2931,123 @@ export function createProjectWorkService({
     request,
     turnSettings,
   ) {
-    const normalized = normalizeVerificationRequest(request);
-    normalized.checks = await Promise.all(normalized.checks.map((check) => (
-      sanitizeForConversation(conversationId, check)
-    )));
+    if (turnSettings?.workflowId === "planning") {
+      throw projectWorkError(
+        "PROJECT_WORK_PLANNING_VERIFICATION_NOT_ALLOWED",
+        "规划方案只输出计划，不能创建或运行验证任务",
+        403,
+      );
+    }
     const createdAt = timestamp();
+    if (typeof request?.recipeId !== "string") {
+      const checks = await Promise.all((
+        Array.isArray(request?.checks) ? request.checks : []
+      )
+        .map((check) => compactText(check, 200))
+        .filter(Boolean)
+        .slice(0, 20)
+        .map((check) => sanitizeForConversation(conversationId, check)));
+      const blocked = {
+        id: `verification-${idFactory()}`,
+        recipeId: null,
+        recipe: null,
+        command: null,
+        checks,
+        turnId: compactText(turnSettings?.turnId, 160) || null,
+        workflowId: compactText(turnSettings?.workflowId, 120) || null,
+        executionPolicyRevision: Number.isSafeInteger(
+          turnSettings?.executionPolicyRevision,
+        )
+          ? turnSettings.executionPolicyRevision
+          : null,
+        resolvedScript: null,
+        bindingHash: null,
+        status: "blocked",
+        blockedReason: "verification_recipe_required",
+        exitCode: null,
+        durationMs: null,
+        output: "",
+        truncated: false,
+        createdAt,
+        completedAt: createdAt,
+      };
+      await updateConversation(conversationId, (current) => ({
+        verifications: [...(current.verifications ?? []), blocked],
+      }));
+      await appendEvent(conversationId, "verification.blocked", {
+        id: blocked.id,
+        turnId: blocked.turnId,
+        status: blocked.status,
+        reasonCode: blocked.blockedReason,
+      });
+      return blocked;
+    }
     const conversation = await conversationStore.get(conversationId);
     const workspace = await resolveConversationWorkspace(conversation);
     const paths = conversationPaths(conversationId);
-    const resolvedScript = await resolvePackageScript(
-      {
-        projectRoot: workspace.projectRoot,
-        baseRoot: paths.baseRoot,
-        workspaceRoot: paths.workspaceRoot,
-      },
-      normalized.command,
-    );
+    const workspaceRoots = {
+      projectRoot: workspace.projectRoot,
+      baseRoot: paths.baseRoot,
+      workspaceRoot: paths.workspaceRoot,
+    };
+    if (
+      !request
+      || typeof request !== "object"
+      || Array.isArray(request)
+      || Object.keys(request).some(
+        (field) => !["recipeId", "cwd", "checks"].includes(field),
+      )
+      || (request.cwd !== undefined && typeof request.cwd !== "string")
+      || (
+        request.checks !== undefined
+        && (
+          !Array.isArray(request.checks)
+          || request.checks.some((check) => typeof check !== "string")
+        )
+      )
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_VERIFICATION_RECIPE_REQUEST_INVALID",
+        "验证配方请求包含未受控字段",
+        400,
+      );
+    }
+    const recipe = await resolveVerificationRecipe({
+      recipeId: request.recipeId,
+      cwd: request.cwd ?? "",
+      readTextFile: async (filePath) => (
+        readProjectWorkOverlayTextFile({
+          ...workspaceRoots,
+          filePath,
+          endLine: Number.MAX_SAFE_INTEGER,
+        })
+      ).then((result) => result.content),
+    });
+    const normalized = {
+      recipeId: recipe.id,
+      recipe,
+      command: recipe.command,
+      checks: Array.isArray(request.checks)
+        ? request.checks
+          .map((check) => compactText(check, 200))
+          .filter(Boolean)
+          .slice(0, 20)
+        : [],
+    };
+    const resolvedScript = recipe.resolvedScript;
+    normalized.checks = await Promise.all(normalized.checks.map((check) => (
+      sanitizeForConversation(conversationId, check)
+    )));
     const safeResolvedScript = resolvedScript
       ? await sanitizeForConversation(conversationId, resolvedScript)
       : null;
+    if (recipe && safeResolvedScript !== recipe.resolvedScript) {
+      throw projectWorkError(
+        "PROJECT_WORK_VERIFICATION_RECIPE_SCRIPT_UNSAFE",
+        "验证脚本包含不应进入会话的本机信息",
+        409,
+      );
+    }
     const verification = {
       id: `verification-${idFactory()}`,
       ...normalized,
@@ -2776,6 +3062,7 @@ export function createProjectWorkService({
       bindingHash: verificationBindingHash({
         command: normalized.command,
         resolvedScript: safeResolvedScript,
+        recipe,
       }),
       status: "requested",
       exitCode: null,
@@ -2791,10 +3078,172 @@ export function createProjectWorkService({
     await appendEvent(conversationId, "verification.requested", {
       id: verification.id,
       turnId: verification.turnId,
+      recipeId: verification.recipeId ?? null,
       command: verification.command,
       checks: verification.checks,
     });
     return verification;
+  }
+
+  async function recordGitCloseoutRequest(
+    conversationId,
+    request,
+    turnSettings,
+  ) {
+    if (
+      !request
+      || typeof request !== "object"
+      || Array.isArray(request)
+      || Object.keys(request).some(
+        (field) => !["commitMessage", "paths"].includes(field),
+      )
+    ) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_REQUEST_INVALID",
+        "Git 收尾请求包含未受控字段",
+        400,
+      );
+    }
+    if (turnSettings?.workflowId) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_READ_ONLY_WORKFLOW",
+        "只读工作流不能创建 Git 收尾预览",
+        403,
+      );
+    }
+    const conversation = await conversationStore.get(conversationId);
+    const workspace = await resolveConversationWorkspace(conversation);
+    if (workspace.workspaceKind !== "bound_project") {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_PROJECT_REQUIRED",
+        "Git 收尾只适用于已绑定的本地项目",
+        409,
+      );
+    }
+    const appliedChangeSet = conversation.activeChangeSet;
+    if (
+      !appliedChangeSet
+      || appliedChangeSet.status !== "applied"
+      || !SHA256_PATTERN.test(String(appliedChangeSet.hash ?? ""))
+    ) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_APPLIED_CHANGESET_REQUIRED",
+        "请先确认并应用完整修改，再创建 Git 收尾预览",
+        409,
+      );
+    }
+    const appliedPaths = new Set(
+      (appliedChangeSet.files ?? [])
+        .filter((file) => file.status === "applied")
+        .map((file) => file.path),
+    );
+    const requestedPaths = Array.isArray(request.paths) ? request.paths : [];
+    if (
+      requestedPaths.length === 0
+      || requestedPaths.some((filePath) => !appliedPaths.has(filePath))
+    ) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_PATH_NOT_APPLIED",
+        "Git 收尾只能包含本轮已经确认写入的精确文件",
+        409,
+      );
+    }
+    const verificationEvidence = (conversation.verifications ?? [])
+      .filter((verification) => (
+        verification.status === "passed"
+        && verification.exitCode === 0
+        && verification.changeSetId === appliedChangeSet.id
+        && verification.changeSetHash === appliedChangeSet.hash
+      ))
+      .slice(-20);
+    if (verificationEvidence.length === 0) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_VERIFICATION_REQUIRED",
+        "需要先完成与当前已应用修改绑定的受控验证",
+        409,
+      );
+    }
+    const appliedJournal = [...(conversation.applyJournal ?? [])]
+      .reverse()
+      .find((journal) => (
+        journal.status === "applied"
+        && journal.changeSetId === appliedChangeSet.id
+        && journal.changeSetHash === appliedChangeSet.hash
+      ));
+    const journalFiles = new Map(
+      (appliedJournal?.files ?? []).map((file) => [file.path, file]),
+    );
+    const changeFiles = new Map(
+      (appliedChangeSet.files ?? []).map((file) => [file.path, file]),
+    );
+    const baseFiles = requestedPaths.map((filePath) => {
+      const change = changeFiles.get(filePath);
+      const journalFile = journalFiles.get(filePath);
+      if (
+        !change
+        || !journalFile
+        || journalFile.baseHash !== change.baseHash
+        || (
+          change.baseHash !== null
+          && !Number.isInteger(journalFile.projectBeforeMode)
+        )
+      ) {
+        throw projectWorkError(
+          "GIT_CLOSEOUT_BASE_BINDING_UNAVAILABLE",
+          "无法证明所选文件在 Pi 修改前的精确状态，未创建提交预览",
+          409,
+        );
+      }
+      return {
+        path: filePath,
+        baseExists: change.baseHash !== null,
+        baseHash: change.baseHash,
+        baseMode: change.baseHash === null
+          ? null
+          : journalFile.projectBeforeMode,
+      };
+    });
+    const turnId = compactText(turnSettings?.turnId, 180);
+    if (!turnId) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_TURN_REQUIRED",
+        "Git 收尾必须绑定当前回合",
+        409,
+      );
+    }
+    const proposal = await effectiveGitCloseoutService.requestGitCloseout({
+      projectRoot: workspace.projectRoot,
+      conversationId,
+      turnId,
+      changeSetId: appliedChangeSet.id,
+      changeSetHash: appliedChangeSet.hash,
+      commitMessage: request.commitMessage,
+      paths: requestedPaths,
+      baseFiles,
+      verificationEvidence,
+    });
+    const publicProposal = publicGitCloseout(proposal);
+    await updateConversation(conversationId, (current) => ({
+      gitCloseouts: [
+        publicProposal,
+        ...(current.gitCloseouts ?? []).filter(
+          (item) => item.id !== publicProposal.id,
+        ),
+      ].slice(0, 50),
+    }));
+    await appendEvent(conversationId, "git_closeout.requested", {
+      id: publicProposal.id,
+      status: publicProposal.status,
+      proposalHash: publicProposal.proposalHash,
+      turnId: publicProposal.turnId,
+      changeSetId: publicProposal.changeSetId,
+      changeSetHash: publicProposal.changeSetHash,
+      branch: publicProposal.branch,
+      head: publicProposal.head,
+      fileCount: publicProposal.files.length,
+      artifactId: "changes",
+    });
+    return publicProposal;
   }
 
   async function recordImageGenerationRequest(
@@ -3225,13 +3674,26 @@ export function createProjectWorkService({
     const conversation = await conversationStore.get(conversationId);
     const paths = conversationPaths(conversationId);
     const priorChangeSet = conversation.activeChangeSet;
+    const recomputed = await recomputeChangeSet({
+      conversationId,
+      baseRoot: paths.baseRoot,
+      workspaceRoot: paths.workspaceRoot,
+      allowDeletes: conversation.workspaceSnapshot?.mode !== "sparse_overlay",
+    });
+    const preservesAppliedGitCloseout = (
+      recomputed.status === "clean"
+      && priorChangeSet?.status === "applied"
+      && (conversation.gitCloseouts ?? []).some((record) => (
+        record.status === "ready"
+        && record.changeSetId === priorChangeSet.id
+        && record.changeSetHash === priorChangeSet.hash
+      ))
+    );
+    if (preservesAppliedGitCloseout) {
+      return priorChangeSet;
+    }
     const changeSet = {
-      ...await recomputeChangeSet({
-        conversationId,
-        baseRoot: paths.baseRoot,
-        workspaceRoot: paths.workspaceRoot,
-        allowDeletes: conversation.workspaceSnapshot?.mode !== "sparse_overlay",
-      }),
+      ...recomputed,
       turnId: compactText(
         turnSettings?.turnId ?? priorChangeSet?.turnId,
         160,
@@ -3459,6 +3921,7 @@ export function createProjectWorkService({
     let claimedRequest;
     const confirmedAt = timestamp();
     await updateConversation(conversationId, (current) => {
+      assertBrowserQaNotRunning(conversationId, current);
       if (conversationWorkspaceKind(current) !== "bound_project") {
         throw projectWorkError(
           "PROJECT_WORK_PREVIEW_PROJECT_REQUIRED",
@@ -3564,8 +4027,286 @@ export function createProjectWorkService({
       artifactId: "preview",
       detail: "已确认并锁定本机预览请求",
     });
-    await launchClaimedPreview(conversationId, claimedRequest);
+    const launched = await launchClaimedPreview(conversationId, claimedRequest);
+    const settled = await updateConversation(conversationId, (current) => ({
+      status: stableStatusAfterOperation(current, "idle"),
+    }));
+    if (
+      launched
+      && ["idle", "applied"].includes(settled.status)
+    ) {
+      await appendEvent(
+        conversationId,
+        "agent.status",
+        agentStatusEventData(settled),
+      );
+    }
     return snapshot(conversationId);
+  }
+
+  async function runBrowserQa(conversationId, {
+    clientRequestId,
+  } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const requestId = normalizeClientRequestId(clientRequestId, idFactory);
+    const projectLease = Object.freeze({
+      conversationId,
+      clientRequestId: requestId,
+    });
+    let leasedProjectId = null;
+    const existingOperation = browserQaRuns.get(conversationId);
+    if (existingOperation) {
+      if (existingOperation.clientRequestId === requestId) {
+        return existingOperation;
+      }
+      throw projectWorkError(
+        "PROJECT_BROWSER_QA_BUSY",
+        "当前页面验收仍在运行",
+        409,
+      );
+    }
+    const operation = (async () => {
+      const conversation = await conversationStore.get(conversationId);
+      if ((conversation.browserQaRuns ?? []).some(
+        (run) => run.clientRequestId === requestId,
+      )) {
+        return snapshot(conversationId);
+      }
+      if (
+        conversationWorkspaceKind(conversation) !== "bound_project"
+        || conversation.preview?.status !== "ready"
+      ) {
+        throw projectWorkError(
+          "PROJECT_BROWSER_QA_PREVIEW_REQUIRED",
+          "请先启动当前会话的受管本地预览",
+          409,
+        );
+      }
+      if (browserQaProjectRuns.has(conversation.projectId)) {
+        throw projectWorkError(
+          "PROJECT_BROWSER_QA_BUSY",
+          "当前项目已有页面验收正在运行",
+          409,
+        );
+      }
+      if (
+        BUSY_CONVERSATION_STATUSES.has(conversation.status)
+        || Boolean(runtimes.get(conversationId)?.completion)
+        || activeMessageClaims.has(conversationId)
+        || verificationControllers.has(conversationId)
+        || autoReviewSettlements.has(conversationId)
+        || applyQueues.has(`project:${conversation.projectId}`)
+        || (conversation.verifications ?? []).some(
+          (verification) => verification.status === "running",
+        )
+      ) {
+        throw projectWorkError(
+          "PROJECT_BROWSER_QA_BUSY",
+          "当前会话仍有 Agent 或验证操作在运行",
+          409,
+        );
+      }
+      browserQaProjectRuns.set(conversation.projectId, projectLease);
+      leasedProjectId = conversation.projectId;
+      const runId = `browser-qa-${idFactory()}`;
+      const createdAt = timestamp();
+      const pending = {
+        id: runId,
+        clientRequestId: requestId,
+        status: "running",
+        verdict: null,
+        issueSummary: null,
+        adapterId: null,
+        preview: null,
+        captures: [],
+        console: { entries: [], truncated: false },
+        failedRequests: { entries: [], truncated: false },
+        security: null,
+        error: null,
+        createdAt,
+        completedAt: null,
+      };
+      await updateConversation(conversationId, (current) => ({
+        browserQaRuns: [
+          pending,
+          ...(current.browserQaRuns ?? []),
+        ].slice(0, 20),
+      }));
+      await appendEvent(conversationId, "browser_qa.started", {
+        id: runId,
+        clientRequestId: requestId,
+        status: "running",
+        artifactId: "run_result",
+      });
+      const runDirectory = path.join(
+        conversationPaths(conversationId).directory,
+        "browser-qa",
+        runId,
+      );
+      try {
+        const result = await effectiveBrowserQaService.run({
+          key: conversationId,
+        });
+        await mkdir(runDirectory, { recursive: true, mode: 0o700 });
+        const captures = [];
+        for (const capture of result.captures) {
+          const profileId = compactText(capture.profile?.id, 80);
+          if (!["desktop", "mobile"].includes(profileId)) {
+            throw projectWorkError(
+              "PROJECT_BROWSER_QA_RESULT_INVALID",
+              "页面验收返回了未知视口",
+              502,
+            );
+          }
+          const bytes = Buffer.from(capture.screenshot.bytes);
+          if (sha256(bytes) !== capture.screenshot.sha256) {
+            throw projectWorkError(
+              "PROJECT_BROWSER_QA_SCREENSHOT_STALE",
+              "页面验收截图校验失败",
+              502,
+            );
+          }
+          await writeFile(
+            path.join(runDirectory, `${profileId}.png`),
+            bytes,
+            { flag: "wx", mode: 0o600 },
+          );
+          captures.push({
+            profile: capture.profile,
+            screenshot: {
+              mimeType: capture.screenshot.mimeType,
+              byteLength: capture.screenshot.byteLength,
+              sha256: capture.screenshot.sha256,
+            },
+            dom: capture.dom,
+            accessibility: capture.accessibility,
+          });
+        }
+        const assessment = assessBrowserQaEvidence({
+          captures,
+          console: result.console,
+          failedRequests: result.failedRequests,
+          security: result.security,
+        });
+        const completed = {
+          ...pending,
+          status: "completed",
+          ...assessment,
+          adapterId: result.adapterId,
+          preview: result.preview,
+          captures,
+          console: result.console,
+          failedRequests: result.failedRequests,
+          security: result.security,
+          completedAt: result.completedAt ?? timestamp(),
+        };
+        await updateConversation(conversationId, (current) => ({
+          browserQaRuns: (current.browserQaRuns ?? []).map((item) => (
+            item.id === runId ? completed : item
+          )),
+        }));
+        await appendEvent(conversationId, "browser_qa.completed", {
+          id: runId,
+          status: "completed",
+          verdict: assessment.verdict,
+          artifactId: "run_result",
+          captureCount: captures.length,
+          ...assessment.issueSummary,
+        });
+      } catch (error) {
+        await rm(runDirectory, { recursive: true, force: true })
+          .catch(() => undefined);
+        const safeError = safeProjectWorkError(error);
+        const failed = {
+          ...pending,
+          status: "failed",
+          verdict: null,
+          issueSummary: null,
+          error: safeError,
+          completedAt: timestamp(),
+        };
+        await updateConversation(conversationId, (current) => ({
+          browserQaRuns: (current.browserQaRuns ?? []).map((item) => (
+            item.id === runId ? failed : item
+          )),
+        }));
+        await appendEvent(conversationId, "browser_qa.failed", {
+          id: runId,
+          status: "failed",
+          artifactId: "run_result",
+          error: safeError,
+        });
+      }
+      return snapshot(conversationId);
+    })();
+    Object.defineProperty(operation, "clientRequestId", {
+      value: requestId,
+      enumerable: false,
+    });
+    browserQaRuns.set(conversationId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (browserQaRuns.get(conversationId) === operation) {
+        browserQaRuns.delete(conversationId);
+      }
+      if (
+        leasedProjectId
+        && browserQaProjectRuns.get(leasedProjectId) === projectLease
+      ) {
+        browserQaProjectRuns.delete(leasedProjectId);
+      }
+    }
+  }
+
+  async function readBrowserQaScreenshot(
+    conversationId,
+    runId,
+    profileId,
+  ) {
+    assertActive();
+    if (!["desktop", "mobile"].includes(profileId)) {
+      throw projectWorkError(
+        "PROJECT_BROWSER_QA_SCREENSHOT_NOT_FOUND",
+        "页面验收截图不存在",
+        404,
+      );
+    }
+    const conversation = await conversationStore.get(conversationId);
+    const run = (conversation.browserQaRuns ?? []).find(
+      (item) => item.id === runId && item.status === "completed",
+    );
+    const capture = run?.captures?.find(
+      (item) => item.profile?.id === profileId,
+    );
+    if (!capture?.screenshot?.sha256) {
+      throw projectWorkError(
+        "PROJECT_BROWSER_QA_SCREENSHOT_NOT_FOUND",
+        "页面验收截图不存在",
+        404,
+      );
+    }
+    const bytes = await readFile(path.join(
+      conversationPaths(conversationId).directory,
+      "browser-qa",
+      runId,
+      `${profileId}.png`,
+    )).catch(() => null);
+    if (
+      !bytes
+      || sha256(bytes) !== capture.screenshot.sha256
+    ) {
+      throw projectWorkError(
+        "PROJECT_BROWSER_QA_SCREENSHOT_STALE",
+        "页面验收截图未通过读回校验",
+        409,
+      );
+    }
+    return {
+      mimeType: "image/png",
+      bytes,
+    };
   }
 
   function changeSetBindings(changeSet) {
@@ -3638,6 +4379,7 @@ export function createProjectWorkService({
       const currentTurnVerifications = (current.verifications ?? []).filter(
         (verification) => (
           verification.status === "requested"
+          && typeof verification.recipeId === "string"
           && verification.turnId === turnSettings.turnId
           && verification.executionPolicyRevision
             === turnSettings.executionPolicyRevision
@@ -3682,12 +4424,13 @@ export function createProjectWorkService({
       }
       await settleAutoPreview(runtime, changeApplied, turnSettings);
       const settled = await conversationStore.get(conversationId);
-      return updateConversation(conversationId, {
-        status: settled.activeChangeSet?.status === "applied"
-          ? "applied"
-          : "idle",
+      const resumeStatus = settled.activeChangeSet?.status === "applied"
+        ? "applied"
+        : "idle";
+      return updateConversation(conversationId, (current) => ({
+        status: stableStatusAfterOperation(current, resumeStatus),
         lastError: null,
-      });
+      }));
     } finally {
       autoReviewSettlements.delete(conversationId);
     }
@@ -3836,6 +4579,7 @@ export function createProjectWorkService({
       case "agent_start":
         await finishRuntimeThinking(runtime);
         resetAssistantPartialState(runtime);
+        runtime.codeEvidence = [];
         await updateConversation(conversationId, {
           status: "running",
           lastError: null,
@@ -3857,23 +4601,31 @@ export function createProjectWorkService({
             turnSettings,
             contextConversation.contextUsage,
           );
-          const changeSet = await refreshChangeSet(
-            conversationId,
-            turnSettings,
-          );
-          const settledConversation = turnSettings.executionPolicyMode
-            === "auto_review"
-            ? await settleAutoReview(runtime, changeSet, turnSettings)
-            : await updateConversation(conversationId, {
-                status: changeSet.files.length > 0
-                  ? "awaiting_confirmation"
-                  : "idle",
-                lastError: null,
-              });
+          let settledConversation;
+          if (turnSettings.workflowId) {
+            settledConversation = await updateConversation(conversationId, (current) => ({
+              status: stableStatusAfterOperation(current, "idle"),
+              lastError: null,
+            }));
+          } else {
+            const changeSet = await refreshChangeSet(
+              conversationId,
+              turnSettings,
+            );
+            settledConversation = turnSettings.executionPolicyMode
+              === "auto_review"
+              ? await settleAutoReview(runtime, changeSet, turnSettings)
+              : await updateConversation(conversationId, (current) => ({
+                  status: stableStatusAfterOperation(current, "idle"),
+                  lastError: null,
+                }));
+          }
           const settledStatus = settledConversation.status;
-          await appendEvent(conversationId, "agent.status", {
-            status: settledStatus,
-          });
+          await appendEvent(
+            conversationId,
+            "agent.status",
+            agentStatusEventData(settledConversation, settledStatus),
+          );
         } catch (error) {
           await failConversationOperation(
             conversationId,
@@ -4023,6 +4775,7 @@ export function createProjectWorkService({
                 contextUsage: null,
                 capturedAt: createdAt,
               },
+              codeEvidence: normalizedCodeEvidence(runtime.codeEvidence),
               createdAt,
             };
             return {
@@ -4043,6 +4796,7 @@ export function createProjectWorkService({
               message.verificationRepairOperationId ?? null,
             repairAttempt: message.repairAttempt ?? null,
             turnEvidence: publicTurnEvidence(message.turnEvidence),
+            codeEvidence: normalizedCodeEvidence(message.codeEvidence),
           });
           runtime.activeAssistantId = null;
           runtime.assistantText = "";
@@ -4074,6 +4828,14 @@ export function createProjectWorkService({
         );
         break;
       case "tool_execution_end":
+        if (!event.isError) {
+          runtime.codeEvidence = normalizedCodeEvidence([
+            ...(runtime.codeEvidence ?? []),
+            ...(Array.isArray(event.result?.details?.evidence)
+              ? event.result.details.evidence
+              : []),
+          ]);
+        }
         await appendEvent(
           conversationId,
           "tool.completed",
@@ -4149,6 +4911,7 @@ export function createProjectWorkService({
       partialPublishedLength: 0,
       partialLastPublishedAtMs: null,
       partialRevision: 0,
+      codeEvidence: [],
       completion: null,
       providerId: conversation.providerId,
       modelId: conversation.modelId,
@@ -4193,6 +4956,11 @@ export function createProjectWorkService({
       },
       onPlan: (plan) => recordPlan(conversationId, plan),
       onVerificationRequest: (request) => recordVerificationRequest(
+        conversationId,
+        request,
+        runtime.activeTurnSettings,
+      ),
+      onGitCloseoutRequest: (request) => recordGitCloseoutRequest(
         conversationId,
         request,
         runtime.activeTurnSettings,
@@ -4427,7 +5195,7 @@ export function createProjectWorkService({
           });
         }
         await appendEvent(conversationId, "agent.status", {
-          status: conversation.status,
+          ...agentStatusEventData(conversation),
         });
       } else {
         conversation = await updateConversation(conversationId, {
@@ -5469,6 +6237,7 @@ export function createProjectWorkService({
           userMessage = existingMessage;
           return {};
         }
+        assertBrowserQaNotRunning(conversationId, current);
         if (
           activeMessageClaims.has(conversationId)
           || BUSY_CONVERSATION_STATUSES.has(current.status)
@@ -5808,8 +6577,15 @@ export function createProjectWorkService({
         try {
           const latest = await conversationStore.get(conversationId);
           if (latest.status === "running") {
-            await updateConversation(conversationId, { status: "idle" });
-            await appendEvent(conversationId, "agent.status", { status: "idle" });
+            const settledStatus = stableStatusAfterOperation(latest, "idle");
+            const settled = await updateConversation(conversationId, {
+              status: settledStatus,
+            });
+            await appendEvent(
+              conversationId,
+              "agent.status",
+              agentStatusEventData(settled, settledStatus),
+            );
           }
         } finally {
           try {
@@ -5863,6 +6639,7 @@ export function createProjectWorkService({
         replayed = true;
         return {};
       }
+      assertBrowserQaNotRunning(conversationId, current);
       if (
         activeMessageClaims.has(conversationId)
         || BUSY_CONVERSATION_STATUSES.has(current.status)
@@ -6125,18 +6902,18 @@ export function createProjectWorkService({
         try {
           const latest = await conversationStore.get(conversationId);
           if (latest.status === "running") {
-            await updateConversation(conversationId, {
-              status: stableStatusAfterOperation(
-                latest,
-                operation.resumeStatus,
-              ),
+            const settledStatus = stableStatusAfterOperation(
+              latest,
+              operation.resumeStatus,
+            );
+            const settled = await updateConversation(conversationId, {
+              status: settledStatus,
             });
-            await appendEvent(conversationId, "agent.status", {
-              status: stableStatusAfterOperation(
-                latest,
-                operation.resumeStatus,
-              ),
-            });
+            await appendEvent(
+              conversationId,
+              "agent.status",
+              agentStatusEventData(settled, settledStatus),
+            );
           }
         } finally {
           try {
@@ -6622,6 +7399,7 @@ export function createProjectWorkService({
     assertActive();
     assertConversationNotDeleting(conversationId);
     const conversation = await conversationStore.get(conversationId);
+    assertBrowserQaNotRunning(conversationId, conversation);
     const runtime = runtimes.get(conversationId);
     if (autoReviewSettlements.has(conversationId)) {
       throw projectWorkError(
@@ -6786,12 +7564,27 @@ export function createProjectWorkService({
     const conversation = await conversationStore.get(conversationId);
     const workspace = await resolveConversationWorkspace(conversation);
     const paths = conversationPaths(conversationId);
-    return readProjectWorkOverlayTextFile({
+    const file = await readProjectWorkOverlayTextFile({
       ...options,
       projectRoot: workspace.projectRoot,
       baseRoot: paths.baseRoot,
       workspaceRoot: paths.workspaceRoot,
     });
+    if (
+      options.expectedContentHash !== undefined
+      && (
+        !SHA256_PATTERN.test(String(options.expectedContentHash))
+        || file.hash !== options.expectedContentHash
+      )
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_CODE_EVIDENCE_STALE",
+        "代码引用对应的文件版本已经变化",
+        409,
+        true,
+      );
+    }
+    return file;
   }
 
   async function readConversationImage(conversationId, options = {}) {
@@ -6883,6 +7676,210 @@ export function createProjectWorkService({
     }
     const workspace = await resolveConversationWorkspace(conversation);
     return gitInspector(workspace.projectRoot);
+  }
+
+  async function listGitCloseouts(conversationId) {
+    assertActive();
+    const conversation = await conversationStore.get(conversationId);
+    if (conversationWorkspaceKind(conversation) === "scratch") return [];
+    const workspace = await resolveConversationWorkspace(conversation);
+    const recovered = await effectiveGitCloseoutService.recoverGitCloseouts({
+      projectRoot: workspace.projectRoot,
+      conversationId,
+    });
+    for (const record of recovered) {
+      if (record.status !== "recovery_blocked") continue;
+      await appendEvent(conversationId, "git_closeout.recovery_blocked", {
+        id: record.id,
+        status: record.status,
+        turnId: record.turnId,
+        changeSetId: record.changeSetId,
+        changeSetHash: record.changeSetHash,
+        artifactId: "changes",
+      });
+    }
+    const records = (await effectiveGitCloseoutService.listGitCloseouts({
+      projectRoot: workspace.projectRoot,
+      conversationId,
+    })).map(publicGitCloseout).filter(Boolean);
+    await updateConversation(conversationId, {
+      gitCloseouts: records.slice(0, 50),
+    });
+    return records;
+  }
+
+  async function confirmGitCloseout(conversationId, confirmation = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const conversation = await conversationStore.get(conversationId);
+    if (
+      BUSY_CONVERSATION_STATUSES.has(conversation.status)
+      || autoReviewSettlements.has(conversationId)
+    ) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_CONVERSATION_BUSY",
+        "Agent 或验证仍在运行，暂不能确认 Git 收尾",
+        409,
+      );
+    }
+    if (conversationWorkspaceKind(conversation) === "scratch") {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_PROJECT_REQUIRED",
+        "Git 收尾只适用于已绑定的本地项目",
+        409,
+      );
+    }
+    const workspace = await resolveConversationWorkspace(conversation);
+    const proposalId = compactText(confirmation?.proposalId, 180);
+    const existing = await effectiveGitCloseoutService.getGitCloseout({
+      projectRoot: workspace.projectRoot,
+      proposalId,
+      conversationId,
+    });
+    const expectedBinding = createGitCloseoutBinding(existing);
+    const receivedBinding = {
+      proposalId,
+      proposalHash: confirmation?.proposalHash,
+      conversationId: confirmation?.conversationId,
+      turnId: confirmation?.turnId,
+      changeSetId: confirmation?.changeSetId,
+      changeSetHash: confirmation?.changeSetHash,
+      branch: confirmation?.branch,
+      head: confirmation?.head,
+      commitMessage: confirmation?.commitMessage,
+      files: confirmation?.files,
+      verificationEvidence: confirmation?.verificationEvidence,
+    };
+    if (JSON.stringify(receivedBinding) !== JSON.stringify(expectedBinding)) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_CONFIRMATION_MISMATCH",
+        "Git 收尾确认内容与当前精确预览不一致",
+        409,
+      );
+    }
+    const activeChangeSet = conversation.activeChangeSet;
+    if (
+      existing.conversationId !== conversationId
+      || !activeChangeSet
+      || activeChangeSet.status !== "applied"
+      || activeChangeSet.id !== existing.changeSetId
+      || activeChangeSet.hash !== existing.changeSetHash
+    ) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_CHANGESET_BINDING_STALE",
+        "Git 收尾绑定的已应用修改已变化，请重新生成预览",
+        409,
+        true,
+      );
+    }
+    const appliedFiles = new Map(
+      (activeChangeSet.files ?? [])
+        .filter((file) => file.status === "applied")
+        .map((file) => [file.path, file.afterHash]),
+    );
+    if (existing.files.some((file) => (
+      !appliedFiles.has(file.path)
+      || appliedFiles.get(file.path) !== file.hash
+    ))) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_FILE_BINDING_STALE",
+        "Git 收尾绑定的文件不再属于当前已应用修改",
+        409,
+        true,
+      );
+    }
+    const appliedJournal = [...(conversation.applyJournal ?? [])]
+      .reverse()
+      .find((journal) => (
+        journal.status === "applied"
+        && journal.changeSetId === existing.changeSetId
+        && journal.changeSetHash === existing.changeSetHash
+      ));
+    const journalFiles = new Map(
+      (appliedJournal?.files ?? []).map((file) => [file.path, file]),
+    );
+    const activeFiles = new Map(
+      (activeChangeSet.files ?? []).map((file) => [file.path, file]),
+    );
+    if (existing.files.some((file) => {
+      const change = activeFiles.get(file.path);
+      const journalFile = journalFiles.get(file.path);
+      return !change
+        || !journalFile
+        || change.baseHash !== file.baseHash
+        || journalFile.baseHash !== file.baseHash
+        || (file.baseHash !== null
+          && journalFile.projectBeforeMode !== file.baseMode)
+        || (file.baseHash === null
+          && (file.baseExists || file.baseMode !== null));
+    })) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_BASE_BINDING_STALE",
+        "Git 收尾绑定的修改前文件状态已变化，请重新生成预览",
+        409,
+        true,
+      );
+    }
+    const currentVerifications = new Map(
+      (conversation.verifications ?? []).map(
+        (verification) => [verification.id, verification],
+      ),
+    );
+    if (existing.verificationEvidence.some((evidence) => {
+      const current = currentVerifications.get(evidence.id);
+      return !current
+        || current.status !== "passed"
+        || current.exitCode !== 0
+        || current.changeSetId !== existing.changeSetId
+        || current.changeSetHash !== existing.changeSetHash
+        || current.commandBindingHash !== evidence.commandBindingHash;
+    })) {
+      throw projectWorkError(
+        "GIT_CLOSEOUT_VERIFICATION_BINDING_STALE",
+        "Git 收尾绑定的验证证据已变化，请重新验证",
+        409,
+        true,
+      );
+    }
+    let committed;
+    if (existing.status === "committed") {
+      committed = existing;
+    } else {
+      committed = await effectiveGitCloseoutService.confirmGitCloseout({
+        projectRoot: workspace.projectRoot,
+        ...receivedBinding,
+      });
+    }
+    const publicCommitted = publicGitCloseout(committed);
+    const settledConversation = await updateConversation(conversationId, (current) => {
+      const gitCloseouts = [
+        publicCommitted,
+        ...(current.gitCloseouts ?? []).filter(
+          (item) => item.id !== publicCommitted.id,
+        ),
+      ].slice(0, 50);
+      return {
+        status: stableStatusAfterOperation({
+          ...current,
+          gitCloseouts,
+        }, "applied"),
+        gitCloseouts,
+      };
+    });
+    await appendEvent(conversationId, "git_closeout.committed", {
+      id: publicCommitted.id,
+      status: publicCommitted.status,
+      turnId: publicCommitted.turnId,
+      changeSetId: publicCommitted.changeSetId,
+      changeSetHash: publicCommitted.changeSetHash,
+      branch: publicCommitted.branch,
+      head: publicCommitted.head,
+      commitHash: publicCommitted.commitHash,
+      fileCount: publicCommitted.files.length,
+      artifactId: "changes",
+      pendingReview: settledConversation.status === "awaiting_confirmation",
+    });
+    return snapshot(conversationId);
   }
 
   async function getWorkspace(conversationId) {
@@ -7394,6 +8391,7 @@ export function createProjectWorkService({
       || (record.status === "applied" && !record.finalizedAt)
     ));
     if (pending.length === 0) return conversation;
+    assertBrowserQaNotRunning(conversationId, conversation);
     const workspace = await resolveConversationWorkspace(conversation);
     const paths = conversationPaths(conversationId);
     await withApplyLock(workspace.lockKey, async () => {
@@ -7446,6 +8444,7 @@ export function createProjectWorkService({
     return withApplyLock(initialWorkspace.lockKey, async () => {
       assertConversationNotDeleting(conversationId);
       const conversation = await conversationStore.get(conversationId);
+      assertBrowserQaNotRunning(conversationId, conversation);
       if (
         (
           BUSY_CONVERSATION_STATUSES.has(conversation.status)
@@ -7552,6 +8551,7 @@ export function createProjectWorkService({
     const workspace = await resolveConversationWorkspace(initial);
     return withApplyLock(workspace.lockKey, async () => {
       const conversation = await conversationStore.get(conversationId);
+      assertBrowserQaNotRunning(conversationId, conversation);
       if (
         BUSY_CONVERSATION_STATUSES.has(conversation.status)
         || activeMessageClaims.has(conversationId)
@@ -7702,6 +8702,7 @@ export function createProjectWorkService({
       (verification) => (
         verification.id === commandId
         && verification.status === "requested"
+        && typeof verification.recipeId === "string"
       ),
     ) ?? null;
   }
@@ -8098,6 +9099,7 @@ export function createProjectWorkService({
     const startedAt = timestamp();
     let operation;
     await updateConversation(conversationId, (current) => {
+      assertBrowserQaNotRunning(conversationId, current);
       const verification = verificationByCommandId(current, commandId);
       if (!verification) {
         throw projectWorkError(
@@ -8173,6 +9175,7 @@ export function createProjectWorkService({
         operation = target;
         return {};
       }
+      assertBrowserQaNotRunning(conversationId, current);
       operation = target?.status === "interrupted" ? target : null;
       if (!operation) {
         throw projectWorkError(
@@ -8229,9 +9232,27 @@ export function createProjectWorkService({
     assertActive();
     assertConversationNotDeleting(conversationId);
     const conversation = await conversationStore.get(conversationId);
-    const verification = (conversation.verifications ?? []).find(
-      (item) => item.id === requestId && item.status === "requested",
+    assertBrowserQaNotRunning(conversationId, conversation);
+    const candidate = (conversation.verifications ?? []).find(
+      (item) => item.id === requestId,
     );
+    if (
+      candidate?.status === "requested"
+      && typeof candidate.recipeId !== "string"
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_VERIFICATION_LEGACY_BLOCKED",
+        "旧版自由命令验证已停用，请让 Pi 重新创建受控配方",
+        409,
+        true,
+      );
+    }
+    const verification = (
+      candidate?.status === "requested"
+      && typeof candidate.recipeId === "string"
+    )
+      ? candidate
+      : null;
     if (!verification) {
       throw projectWorkError(
         "PROJECT_WORK_VERIFICATION_NOT_FOUND",
@@ -8323,6 +9344,7 @@ export function createProjectWorkService({
     );
     const verificationBaseRoot = path.join(verificationDirectory, "base");
     const verificationWorkspaceRoot = path.join(verificationDirectory, "workspace");
+    const verificationTemporaryRoot = path.join(verificationDirectory, "tmp");
     await updateConversation(conversationId, (current) => ({
       status: preserveConversationStatus ? current.status : "verifying",
       verifications: [...current.verifications, attempt],
@@ -8336,11 +9358,12 @@ export function createProjectWorkService({
     let result;
     let failureCode = null;
     try {
-      const materialized = await createSnapshot({
+      const materialized = await createVerificationSnapshot({
         projectRoot: workspace.projectRoot,
         baseRoot: verificationBaseRoot,
         workspaceRoot: verificationWorkspaceRoot,
         storageRoot: configuredStorageRoot,
+        recipeStack: verification.recipe?.stack ?? "node",
       });
       if (
         materialized?.truncated === true
@@ -8381,14 +9404,33 @@ export function createProjectWorkService({
           transitions,
         });
       }
-      const resolvedScript = await resolvePackageScript(
-        {
-          projectRoot: verificationWorkspaceRoot,
-          baseRoot: verificationBaseRoot,
-          workspaceRoot: verificationWorkspaceRoot,
+      const currentRecipe = await resolveVerificationRecipe({
+        recipeId: verification.recipeId,
+        cwd: verification.command.cwd,
+        readTextFile: async (filePath) => {
+          const normalizedPath = normalizeProjectPath(filePath);
+          return readFile(
+            path.join(
+              verificationWorkspaceRoot,
+              ...normalizedPath.split("/"),
+            ),
+            "utf8",
+          );
         },
-        verification.command,
-      );
+      });
+      if (
+        currentRecipe.bindingHash !== verification.recipe?.bindingHash
+        || JSON.stringify(currentRecipe.command)
+          !== JSON.stringify(verification.command)
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_VERIFICATION_BINDING_CHANGED",
+          "项目清单或验证配方已变化，请让 Pi 重新保存验证请求",
+          409,
+          true,
+        );
+      }
+      const resolvedScript = currentRecipe.resolvedScript;
       if ((resolvedScript ?? null) !== (verification.resolvedScript ?? null)) {
         throw projectWorkError(
           "PROJECT_WORK_VERIFICATION_BINDING_CHANGED",
@@ -8401,9 +9443,15 @@ export function createProjectWorkService({
         verificationWorkspaceRoot,
         verification.command.cwd,
       );
+      await mkdir(verificationTemporaryRoot, {
+        recursive: true,
+        mode: 0o700,
+      });
       result = await runner({
         ...verification.command,
+        workspaceRoot: verificationWorkspaceRoot,
         cwd,
+        temporaryDirectory: verificationTemporaryRoot,
         signal: controller.signal,
       });
     } catch (error) {
@@ -8479,19 +9527,27 @@ export function createProjectWorkService({
         },
         truncated: result.truncated === true,
         timedOut: result.timedOut === true,
+        isolation: compactText(result.isolation, 120) || null,
         errorCode: failureCode,
         completedAt,
       };
-      await updateConversation(conversationId, (current) => ({
-        status: preserveConversationStatus
-          || operationAborted
-          || ["aborted", "stopped"].includes(current.status)
-          ? current.status
-          : resumeStatus,
-        verifications: current.verifications.map((item) => (
+      const settledConversation = await updateConversation(conversationId, (current) => {
+        const verifications = current.verifications.map((item) => (
           item.id === attempt.id ? completed : item
-        )),
-      }));
+        ));
+        const nextCurrent = {
+          ...current,
+          verifications,
+        };
+        return {
+          status: preserveConversationStatus
+            || operationAborted
+            || ["aborted", "stopped"].includes(current.status)
+            ? current.status
+            : stableStatusAfterOperation(nextCurrent, resumeStatus),
+          verifications,
+        };
+      });
       await appendEvent(conversationId, "verification.completed", {
         id: attempt.id,
         commandId: verification.id,
@@ -8504,6 +9560,18 @@ export function createProjectWorkService({
         repairOperationId: completed.repairOperationId,
         repairAttempt: completed.repairAttempt,
       });
+      if (
+        status === "passed"
+        && !autoReviewSettlement
+        && !preserveConversationStatus
+        && ["idle", "applied"].includes(settledConversation.status)
+      ) {
+        await appendEvent(
+          conversationId,
+          "agent.status",
+          agentStatusEventData(settledConversation),
+        );
+      }
       if (
         !suppressRepairLoop
         && !autoReviewSettlement
@@ -8654,6 +9722,7 @@ export function createProjectWorkService({
     const hasBusyConversation = (items) => items.some((conversation) => (
       BUSY_CONVERSATION_STATUSES.has(conversation.status)
       || Boolean(runtimes.get(conversation.id)?.completion)
+      || browserQaRuns.has(conversation.id)
       || autoReviewSettlements.has(conversation.id)
       || (documentOperationCounts.get(conversation.id) ?? 0) > 0
       || hasActiveConversationDocuments(conversation)
@@ -8726,6 +9795,9 @@ export function createProjectWorkService({
       if (runtime.completion) closing.push(runtime.completion);
       runtime.host?.dispose?.();
     }
+    closing.push(...browserQaRuns.values());
+    browserQaRuns.clear();
+    browserQaProjectRuns.clear();
     runtimes.clear();
     activeMessageClaims.clear();
     followUpMutationQueues.clear();
@@ -8753,6 +9825,7 @@ export function createProjectWorkService({
     compactConversation,
     configureConversation,
     configureExecutionPolicy,
+    confirmGitCloseout,
     createAskUserRequest,
     createConversationAttachment,
     createConversation,
@@ -8772,6 +9845,7 @@ export function createProjectWorkService({
     listAskUserRequests,
     listConversations,
     listFollowUps,
+    listGitCloseouts,
     listInstalledSkills,
     listModels,
     listProviderConnections,
@@ -8784,6 +9858,7 @@ export function createProjectWorkService({
     readConversationFile,
     readConversationImage,
     readGeneratedImage,
+    readBrowserQaScreenshot,
     readProjectFile,
     readProjectImage,
     registerProject,
@@ -8801,6 +9876,7 @@ export function createProjectWorkService({
     retryConversationDocument,
     retryLastTurn,
     resumeVerificationRepair,
+    runBrowserQa,
     runVerification,
     saveProviderApiKey,
     sendMessage,

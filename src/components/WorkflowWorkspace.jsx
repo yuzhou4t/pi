@@ -662,6 +662,26 @@ function pastRunWeekLabel(run) {
   return date ? `${date} 那周` : "早先周次";
 }
 
+// 周窗口以周一为起点（与服务端 journalWeekWindowKey 一致），展示为周一至周日。
+function weekWindowLabel(windowKey, fallbackDate = null) {
+  let start = null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(windowKey ?? ""))) {
+    start = new Date(`${windowKey}T00:00:00Z`);
+  } else if (fallbackDate) {
+    const parsed = new Date(fallbackDate);
+    if (Number.isFinite(parsed.getTime())) {
+      parsed.setUTCHours(0, 0, 0, 0);
+      parsed.setUTCDate(parsed.getUTCDate() - ((parsed.getUTCDay() + 6) % 7));
+      start = parsed;
+    }
+  }
+  if (!start || !Number.isFinite(start.getTime())) return null;
+  const end = new Date(start);
+  end.setUTCDate(end.getUTCDate() + 6);
+  const fmt = (date) => `${date.getUTCMonth() + 1}月${date.getUTCDate()}日`;
+  return `${start.getUTCFullYear()}年${fmt(start)} – ${fmt(end)}`;
+}
+
 function pastDecisionLabel(decision) {
   if (decision === "read") return "已精读";
   if (decision === "collect") return "已收藏";
@@ -846,6 +866,12 @@ function CandidateReview({
                       : "等待开始本周扫描"}
             </span>
             <h2 id="review-title">选择本周要读的论文</h2>
+            {(() => {
+              const windowLabel = weekWindowLabel(liveRun?.windowKey, liveRun?.createdAt);
+              return windowLabel ? (
+                <p className="workflow-week-window">本周窗口：{windowLabel}（仅此区间内发表的算本周新论文）</p>
+              ) : null;
+            })()}
             {scanSummary ? (
               <p className="workflow-scan-summary">
                 扫描 <strong>{scanMetric(scanSummary, "raw_record_count", "rawCount", 46)}</strong> 条
