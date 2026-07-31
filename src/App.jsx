@@ -101,6 +101,9 @@ const WorkflowContextRail = lazy(() => import(
 const TopicSearchWorkspace = lazy(() => import(
   "./components/TopicSearchWorkspace.jsx"
 ).then((module) => ({ default: module.TopicSearchWorkspace })));
+const JournalLibraryWorkspace = lazy(() => import(
+  "./components/JournalLibraryWorkspace.jsx"
+).then((module) => ({ default: module.JournalLibraryWorkspace })));
 const WORKFLOW_FIXTURES_ENABLED = import.meta.env.VITE_ENABLE_WORKFLOW_FIXTURES === "true";
 
 const runStatusLabels = {
@@ -805,7 +808,30 @@ export function App() {
   const topicSearchMode = !projectWorkMode
     && !readingMode
     && activeConversationId === "topic-search";
-  const workflowMode = !projectWorkMode && !readingMode && !topicSearchMode;
+  const journalLibraryView = !projectWorkMode && !readingMode
+    ? (activeConversationId === "journal-classics"
+        ? "recent_classics"
+        : activeConversationId === "journal-history"
+          ? "past_runs"
+          : null)
+    : null;
+  const workflowMode = !projectWorkMode && !readingMode && !topicSearchMode && !journalLibraryView;
+  // 近年经典优先取当前 Run；当前 Run 还没整理时退回最近一期有数据的 Run。
+  const recentClassicsSource = useMemo(() => {
+    if (journalRunState.run?.recentClassics) {
+      return { data: journalRunState.run.recentClassics, runId: journalRunState.run.id, status: journalRunState.run.status };
+    }
+    const fallback = journalRunHistory.find((historyRun) => historyRun.recentClassics);
+    return fallback
+      ? { data: fallback.recentClassics, runId: fallback.id, status: fallback.status }
+      : null;
+  }, [journalRunState.run, journalRunHistory]);
+  const recentClassicsCanAdd = ["review_ready", "guide_ready", "reading", "draft_ready", "reading_ready"]
+    .includes(recentClassicsSource?.status);
+  const journalPastRuns = useMemo(() => journalRunHistory.filter((historyRun) => (
+    historyRun.id !== journalRunState.run?.id
+    && (historyRun.candidates?.length ?? 0) > 0
+  )), [journalRunHistory, journalRunState.run?.id]);
   const readerGuideArtifactState = readerTarget
     ? readerRun?.guides?.papers?.[readerTarget.paperId] ?? null
     : null;
@@ -1864,6 +1890,18 @@ export function App() {
     setMobileView("run");
   }, [setActiveConversationId]);
 
+  const openRecentClassics = useCallback(() => {
+    setReaderTarget(null);
+    setActiveConversationId("journal-classics");
+    setMobileView("run");
+  }, [setActiveConversationId]);
+
+  const openPastRuns = useCallback(() => {
+    setReaderTarget(null);
+    setActiveConversationId("journal-history");
+    setMobileView("run");
+  }, [setActiveConversationId]);
+
   const selectTopicConversation = useCallback(async (conversationId) => {
     setActiveTopicConversationId(conversationId);
     setActiveConversationId("topic-search");
@@ -1981,23 +2019,22 @@ export function App() {
     }
   }, [activeTopicConversationId, showToast, syncJournalRun]);
 
-  const addRecentClassicPapers = useCallback(async (paperIds) => {
-    const runId = journalRunState.run?.id;
+  const addRecentClassicPapers = useCallback(async (runId, paperIds) => {
     if (!runId) throw new Error("当前没有可操作的运行");
     const nextRun = await addRecentClassicsToWeekly({ runId, paperIds });
     syncJournalRun(nextRun);
     showToast("已加入本月推荐，可从每月追踪准备全文");
-  }, [journalRunState.run?.id, showToast, syncJournalRun]);
+  }, [showToast, syncJournalRun]);
 
-  const dismissRecentClassicPaper = useCallback(async (paper) => {
+  const dismissRecentClassicPaper = useCallback(async (runId, paper) => {
     const result = await dismissJournalPaper({
-      runId: journalRunState.run?.id ?? null,
+      runId: runId ?? null,
       dedupeKey: paper.dedupeKey,
       title: paper.title ?? "",
     });
     if (result.run) syncJournalRun(result.run);
     showToast("已标记不感兴趣，之后不会再推荐这篇论文");
-  }, [journalRunState.run?.id, showToast, syncJournalRun]);
+  }, [showToast, syncJournalRun]);
 
   const retryPaperDocument = useCallback(async (paperId) => {
     const runId = journalRunState.run?.id;
@@ -3299,6 +3336,16 @@ export function App() {
             && project.id === workflowFixture.project.id
             ? openTopicSearch
             : undefined}
+          recentClassicsActive={journalLibraryView === "recent_classics"}
+          onSelectRecentClassics={workspaceKind === "paper_reading"
+            && project.id === workflowFixture.project.id
+            ? openRecentClassics
+            : undefined}
+          pastRunsActive={journalLibraryView === "past_runs"}
+          onSelectPastRuns={workspaceKind === "paper_reading"
+            && project.id === workflowFixture.project.id
+            ? openPastRuns
+            : undefined}
           topicConversations={topicConversations}
           activeTopicConversationId={activeTopicConversationId}
           onSelectTopicConversation={selectTopicConversation}
@@ -3442,6 +3489,17 @@ export function App() {
             mobileActive={mobileView === "run" || mobileView === "evidence"}
             mobileView={mobileView}
           />
+        ) : journalLibraryView ? (
+          <JournalLibraryWorkspace
+            view={journalLibraryView}
+            recentClassics={recentClassicsSource?.data ?? null}
+            canAddToWeekly={recentClassicsCanAdd}
+            onAddRecentClassics={(paperIds) => addRecentClassicPapers(recentClassicsSource?.runId ?? null, paperIds)}
+            onDismissRecentClassic={(paper) => dismissRecentClassicPaper(recentClassicsSource?.runId ?? null, paper)}
+            pastRuns={journalPastRuns}
+            sidebarOpen={sidebarOpen}
+            onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
+          />
         ) : topicSearchMode ? (
           <TopicSearchWorkspace
             conversationState={topicSearchState}
@@ -3482,12 +3540,6 @@ export function App() {
           candidateSummaryState={candidateSummaryState}
           onGenerateCandidateSummaries={generateCandidateSummaries}
           journalRunState={journalRunState}
-          pastRuns={journalRunHistory.filter((historyRun) => (
-            historyRun.id !== journalRunState.run?.id
-            && (historyRun.candidates?.length ?? 0) > 0
-          ))}
-          onAddRecentClassics={addRecentClassicPapers}
-          onDismissRecentClassic={dismissRecentClassicPaper}
           readerTarget={readerTarget}
           onOpenPaper={openJournalPaper}
           onOpenCloseReading={(paperId) => openJournalPaper(

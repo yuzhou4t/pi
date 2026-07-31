@@ -5,6 +5,7 @@ import {
   CaretRight,
   ChatText,
   CircleNotch,
+  ClockCounterClockwise,
   Code,
   DotsThree,
   FolderSimplePlus,
@@ -198,6 +199,10 @@ export function ProjectRail({
   selectedRunId = null,
   topicSearchActive = false,
   onSelectTopicSearch,
+  recentClassicsActive = false,
+  onSelectRecentClassics,
+  pastRunsActive = false,
+  onSelectPastRuns,
   topicConversations = [],
   activeTopicConversationId = null,
   onSelectTopicConversation,
@@ -503,6 +508,35 @@ export function ProjectRail({
                         </ul>
                       ) : null}
                     </div>
+                  ) : null}
+
+                  {workspaceKind === "paper_reading" && onSelectRecentClassics ? (
+                    <button
+                      className={`capability-row project-run-row${recentClassicsActive ? " is-active" : ""}`}
+                      type="button"
+                      aria-label="打开近年经典：注册刊物高引未读论文"
+                      onClick={onSelectRecentClassics}
+                    >
+                      <BookOpenText size={17} weight="regular" aria-hidden="true" />
+                      <span>
+                        <strong>近年经典</strong>
+                        <small>高引未读论文</small>
+                      </span>
+                    </button>
+                  ) : null}
+                  {workspaceKind === "paper_reading" && onSelectPastRuns ? (
+                    <button
+                      className={`capability-row project-run-row${pastRunsActive ? " is-active" : ""}`}
+                      type="button"
+                      aria-label="打开往期回看：历次推荐与处理记录"
+                      onClick={onSelectPastRuns}
+                    >
+                      <ClockCounterClockwise size={17} weight="regular" aria-hidden="true" />
+                      <span>
+                        <strong>往期回看</strong>
+                        <small>历次推荐记录</small>
+                      </span>
+                    </button>
                   ) : null}
 
                   <section

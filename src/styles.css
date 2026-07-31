@@ -14344,6 +14344,40 @@ h4.reader-rail-full-heading {
   justify-items: start;
 }
 
+.journal-library-workspace {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.journal-library-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 18px 22px 28px;
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.journal-library-body {
+  display: grid;
+  gap: 12px;
+  max-width: 860px;
+}
+
+.journal-library-scroll .workflow-past-weeks-list {
+  max-width: 860px;
+}
+
+.journal-library-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+  max-width: 640px;
+}
+
 .workflow-recent-classics-body {
   width: 100%;
   display: grid;

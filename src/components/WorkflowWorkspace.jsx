@@ -657,11 +657,6 @@ function PaperTabs({ papers, activePaperId, onSetActivePaper }) {
   );
 }
 
-function pastRunWeekLabel(run) {
-  const date = String(run.createdAt ?? "").slice(0, 10);
-  return date ? `${date} 那期` : "早先期次";
-}
-
 // 发现窗口与服务端判定一致：以扫描时刻为终点的近 30 天滚动区间，
 // 而不是自然月；月窗口 key 只用于 Run 去重。
 function monthWindowLabel(fallbackDate = null) {
@@ -672,149 +667,6 @@ function monthWindowLabel(fallbackDate = null) {
   start.setUTCDate(start.getUTCDate() - 30);
   const fmt = (date) => `${date.getUTCMonth() + 1}月${date.getUTCDate()}日`;
   return `${start.getUTCFullYear()}年${fmt(start)} – ${fmt(end)}`;
-}
-
-function pastDecisionLabel(decision) {
-  if (decision === "read") return "已精读";
-  if (decision === "collect") return "已收藏";
-  return "未处理";
-}
-
-function RecentClassicsSection({ recentClassics, onAddRecentClassics, onDismissRecentClassic }) {
-  const [open, setOpen] = useState(false);
-  const [busyId, setBusyId] = useState(null);
-  const [error, setError] = useState(null);
-  if (!recentClassics) return null;
-  const papers = recentClassics.papers ?? [];
-  const failed = recentClassics.status !== "success";
-  if (!failed && papers.length === 0) return null;
-
-  const runAction = async (paperId, action) => {
-    setBusyId(paperId);
-    setError(null);
-    try {
-      await action();
-    } catch (actionError) {
-      setError(actionError?.message ?? "操作未完成，可稍后重试");
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  return (
-    <section className="workflow-recent-classics" aria-label="近年高引未读经典">
-      <button
-        type="button"
-        className="workflow-evidence-toggle"
-        aria-expanded={open}
-        onClick={() => setOpen((current) => !current)}
-      >
-        {open ? "收起近年经典" : `近年高引 · 未读经典（${papers.length} 篇）`}
-      </button>
-      {open ? (
-        <div className="workflow-recent-classics-body">
-          {recentClassics.fromYear ? (
-            <p className="workflow-recent-classics-note">
-              {recentClassics.fromYear} 年以来、与项目主题相关的高引论文，已读、已收藏和标过不感兴趣的不会出现。
-            </p>
-          ) : null}
-          {failed ? (
-            <p className="workflow-recent-classics-note">近年经典暂时无法获取（{recentClassics.error?.message ?? "数据源不可用"}），下次扫描会重试。</p>
-          ) : null}
-          {error ? <p className="workflow-recent-classics-error">{error}</p> : null}
-          <ul className="workflow-recent-classics-list">
-            {papers.map((paper) => (
-              <li key={paper.id}>
-                <div className="workflow-recent-classic-main">
-                  <strong>{paper.titleZh || paper.title}</strong>
-                  {paper.titleZh && paper.titleZh !== paper.title ? <small>{paper.title}</small> : null}
-                  <small>
-                    {paper.venue}
-                    {paper.publishedAt ? ` · ${String(paper.publishedAt).slice(0, 10)}` : ""}
-                    {Number.isInteger(paper.citedByCount) ? ` · 引用 ${paper.citedByCount}` : ""}
-                  </small>
-                  {paper.abstract ? <p>{paper.abstract.slice(0, 180)}</p> : null}
-                </div>
-                <div className="workflow-recent-classic-actions">
-                  <button
-                    type="button"
-                    className="workflow-secondary-action"
-                    disabled={busyId === paper.id}
-                    onClick={() => runAction(paper.id, () => onAddRecentClassics([paper.id]))}
-                  >
-                    加入本月推荐
-                  </button>
-                  <button
-                    type="button"
-                    className="workflow-secondary-action"
-                    disabled={busyId === paper.id || !paper.dedupeKey}
-                    onClick={() => runAction(paper.id, () => onDismissRecentClassic(paper))}
-                  >
-                    不感兴趣
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-    </section>
-  );
-}
-
-function PastWeeksReview({ pastRuns }) {
-  const [open, setOpen] = useState(false);
-  if (!Array.isArray(pastRuns) || pastRuns.length === 0) return null;
-  return (
-    <section className="workflow-past-weeks" aria-label="往期推荐回看">
-      <button
-        type="button"
-        className="workflow-evidence-toggle"
-        aria-expanded={open}
-        onClick={() => setOpen((current) => !current)}
-      >
-        {open ? "收起往期推荐" : `回看往期推荐（${pastRuns.length} 期）`}
-      </button>
-      {open ? (
-        <div className="workflow-past-weeks-list">
-          {pastRuns.map((pastRun) => {
-            const decisions = pastRun.paperDecisions ?? {};
-            const candidates = pastRun.candidates ?? [];
-            const handledCount = candidates.filter(
-              (paper) => ["read", "collect"].includes(decisions[paper.id]),
-            ).length;
-            return (
-              <article className="workflow-past-week" key={pastRun.id}>
-                <header>
-                  <strong>{pastRunWeekLabel(pastRun)}</strong>
-                  <small>{candidates.length} 篇推荐 · 处理 {handledCount} 篇</small>
-                </header>
-                <ul>
-                  {candidates.map((paper) => {
-                    const decision = decisions[paper.id];
-                    const date = String(paper.publishedAt ?? "").slice(0, 10);
-                    return (
-                      <li key={`${pastRun.id}-${paper.id}`}>
-                        <span className="workflow-past-paper-title">
-                          {paper.titleZh && paper.titleZh !== paper.title ? paper.titleZh : paper.title}
-                        </span>
-                        <small>
-                          {[paper.venue, date ? `发表于 ${date}` : null].filter(Boolean).join(" · ")}
-                        </small>
-                        <em className={decision ? `is-${decision}` : "is-unread"}>
-                          {pastDecisionLabel(decision)}
-                        </em>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </article>
-            );
-          })}
-        </div>
-      ) : null}
-    </section>
-  );
 }
 
 function CandidateReview({
@@ -830,9 +682,6 @@ function CandidateReview({
   onStartJournalRun,
   onResumeJournalRun,
   onRetryPaperDocument,
-  pastRuns = [],
-  onAddRecentClassics,
-  onDismissRecentClassic,
   readOnly = false,
   readOnlyQuiet = false,
 }) {
@@ -1147,16 +996,6 @@ function CandidateReview({
           })}
         </div>
       </div>
-
-      {readOnly ? null : (
-        <RecentClassicsSection
-          recentClassics={liveRun?.recentClassics ?? null}
-          onAddRecentClassics={onAddRecentClassics}
-          onDismissRecentClassic={onDismissRecentClassic}
-        />
-      )}
-
-      {readOnly ? null : <PastWeeksReview pastRuns={pastRuns} />}
 
       {readOnly && readOnlyQuiet ? null : (
         <footer className="workflow-stage-actions">
@@ -2208,9 +2047,6 @@ export function WorkflowWorkspace({
   candidateSummaryState,
   onGenerateCandidateSummaries,
   journalRunState,
-  pastRuns = [],
-  onAddRecentClassics,
-  onDismissRecentClassic,
   guideState,
   readerTarget,
   onOpenPaper,
@@ -2377,7 +2213,7 @@ export function WorkflowWorkspace({
         : JOURNAL_PHASE_LABELS[journalRunState?.run?.phase];
 
   let content = null;
-  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onResumeJournalRun={onResumeJournalRun} onRetryPaperDocument={onRetryPaperDocument} pastRuns={pastRuns} onAddRecentClassics={onAddRecentClassics} onDismissRecentClassic={onDismissRecentClassic} />;
+  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onResumeJournalRun={onResumeJournalRun} onRetryPaperDocument={onRetryPaperDocument} />;
   if (status === "preparing_guides") {
     content = <PreparingGuides run={run} selectedPapers={selectedPapers} journalRunState={journalRunState} />;
   }
