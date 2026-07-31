@@ -898,6 +898,68 @@ function createBlockingSessionFactory() {
   return factory;
 }
 
+function createAbortToolSessionFactory() {
+  const sessions = [];
+  const factory = async () => {
+    let subscriber = null;
+    let releasePrompt = null;
+    const record = { prompts: [] };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      setActiveToolsByName(names) {
+        return [...names];
+      },
+      prompt(prompt) {
+        record.prompts.push(prompt);
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({
+          type: "tool_execution_start",
+          toolCallId: "subagent-abort-call",
+          toolName: "subagent",
+          args: { agent: "delegate" },
+        });
+        return new Promise((resolve) => {
+          releasePrompt = resolve;
+        });
+      },
+      async abort() {
+        subscriber?.({
+          type: "tool_execution_end",
+          toolCallId: "subagent-abort-call",
+          toolName: "subagent",
+          isError: true,
+          result: {
+            content: [{
+              type: "text",
+              text: "Child stopped at /Users/private/project after parent abort",
+            }],
+          },
+        });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        releasePrompt?.();
+      },
+      async steer() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {
+        releasePrompt?.();
+      },
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
 function createFollowUpSessionFactory() {
   const sessions = [];
   const factory = async () => {
@@ -1113,6 +1175,61 @@ function createThinkingSessionFactory() {
         subscriber?.({ type: "turn_end" });
         subscriber?.({ type: "agent_end", willRetry: false });
         subscriber?.({ type: "agent_settled" });
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createProgressSessionFactory(progressUpdates) {
+  const sessions = [];
+  const factory = async (options) => {
+    let subscriber = null;
+    const record = { outcomes: [] };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt() {
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({ type: "turn_start" });
+        subscriber?.({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "thinking_delta",
+            delta: "private progress reasoning must stay private",
+          },
+        });
+        for (const progress of progressUpdates) {
+          record.outcomes.push(await options.onProgress(progress));
+        }
+        subscriber?.({
+          type: "message_update",
+          assistantMessageEvent: { type: "thinking_end" },
+        });
+        subscriber?.({ type: "turn_end" });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        subscriber?.({ type: "agent_settled" });
+      },
+      setActiveToolsByName(names) {
+        return [...names];
+      },
+      setThinkingLevel(level) {
+        return level;
       },
       async steer() {},
       async abort() {},
@@ -2854,6 +2971,36 @@ test("follow-up queue is durable, independently editable, and stop clears pendin
   );
 });
 
+test("stopping a parent turn records its interrupted subagent as stopped instead of failed", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-stop-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createAbortToolSessionFactory(),
+    idFactory: incrementalId("subagent-stop"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "并行检查项目" });
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.events.some((event) => (
+      event.type === "tool.started" && event.data.name === "subagent"
+    )),
+    "subagent tool did not start",
+  );
+  await service.abortConversation(conversation.id);
+  const stopped = await service.getConversation(conversation.id);
+  const completed = stopped.events.find((event) => (
+    event.type === "tool.completed" && event.data.name === "subagent"
+  ));
+
+  assert.equal(stopped.conversation.status, "aborted");
+  assert.equal(completed.data.status, "aborted");
+  assert.doesNotMatch(JSON.stringify(completed), /Users\/private\/project/);
+});
+
 test("queued follow-ups survive a service restart even when the active turn cannot resume", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-follow-up-restore-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
@@ -3230,6 +3377,124 @@ test("thinking blocks persist lifecycle pairs without private reasoning", async 
   assert.equal(completedEvents.length, 2);
   assert.ok(thinkingEvents[3].seq < completedEvents[0].seq);
   assert.ok(thinkingEvents[7].seq < completedEvents[1].seq);
+});
+
+test("public progress is turn-bound, sanitized, deduplicated, and capped without persisting thinking", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-public-progress-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const firstProgress = {
+    summary: `已检查 ${storageRoot}/workspace，api_key=top-secret-value`,
+    detail: `Bearer abcdefghijklmnop ${"x".repeat(600)}`,
+  };
+  const progressUpdates = [
+    firstProgress,
+    { ...firstProgress },
+    {
+      summary: "确认脱敏入口 https://alice:secret@example.com/private AKIA1234567890ABCDEF",
+      detail: "xoxb-123456789012-abcdefghijkl npm_1234567890abcdefghijklmnop eyJheader1.eyJpayload1.signature1",
+    },
+    { ...firstProgress },
+    { summary: "确认持久化入口", detail: "下一步检查去重" },
+    { summary: "确认去重边界", detail: "下一步检查上限" },
+    { summary: "确认每轮上限", detail: "下一步检查脱敏" },
+    { summary: "确认脱敏边界", detail: "下一步检查回合绑定" },
+    { summary: "确认回合绑定", detail: "下一步整理结论" },
+    { summary: "这条超过上限", detail: "不应持久化" },
+  ];
+  const sessionFactory = createProgressSessionFactory(progressUpdates);
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    idFactory: incrementalId("progress"),
+  });
+  t.after(() => service.dispose());
+
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "检查公开进展" });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.events.filter((event) => event.type === "agent.progress").length === 8
+    ),
+    "public progress did not settle",
+  );
+
+  const progressEvents = settled.events.filter(
+    (event) => event.type === "agent.progress",
+  );
+  assert.equal(progressEvents.length, 8);
+  assert.deepEqual(
+    progressEvents.map((event) => event.data.index),
+    [1, 2, 3, 4, 5, 6, 7, 8],
+  );
+  assert.ok(progressEvents.every((event) => (
+    event.data.turnId === settled.conversation.messages[0].turnId
+    && event.data.attempt === 1
+    && event.data.summary.length <= 200
+    && (event.data.detail?.length ?? 0) <= 500
+  )));
+  assert.match(progressEvents[0].data.summary, /<workspace>/);
+  assert.match(progressEvents[0].data.summary, /api_key=<redacted>/);
+  assert.match(progressEvents[0].data.detail, /^Bearer <redacted>/);
+  assert.equal(
+    progressEvents[1].data.summary,
+    "确认脱敏入口 https://<redacted>@example.com/private <redacted>",
+  );
+  assert.equal(
+    progressEvents[1].data.detail,
+    "<redacted> <redacted> <redacted>",
+  );
+  assert.equal(
+    progressEvents.filter((event) => event.data.summary.includes("已检查")).length,
+    2,
+    "only adjacent identical progress should be deduplicated",
+  );
+  assert.deepEqual(
+    sessionFactory.sessions[0].outcomes.map((outcome) => outcome.status),
+    [
+      "recorded",
+      "duplicate",
+      "recorded",
+      "recorded",
+      "recorded",
+      "recorded",
+      "recorded",
+      "recorded",
+      "recorded",
+      "limit_reached",
+    ],
+  );
+  const persisted = JSON.stringify(settled.events);
+  assert.equal(persisted.includes("top-secret-value"), false);
+  assert.equal(persisted.includes("abcdefghijklmnop"), false);
+  assert.equal(persisted.includes("private progress reasoning"), false);
+  assert.equal(persisted.includes("这条超过上限"), false);
+
+  await delay(0);
+  await service.sendMessage(conversation.id, { text: "继续检查第二轮公开进展" });
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.events.filter((event) => event.type === "agent.progress").length === 16
+    ),
+    "second public-progress turn did not settle",
+  );
+  const history = await service.getConversationTurns(conversation.id, {
+    limit: 2,
+  });
+  assert.deepEqual(
+    history.turns.map((turn) => (
+      turn.events.filter((event) => event.type === "agent.progress").length
+    )),
+    [8, 8],
+  );
+  assert.ok(history.turns.every((turn) => turn.events.every((event) => (
+    !event.data?.turnId || event.data.turnId === turn.id
+  ))));
+  assert.equal(JSON.stringify(history).includes("private progress reasoning"), false);
 });
 
 test("a new turn clears the previous plan until it publishes its own", async (t) => {
@@ -4381,7 +4646,7 @@ test("a confirmed failed verification is repaired once and rerun against the sam
     reason: null,
   });
   assert.ok(sessionFactory.sessions[0].activeToolCalls.some((names) => (
-    names.join(",") === "read,edit,write,grep,find,ls,update_plan"
+    names.join(",") === "read,edit,write,grep,find,ls,report_progress,update_plan"
   )));
 
   const settled = await service.getConversation(conversation.id);
@@ -4932,7 +5197,10 @@ test("a prepared apply journal rolls back deterministically after service restar
   await firstService.sendMessage(conversation.id, { text: "准备可恢复修改" });
   const ready = await eventually(
     () => firstService.getConversation(conversation.id),
-    (snapshot) => snapshot.conversation.activeChangeSet?.status === "ready",
+    (snapshot) => (
+      snapshot.conversation.status === "awaiting_confirmation"
+      && snapshot.conversation.activeChangeSet?.status === "ready"
+    ),
     "recovery change did not become reviewable",
   );
   const changeSet = ready.conversation.activeChangeSet;

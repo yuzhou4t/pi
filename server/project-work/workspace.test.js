@@ -16,10 +16,24 @@ import {
   createFilteredProjectSnapshot,
   getProjectFileTree,
   getProjectOverlayFileTree,
+  isFilteredProjectPath,
   readProjectImageFile,
   readProjectOverlayImageFile,
   recomputeChangeSet,
 } from "./workspace.js";
+
+test("project path filters are case-insensitive on macOS-style filesystems", () => {
+  for (const relativePath of [
+    ".PI/settings.json",
+    ".Agents/delegate.md",
+    ".Git/config",
+    ".Codex/rules.md",
+    "Node_Modules/package/index.js",
+    "nested/.VENV/bin/python",
+  ]) {
+    assert.equal(isFilteredProjectPath(relativePath), true, relativePath);
+  }
+});
 
 async function listSnapshotFiles(root, relativeDirectory = "") {
   const directory = path.join(root, relativeDirectory);
@@ -48,6 +62,7 @@ test("large project snapshots stay usable by collecting shallow text files first
   await mkdir(path.join(projectRoot, "alpha", "src", "deep"), { recursive: true });
   await mkdir(path.join(projectRoot, "beta", "src"), { recursive: true });
   await mkdir(path.join(projectRoot, ".worktrees", "copy"), { recursive: true });
+  await mkdir(path.join(projectRoot, ".CACHE"), { recursive: true });
   await writeFile(path.join(projectRoot, "README.md"), "root\n");
   await writeFile(path.join(projectRoot, "alpha", "package.json"), "{}\n");
   await writeFile(path.join(projectRoot, "beta", "package.json"), "{}\n");
@@ -58,6 +73,7 @@ test("large project snapshots stay usable by collecting shallow text files first
     "later\n",
   );
   await writeFile(path.join(projectRoot, ".worktrees", "copy", "ignored.js"), "ignored\n");
+  await writeFile(path.join(projectRoot, ".CACHE", "ignored.js"), "ignored\n");
   await writeFile(path.join(projectRoot, "preview.png"), Buffer.from([0, 1, 2]));
 
   const snapshot = await createFilteredProjectSnapshot({
@@ -87,6 +103,7 @@ test("large project snapshots stay usable by collecting shallow text files first
   assert.equal(await readFile(path.join(workspaceRoot, "alpha", "src", "app.js"), "utf8"), "alpha\n");
   assert.equal(await readFile(path.join(workspaceRoot, "beta", "src", "app.js"), "utf8"), "beta\n");
   await assert.rejects(access(path.join(workspaceRoot, ".worktrees", "copy", "ignored.js")));
+  await assert.rejects(access(path.join(workspaceRoot, ".CACHE", "ignored.js")));
   await assert.rejects(access(path.join(workspaceRoot, "preview.png")));
   await assert.rejects(access(path.join(workspaceRoot, "alpha", "src", "deep", "later.js")));
 });

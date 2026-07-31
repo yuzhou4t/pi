@@ -595,6 +595,7 @@ function mapConversationTurn(raw) {
     operations: asArray(raw.operations)
       .map(mapConversationOperation)
       .filter(Boolean),
+    events: asArray(raw.events).map(mapEvent).filter(Boolean),
     createdAt: pick(raw, "created_at", "createdAt"),
     updatedAt: pick(raw, "updated_at", "updatedAt"),
   };
@@ -1526,6 +1527,18 @@ export function mapProjectWorkConversation(raw) {
   if (typeof id !== "string" || !id) throw new Error("项目工作会话缺少 ID");
   const events = asArray(raw?.events ?? source.events).map(mapEvent).filter(Boolean)
     .sort((left, right) => left.seq - right.seq);
+  const rawDeliveredEventSeq = pick(
+    raw,
+    "delivered_event_seq",
+    "deliveredEventSeq",
+    pick(
+      source,
+      "delivered_event_seq",
+      "deliveredEventSeq",
+      events.at(-1)?.seq,
+    ),
+  );
+  const deliveredEventSeq = Number(rawDeliveredEventSeq);
   const changeSet = mapChangeSet(
     pick(
       source,
@@ -1693,6 +1706,10 @@ export function mapProjectWorkConversation(raw) {
     lastEventSeq: Number(
       pick(source, "last_event_seq", "lastEventSeq", events.at(-1)?.seq ?? 0),
     ) || 0,
+    deliveredEventSeq: Number.isSafeInteger(deliveredEventSeq)
+      && deliveredEventSeq >= 0
+      ? deliveredEventSeq
+      : null,
     plan: planSteps.map((step, index) => mapPlanStep({
       ...step,
       title: step?.title ?? step?.text,
@@ -2512,6 +2529,7 @@ export async function fetchProjectWorkConversation({
   return mapProjectWorkConversation({
     ...payload,
     events,
+    deliveredEventSeq: afterSeq,
     hasMoreEvents: Boolean(
       (payload?.hasMoreEvents ?? payload?.has_more_events) && pages >= 20,
     ),
@@ -2544,6 +2562,9 @@ export function subscribeProjectWorkConversation({
       onConversation?.(mapProjectWorkConversation({
         conversation: payload.conversation,
         events: asArray(payload.events),
+        deliveredEventSeq: Number(
+          payload.last_seq ?? payload.lastSeq ?? payload.events?.at(-1)?.seq,
+        ),
         hasMoreEvents: Boolean(payload.has_more ?? payload.hasMoreEvents),
       }), {
         events: asArray(payload.events),

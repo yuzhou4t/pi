@@ -17,6 +17,7 @@ test("a normal turn keeps the default tools without extra guidance", () => {
   assert.deepEqual(turn.capabilityIds, []);
   assert.ok(turn.toolNames.includes("edit"));
   assert.ok(turn.toolNames.includes("write"));
+  assert.ok(turn.toolNames.includes("report_progress"));
   assert.equal(turn.toolNames.includes("generate_image"), false);
   assert.equal(turn.guidance, "");
 });
@@ -31,6 +32,7 @@ test("planning is enforced as a read-only question-and-plan workflow", () => {
   assert.ok(turn.toolNames.includes("grep"));
   assert.ok(turn.toolNames.includes("ask_user"));
   assert.ok(turn.toolNames.includes("update_plan"));
+  assert.ok(turn.toolNames.includes("report_progress"));
   assert.equal(turn.toolNames.includes("edit"), false);
   assert.equal(turn.toolNames.includes("write"), false);
   assert.equal(turn.toolNames.includes("request_preview"), false);
@@ -100,6 +102,7 @@ test("code review is one-turn read-only while optional search is explicit", () =
   assert.deepEqual(turn.capabilityIds, ["web_search"]);
   assert.ok(turn.toolNames.includes("read"));
   assert.ok(turn.toolNames.includes("search_web"));
+  assert.ok(turn.toolNames.includes("report_progress"));
   assert.equal(turn.toolNames.includes("edit"), false);
   assert.equal(turn.toolNames.includes("write"), false);
   assert.match(turn.guidance, /Review only/);

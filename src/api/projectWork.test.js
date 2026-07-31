@@ -13,6 +13,7 @@ import {
   fetchProjectWorkFile,
   fetchProjectWorkGitEvidence,
   fetchProjectWorkGitCloseouts,
+  fetchProjectWorkConversation,
   fetchProjectWorkModels,
   fetchProjectWorkProviderConnections,
   fetchProjectWorkSkillCatalog,
@@ -860,6 +861,7 @@ test("project-work subscription resumes after seq and maps incremental snapshots
     }),
   });
   assert.equal(snapshots[0].conversation.lastEventSeq, 10);
+  assert.equal(snapshots[0].conversation.deliveredEventSeq, 10);
   assert.equal(snapshots[0].conversation.askUserRequests[0].status, "pending");
   assert.equal(snapshots[0].metadata.events[0].seq, 7);
   assert.equal(snapshots[0].metadata.snapshotWatermark, 10);
@@ -908,6 +910,128 @@ test("project-work subscription resumes after seq and maps incremental snapshots
   unsubscribe();
   assert.equal(source.closed, true);
   assert.equal(source.listeners.size, 0);
+});
+
+test("conversation fetch resumes all 10,501 events from its delivered cursor", async () => {
+  const totalEvents = 10_501;
+  const pageSize = 500;
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(url);
+    const parsed = new URL(url, "http://127.0.0.1");
+    const afterSeq = Number(parsed.searchParams.get("after_seq") ?? 0);
+    const events = Array.from(
+      { length: Math.min(pageSize, totalEvents - afterSeq) },
+      (_, index) => ({
+        seq: afterSeq + index + 1,
+        type: "agent.progress",
+        data: { summary: `公开进展 ${afterSeq + index + 1}` },
+      }),
+    );
+    return jsonResponse({
+      conversation: {
+        id: "conversation-long-history",
+        project_id: "project-1",
+        status: "completed",
+        last_event_seq: totalEvents,
+      },
+      events,
+      has_more_events: afterSeq + events.length < totalEvents,
+    });
+  };
+
+  const fetched = await fetchProjectWorkConversation({
+    conversationId: "conversation-long-history",
+    fetchImpl,
+  });
+
+  assert.equal(calls.length, 20);
+  assert.equal(fetched.lastEventSeq, totalEvents);
+  assert.equal(fetched.deliveredEventSeq, 10_000);
+  assert.equal(fetched.hasMoreEvents, true);
+  assert.equal(fetched.events.length, 10_000);
+
+  class FakeEventSource {
+    constructor(url) {
+      this.url = url;
+      this.listeners = new Map();
+    }
+
+    addEventListener(type, listener) {
+      this.listeners.set(type, listener);
+    }
+
+    removeEventListener(type) {
+      this.listeners.delete(type);
+    }
+
+    close() {}
+
+    emit(type, payload) {
+      this.listeners.get(type)?.(payload);
+    }
+  }
+
+  let source;
+  const resumedEvents = [...fetched.events];
+  const unsubscribe = subscribeProjectWorkConversation({
+    conversationId: fetched.id,
+    afterSeq: fetched.deliveredEventSeq,
+    eventSourceFactory: class extends FakeEventSource {
+      constructor(url) {
+        super(url);
+        source = this;
+      }
+    },
+    onConversation: (conversation) => {
+      resumedEvents.push(...conversation.events);
+    },
+  });
+
+  assert.match(source.url, /after_seq=10000$/);
+  source.emit("snapshot", {
+    data: JSON.stringify({
+      snapshot_watermark: totalEvents,
+      last_seq: 10_500,
+      has_more: true,
+      conversation: {
+        id: fetched.id,
+        project_id: "project-1",
+        status: "completed",
+        last_event_seq: totalEvents,
+      },
+      events: Array.from({ length: 500 }, (_, index) => ({
+        seq: 10_001 + index,
+        type: "agent.progress",
+        data: { summary: `公开进展 ${10_001 + index}` },
+      })),
+    }),
+  });
+  source.emit("snapshot", {
+    data: JSON.stringify({
+      snapshot_watermark: totalEvents,
+      last_seq: totalEvents,
+      has_more: false,
+      conversation: {
+        id: fetched.id,
+        project_id: "project-1",
+        status: "completed",
+        last_event_seq: totalEvents,
+      },
+      events: [{
+        seq: totalEvents,
+        type: "agent.progress",
+        data: { summary: `公开进展 ${totalEvents}` },
+      }],
+    }),
+  });
+
+  assert.equal(resumedEvents.length, totalEvents);
+  assert.equal(
+    resumedEvents.every((event, index) => event.seq === index + 1),
+    true,
+  );
+  unsubscribe();
 });
 
 test("follow-up API distinguishes queue mutations from steer and keeps exact routes", async () => {
@@ -2324,6 +2448,15 @@ test("turn history maps stable sequence, attempts, evidence, and operations", as
             status: "completed",
             turnId: "turn-7",
           }],
+          events: [{
+            seq: 71,
+            type: "message.created",
+            data: { id: "message-user-1", turnId: "turn-7", turnSeq: 7 },
+          }, {
+            seq: 72,
+            type: "agent.progress",
+            data: { turnId: "turn-7", summary: "已经定位问题，正在复测。" },
+          }],
         }],
         hasMore: true,
         nextBeforeTurnSeq: 7,
@@ -2345,6 +2478,14 @@ test("turn history maps stable sequence, attempts, evidence, and operations", as
   assert.equal(page.turns[0].messages[1].turnEvidence.usage.totalTokens, 1500);
   assert.equal(page.turns[0].messages[1].turnEvidence.usage.costUsd, 0.0123);
   assert.equal(page.turns[0].operations[0].clientRequestId, "retry:test");
+  assert.deepEqual(
+    page.turns[0].events.map((event) => event.seq),
+    [71, 72],
+  );
+  assert.equal(
+    page.turns[0].events[1].data.summary,
+    "已经定位问题，正在复测。",
+  );
 });
 
 test("read, retry, and interrupted-repair resume use distinct idempotent mutations", async () => {

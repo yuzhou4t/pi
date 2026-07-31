@@ -2,15 +2,18 @@ import { randomUUID } from "node:crypto";
 import {
   lstat,
   link,
+  mkdtemp,
   mkdir,
   readFile,
   readdir,
   realpath,
   rename,
+  rm,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createTwoFilesPatch } from "diff";
 import { createJiti } from "jiti";
@@ -37,9 +40,13 @@ import {
 } from "./githubReadConnector.js";
 import { VERIFICATION_RECIPE_IDS } from "./verificationRecipes.js";
 import {
+  applyBoundFileTransitions,
+  createFilteredProjectSnapshot,
   isFilteredProjectPath,
   normalizeProjectPath,
+  readBoundFileState,
   readSafeAgentsFiles,
+  recomputeChangeSet,
   sha256,
 } from "./workspace.js";
 
@@ -56,6 +63,7 @@ export const PROJECT_WORK_DEFAULT_TOOL_NAMES = [
   "list_attachments",
   "search_attachments",
   "read_attachment",
+  "report_progress",
   "update_plan",
   "ask_user",
   "request_verification",
@@ -63,6 +71,7 @@ export const PROJECT_WORK_DEFAULT_TOOL_NAMES = [
 ];
 export const PROJECT_WORK_IMAGE_TOOL_NAME = "generate_image";
 export const PROJECT_WORK_PREVIEW_TOOL_NAME = "request_preview";
+export const PROJECT_WORK_PROGRESS_TOOL_NAME = "report_progress";
 export const PROJECT_WORK_SUBAGENT_TOOL_NAME = "subagent";
 export const PROJECT_WORK_ULTRA_THINKING_LEVEL = "ultra";
 export const PROJECT_WORK_REPAIR_TOOL_NAMES = [
@@ -72,6 +81,7 @@ export const PROJECT_WORK_REPAIR_TOOL_NAMES = [
   "grep",
   "find",
   "ls",
+  PROJECT_WORK_PROGRESS_TOOL_NAME,
   "update_plan",
 ];
 const TOOL_NAMES = [
@@ -94,8 +104,19 @@ const STANDARD_THINKING_LEVELS = [
   "high",
 ];
 const PI_SUBAGENTS_EXTENSION_PATH = fileURLToPath(import.meta.resolve("pi-subagents"));
+const PI_SUBAGENT_CONTAINED_TOOLS_EXTENSION_PATH = fileURLToPath(
+  new URL("./subagentContainedTools.js", import.meta.url),
+);
+const PI_SUBAGENT_PROCESS_SUPERVISOR_PATH = fileURLToPath(
+  new URL("./subagentProcessSupervisor.js", import.meta.url),
+);
+const PI_AGENT_CONTAINED_SUBAGENT_NAME = "pi-agent-contained-scout";
+const PI_AGENT_SUBAGENT_VIEW_PREFIX = "pi-agent-ultra-read-view-";
+const PI_AGENT_SUBAGENT_VIEW_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const SUBAGENT_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 const SUBAGENT_MAX_TASKS_PER_TURN = 3;
+const SUBAGENT_TURN_BUDGET = Object.freeze({ maxTurns: 12, graceTurns: 1 });
+const SUBAGENT_TOOL_BUDGET = Object.freeze({ soft: 20, hard: 28, block: "*" });
 const SUBAGENT_ALLOWED_TOP_LEVEL_FIELDS = new Set([
   "agent",
   "task",
@@ -111,19 +132,23 @@ const SUBAGENT_ALLOWED_TOP_LEVEL_FIELDS = new Set([
   "clarify",
   "artifacts",
   "async",
+  "acceptance",
 ]);
 const SUBAGENT_ALLOWED_TASK_FIELDS = new Set([
   "agent",
   "task",
   "count",
   "toolBudget",
+  "reads",
+  "acceptance",
 ]);
 const ULTRA_GUIDANCE = [
   "Ultra mode combines the current model's native max thinking level with bounded read-only subagents.",
   "Delegate only independent codebase inspection or review tasks that materially benefit from parallel work.",
   "Use the subagent tool in foreground mode only, with the built-in delegate agent, fresh context, and at most three total child tasks in this turn.",
+  "Use only one of these minimal shapes: {\"agent\":\"delegate\",\"task\":\"...\"} or {\"tasks\":[{\"agent\":\"delegate\",\"task\":\"...\"}]}. Omit reads, acceptance, budgets, cwd, model, output, and management fields; the server fixes those safely.",
   "The delegate agent is already available. Do not call subagent management actions such as list or status.",
-  "Subagents can only read, grep, find, and list files. They cannot edit files, run shell commands, load extensions, approve changes, or bypass the parent review overlay.",
+  "Subagents can only read, grep, find, and list relative paths in a temporary filtered project view. They cannot edit files, run shell commands, load extensions, approve changes, or inspect arbitrary absolute paths.",
   "Treat child reports as advisory. Verify relevant findings with the parent's contained tools before proposing changes or making claims.",
 ].join("\n");
 const subagentJiti = createJiti(import.meta.url);
@@ -131,7 +156,8 @@ let subagentCapabilityApiPromise = null;
 const APP_GUIDANCE = [
   "You are working through a contained review overlay for the user's project.",
   "Reads use the latest safe project files unless a proposed overlay file exists.",
-  "Use only the provided contained file tools. They cannot access paths outside the project and review overlay.",
+  "Use only the provided contained file tools. Project reads cannot access paths outside the project and review overlay; read may additionally load text resources only under the exact enabled Skill directories advertised in the Skills list.",
+  "For non-trivial tasks, use report_progress in the user's language with 1-2 concise sentences stating the fact just confirmed and what comes next. Report only before the first substantive inspection, at a key finding or phase change, when blocked, or before verification. When work continues, include it in the same assistant turn as the next substantive tool call instead of pausing only to report. Never narrate every tool call, and never expose private reasoning, hidden chain-of-thought, secrets, raw tool arguments, or unfiltered tool output.",
   "Keep the public plan current with update_plan.",
   "Use request_verification only with one registered recipe ID. Never provide a command, argv, shell, installer, watch process, or network option. The app's deterministic server policy resolves the recipe and decides whether it waits, is blocked, or continues after the turn settles.",
   "Use generate_image only when the user's current explicit message asks to create an image. It creates one conversation-owned image and never writes that binary asset into the project.",
@@ -142,6 +168,7 @@ const STANDALONE_GUIDANCE = [
   "This conversation is not connected to any user folder or project.",
   "You can access only this conversation's private scratch workspace through the provided contained file tools.",
   "Do not claim that you inspected, changed, or can discover files elsewhere on the user's computer.",
+  "For non-trivial tasks, use report_progress in the user's language with 1-2 concise sentences stating the fact just confirmed and what comes next. Report only before the first substantive inspection, at a key finding or phase change, when blocked, or before verification. When work continues, include it in the same assistant turn as the next substantive tool call instead of pausing only to report. Never narrate every tool call, and never expose private reasoning, hidden chain-of-thought, secrets, raw tool arguments, or unfiltered tool output.",
   "Keep the public plan current with update_plan.",
   "Use request_verification only with one registered recipe ID. Never provide a command, argv, shell, installer, watch process, or network option. The app's deterministic server policy resolves the recipe and decides whether it waits, is blocked, or continues after the turn settles.",
   "Use generate_image only when the user's current explicit message asks to create an image. It creates one conversation-owned image and never writes that binary asset into the scratch workspace.",
@@ -265,16 +292,25 @@ function requestedSubagentTaskCount(input) {
   return typeof input.agent === "string" && input.agent.trim() ? 1 : 0;
 }
 
-export function createProjectWorkSubagentPolicyExtension() {
+export function createProjectWorkSubagentPolicyExtension({
+  prepareReadOnlyView = async () => null,
+  releaseReadOnlyView = async () => undefined,
+} = {}) {
   let spawnedThisTurn = 0;
   return {
     name: "pi-agent-subagent-policy",
     hidden: true,
     factory(pi) {
-      pi.on("agent_start", () => {
+      pi.on("agent_start", async () => {
         spawnedThisTurn = 0;
+        await releaseReadOnlyView();
       });
-      pi.on("tool_call", (event) => {
+      pi.on("tool_result", async (event) => {
+        if (event.toolName === PROJECT_WORK_SUBAGENT_TOOL_NAME) {
+          await releaseReadOnlyView();
+        }
+      });
+      pi.on("tool_call", async (event) => {
         if (event.toolName !== PROJECT_WORK_SUBAGENT_TOOL_NAME) {
           return undefined;
         }
@@ -330,19 +366,80 @@ export function createProjectWorkSubagentPolicyExtension() {
         if (
           requestedTasks < 1
           || requestedTasks > SUBAGENT_MAX_TASKS_PER_TURN
-          || spawnedThisTurn + requestedTasks > SUBAGENT_MAX_TASKS_PER_TURN
+          || spawnedThisTurn > 0
         ) {
           return {
             block: true,
-            reason: "Ultra 每轮最多启动 3 个只读子智能体。",
+            reason: "Ultra 每轮只允许一次并行检查，单次最多启动 3 个只读子智能体。",
           };
         }
-        spawnedThisTurn += requestedTasks;
+        const taskTexts = tasks
+          ? tasks.map((task) => task.task)
+          : [input.task];
+        if (taskTexts.some((task) => (
+          typeof task !== "string"
+          || !task.trim()
+          || task.length > 16_000
+        ))) {
+          return {
+            block: true,
+            reason: "Ultra 子智能体任务必须是非空的有界文本。",
+          };
+        }
+        spawnedThisTurn = requestedTasks;
+        let readOnlyView;
+        try {
+          readOnlyView = await prepareReadOnlyView();
+        } catch {
+          spawnedThisTurn = 0;
+          return {
+            block: true,
+            reason: "Ultra 子智能体的受控只读项目视图未能准备完成。",
+          };
+        }
+        const readOnlyCwd = readOnlyView?.cwd;
+        if (typeof readOnlyCwd !== "string" || !path.isAbsolute(readOnlyCwd)) {
+          spawnedThisTurn = 0;
+          await releaseReadOnlyView();
+          return {
+            block: true,
+            reason: "Ultra 子智能体的受控只读项目视图尚未准备完成。",
+          };
+        }
+        const snapshotGuidance = readOnlyView.snapshot?.truncated === true
+          ? [
+              "The server-created read-only project view is truncated by safety limits.",
+              Number.isSafeInteger(readOnlyView.snapshot.includedFiles)
+                ? `It contains ${readOnlyView.snapshot.includedFiles} files.`
+                : "It contains only a bounded subset of files.",
+              "Do not claim complete-project coverage; ask the parent to verify missing paths.",
+            ].join(" ")
+          : "";
+        const boundedTask = (task) => [task.trim(), snapshotGuidance]
+          .filter(Boolean)
+          .join("\n\n");
+        const singleTask = input.task;
+        for (const key of Object.keys(input)) delete input[key];
+        if (tasks) {
+          input.tasks = tasks.map((task) => ({
+            agent: PI_AGENT_CONTAINED_SUBAGENT_NAME,
+            task: boundedTask(task.task),
+            acceptance: false,
+          }));
+        } else {
+          input.agent = PI_AGENT_CONTAINED_SUBAGENT_NAME;
+          input.task = boundedTask(singleTask);
+        }
         input.async = false;
         input.clarify = false;
         input.context = "fresh";
         input.artifacts = false;
-        input.agentScope = "user";
+        input.agentScope = "project";
+        input.cwd = readOnlyCwd;
+        input.timeoutMs = 180_000;
+        input.turnBudget = { ...SUBAGENT_TURN_BUDGET };
+        input.toolBudget = { ...SUBAGENT_TOOL_BUDGET };
+        input.acceptance = false;
         if (tasks) {
           input.concurrency = Math.min(
             SUBAGENT_MAX_TASKS_PER_TURN,
@@ -353,6 +450,123 @@ export function createProjectWorkSubagentPolicyExtension() {
       });
     },
   };
+}
+
+async function cleanupStaleProjectWorkSubagentViews() {
+  const cutoff = Date.now() - PI_AGENT_SUBAGENT_VIEW_MAX_AGE_MS;
+  const entries = await readdir(tmpdir(), { withFileTypes: true });
+  await Promise.all(entries.map(async (entry) => {
+    if (
+      !entry.isDirectory()
+      || !entry.name.startsWith(PI_AGENT_SUBAGENT_VIEW_PREFIX)
+    ) {
+      return;
+    }
+    const target = path.join(tmpdir(), entry.name);
+    try {
+      const targetStat = await lstat(target);
+      if (
+        targetStat.isSymbolicLink()
+        || !targetStat.isDirectory()
+        || targetStat.mtimeMs > cutoff
+      ) {
+        return;
+      }
+      await rm(target, { recursive: true, force: true });
+    } catch {
+      // Cleanup is best-effort; preparing the current isolated view stays primary.
+    }
+  }));
+}
+
+export async function createProjectWorkSubagentView({
+  projectRoot,
+  baseRoot,
+  workspaceRoot,
+} = {}) {
+  await cleanupStaleProjectWorkSubagentViews().catch(() => undefined);
+  const temporaryRoot = await mkdtemp(
+    path.join(tmpdir(), PI_AGENT_SUBAGENT_VIEW_PREFIX),
+  );
+  const snapshotBaseRoot = path.join(temporaryRoot, "base");
+  const snapshotWorkspaceRoot = path.join(temporaryRoot, "workspace");
+  try {
+    const snapshot = await createFilteredProjectSnapshot({
+      projectRoot,
+      baseRoot: snapshotBaseRoot,
+      workspaceRoot: snapshotWorkspaceRoot,
+    });
+    const changeSet = await recomputeChangeSet({
+      conversationId: "ultra-read-view",
+      baseRoot,
+      workspaceRoot,
+      allowDeletes: false,
+    });
+    const transitions = [];
+    for (const file of changeSet.files) {
+      const overlayState = await readBoundFileState(workspaceRoot, file.path);
+      const snapshotState = await readBoundFileState(snapshotWorkspaceRoot, file.path);
+      transitions.push({
+        path: file.path,
+        expectedHash: snapshotState.hash,
+        targetBuffer: overlayState.exists ? overlayState.buffer : null,
+        targetHash: file.afterHash,
+        targetMode: overlayState.mode,
+      });
+    }
+    await applyBoundFileTransitions({
+      root: snapshotWorkspaceRoot,
+      transitions,
+    });
+    const settingsDirectory = path.join(temporaryRoot, ".pi");
+    const agentDirectory = path.join(settingsDirectory, "agents");
+    await mkdir(settingsDirectory, { recursive: true, mode: 0o700 });
+    await mkdir(agentDirectory, { mode: 0o700 });
+    await writeFile(
+      path.join(settingsDirectory, "settings.json"),
+      `${JSON.stringify({
+        subagents: {
+          defaultExtensions: [],
+        },
+      }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    await writeFile(
+      path.join(agentDirectory, `${PI_AGENT_CONTAINED_SUBAGENT_NAME}.md`),
+      [
+        "---",
+        `name: ${PI_AGENT_CONTAINED_SUBAGENT_NAME}`,
+        "description: Server-owned bounded read-only project inspector",
+        "tools:",
+        ...SUBAGENT_READ_ONLY_TOOLS.map((tool) => `  - ${tool}`),
+        "extensions:",
+        `subagentOnlyExtensions: ${PI_SUBAGENT_CONTAINED_TOOLS_EXTENSION_PATH}`,
+        "systemPromptMode: replace",
+        "inheritProjectContext: false",
+        "inheritSkills: false",
+        "defaultContext: fresh",
+        "output: false",
+        "acceptanceRole: read-only",
+        "completionGuard: false",
+        "---",
+        "Inspect only the assigned task through the contained relative-path read tools.",
+        "Return concise findings and never claim access outside the provided view.",
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    return {
+      root: temporaryRoot,
+      cwd: snapshotWorkspaceRoot,
+      snapshot,
+      async dispose() {
+        await rm(temporaryRoot, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    await rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 function workspaceSnapshotGuidance(workspaceSnapshot) {
@@ -552,6 +766,66 @@ async function readBoundedText(roots, rawPath) {
   };
 }
 
+async function canonicalSkillResources(enabledSkillPaths = []) {
+  const resources = [];
+  for (const skillPath of enabledSkillPaths) {
+    if (typeof skillPath !== "string" || !path.isAbsolute(skillPath)) continue;
+    try {
+      const advertisedPath = path.resolve(skillPath);
+      const advertisedRoot = path.dirname(advertisedPath);
+      const skillStat = await lstat(advertisedPath);
+      if (!skillStat.isFile() || skillStat.isSymbolicLink()) continue;
+      const canonicalPath = await realpath(advertisedPath);
+      const canonicalRoot = await realpath(advertisedRoot);
+      if (!isInside(canonicalRoot, canonicalPath)) continue;
+      resources.push({
+        name: skillNameFromPath(advertisedPath) ?? "skill",
+        advertisedRoot,
+        canonicalRoot,
+      });
+    } catch {
+      // A stale audited Skill entry cannot break ordinary project file access.
+    }
+  }
+  return resources;
+}
+
+async function readBoundedSkillText(resources, rawPath) {
+  if (typeof rawPath !== "string" || !path.isAbsolute(rawPath)) return null;
+  const requestedPath = path.resolve(rawPath);
+  const resource = resources.find((candidate) => (
+    isInside(candidate.advertisedRoot, requestedPath)
+  ));
+  if (!resource) return null;
+  const relative = path.relative(resource.advertisedRoot, requestedPath)
+    .split(path.sep)
+    .join("/");
+  const resolved = await resolveContainedPath(resource.canonicalRoot, relative, {
+    expectedKind: "file",
+  });
+  if (resolved.stat.size > MAX_TOOL_FILE_BYTES) {
+    throw new Error("Skill resource exceeds the contained tool size limit");
+  }
+  const buffer = await readFile(resolved.target);
+  if (buffer.subarray(0, Math.min(buffer.length, 8_192)).includes(0)) {
+    throw new Error("Binary Skill resources are not supported by this tool");
+  }
+  let content;
+  try {
+    content = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+  } catch {
+    throw new Error("Skill resource must be valid UTF-8 text");
+  }
+  return {
+    buffer,
+    content,
+    hash: sha256(buffer),
+    source: "skill",
+    skillName: resource.name,
+    resourcePath: relative,
+  };
+}
+
 async function atomicScratchWrite(root, rawPath, content, mode = 0o600) {
   if (Buffer.byteLength(content, "utf8") > MAX_TOOL_FILE_BYTES) {
     throw new Error("File exceeds the contained tool size limit");
@@ -742,6 +1016,7 @@ function boundedSearchExpression(pattern, { literal, ignoreCase }) {
       pattern.includes("(?")
       || /\\[1-9]/.test(pattern)
       || /(?:[+*}]|\{\d+(?:,\d*)?\})\s*(?:[+*{])/.test(pattern)
+      || /\([^()]*(?:[+*]|\{\d+(?:,\d*)?\})[^()]*\)\s*(?:[+*]|\{\d+(?:,\d*)?\})/.test(pattern)
     )
   ) {
     throw new Error("Search pattern uses an unsupported expensive expression");
@@ -807,19 +1082,20 @@ async function walkOverlayFiles(roots, startPath, visitor, {
   return { files, bytes, truncated: stopped };
 }
 
-function createReadTool(roots) {
+function createReadTool(roots, skillResources) {
   return defineTool({
     name: "read",
     label: "read",
-    description: "Read a text file from the contained project view and review overlay.",
-    promptSnippet: "Read a contained project text file",
+    description: "Read a text file from the contained project view, review overlay, or an enabled audited Skill directory.",
+    promptSnippet: "Read a contained project or enabled Skill text file",
     parameters: Type.Object({
       path: Type.String(),
       offset: Type.Optional(Type.Number()),
       limit: Type.Optional(Type.Number()),
     }),
     async execute(_toolCallId, { path: filePath, offset, limit }) {
-      const file = await readBoundedText(roots, filePath);
+      const file = await readBoundedSkillText(skillResources, filePath)
+        ?? await readBoundedText(roots, filePath);
       const lines = file.content.split(/\r\n|\n|\r/);
       const start = Number.isInteger(offset) && offset > 0 ? offset - 1 : 0;
       const count = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 1_000) : 500;
@@ -828,19 +1104,30 @@ function createReadTool(roots) {
       const continuation = start + selected.length < lines.length
         ? `\n\n[${lines.length - start - selected.length} more lines; continue at offset ${start + selected.length + 1}]`
         : "";
-      return textResult(`${selected.join("\n")}${continuation}`, {
-        path: file.normalized,
-        contentHash: file.hash,
-        startLine: start + 1,
-        endLine: start + selected.length,
-        totalLines: lines.length,
-        evidence: [{
+      const details = file.source === "skill"
+        ? {
+            resourceKind: "skill",
+            skillName: file.skillName,
+            resourcePath: file.resourcePath,
+            contentHash: file.hash,
+            startLine: start + 1,
+            endLine: start + selected.length,
+            totalLines: lines.length,
+          }
+        : {
+            path: file.normalized,
+            contentHash: file.hash,
+            startLine: start + 1,
+            endLine: start + selected.length,
+            totalLines: lines.length,
+            evidence: [{
           path: file.normalized,
           contentHash: file.hash,
           startLine: start + 1,
           endLine: start + selected.length,
-        }],
-      });
+            }],
+          };
+      return textResult(`${selected.join("\n")}${continuation}`, details);
     },
   });
 }
@@ -1192,11 +1479,41 @@ export async function createProjectWorkTools({
   onGitCloseoutRequest,
   onImageGenerationRequest,
   onPreviewRequest,
+  onProgress,
+  enabledSkillPaths = [],
 } = {}) {
-  const roots = await canonicalOverlayRoots({
-    projectRoot,
-    baseRoot,
-    workspaceRoot,
+  const [roots, skillResources] = await Promise.all([
+    canonicalOverlayRoots({
+      projectRoot,
+      baseRoot,
+      workspaceRoot,
+    }),
+    canonicalSkillResources(enabledSkillPaths),
+  ]);
+  const reportProgress = defineTool({
+    name: PROJECT_WORK_PROGRESS_TOOL_NAME,
+    label: PROJECT_WORK_PROGRESS_TOOL_NAME,
+    description: "Publish one brief factual progress update for the user without exposing private reasoning or raw tool data.",
+    promptSnippet: "Report one safe public work milestone",
+    executionMode: "sequential",
+    parameters: Type.Object({
+      summary: Type.String({ minLength: 1, maxLength: 200 }),
+      detail: Type.Optional(Type.String({ maxLength: 500 })),
+    }, { additionalProperties: false }),
+    async execute(_toolCallId, progress) {
+      if (typeof onProgress !== "function") {
+        throw new Error("Public progress reporting is unavailable");
+      }
+      const recorded = await onProgress(progress);
+      return textResult(
+        recorded.recorded === true
+          ? "Public progress update recorded"
+          : recorded.status === "duplicate"
+            ? "Duplicate public progress update skipped"
+            : "Public progress update limit reached for this turn",
+        recorded,
+      );
+    },
   });
   const updatePlan = defineTool({
     name: "update_plan",
@@ -1539,7 +1856,7 @@ export async function createProjectWorkTools({
   });
 
   return [
-    createReadTool(roots),
+    createReadTool(roots, skillResources),
     createEditTool(roots),
     createWriteTool(roots),
     createGrepTool(roots),
@@ -1553,6 +1870,7 @@ export async function createProjectWorkTools({
     readAttachment,
     ...externalRetrievalTools,
     ...githubReadTools,
+    reportProgress,
     updatePlan,
     askUser,
     requestVerification,
@@ -1746,6 +2064,10 @@ export function createPiSessionFactory({
   imageGenerationProbe,
   skillProvider,
 } = {}) {
+  // pi-subagents intentionally supports a caller-owned child launcher. Keep it
+  // server-owned so abort escalation can observe the real Pi child exit rather
+  // than relying on ChildProcess.killed after merely sending SIGTERM.
+  process.env.PI_SUBAGENT_PI_BINARY = PI_SUBAGENT_PROCESS_SUPERVISOR_PATH;
   const runtimePromise = modelRuntime
     ? Promise.resolve(modelRuntime)
     : ModelRuntime.create({ allowModelNetwork: false });
@@ -1931,6 +2253,7 @@ export function createPiSessionFactory({
     onGitCloseoutRequest,
     onImageGenerationRequest,
     onPreviewRequest,
+    onProgress,
   } = {}) => {
     const cwd = await realpath(workspaceRoot);
     const runtime = await runtimePromise;
@@ -1978,6 +2301,22 @@ export function createPiSessionFactory({
     let pendingTurnGuidance = "";
     let publicThinkingLevel = thinkingLevel;
     let subagentsAllowedForTurn = false;
+    let activeSubagentView = null;
+    async function releaseActiveSubagentView() {
+      const view = activeSubagentView;
+      activeSubagentView = null;
+      await view?.dispose();
+    }
+    async function prepareActiveSubagentView() {
+      await releaseActiveSubagentView();
+      const view = await createProjectWorkSubagentView({
+        projectRoot,
+        baseRoot,
+        workspaceRoot: cwd,
+      });
+      activeSubagentView = view;
+      return view;
+    }
     const turnGuidanceExtension = createProjectWorkTurnGuidanceExtension(
       () => [
         pendingTurnGuidance,
@@ -1987,7 +2326,10 @@ export function createPiSessionFactory({
           : "",
       ].filter(Boolean).join("\n\n"),
     );
-    const subagentPolicyExtension = createProjectWorkSubagentPolicyExtension();
+    const subagentPolicyExtension = createProjectWorkSubagentPolicyExtension({
+      prepareReadOnlyView: prepareActiveSubagentView,
+      releaseReadOnlyView: releaseActiveSubagentView,
+    });
     const enabledSkillPaths = typeof skillProvider === "function"
       ? await skillProvider()
       : [];
@@ -2059,6 +2401,8 @@ export function createPiSessionFactory({
       onGitCloseoutRequest,
       onImageGenerationRequest,
       onPreviewRequest,
+      onProgress,
+      enabledSkillPaths,
     });
     const { session } = await createAgentSession({
       cwd,
@@ -2078,7 +2422,10 @@ export function createPiSessionFactory({
       source: "pi-agent-project-work",
       ceiling: {
         allowedTools: SUBAGENT_READ_ONLY_TOOLS,
-        denyExtensions: true,
+        // Ambient and model-selected extensions are disabled by the server-owned
+        // project settings. This one fixed child-only extension replaces Pi's
+        // absolute-path-capable builtins with contained equivalents.
+        denyExtensions: false,
       },
     });
     session.setActiveToolsByName(PROJECT_WORK_DEFAULT_TOOL_NAMES);
@@ -2174,6 +2521,13 @@ export function createPiSessionFactory({
       subagentsAllowedForTurn = allowSubagents === true;
       return applyActiveTools();
     }
+    async function withSubagentCleanup(operation) {
+      try {
+        return await operation();
+      } finally {
+        await releaseActiveSubagentView();
+      }
+    }
     return {
       get isStreaming() {
         return session.isStreaming;
@@ -2212,7 +2566,9 @@ export function createPiSessionFactory({
         }
         pendingTurnGuidance = String(turnGuidance ?? "").trim();
         try {
-          return await session.prompt(text, promptOptions);
+          return await withSubagentCleanup(
+            () => session.prompt(text, promptOptions),
+          );
         } finally {
           pendingTurnGuidance = "";
         }
@@ -2257,7 +2613,9 @@ export function createPiSessionFactory({
               true,
             );
           }
-          return await session.sendUserMessage(content);
+          return await withSubagentCleanup(
+            () => session.sendUserMessage(content),
+          );
         } finally {
           pendingTurnGuidance = "";
         }
@@ -2312,6 +2670,7 @@ export function createPiSessionFactory({
         const content = [
           "A previously user-confirmed verification command failed inside the isolated verification workspace.",
           "Fix only the project files available through the contained overlay tools.",
+          "For this non-trivial repair, use report_progress in the user's language with 1-2 concise sentences only at a key finding, phase change, blocker, or before verification; state the fact just confirmed and what comes next. When work continues, include it in the same assistant turn as the next substantive tool call instead of pausing only to report. Never narrate every tool call, and never include private reasoning, secrets, raw tool arguments, or unfiltered tool output.",
           "Do not request, invent, replace, or run another command. Do not ask for write approval, apply changes to the real project, start a preview, enqueue follow-ups, or ask the user a question.",
           "The application will rerun only the exact bound command after this repair turn. The resulting diff still requires the normal hash-bound user confirmation.",
           JSON.stringify(payload),
@@ -2379,6 +2738,7 @@ export function createPiSessionFactory({
         return session.subscribe(listener);
       },
       dispose() {
+        releaseActiveSubagentView().catch(() => undefined);
         subagentCapabilityCeiling.dispose();
         session.dispose();
       },

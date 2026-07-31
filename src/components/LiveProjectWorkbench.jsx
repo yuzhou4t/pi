@@ -184,6 +184,7 @@ const TOOL_LABELS = {
   request_git_closeout: "准备 Git 收尾",
   generate_image: "生成图片",
   request_preview: "登记本机预览",
+  report_progress: "报告公开进展",
   subagent: "并行子智能体",
 };
 
@@ -214,6 +215,7 @@ const HIDDEN_TOOL_ACTIVITY = new Set([
   "request_verification",
   "request_git_closeout",
   "request_preview",
+  "report_progress",
 ]);
 
 const OPERATION_LABELS = {
@@ -240,6 +242,11 @@ const QUIET_EVENT_TYPES = new Set([
   "message.partial",
   "message.update",
   "assistant.delta",
+  "follow_up.queued",
+  "follow_up.delivered",
+  "ask_user.requested",
+  "ask_user.answered",
+  "ask_user.cancelled",
   "harness.snapshot",
   "plan.updated",
   "workspace.recorded",
@@ -324,6 +331,23 @@ function activeStatus(conversation) {
 
 function isConversationRunning(conversation) {
   return RUNNING_STATUSES.has(activeStatus(conversation));
+}
+
+export function conversationEventResumeSeq(conversation) {
+  const latest = Number(conversation?.lastEventSeq);
+  const delivered = Number(conversation?.deliveredEventSeq);
+  const lastReceived = Number(conversation?.events?.at(-1)?.seq);
+  if (conversation?.hasMoreEvents) {
+    return Math.max(
+      Number.isSafeInteger(delivered) && delivered >= 0 ? delivered : 0,
+      Number.isSafeInteger(lastReceived) && lastReceived >= 0 ? lastReceived : 0,
+    );
+  }
+  if (Number.isSafeInteger(latest) && latest >= 0) return latest;
+  if (Number.isSafeInteger(delivered) && delivered >= 0) return delivered;
+  return Number.isSafeInteger(lastReceived) && lastReceived >= 0
+    ? lastReceived
+    : 0;
 }
 
 export function hasProcessingDocuments(conversation) {
@@ -523,7 +547,11 @@ function eventTitle(event) {
   if (event.title) return event.title;
   const tool = TOOL_LABELS[event.toolName] ?? event.toolName ?? "工具";
   if (type === "agent.thinking") {
-    return event.status === "active" ? "正在思考" : "思考完成";
+    if (event.status === "active") return "正在思考";
+    if (event.status === "waiting") return "思考已暂停";
+    if (event.status === "stopped") return "思考已停止";
+    if (event.status === "incomplete") return "思考未完成";
+    return "思考完成";
   }
   if (type === "conversation.created") return "工作会话已创建";
   if (type === "message.created") return "任务已提交";
@@ -557,6 +585,7 @@ function eventTitle(event) {
     return TOOL_LABELS[event.toolName] ?? `调用 ${tool}`;
   }
   if (/tool.*(?:end|result|complete)|tool_result/.test(type)) {
+    if (["aborted", "stopped"].includes(event.status)) return `${tool}已停止`;
     return event.status === "failed" ? `${tool}失败` : `${tool}完成`;
   }
   if (/plan/.test(type)) return "计划已更新";
@@ -575,6 +604,27 @@ function boundedValue(value) {
   } catch {
     return String(value).slice(0, 500);
   }
+}
+
+function progressNarration(event) {
+  const summary = [
+    event?.summary,
+    event?.data?.summary,
+    event?.title,
+    event?.detail,
+  ].find((value) => typeof value === "string" && value.trim());
+  const detail = [
+    event?.data?.detail,
+    event?.detail,
+  ].find((value) => (
+    typeof value === "string"
+    && value.trim()
+    && value.trim() !== summary?.trim()
+  ));
+  return {
+    summary: summary?.trim().slice(0, 500) ?? "",
+    detail: detail?.trim().slice(0, 1_000) ?? "",
+  };
 }
 
 function eventDetail(event) {
@@ -762,7 +812,7 @@ function PlanCard({ plan }) {
   );
 }
 
-function ActivityEvent({ event, isLatest, onOpenArtifact }) {
+function ActivityEvent({ event, isLatest, isLatestProgress = false, onOpenArtifact }) {
   const [open, setOpen] = useState(isLatest);
   const artifactId = eventArtifact(event);
   const autoReviewDecision = event.type === "auto_review.decision";
@@ -772,6 +822,25 @@ function ActivityEvent({ event, isLatest, onOpenArtifact }) {
   useEffect(() => {
     setOpen(isLatest);
   }, [isLatest]);
+
+  if (event.type === "agent.progress") {
+    const narration = progressNarration(event);
+    return (
+      <article
+        className={`project-activity-progress${isLatestProgress ? " is-latest" : ""}`}
+        {...(isLatestProgress ? {
+          role: "status",
+          "aria-live": "polite",
+        } : {})}
+      >
+        <span className="project-activity-progress-dot" aria-hidden="true" />
+        <div>
+          <p>{narration.summary}</p>
+          {narration.detail ? <small>{narration.detail}</small> : null}
+        </div>
+      </article>
+    );
+  }
 
   return (
     <details
@@ -812,9 +881,14 @@ function ActivityEvent({ event, isLatest, onOpenArtifact }) {
 
 function toolActivityStatus(event, previousStatus) {
   if (event.type === "tool.completed") {
-    return event.status === "failed" ? "failed" : "completed";
+    if (["failed", "aborted", "stopped"].includes(event.status)) {
+      return event.status;
+    }
+    return "completed";
   }
-  if (["completed", "failed"].includes(previousStatus)) return previousStatus;
+  if (["completed", "failed", "aborted", "stopped"].includes(previousStatus)) {
+    return previousStatus;
+  }
   return "active";
 }
 
@@ -908,6 +982,154 @@ function currentTurnActivityEvents(events) {
   };
 }
 
+function activityTurnBoundary(event) {
+  if (event?.type === "message.created") {
+    return {
+      messageId: event.messageId ?? event.data?.id ?? null,
+      turnId: event.turnId ?? event.data?.turnId ?? event.data?.id ?? null,
+      turnSeq: event.turnSeq ?? event.data?.turnSeq ?? null,
+    };
+  }
+  if (event?.type === "follow_up.delivered") {
+    return {
+      messageId: event.messageId ?? event.data?.messageId ?? null,
+      turnId: event.turnId
+        ?? event.data?.turnId
+        ?? event.data?.messageId
+        ?? null,
+      turnSeq: event.turnSeq ?? event.data?.turnSeq ?? null,
+    };
+  }
+  return null;
+}
+
+function activityBoundaryMatchesTurn(boundary, turn) {
+  if (!boundary || !turn) return false;
+  const turnId = turn.turnId ?? turn.id ?? null;
+  if (turnId && boundary.turnId) return boundary.turnId === turnId;
+  if (turn.id && boundary.messageId) return boundary.messageId === turn.id;
+  return Number.isSafeInteger(turn.turnSeq)
+    && Number.isSafeInteger(boundary.turnSeq)
+    && boundary.turnSeq === turn.turnSeq;
+}
+
+export function activityTurnScopes(events) {
+  const safeEvents = (Array.isArray(events) ? events : [])
+    .filter((event) => Number.isSafeInteger(event?.seq) && event.seq > 0)
+    .sort((left, right) => left.seq - right.seq);
+  const scopes = [];
+  let current = null;
+  for (const event of safeEvents) {
+    const boundary = activityTurnBoundary(event);
+    if (boundary) {
+      current = { boundary, events: [] };
+      scopes.push(current);
+    }
+    current?.events.push(event);
+  }
+  return scopes;
+}
+
+export function activityEventsForTurn(events, turn) {
+  return activityTurnScopes(events).find(({ boundary }) => (
+    activityBoundaryMatchesTurn(boundary, turn)
+  ))?.events ?? [];
+}
+
+const ACTIVITY_TERMINAL_STATES = {
+  completed: {
+    key: "completed",
+    label: "已完成",
+    thinkingStatus: "finished",
+    thinkingDetail: "本轮思考已完成",
+    summaryDetail: "本轮已结束，没有额外记录公开进展或工具活动。",
+  },
+  waiting: {
+    key: "waiting",
+    label: "等待你的回答",
+    thinkingStatus: "waiting",
+    thinkingDetail: "本轮思考已暂停，正在等待你的回答",
+    summaryDetail: "本轮已暂停，正在等待你的回答；没有额外记录公开进展。",
+  },
+  stopped: {
+    key: "stopped",
+    label: "已停止",
+    thinkingStatus: "stopped",
+    thinkingDetail: "本轮思考已停止",
+    summaryDetail: "本轮已经停止；停止前没有额外记录公开进展。",
+  },
+  incomplete: {
+    key: "incomplete",
+    label: "未完成",
+    thinkingStatus: "incomplete",
+    thinkingDetail: "本轮思考未完成",
+    summaryDetail: "本轮未完成；失败前没有额外记录可安全展示的进展。",
+  },
+};
+
+function terminalStateForStatus(status) {
+  if (status === "awaiting_user") return ACTIVITY_TERMINAL_STATES.waiting;
+  if (["aborted", "stopped", "interrupted"].includes(status)) {
+    return ACTIVITY_TERMINAL_STATES.stopped;
+  }
+  if (["failed", "error"].includes(status)) {
+    return ACTIVITY_TERMINAL_STATES.incomplete;
+  }
+  if ([
+    "idle",
+    "ready",
+    "completed",
+    "applied",
+    "awaiting_confirmation",
+    "awaiting_approval",
+    "changes_ready",
+  ].includes(status)) {
+    return ACTIVITY_TERMINAL_STATES.completed;
+  }
+  return null;
+}
+
+function activityTerminalState(events, fallbackStatus = null) {
+  let state = null;
+  const orderedEvents = (Array.isArray(events) ? events : [])
+    .filter((event) => Number.isSafeInteger(event?.seq) && event.seq > 0)
+    .sort((left, right) => left.seq - right.seq);
+  for (const event of orderedEvents) {
+    const status = event.status ?? event.data?.status ?? null;
+    if (event.type === "ask_user.requested") {
+      state = ACTIVITY_TERMINAL_STATES.waiting;
+      continue;
+    }
+    if (["ask_user.answered", "ask_user.cancelled"].includes(event.type)) {
+      state = null;
+      continue;
+    }
+    if (event.type === "error") {
+      state = ACTIVITY_TERMINAL_STATES.incomplete;
+      continue;
+    }
+    if (
+      event.type === "message.completed"
+      && event.isFinal !== false
+      && event.data?.isFinal !== false
+    ) {
+      state = status === "failed"
+        ? ACTIVITY_TERMINAL_STATES.incomplete
+        : ACTIVITY_TERMINAL_STATES.completed;
+      continue;
+    }
+    if (event.type === "agent.status") {
+      if (["running", "queued", "planning", "streaming"].includes(status)) {
+        state = null;
+      } else {
+        state = terminalStateForStatus(status) ?? state;
+      }
+    }
+  }
+  const fallback = terminalStateForStatus(fallbackStatus);
+  return fallback ?? state ?? ACTIVITY_TERMINAL_STATES.completed;
+}
+
 function formatTraceDuration(milliseconds) {
   if (!Number.isFinite(milliseconds) || milliseconds < 0) return null;
   if (milliseconds < 1_000) return "<1 秒";
@@ -962,9 +1184,18 @@ export function summarizeActivityTrace(events) {
   ].filter(Boolean).join(" · ");
 }
 
-export function normalizeActivityEvents(events, running, phase = null) {
+export function normalizeActivityEvents(
+  events,
+  running,
+  phase = null,
+  terminalStatus = null,
+) {
   const safeEvents = Array.isArray(events) ? events : [];
   const currentTurn = currentTurnActivityEvents(safeEvents);
+  const terminalState = activityTerminalState(
+    currentTurn.events,
+    terminalStatus,
+  );
   const latestMessageSeq = currentTurn.latestMessageSeq;
   const currentTurnEvents = currentTurn.events.filter(
     (event) => !QUIET_EVENT_TYPES.has(event.type),
@@ -980,6 +1211,16 @@ export function normalizeActivityEvents(events, running, phase = null) {
   let commandEvent = null;
 
   for (const event of collapseToolActivity(currentTurnEvents)) {
+    if (event.type === "agent.progress") {
+      const narration = progressNarration(event);
+      if (!narration.summary) continue;
+      normalized.push({
+        ...event,
+        activityKey: event.activityKey ?? `progress-${event.eventId ?? event.seq}`,
+        hideSequence: true,
+      });
+      continue;
+    }
     if (event.type === "agent.thinking") {
       if (!thinkingEvent) {
         thinkingEvent = {
@@ -1062,14 +1303,14 @@ export function normalizeActivityEvents(events, running, phase = null) {
   }
 
   if (thinkingEvent) {
-    thinkingEvent.status = running ? "active" : "finished";
+    thinkingEvent.status = running ? "active" : terminalState.thinkingStatus;
     thinkingEvent.detail = running
       ? researchEvent
         ? "正在结合刚查看的资料，判断下一步"
         : commandEvent
           ? "正在核对命令与结果，判断下一步"
           : "正在分析任务并组织下一步"
-      : "本轮思考已完成";
+      : terminalState.thinkingDetail;
     normalized.push(thinkingEvent);
   }
   if (normalized.length === 0 && running) {
@@ -1096,6 +1337,24 @@ export function normalizeActivityEvents(events, running, phase = null) {
         : hasPartialAnswer
           ? "回答正文正在逐步写入"
           : "Pi 已接收任务，正在准备上下文与模型回复",
+    });
+  } else if (
+    normalized.length === 0
+    && currentTurn.events.some((event) => [
+      "message.created",
+      "follow_up.delivered",
+      "message.completed",
+      "agent.status",
+    ].includes(event.type))
+  ) {
+    normalized.push({
+      type: "activity.turn_summary",
+      seq: currentTurn.events.at(-1)?.seq ?? currentTurn.latestMessageSeq ?? 0,
+      activityKey: `terminal-${currentTurn.latestMessageSeq || "turn"}`,
+      hideSequence: true,
+      status: terminalState.key,
+      title: "本轮状态已记录",
+      detail: terminalState.summaryDetail,
     });
   }
   return normalized.slice(-100);
@@ -1180,17 +1439,30 @@ export function ActivityTimeline({
   compact,
   transparentMode = false,
   phase,
+  terminalStatus = null,
   onOpenArtifact,
 }) {
   const [expanded, setExpanded] = useState(
     transparentMode ? true : !compact,
   );
-  const visibleEvents = normalizeActivityEvents(events, running, phase);
+  const visibleEvents = normalizeActivityEvents(
+    events,
+    running,
+    phase,
+    terminalStatus,
+  );
   const currentTurn = currentTurnActivityEvents(events).events;
+  const terminalState = activityTerminalState(currentTurn, terminalStatus);
   const harnessEvent = [...currentTurn]
     .reverse()
     .find((event) => event.type === "harness.snapshot");
   const traceSummary = summarizeActivityTrace(events);
+  const latestProgressEvent = [...visibleEvents]
+    .reverse()
+    .find((event) => event.type === "agent.progress");
+  const latestProgressSummary = latestProgressEvent
+    ? progressNarration(latestProgressEvent).summary
+    : "";
 
   useEffect(() => {
     setExpanded(transparentMode ? true : !compact);
@@ -1207,6 +1479,7 @@ export function ActivityTimeline({
       className={[
         "project-activity",
         running ? "is-running" : "is-settled",
+        running ? "" : `is-${terminalState.key}`,
         compact ? "is-compact" : "",
         expanded ? "is-expanded" : "",
       ].filter(Boolean).join(" ")}
@@ -1221,22 +1494,28 @@ export function ActivityTimeline({
       >
         {running ? (
           <CircleNotch size={15} weight="bold" aria-hidden="true" />
+        ) : terminalState.key === "stopped" ? (
+          <StopCircle size={15} weight="fill" aria-hidden="true" />
+        ) : ["waiting", "incomplete"].includes(terminalState.key) ? (
+          <WarningCircle size={15} weight="fill" aria-hidden="true" />
         ) : (
           <CheckCircle size={15} weight="fill" aria-hidden="true" />
         )}
         <span>
           <strong>
             {transparentMode
-              ? "Agent 透视"
+              ? running
+                ? "Agent 透视 · 正在工作"
+                : `Agent 透视 · ${terminalState.label}`
               : running
                 ? "Agent 正在工作"
-                : "已完成"}
+                : terminalState.label}
           </strong>
           <small>
             {transparentMode
               ? traceSummary || `${visibleEvents.length} 项过程`
               : running
-                ? `${visibleEvents.length} 项实时进展`
+                ? latestProgressSummary || `${visibleEvents.length} 项实时进展`
                 : `${visibleEvents.length} 项 · 查看过程`}
           </small>
         </span>
@@ -1248,6 +1527,7 @@ export function ActivityTimeline({
           <ActivityEvent
             event={event}
             isLatest={index === visibleEvents.length - 1}
+            isLatestProgress={event === latestProgressEvent}
             key={event.activityKey ?? event.seq}
             onOpenArtifact={onOpenArtifact}
           />
@@ -2241,15 +2521,38 @@ export function ProjectAgentPane({
     || Boolean(limitedSnapshotEvent);
   const includedFiles = conversation.workspaceSnapshot?.includedFiles
     ?? limitedSnapshotEvent?.data?.snapshot?.includedFiles;
-  const lastAssistantMessageIndex = conversation.messages.reduce(
-    (latest, message, index) => (
-      message.role === "assistant" && messageText(message.content)
-        ? index
-        : latest
-    ),
-    -1,
+  const activityByUserMessageId = new Map();
+  let latestExecutedTurnStartSeq = 0;
+  const userMessages = conversation.messages.filter(
+    (message) => message.role === "user",
   );
-  const settledWithAnswer = !workActive && lastAssistantMessageIndex >= 0;
+  const activityScopes = activityTurnScopes(conversation.events);
+  for (const message of userMessages) {
+    const turnEvents = activityScopes.find(({ boundary }) => (
+      activityBoundaryMatchesTurn(boundary, message)
+    ))?.events ?? [];
+    if (turnEvents.length === 0) continue;
+    const startSeq = turnEvents[0].seq;
+    activityByUserMessageId.set(message.id, { events: turnEvents, startSeq });
+    latestExecutedTurnStartSeq = Math.max(latestExecutedTurnStartSeq, startSeq);
+  }
+  if (
+    activityByUserMessageId.size === 0
+    && userMessages.length === 1
+    && conversation.events.some((event) => event.type === "message.created")
+  ) {
+    const legacyEvents = currentTurnActivityEvents(conversation.events).events;
+    if (legacyEvents.length > 0) {
+      const startSeq = legacyEvents[0]?.seq ?? 0;
+      activityByUserMessageId.set(userMessages[0].id, {
+        events: legacyEvents,
+        startSeq,
+      });
+      latestExecutedTurnStartSeq = startSeq;
+    }
+  }
+  const hasUnscopedActivity = activityByUserMessageId.size === 0
+    && conversation.events.length > 0;
   const latestEventSeq = conversation.events.at(-1)?.seq
     ?? conversation.lastEventSeq
     ?? 0;
@@ -2296,19 +2599,6 @@ export function ProjectAgentPane({
     userMessageCount,
   ]);
 
-  const processBlock = (compact) => (
-    <>
-      <PlanCard plan={conversation.plan} />
-      <ActivityTimeline
-        events={submitting && !running ? [] : conversation.events}
-        running={workActive}
-        compact={compact}
-        transparentMode={transparentMode}
-        phase={submitting && !running ? "submitting" : null}
-        onOpenArtifact={onOpenArtifact}
-      />
-    </>
-  );
   const streamingAssistant = latestStreamingAssistant(
     conversation.events,
     conversation.messages,
@@ -2426,6 +2716,12 @@ export function ProjectAgentPane({
             const messageAttachments = Array.isArray(message.attachments)
               ? message.attachments
               : [];
+            const turnActivity = message.role === "user"
+              ? activityByUserMessageId.get(message.id)
+              : null;
+            const isLatestExecutedTurn = turnActivity?.startSeq
+              === latestExecutedTurnStartSeq;
+            const turnRunning = Boolean(running && isLatestExecutedTurn);
             const isLastAssistantForTurn = message.role === "assistant"
               && !conversation.messages.slice(index + 1).some((candidate) => (
                 candidate.role === "assistant"
@@ -2445,9 +2741,6 @@ export function ProjectAgentPane({
             ) return null;
             return (
               <Fragment key={message.id}>
-                {settledWithAnswer && index === lastAssistantMessageIndex
-                  ? processBlock(true)
-                  : null}
                 <article
                   className={`project-agent-message is-${message.role} is-${message.kind}`}
                 >
@@ -2499,12 +2792,49 @@ export function ProjectAgentPane({
                     <TurnEvidence message={message} />
                   ) : null}
                 </article>
+                {turnActivity ? (
+                  <>
+                    {isLatestExecutedTurn ? <PlanCard plan={conversation.plan} /> : null}
+                    <ActivityTimeline
+                      events={turnActivity.events}
+                      running={turnRunning}
+                      compact={!turnRunning}
+                      transparentMode={transparentMode}
+                      terminalStatus={isLatestExecutedTurn
+                        ? activeStatus(conversation)
+                        : null}
+                      onOpenArtifact={onOpenArtifact}
+                    />
+                  </>
+                ) : null}
               </Fragment>
             );
           })
         )}
 
-        {settledWithAnswer ? null : processBlock(!workActive)}
+        {submitting && !running ? (
+          <>
+            <PlanCard plan={conversation.plan} />
+            <ActivityTimeline
+              events={[]}
+              running
+              compact={false}
+              transparentMode={transparentMode}
+              phase="submitting"
+              onOpenArtifact={onOpenArtifact}
+            />
+          </>
+        ) : null}
+        {!submitting && hasUnscopedActivity ? (
+          <ActivityTimeline
+            events={conversation.events}
+            running={running}
+            compact={!running}
+            transparentMode={transparentMode}
+            terminalStatus={activeStatus(conversation)}
+            onOpenArtifact={onOpenArtifact}
+          />
+        ) : null}
         {streamingAssistant ? (
           <article
             className="project-agent-message is-assistant is-streaming"
@@ -4603,6 +4933,15 @@ function mergeTurnHistoryMessages(turns, messages) {
   ));
 }
 
+export function mergeTurnHistoryEvents(turns, events) {
+  return [...new Map([
+    ...turns.flatMap((turn) => turn.events ?? []),
+    ...(events ?? []),
+  ].filter((event) => Number.isSafeInteger(event?.seq) && event.seq > 0)
+    .map((event) => [event.seq, event])).values()]
+    .sort((left, right) => left.seq - right.seq);
+}
+
 export function LiveProjectWorkbench({
   project = null,
   conversation = null,
@@ -4898,7 +5237,7 @@ export function LiveProjectWorkbench({
       try {
         unsubscribe = api.subscribeConversation({
           conversationId,
-          afterSeq: snapshotRef.current?.lastEventSeq ?? 0,
+          afterSeq: conversationEventResumeSeq(snapshotRef.current),
           onConversation: (nextSnapshot) => {
             if (disposed) return;
             publishSnapshot(mergeIncrementalConversationSnapshot(
@@ -5894,6 +6233,7 @@ export function LiveProjectWorkbench({
             olderTurns,
             snapshot.messages,
           ),
+          events: mergeTurnHistoryEvents(olderTurns, snapshot.events),
         }
       : snapshot
   ), [olderTurns, snapshot]);

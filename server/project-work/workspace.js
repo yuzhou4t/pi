@@ -159,7 +159,9 @@ export function normalizeProjectPath(value, { allowEmpty = false } = {}) {
 export function isFilteredProjectPath(relativePath) {
   const normalized = normalizeProjectPath(relativePath);
   const segments = normalized.split("/");
-  if (segments.some((segment) => FILTERED_DIRECTORIES.has(segment))) return true;
+  if (segments.some((segment) => FILTERED_DIRECTORIES.has(segment.toLowerCase()))) {
+    return true;
+  }
   const baseName = segments.at(-1);
   const lowerBaseName = baseName.toLowerCase();
   const extension = path.posix.extname(baseName).toLowerCase();
@@ -860,7 +862,7 @@ function shouldSkipSnapshotPath(relativePath) {
   if (isFilteredProjectPath(relativePath)) return true;
   return relativePath
     .split("/")
-    .some((segment) => SNAPSHOT_ONLY_DIRECTORIES.has(segment));
+    .some((segment) => SNAPSHOT_ONLY_DIRECTORIES.has(segment.toLowerCase()));
 }
 
 function isKnownSnapshotBinaryPath(relativePath) {

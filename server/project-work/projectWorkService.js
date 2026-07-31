@@ -97,6 +97,9 @@ import {
 const SELECTION_TTL_MS = 10 * 60 * 1_000;
 const ASSISTANT_PARTIAL_INTERVAL_MS = 250;
 const ASSISTANT_PARTIAL_GROWTH_CHARS = 512;
+const MAX_PUBLIC_PROGRESS_PER_TURN = 8;
+const MAX_PUBLIC_PROGRESS_SUMMARY_CHARS = 200;
+const MAX_PUBLIC_PROGRESS_DETAIL_CHARS = 500;
 const LEGACY_THINKING_LEVELS = [
   "off",
   "minimal",
@@ -829,10 +832,38 @@ function publicConversationOperation(operation) {
   };
 }
 
-function conversationTurns(conversation) {
+function activityBoundaryTurnId(event) {
+  if (event?.type === "message.created") {
+    return compactText(event.data?.turnId ?? event.data?.id, 180) || null;
+  }
+  if (event?.type === "follow_up.delivered") {
+    return compactText(
+      event.data?.turnId ?? event.data?.messageId,
+      180,
+    ) || null;
+  }
+  return null;
+}
+
+function activityEventsByTurn(events) {
+  const grouped = new Map();
+  let activeTurnId = null;
+  for (const event of Array.isArray(events) ? events : []) {
+    const boundaryTurnId = activityBoundaryTurnId(event);
+    if (boundaryTurnId) {
+      activeTurnId = boundaryTurnId;
+      if (!grouped.has(activeTurnId)) grouped.set(activeTurnId, []);
+    }
+    if (activeTurnId) grouped.get(activeTurnId).push(event);
+  }
+  return grouped;
+}
+
+function conversationTurns(conversation, events = []) {
   const operations = (conversation.operations ?? [])
     .map(publicConversationOperation)
     .filter(Boolean);
+  const activity = activityEventsByTurn(events);
   const grouped = new Map();
   for (const message of normalizedConversationMessages(conversation)) {
     const turn = grouped.get(message.turnId) ?? {
@@ -870,6 +901,7 @@ function conversationTurns(conversation) {
         latestAssistantMessageId: latestAssistant?.id ?? null,
         turnEvidence: finalAssistant?.turnEvidence ?? null,
         operations: turnOperations,
+        events: structuredClone(activity.get(turn.id) ?? []),
         createdAt: user?.createdAt ?? turn.messages[0]?.createdAt ?? null,
         updatedAt: turn.messages.at(-1)?.createdAt ?? null,
       };
@@ -2456,6 +2488,113 @@ export function createProjectWorkService({
 
   async function sanitizeForConversation(conversationId, value) {
     return (await sanitizeConversationPaths(conversationId, value)).slice(0, 64_000);
+  }
+
+  function redactPublicProgressSecrets(value) {
+    return String(value ?? "")
+      .replace(
+        /\b([a-z][a-z0-9+.-]*:\/\/)[^@\s/]+@/gi,
+        "$1<redacted>@",
+      )
+      .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer <redacted>")
+      .replace(
+        /\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_-]{8,}|github_pat_[A-Za-z0-9_-]{8,}|npm_[A-Za-z0-9]{20,}|xox[a-z]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{16})\b/gi,
+        "<redacted>",
+      )
+      .replace(
+        /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g,
+        "<redacted>",
+      )
+      .replace(
+        /\b((?:api[_-]?key|access[_-]?token|auth(?:orization)?|password|secret|aws[_-]?secret[_-]?access[_-]?key)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+        "$1<redacted>",
+      );
+  }
+
+  async function sanitizePublicProgressText(
+    conversationId,
+    value,
+    maxLength,
+  ) {
+    const bounded = compactText(value, maxLength * 4);
+    const pathSafe = await sanitizeConversationPaths(conversationId, bounded);
+    return redactPublicProgressSecrets(pathSafe).trim().slice(0, maxLength);
+  }
+
+  async function recordRuntimeProgress(runtime, progress, turnSettings) {
+    const turnId = compactText(turnSettings?.turnId, 180);
+    if (!turnId) {
+      throw projectWorkError(
+        "PROJECT_WORK_PROGRESS_TURN_REQUIRED",
+        "公开进展必须绑定当前工作回合",
+        409,
+      );
+    }
+    const summary = await sanitizePublicProgressText(
+      runtime.conversationId,
+      progress?.summary,
+      MAX_PUBLIC_PROGRESS_SUMMARY_CHARS,
+    );
+    const detail = await sanitizePublicProgressText(
+      runtime.conversationId,
+      progress?.detail,
+      MAX_PUBLIC_PROGRESS_DETAIL_CHARS,
+    );
+    if (!summary) {
+      throw projectWorkError(
+        "PROJECT_WORK_PROGRESS_INVALID",
+        "公开进展需要简短摘要",
+        400,
+      );
+    }
+    const attempt = Number.isSafeInteger(turnSettings?.attempt)
+      && turnSettings.attempt > 0
+      ? turnSettings.attempt
+      : 1;
+    const turnKey = turnId;
+    if (runtime.progressState?.turnKey !== turnKey) {
+      runtime.progressState = {
+        turnKey,
+        count: 0,
+        lastFingerprint: null,
+      };
+    }
+    const fingerprint = sha256(`${summary}\u0000${detail}`);
+    if (runtime.progressState.lastFingerprint === fingerprint) {
+      return {
+        recorded: false,
+        status: "duplicate",
+        index: runtime.progressState.count,
+      };
+    }
+    if (runtime.progressState.count >= MAX_PUBLIC_PROGRESS_PER_TURN) {
+      return {
+        recorded: false,
+        status: "limit_reached",
+        index: runtime.progressState.count,
+      };
+    }
+    const index = runtime.progressState.count + 1;
+    await appendEvent(runtime.conversationId, "agent.progress", {
+      summary,
+      detail: detail || null,
+      turnId,
+      turnSeq: Number.isSafeInteger(turnSettings?.turnSeq)
+        ? turnSettings.turnSeq
+        : null,
+      attempt,
+      index,
+    });
+    runtime.progressState = {
+      turnKey,
+      count: index,
+      lastFingerprint: fingerprint,
+    };
+    return {
+      recorded: true,
+      status: "recorded",
+      index,
+    };
   }
 
   async function updateConversation(conversationId, patch) {
@@ -4542,28 +4681,36 @@ export function createProjectWorkService({
         "read_attachment",
       ].includes(data.name);
       const attachmentDetails = event.result?.details;
-      const summary = attachmentTool
-        ? data.name === "list_attachments"
-          ? `附件清单 ${Array.isArray(attachmentDetails?.attachments)
-            ? attachmentDetails.attachments.length
-            : 0} 项`
-          : data.name === "search_attachments"
-            ? `附件检索 ${Array.isArray(attachmentDetails?.matches)
-              ? attachmentDetails.matches.length
+      const summary = event.isError
+        ? runtime.abortRequested === true
+          ? "工具已随本轮停止"
+          : "工具调用未完成"
+        : attachmentTool
+          ? data.name === "list_attachments"
+            ? `附件清单 ${Array.isArray(attachmentDetails?.attachments)
+              ? attachmentDetails.attachments.length
               : 0} 项`
-            : `已按需读取附件${attachmentDetails?.hasMore === true
-              ? "，仍有后续内容"
-              : "，已到文件末尾"}`
-        : extractMessageText({
-            content: event.result?.content,
-          });
+            : data.name === "search_attachments"
+              ? `附件检索 ${Array.isArray(attachmentDetails?.matches)
+                ? attachmentDetails.matches.length
+                : 0} 项`
+              : `已按需读取附件${attachmentDetails?.hasMore === true
+                ? "，仍有后续内容"
+                : "，已到文件末尾"}`
+          : extractMessageText({
+              content: event.result?.content,
+            });
       if (summary) {
         data.summary = await sanitizeForConversation(
           runtime.conversationId,
           summary.slice(0, 500),
         );
       }
-      data.status = event.isError ? "failed" : "completed";
+      data.status = event.isError
+        ? runtime.abortRequested === true
+          ? "aborted"
+          : "failed"
+        : "completed";
     }
     return data;
   }
@@ -4911,6 +5058,7 @@ export function createProjectWorkService({
       partialPublishedLength: 0,
       partialLastPublishedAtMs: null,
       partialRevision: 0,
+      progressState: null,
       codeEvidence: [],
       completion: null,
       providerId: conversation.providerId,
@@ -4919,6 +5067,7 @@ export function createProjectWorkService({
       thinkingLevel: conversation.thinkingLevel,
       skillRevision,
       activeTurnSettings: null,
+      abortRequested: false,
       host: null,
       unsubscribe: null,
     };
@@ -4955,6 +5104,11 @@ export function createProjectWorkService({
         ),
       },
       onPlan: (plan) => recordPlan(conversationId, plan),
+      onProgress: (progress) => recordRuntimeProgress(
+        runtime,
+        progress,
+        runtime.activeTurnSettings,
+      ),
       onVerificationRequest: (request) => recordVerificationRequest(
         conversationId,
         request,
@@ -5751,8 +5905,11 @@ export function createProjectWorkService({
         400,
       );
     }
-    const conversation = await conversationStore.get(conversationId);
-    const eligible = conversationTurns(conversation).filter(
+    const [conversation, events] = await Promise.all([
+      conversationStore.get(conversationId),
+      conversationStore.readAllEvents(conversationId),
+    ]);
+    const eligible = conversationTurns(conversation, events).filter(
       (turn) => beforeTurnSeq === undefined || turn.turnSeq < beforeTurnSeq,
     );
     const start = Math.max(0, eligible.length - limit);
@@ -6448,6 +6605,7 @@ export function createProjectWorkService({
         });
       }
       runtime.activeTurnSettings = turnSettings;
+      runtime.abortRequested = false;
       const {
         clientRequestId: _clientRequestId,
         requestFingerprint: _requestFingerprint,
@@ -6819,6 +6977,7 @@ export function createProjectWorkService({
         previewToolActive = previewAllowed;
       }
       runtime.activeTurnSettings = turnSettings;
+      runtime.abortRequested = false;
     } catch (error) {
       await failConversationOperation(
         conversationId,
@@ -7429,6 +7588,7 @@ export function createProjectWorkService({
         reason: "stopped",
         rewriteRuntime: false,
       });
+      runtime.abortRequested = true;
       await runtime.host.abort();
       await runtime.eventQueue;
     } else {

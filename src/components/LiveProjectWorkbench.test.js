@@ -992,7 +992,7 @@ test("live workbench keeps a bounded polling watchdog beside incremental EventSo
   assert.match(implementation, /api\.subscribeConversation/);
   assert.match(
     implementation,
-    /afterSeq: snapshotRef\.current\?\.lastEventSeq \?\? 0/,
+    /afterSeq: conversationEventResumeSeq\(snapshotRef\.current\)/,
   );
   assert.match(implementation, /mergeIncrementalConversationSnapshot/);
   assert.match(
@@ -1002,6 +1002,29 @@ test("live workbench keeps a bounded polling watchdog beside incremental EventSo
   assert.match(implementation, /if \(shouldPollConversation\)/);
   assert.match(implementation, /api\.fetchConversation/);
   assert.match(implementation, /unsubscribe\?\.\(\)/);
+});
+
+test("live workbench resumes incomplete event history from the delivered cursor", async () => {
+  await withLiveWorkbench(({ conversationEventResumeSeq }) => {
+    assert.equal(conversationEventResumeSeq({
+      lastEventSeq: 10_501,
+      deliveredEventSeq: 10_000,
+      hasMoreEvents: true,
+      events: [{ seq: 10_000 }],
+    }), 10_000);
+    assert.equal(conversationEventResumeSeq({
+      lastEventSeq: 10_501,
+      deliveredEventSeq: 10_000,
+      hasMoreEvents: true,
+      events: [{ seq: 10_500 }],
+    }), 10_500);
+    assert.equal(conversationEventResumeSeq({
+      lastEventSeq: 10_501,
+      deliveredEventSeq: 10_501,
+      hasMoreEvents: false,
+      events: [{ seq: 10_501 }],
+    }), 10_501);
+  });
 });
 
 test("safe image metadata is visible without returning image data to the browser", async () => {
@@ -1587,6 +1610,237 @@ test("settled activity is coalesced and collapsed above the final answer", async
   });
 });
 
+test("activity events are split by executed turns and ignore queued follow-ups", async () => {
+  await withLiveWorkbench(({ activityEventsForTurn }) => {
+    const events = [
+      {
+        seq: 1,
+        type: "message.created",
+        data: { id: "user-1", turnId: "turn-1", turnSeq: 1 },
+      },
+      {
+        seq: 2,
+        type: "agent.progress",
+        data: { turnId: "turn-1", summary: "第一轮公开进展" },
+      },
+      {
+        seq: 3,
+        type: "follow_up.queued",
+        data: { messageId: "user-2" },
+      },
+      {
+        seq: 4,
+        type: "follow_up.delivered",
+        data: { messageId: "user-2" },
+      },
+      {
+        seq: 5,
+        type: "agent.progress",
+        data: { turnId: "user-2", summary: "第二轮公开进展" },
+      },
+    ];
+
+    assert.deepEqual(
+      activityEventsForTurn(events, { id: "user-1", turnId: "turn-1", turnSeq: 1 })
+        .map((event) => event.seq),
+      [1, 2, 3],
+    );
+    assert.deepEqual(
+      activityEventsForTurn(events.slice(0, 3), {
+        id: "user-2",
+        turnId: "user-2",
+        turnSeq: 2,
+      }),
+      [],
+      "a queued follow-up must not become an executed activity turn",
+    );
+    assert.deepEqual(
+      activityEventsForTurn(events, {
+        id: "user-2",
+        turnId: "user-2",
+        turnSeq: 2,
+      }).map((event) => event.seq),
+      [4, 5],
+    );
+  });
+});
+
+test("loaded historical turns restore their durable activity events", async () => {
+  await withLiveWorkbench(({ mergeTurnHistoryEvents }) => {
+    const merged = mergeTurnHistoryEvents([{
+      id: "turn-1",
+      events: [
+        { seq: 1, type: "message.created" },
+        { seq: 2, type: "agent.progress", data: { summary: "旧轮进展" } },
+      ],
+    }], [
+      { seq: 2, type: "agent.progress", data: { summary: "重放后的旧轮进展" } },
+      { seq: 10, type: "message.created" },
+    ]);
+
+    assert.deepEqual(merged.map((event) => event.seq), [1, 2, 10]);
+    assert.equal(merged[1].data.summary, "重放后的旧轮进展");
+  });
+});
+
+test("every executed user turn keeps its own collapsed public activity", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        messages: [
+          {
+            id: "user-1",
+            role: "user",
+            turnId: "turn-1",
+            turnSeq: 1,
+            content: "检查第一处",
+          },
+          {
+            id: "assistant-1",
+            role: "assistant",
+            turnId: "turn-1",
+            turnSeq: 1,
+            content: "第一处已经检查。",
+          },
+          {
+            id: "user-2",
+            role: "user",
+            turnId: "turn-2",
+            turnSeq: 2,
+            content: "继续检查第二处",
+          },
+          {
+            id: "assistant-2",
+            role: "assistant",
+            turnId: "turn-2",
+            turnSeq: 2,
+            content: "第二处已经检查。",
+          },
+        ],
+        events: [
+          {
+            seq: 1,
+            type: "message.created",
+            data: { id: "user-1", turnId: "turn-1", turnSeq: 1 },
+          },
+          {
+            seq: 2,
+            type: "agent.progress",
+            data: { summary: "正在核对第一处。", turnId: "turn-1" },
+          },
+          {
+            seq: 3,
+            type: "message.completed",
+            data: { turnId: "turn-1" },
+          },
+          {
+            seq: 4,
+            type: "message.created",
+            data: { id: "user-2", turnId: "turn-2", turnSeq: 2 },
+          },
+          {
+            seq: 5,
+            type: "agent.progress",
+            data: { summary: "正在核对第二处。", turnId: "turn-2" },
+          },
+          {
+            seq: 6,
+            type: "message.completed",
+            data: { turnId: "turn-2" },
+          },
+        ],
+      }),
+    }));
+
+    assert.equal((html.match(/aria-label="Pi Agent 活动"/g) ?? []).length, 2);
+    assert.equal(
+      (html.match(/class="project-activity-body" hidden=""/g) ?? []).length,
+      2,
+    );
+    assert.match(html, /正在核对第一处/);
+    assert.match(html, /正在核对第二处/);
+    assert.ok(html.indexOf("检查第一处") < html.indexOf("正在核对第一处"));
+    assert.ok(html.indexOf("正在核对第一处") < html.indexOf("第一处已经检查"));
+    assert.ok(html.indexOf("继续检查第二处") < html.indexOf("正在核对第二处"));
+    assert.ok(html.indexOf("正在核对第二处") < html.indexOf("第二处已经检查"));
+  });
+});
+
+test("the current executed turn expands while prior activity stays collapsed", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        status: "running",
+        turnStatus: "running",
+        messages: [
+          { id: "user-1", role: "user", turnId: "turn-1", turnSeq: 1, content: "第一轮" },
+          { id: "assistant-1", role: "assistant", turnId: "turn-1", turnSeq: 1, content: "完成" },
+          { id: "user-2", role: "user", turnId: "turn-2", turnSeq: 2, content: "第二轮" },
+        ],
+        events: [
+          {
+            seq: 1,
+            type: "message.created",
+            data: { id: "user-1", turnId: "turn-1", turnSeq: 1 },
+          },
+          { seq: 2, type: "agent.progress", data: { summary: "第一轮过程" } },
+          {
+            seq: 3,
+            type: "message.created",
+            data: { id: "user-2", turnId: "turn-2", turnSeq: 2 },
+          },
+          { seq: 4, type: "agent.progress", data: { summary: "第二轮正在继续" } },
+        ],
+      }),
+    }));
+
+    assert.match(html, /project-activity is-settled is-completed is-compact/);
+    assert.match(html, /project-activity is-running is-expanded/);
+    assert.equal(
+      (html.match(/class="project-activity-body" hidden=""/g) ?? []).length,
+      1,
+    );
+  });
+});
+
+test("a failed turn without an answer keeps its process after its user message", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        status: "failed",
+        turnStatus: "failed",
+        messages: [
+          { id: "user-1", role: "user", turnId: "turn-1", turnSeq: 1, content: "第一轮" },
+          { id: "assistant-1", role: "assistant", turnId: "turn-1", turnSeq: 1, content: "第一轮回答" },
+          { id: "user-2", role: "user", turnId: "turn-2", turnSeq: 2, content: "失败的第二轮" },
+        ],
+        events: [
+          {
+            seq: 1,
+            type: "message.created",
+            data: { id: "user-1", turnId: "turn-1", turnSeq: 1 },
+          },
+          { seq: 2, type: "agent.progress", data: { summary: "第一轮过程" } },
+          {
+            seq: 3,
+            type: "message.created",
+            data: { id: "user-2", turnId: "turn-2", turnSeq: 2 },
+          },
+          { seq: 4, type: "agent.progress", data: { summary: "失败前已经完成的检查" } },
+          { seq: 5, type: "agent.status", data: { status: "failed" } },
+        ],
+      }),
+    }));
+
+    assert.equal((html.match(/aria-label="Pi Agent 活动"/g) ?? []).length, 2);
+    assert.ok(html.indexOf("失败的第二轮") < html.indexOf("失败前已经完成的检查"));
+    assert.ok(html.indexOf("第一轮回答") < html.indexOf("失败的第二轮"));
+  });
+});
+
 test("agent insight shows a safe harness snapshot and compact turn totals", async () => {
   await withLiveWorkbench(({ ActivityTimeline }) => {
     const events = [
@@ -1691,6 +1945,267 @@ test("repeated file inspection stays in one public activity layer", async () => 
     assert.equal(normalized[0].title, "查看与检索了 8 次");
     assert.equal(normalized[0].detail, "项目资料 8 次");
   });
+});
+
+test("an aborted subagent tool is presented as stopped rather than failed", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+      events: [
+        { seq: 1, type: "message.created", status: "accepted" },
+        {
+          seq: 2,
+          type: "tool.started",
+          toolName: "subagent",
+          toolCallId: "subagent-stop",
+        },
+        {
+          seq: 3,
+          type: "tool.completed",
+          toolName: "subagent",
+          toolCallId: "subagent-stop",
+          status: "aborted",
+        },
+      ],
+      running: false,
+      compact: true,
+      onOpenArtifact: () => {},
+    }));
+
+    assert.match(html, /并行子智能体已停止/);
+    assert.doesNotMatch(html, /并行子智能体失败/);
+  });
+});
+
+test("public progress narration stays separate while its tool lifecycle remains hidden", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "tool.started",
+        toolName: "report_progress",
+        toolCallId: "progress-1",
+      },
+      {
+        seq: 3,
+        type: "agent.progress",
+        data: {
+          summary: "我先确认正常工作台怎样接收实时事件。",
+          detail: "接下来核对活动归一化与最终回答的衔接。",
+        },
+      },
+      {
+        seq: 4,
+        type: "tool.completed",
+        toolName: "report_progress",
+        toolCallId: "progress-1",
+        status: "completed",
+      },
+      {
+        seq: 5,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "read-1",
+        path: "src/app.js",
+        status: "completed",
+      },
+      { seq: 6, type: "agent.thinking", status: "active" },
+      {
+        seq: 7,
+        type: "agent.progress",
+        data: {
+          summary: "已经定位到进展被压成计数的位置。",
+          detail: "现在准备保留语义化旁白，同时维持工具审计。",
+        },
+      },
+      { seq: 8, type: "agent.thinking", status: "finished" },
+    ], true);
+
+    assert.deepEqual(
+      normalized.map((event) => event.type),
+      [
+        "agent.progress",
+        "activity.research_summary",
+        "agent.progress",
+        "agent.thinking",
+      ],
+    );
+    assert.equal(
+      normalized.filter((event) => event.type === "agent.progress").length,
+      2,
+    );
+    assert.doesNotMatch(JSON.stringify(normalized), /report_progress/);
+  });
+});
+
+test("running activity presents the latest public progress as natural narration", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+      events: [
+        { seq: 1, type: "message.created", status: "accepted" },
+        {
+          seq: 2,
+          type: "agent.progress",
+          data: {
+            summary: "我正在确认事件从服务端到界面的传递路径。",
+          },
+        },
+        {
+          seq: 3,
+          type: "agent.progress",
+          data: {
+            summary: "已经找到僵硬文案的来源，正在调整公开进展层。",
+            detail: "原始私有推理仍不会进入浏览器。",
+          },
+        },
+      ],
+      running: true,
+      compact: false,
+      onOpenArtifact: () => {},
+    }));
+
+    assert.match(html, /project-activity-progress/);
+    assert.match(html, /project-activity-progress is-latest/);
+    assert.match(html, /我正在确认事件从服务端到界面的传递路径/);
+    assert.match(html, /已经找到僵硬文案的来源，正在调整公开进展层/);
+    assert.match(html, /原始私有推理仍不会进入浏览器/);
+    assert.match(html, /aria-live="polite"/);
+    assert.doesNotMatch(html, /agent\.progress|#2|#3/);
+  });
+});
+
+test("settled public progress remains inside the collapsed turn process", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+      events: [
+        { seq: 1, type: "message.created", status: "accepted" },
+        {
+          seq: 2,
+          type: "agent.progress",
+          data: { summary: "本轮公开进展已经记录。" },
+        },
+      ],
+      running: false,
+      compact: true,
+      onOpenArtifact: () => {},
+    }));
+
+    assert.match(html, /aria-expanded="false"/);
+    assert.match(html, /class="project-activity-body" hidden=""/);
+    assert.match(html, /本轮公开进展已经记录/);
+  });
+});
+
+test("quiet executed turns keep a safe durable terminal summary", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    const cases = [{
+      status: "awaiting_user",
+      event: { seq: 2, type: "ask_user.requested", data: { id: "ask-1" } },
+      className: "is-waiting",
+      label: "等待你的回答",
+    }, {
+      status: "failed",
+      event: { seq: 2, type: "agent.status", data: { status: "failed" } },
+      className: "is-incomplete",
+      label: "未完成",
+    }, {
+      status: "aborted",
+      event: { seq: 2, type: "agent.status", data: { status: "aborted" } },
+      className: "is-stopped",
+      label: "已停止",
+    }, {
+      status: "idle",
+      event: { seq: 2, type: "agent.status", data: { status: "idle" } },
+      className: "is-completed",
+      label: "已完成",
+    }];
+
+    for (const item of cases) {
+      const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+        events: [
+          {
+            seq: 1,
+            type: "message.created",
+            data: { id: "user-1", turnId: "turn-1", turnSeq: 1 },
+          },
+          item.event,
+        ],
+        running: false,
+        compact: true,
+        terminalStatus: item.status,
+        onOpenArtifact: () => {},
+      }));
+
+      assert.match(html, new RegExp(item.className));
+      assert.match(html, new RegExp(`>${item.label}<`));
+      assert.match(html, /本轮状态已记录/);
+      assert.doesNotMatch(html, /thinking_delta|原始思维链|隐藏推理/);
+    }
+  });
+});
+
+test("an extremely early failure still has an incomplete activity card", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+      events: [{
+        seq: 1,
+        type: "message.created",
+        data: { id: "user-early", turnId: "turn-early", turnSeq: 1 },
+      }],
+      running: false,
+      compact: true,
+      terminalStatus: "failed",
+      onOpenArtifact: () => {},
+    }));
+
+    assert.match(html, /is-incomplete/);
+    assert.match(html, />未完成</);
+    assert.match(html, /失败前没有额外记录可安全展示的进展/);
+    assert.doesNotMatch(html, />已完成</);
+  });
+});
+
+test("thinking lifecycle copy follows waiting, stopped, and failed terminal states", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    for (const [status, title, detail] of [
+      ["awaiting_user", "思考已暂停", "正在等待你的回答"],
+      ["aborted", "思考已停止", "本轮思考已停止"],
+      ["failed", "思考未完成", "本轮思考未完成"],
+    ]) {
+      const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+        events: [
+          {
+            seq: 1,
+            type: "message.created",
+            data: { id: "user-thinking", turnId: "turn-thinking", turnSeq: 1 },
+          },
+          { seq: 2, type: "agent.thinking", status: "active" },
+          { seq: 3, type: "agent.thinking", status: "finished" },
+        ],
+        running: false,
+        compact: false,
+        terminalStatus: status,
+        onOpenArtifact: () => {},
+      }));
+
+      assert.match(html, new RegExp(title));
+      assert.match(html, new RegExp(detail));
+      assert.doesNotMatch(html, /思考完成|本轮思考已完成/);
+    }
+  });
+});
+
+test("public progress narration uses comfortable desktop working text", async () => {
+  const styles = await readFile(STYLES_URL, "utf8");
+  const progressStart = styles.indexOf(".project-activity-progress p {");
+  const progressEnd = styles.indexOf("}", progressStart);
+  const latestStart = styles.indexOf(".project-activity-progress.is-latest p {");
+  const latestEnd = styles.indexOf("}", latestStart);
+
+  assert.notEqual(progressStart, -1);
+  assert.notEqual(latestStart, -1);
+  assert.match(styles.slice(progressStart, progressEnd), /font-size: 13px/);
+  assert.match(styles.slice(latestStart, latestEnd), /font-size: 13\.5px/);
 });
 
 test("activity normalization collapses tool lifecycles into counted public summaries", async () => {

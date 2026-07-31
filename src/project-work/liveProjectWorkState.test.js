@@ -518,6 +518,32 @@ test("incremental event snapshots keep prior history and deduplicate replays", (
   assert.equal(mergeIncrementalConversationSnapshot(merged, stale), merged);
 });
 
+test("fresh snapshots keep durable prior events when a newer response is paged", () => {
+  const current = {
+    id: "conversation-old",
+    status: "running",
+    lastEventSeq: 4,
+    updatedAt: "2026-07-25T14:00:00.000Z",
+    events: [{ seq: 2, type: "agent.progress" }, { seq: 4, type: "turn.started" }],
+  };
+  const incoming = {
+    id: "conversation-old",
+    status: "failed",
+    lastEventSeq: 6,
+    updatedAt: "2026-07-25T14:00:01.000Z",
+    events: [{ seq: 4, type: "turn.started", status: "replayed" }, {
+      seq: 6,
+      type: "agent.status",
+      status: "failed",
+    }],
+  };
+
+  const merged = mergeFreshConversationSnapshot(current, incoming);
+  assert.equal(merged.status, "failed");
+  assert.deepEqual(merged.events.map((event) => event.seq), [2, 4, 6]);
+  assert.equal(merged.events[1].status, "replayed");
+});
+
 test("only a live busy status blocks conversation deletion", () => {
   assert.equal(isProjectWorkConversationBusy({ status: "running" }), true);
   assert.equal(

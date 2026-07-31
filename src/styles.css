@@ -9343,6 +9343,63 @@ h4.reader-rail-full-heading {
   border-left: 0;
 }
 
+.project-activity-progress {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  padding: 8px 2px;
+  border-top: 1px solid var(--border);
+}
+
+.project-activity-progress > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.project-activity-progress p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.58;
+  overflow-wrap: anywhere;
+}
+
+.project-activity-progress small {
+  color: var(--weak);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.project-activity-progress-dot {
+  width: 6px;
+  height: 6px;
+  margin-top: 7px;
+  background: var(--border-strong);
+  border-radius: 50%;
+}
+
+.project-activity-progress.is-latest {
+  margin: 3px -4px 0;
+  padding: 8px 6px;
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+  border-radius: 7px;
+}
+
+.project-activity-progress.is-latest p {
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 560;
+}
+
+.project-activity-progress.is-latest .project-activity-progress-dot {
+  background: var(--teal-accent);
+  box-shadow: 0 0 0 3px rgba(33, 93, 83, 0.1);
+}
+
 .project-activity details {
   padding: 2px 0;
   border-top: 1px solid var(--border);

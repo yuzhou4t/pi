@@ -315,6 +315,16 @@ export function createConversationStore({ storageRoot } = {}) {
     });
   }
 
+  function readAllEvents(conversationId) {
+    return withLock(conversationId, async () => {
+      const id = assertConversationId(conversationId);
+      const events = await parseEvents(id, { repairTail: true });
+      const sequence = events.at(-1)?.seq ?? 0;
+      eventSequences.set(id, sequence);
+      return events;
+    });
+  }
+
   async function list(projectId) {
     let entries;
     try {
@@ -359,6 +369,7 @@ export function createConversationStore({ storageRoot } = {}) {
     directory,
     get,
     list,
+    readAllEvents,
     readEvents,
     remove,
     subscribe,

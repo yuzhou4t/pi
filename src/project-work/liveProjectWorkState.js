@@ -78,14 +78,7 @@ function shouldApplyHydration(current, incoming) {
 export function mergeFreshConversationSnapshot(current, incoming) {
   if (!incoming) return current;
   if (!current || current.id !== incoming.id) return incoming;
-  return shouldApplyHydration(current, incoming) ? incoming : current;
-}
-
-export function mergeIncrementalConversationSnapshot(current, incoming) {
-  const accepted = mergeFreshConversationSnapshot(current, incoming);
-  if (accepted !== incoming || !current || current.id !== incoming?.id) {
-    return accepted;
-  }
+  if (!shouldApplyHydration(current, incoming)) return current;
   const events = new Map(
     [...(current.events ?? []), ...(incoming.events ?? [])]
       .filter((event) => Number.isSafeInteger(event?.seq) && event.seq > 0)
@@ -95,6 +88,10 @@ export function mergeIncrementalConversationSnapshot(current, incoming) {
     ...incoming,
     events: [...events.values()].sort((left, right) => left.seq - right.seq),
   };
+}
+
+export function mergeIncrementalConversationSnapshot(current, incoming) {
+  return mergeFreshConversationSnapshot(current, incoming);
 }
 
 export function upsertLiveProject(state, project) {

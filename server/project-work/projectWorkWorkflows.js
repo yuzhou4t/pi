@@ -4,7 +4,10 @@ import {
   projectWorkWorkflow,
 } from "../../shared/projectWorkCapabilities.js";
 import { projectWorkError } from "./errors.js";
-import { PROJECT_WORK_DEFAULT_TOOL_NAMES } from "./piSessionHost.js";
+import {
+  PROJECT_WORK_DEFAULT_TOOL_NAMES,
+  PROJECT_WORK_PROGRESS_TOOL_NAME,
+} from "./piSessionHost.js";
 
 const READ_ONLY_TOOL_NAMES = [
   "read",
@@ -14,6 +17,7 @@ const READ_ONLY_TOOL_NAMES = [
   "list_documents",
   "search_documents",
   "read_document",
+  PROJECT_WORK_PROGRESS_TOOL_NAME,
   "update_plan",
   "request_verification",
 ];
@@ -29,6 +33,7 @@ const PLANNING_TOOL_NAMES = [
   "list_attachments",
   "search_attachments",
   "read_attachment",
+  PROJECT_WORK_PROGRESS_TOOL_NAME,
   "update_plan",
   "ask_user",
 ];
