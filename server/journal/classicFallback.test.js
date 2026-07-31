@@ -15,7 +15,7 @@ test("zero new papers yields five explicitly labeled classic reviews", () => {
   for (const paper of result.candidates) {
     assert.equal(paper.candidate_origin, "classic_review");
     assert.equal(paper.is_new, false);
-    assert.equal(paper.display_label, "经典回顾 · 非本周新论文");
+    assert.equal(paper.display_label, "经典回顾 · 非本月新论文");
     assert.equal(paper.observed_at, "2026-07-23T08:00:00.000Z");
   }
 });

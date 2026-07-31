@@ -286,7 +286,7 @@ test("workflow runs scan, ranks five papers, submits one MinerU batch, and becom
   const completed = await service.waitForRun(started.run_id);
   assert.equal(completed.status, "review_ready");
   assert.equal(completed.candidates.length, 5);
-  assert.equal(completed.candidates[4].display_label, "经典回顾 · 非本周新论文");
+  assert.equal(completed.candidates[4].display_label, "经典回顾 · 非本月新论文");
   assert.equal(submitted.length, 1);
   assert.equal(submitted[0].length, 5);
   assert.equal(completed.mineru.status, "ready");

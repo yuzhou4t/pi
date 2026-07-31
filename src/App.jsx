@@ -52,6 +52,8 @@ import {
   fetchProjectStatePreview,
   fetchZoteroProposal,
   fetchZoteroTargets,
+  addRecentClassicsToWeekly,
+  dismissJournalPaper,
   restartJournalReadingFromGuide,
   resetJournalPaperReading,
   retryJournalPaperDocument,
@@ -102,7 +104,7 @@ const TopicSearchWorkspace = lazy(() => import(
 const WORKFLOW_FIXTURES_ENABLED = import.meta.env.VITE_ENABLE_WORKFLOW_FIXTURES === "true";
 
 const runStatusLabels = {
-  [RUN_STATUS.REVIEW_READY]: "本周待审阅",
+  [RUN_STATUS.REVIEW_READY]: "本月待审阅",
   [RUN_STATUS.PREPARING_GUIDES]: "正在准备导读",
   [RUN_STATUS.GUIDE_READY]: "导读待决定",
   [RUN_STATUS.READING]: "论文研读",
@@ -140,7 +142,7 @@ const BASE_PROJECTS = [
     name: workflowFixture.project.name,
     state: "2 个会话 · 1 个追踪",
     rootLabel: workflowFixture.project.rootLabel,
-    updated: "本周",
+    updated: "本月",
     workspaceKinds: ["project_work", "paper_reading"],
     seeded: true,
   },
@@ -764,11 +766,11 @@ export function App() {
       : journalRunState.status === "error"
         ? "扫描状态读取失败"
         : journalRunState.status === "idle" && !journalRunState.run
-          ? "等待开始本周扫描"
+          ? "等待开始本月扫描"
         : journalRunStatusLabels[journalRunState.run?.status]
           ?? (WORKFLOW_FIXTURES_ENABLED
             ? runStatusLabels[run.status] ?? run.status
-            : "等待开始本周扫描"),
+            : "等待开始本月扫描"),
   }), [journalRunState.run?.id, journalRunState.run?.status, journalRunState.status, run.runId, run.status]);
   const liveJournalPapers = journalRunState.run?.candidates;
   const obsidianAgentActionRevision = runAgentActionRevision(journalRunState.run);
@@ -1971,13 +1973,31 @@ export function App() {
       });
       setTopicSearchState({ status: "ready", conversation: result.conversation, error: null });
       syncJournalRun(result.run);
-      showToast("已加入本周推荐，可从每周追踪准备全文");
+      showToast("已加入本月推荐，可从每月追踪准备全文");
     } catch (error) {
       setTopicSearchAddErrors((current) => ({ ...current, [turnId]: error.message }));
     } finally {
       setTopicSearchAddingTurnId(null);
     }
   }, [activeTopicConversationId, showToast, syncJournalRun]);
+
+  const addRecentClassicPapers = useCallback(async (paperIds) => {
+    const runId = journalRunState.run?.id;
+    if (!runId) throw new Error("当前没有可操作的运行");
+    const nextRun = await addRecentClassicsToWeekly({ runId, paperIds });
+    syncJournalRun(nextRun);
+    showToast("已加入本月推荐，可从每月追踪准备全文");
+  }, [journalRunState.run?.id, showToast, syncJournalRun]);
+
+  const dismissRecentClassicPaper = useCallback(async (paper) => {
+    const result = await dismissJournalPaper({
+      runId: journalRunState.run?.id ?? null,
+      dedupeKey: paper.dedupeKey,
+      title: paper.title ?? "",
+    });
+    if (result.run) syncJournalRun(result.run);
+    showToast("已标记不感兴趣，之后不会再推荐这篇论文");
+  }, [journalRunState.run?.id, showToast, syncJournalRun]);
 
   const retryPaperDocument = useCallback(async (paperId) => {
     const runId = journalRunState.run?.id;
@@ -2087,7 +2107,7 @@ export function App() {
       setActiveConversationId("workflow-run");
       setMobileView("run");
     }
-    showToast("已删除研读记录，论文已回到本周候选");
+    showToast("已删除研读记录，论文已回到本月候选");
   }, [
     activeConversationId,
     journalRunState.run?.id,
@@ -2238,7 +2258,7 @@ export function App() {
           nextRun,
           ...current.filter((runItem) => runItem.id !== nextRun.id),
         ]);
-        showToast("该次研读已从导读重新开始；当前每周追踪保持不变");
+        showToast("该次研读已从导读重新开始；当前每月追踪保持不变");
       }
       return nextRun;
     } catch (error) {
@@ -3210,7 +3230,7 @@ export function App() {
             }
             setActiveConversationId("workflow-run");
             setMobileView("run");
-            showToast("请先从每周追踪选择一篇论文开始研读", "warning");
+            showToast("请先从每月追踪选择一篇论文开始研读", "warning");
           }}
           creatingConversationProjectIds={creatingConversationProjectIds}
           preparingConversationProjectId={preparingConversationSelection?.projectId ?? null}
@@ -3237,7 +3257,7 @@ export function App() {
             setMobileView("run");
             showToast(
               projectId === workflowFixture.project.id
-                ? "请从本周追踪选择要精读的论文"
+                ? "请从每月追踪选择要精读的论文"
                 : "该项目尚未设置论文追踪",
               "warning",
             );
@@ -3270,7 +3290,7 @@ export function App() {
             ? activeRun.id
             : null}
           onSelectRun={() => {
-            // 每周追踪固定落在候选页：清掉残留的论文阅读目标，避免旧工作流
+            // 每月追踪固定落在候选页：清掉残留的论文阅读目标，避免旧工作流
             // 布局把论文渲染到中栏、把论文 Agent 挤到右栏（位置调换 bug）。
             closeJournalPaper();
           }}
@@ -3466,6 +3486,8 @@ export function App() {
             historyRun.id !== journalRunState.run?.id
             && (historyRun.candidates?.length ?? 0) > 0
           ))}
+          onAddRecentClassics={addRecentClassicPapers}
+          onDismissRecentClassic={dismissRecentClassicPaper}
           readerTarget={readerTarget}
           onOpenPaper={openJournalPaper}
           onOpenCloseReading={(paperId) => openJournalPaper(
@@ -3542,7 +3564,7 @@ export function App() {
           onRetryFailed={() => commitWritePreview({ retry: true })}
           onReset={() => {
             dispatchAction(RUN_ACTIONS.RESET);
-            showToast("已重置为本周待审阅状态");
+            showToast("已重置为本月待审阅状态");
           }}
           mobileActive={mobileView === "run"}
           sidebarOpen={sidebarOpen}

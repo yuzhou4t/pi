@@ -1,4 +1,4 @@
-const RESURFACE_LABEL = "往周未读回补 · 非本周新论文";
+const RESURFACE_LABEL = "往期未读回补 · 非本月新论文";
 
 function decisionOf(run, paperId) {
   const decisions = run?.paper_decisions;
@@ -17,8 +17,8 @@ function identityKeys(paper) {
 export { RESURFACE_LABEL };
 
 /**
- * 从往周 Run 里挑出「用户没有处理过、但当时进入过推荐」的论文，
- * 作为本周候选的回补。只做确定性筛选，不调用模型。
+ * 从往期 Run 里挑出「用户没有处理过、但当时进入过推荐」的论文，
+ * 作为本月候选的回补。只做确定性筛选，不调用模型。
  */
 export function selectResurfaceCandidates({
   previousRuns = [],
@@ -26,12 +26,17 @@ export function selectResurfaceCandidates({
   currentRunId = null,
   limit = 5,
   observedAt = null,
+  dismissedKeys = [],
 } = {}) {
   if (!Array.isArray(previousRuns) || previousRuns.length === 0) return [];
   if (!Number.isInteger(limit) || limit < 1) return [];
   const seen = new Set(
     currentCandidates.flatMap((paper) => identityKeys(paper)),
   );
+  // 用户标记过「不感兴趣」的论文不再回补。
+  for (const key of dismissedKeys) {
+    if (typeof key === "string" && key) seen.add(`key:${key}`);
+  }
   const ordered = previousRuns
     .filter((run) => run && run.run_id !== currentRunId)
     .slice()
@@ -56,7 +61,7 @@ export function selectResurfaceCandidates({
         ...paper,
         candidate_origin: "resurfaced_unread",
         is_new: false,
-        published_this_week: false,
+        published_this_month: false,
         display_label: RESURFACE_LABEL,
         resurfaced_from_run_id: run.run_id ?? null,
         observed_at: observedAt ?? paper.observed_at ?? null,

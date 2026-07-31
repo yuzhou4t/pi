@@ -32,7 +32,7 @@ test("Skill center defaults to installed items and keeps the broad catalog exter
     assert.match(html, /已安装 0/);
     assert.match(html, /已确认候选 4/);
     assert.match(html, /没有安装任何 Skill/);
-    assert.doesNotMatch(html, /正在同步 Pi Skill 目录|Superpowers|论文每周追踪/);
+    assert.doesNotMatch(html, /正在同步 Pi Skill 目录|Superpowers|论文每月追踪/);
     assert.match(html, /安装不会自动启用/);
     assert.match(html, /不开放 Extension/);
     assert.doesNotMatch(html, /一键运行安装脚本|MCP 市场/);

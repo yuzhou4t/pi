@@ -51,13 +51,12 @@ function normalizeJournalMutationLedger(value) {
   };
 }
 
-export function journalWeekWindowKey(value) {
+// 月窗口以每月 1 日（UTC）为起点；返回该月第一天的日期串，作为 Run 去重与展示的窗口标识。
+export function journalMonthWindowKey(value) {
   const date = value instanceof Date ? new Date(value) : new Date(value);
-  if (!Number.isFinite(date.getTime())) throw new Error("Invalid journal week date");
-  const day = date.getUTCDay();
-  const daysSinceMonday = (day + 6) % 7;
+  if (!Number.isFinite(date.getTime())) throw new Error("Invalid journal month date");
   date.setUTCHours(0, 0, 0, 0);
-  date.setUTCDate(date.getUTCDate() - daysSinceMonday);
+  date.setUTCDate(1);
   return date.toISOString().slice(0, 10);
 }
 
@@ -165,7 +164,7 @@ export function createRunStore({ dataDir, now = () => new Date(), idFactory = ra
       throw new Error("projectId contains unsupported characters");
     }
     const createdAt = now().toISOString();
-    const resolvedWindowKey = windowKey || journalWeekWindowKey(createdAt);
+    const resolvedWindowKey = windowKey || journalMonthWindowKey(createdAt);
     const runId = `journal-${createdAt.replaceAll(/[:.]/g, "-")}-${idFactory().slice(0, 8)}`;
     const run = {
       schema_version: JOURNAL_RUN_SCHEMA_VERSION,
@@ -228,7 +227,7 @@ export function createRunStore({ dataDir, now = () => new Date(), idFactory = ra
 
   function createOrReuseActiveRun(options = {}) {
     const projectId = options.projectId ?? DEFAULT_JOURNAL_PROJECT_ID;
-    const windowKey = options.windowKey || journalWeekWindowKey(now());
+    const windowKey = options.windowKey || journalMonthWindowKey(now());
     const previous = creationQueue;
     const operation = previous
       .catch(() => undefined)
@@ -236,7 +235,7 @@ export function createRunStore({ dataDir, now = () => new Date(), idFactory = ra
         const runs = await listRuns();
         const active = runs.find((run) => (
           run.project_id === projectId
-          && (run.window_key || journalWeekWindowKey(run.created_at)) === windowKey
+          && (run.window_key || journalMonthWindowKey(run.created_at)) === windowKey
           && !TERMINAL_RUN_STATUSES.has(run.status)
         ));
         if (active) return { run: active, created: false };

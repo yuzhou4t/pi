@@ -97,7 +97,7 @@ const runBody = {
     venue: "ICLR",
     published_at: "2023",
     first_seen_at: null,
-    display_label: "经典回顾 · 非本周新论文",
+    display_label: "经典回顾 · 非本月新论文",
     candidate_origin: "classic_review",
     is_new: false,
     selection_summary: "A summary",
@@ -110,7 +110,7 @@ const runBody = {
 
 test("journal runs keep classic origin and MinerU state visible", () => {
   const run = mapJournalRun(runBody);
-  assert.equal(run.candidates[0].discoveryType, "经典回顾 · 非本周新论文");
+  assert.equal(run.candidates[0].discoveryType, "经典回顾 · 非本月新论文");
   assert.equal(run.candidates[0].isNew, false);
   assert.equal(run.candidates[0].mineruStatus, "ready");
   assert.equal(run.candidates[0].mineruRunStatus, "partial");

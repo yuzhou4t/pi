@@ -1149,7 +1149,7 @@ export function createReadingService({
           return completedMutationPatch(current, identity, {
             status: "review_ready",
             phase: "candidate_review",
-            paused_reason: "已返回本周推荐文章，可重新选择要研读的论文",
+            paused_reason: "已返回本月推荐文章，可重新选择要研读的论文",
             paper_decisions: {},
             readings: emptyReadings(),
             reading_restart: {

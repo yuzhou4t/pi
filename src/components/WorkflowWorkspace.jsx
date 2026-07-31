@@ -26,7 +26,7 @@ import { PaperRichText } from "./PaperRichText.jsx";
 import { ProviderMenu } from "./ProviderMenu.jsx";
 
 const STATUS_LABELS = {
-  review_ready: "本周待审阅",
+  review_ready: "本月待审阅",
   preparing_guides: "正在准备导读",
   guide_ready: "导读待决定",
   reading: "论文研读",
@@ -659,25 +659,17 @@ function PaperTabs({ papers, activePaperId, onSetActivePaper }) {
 
 function pastRunWeekLabel(run) {
   const date = String(run.createdAt ?? "").slice(0, 10);
-  return date ? `${date} 那周` : "早先周次";
+  return date ? `${date} 那期` : "早先期次";
 }
 
-// 周窗口以周一为起点（与服务端 journalWeekWindowKey 一致），展示为周一至周日。
-function weekWindowLabel(windowKey, fallbackDate = null) {
-  let start = null;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(String(windowKey ?? ""))) {
-    start = new Date(`${windowKey}T00:00:00Z`);
-  } else if (fallbackDate) {
-    const parsed = new Date(fallbackDate);
-    if (Number.isFinite(parsed.getTime())) {
-      parsed.setUTCHours(0, 0, 0, 0);
-      parsed.setUTCDate(parsed.getUTCDate() - ((parsed.getUTCDay() + 6) % 7));
-      start = parsed;
-    }
-  }
-  if (!start || !Number.isFinite(start.getTime())) return null;
-  const end = new Date(start);
-  end.setUTCDate(end.getUTCDate() + 6);
+// 发现窗口与服务端判定一致：以扫描时刻为终点的近 30 天滚动区间，
+// 而不是自然月；月窗口 key 只用于 Run 去重。
+function monthWindowLabel(fallbackDate = null) {
+  const end = fallbackDate ? new Date(fallbackDate) : null;
+  if (!end || !Number.isFinite(end.getTime())) return null;
+  end.setUTCHours(0, 0, 0, 0);
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - 30);
   const fmt = (date) => `${date.getUTCMonth() + 1}月${date.getUTCDate()}日`;
   return `${start.getUTCFullYear()}年${fmt(start)} – ${fmt(end)}`;
 }
@@ -688,18 +680,100 @@ function pastDecisionLabel(decision) {
   return "未处理";
 }
 
-function PastWeeksReview({ pastRuns }) {
+function RecentClassicsSection({ recentClassics, onAddRecentClassics, onDismissRecentClassic }) {
   const [open, setOpen] = useState(false);
-  if (!Array.isArray(pastRuns) || pastRuns.length === 0) return null;
+  const [busyId, setBusyId] = useState(null);
+  const [error, setError] = useState(null);
+  if (!recentClassics) return null;
+  const papers = recentClassics.papers ?? [];
+  const failed = recentClassics.status !== "success";
+  if (!failed && papers.length === 0) return null;
+
+  const runAction = async (paperId, action) => {
+    setBusyId(paperId);
+    setError(null);
+    try {
+      await action();
+    } catch (actionError) {
+      setError(actionError?.message ?? "操作未完成，可稍后重试");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   return (
-    <section className="workflow-past-weeks" aria-label="往周推荐回看">
+    <section className="workflow-recent-classics" aria-label="近年高引未读经典">
       <button
         type="button"
         className="workflow-evidence-toggle"
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
       >
-        {open ? "收起往周推荐" : `回看往周推荐（${pastRuns.length} 周）`}
+        {open ? "收起近年经典" : `近年高引 · 未读经典（${papers.length} 篇）`}
+      </button>
+      {open ? (
+        <div className="workflow-recent-classics-body">
+          {recentClassics.fromYear ? (
+            <p className="workflow-recent-classics-note">
+              {recentClassics.fromYear} 年以来、与项目主题相关的高引论文，已读、已收藏和标过不感兴趣的不会出现。
+            </p>
+          ) : null}
+          {failed ? (
+            <p className="workflow-recent-classics-note">近年经典暂时无法获取（{recentClassics.error?.message ?? "数据源不可用"}），下次扫描会重试。</p>
+          ) : null}
+          {error ? <p className="workflow-recent-classics-error">{error}</p> : null}
+          <ul className="workflow-recent-classics-list">
+            {papers.map((paper) => (
+              <li key={paper.id}>
+                <div className="workflow-recent-classic-main">
+                  <strong>{paper.titleZh || paper.title}</strong>
+                  {paper.titleZh && paper.titleZh !== paper.title ? <small>{paper.title}</small> : null}
+                  <small>
+                    {paper.venue}
+                    {paper.publishedAt ? ` · ${String(paper.publishedAt).slice(0, 10)}` : ""}
+                    {Number.isInteger(paper.citedByCount) ? ` · 引用 ${paper.citedByCount}` : ""}
+                  </small>
+                  {paper.abstract ? <p>{paper.abstract.slice(0, 180)}</p> : null}
+                </div>
+                <div className="workflow-recent-classic-actions">
+                  <button
+                    type="button"
+                    className="workflow-secondary-action"
+                    disabled={busyId === paper.id}
+                    onClick={() => runAction(paper.id, () => onAddRecentClassics([paper.id]))}
+                  >
+                    加入本月推荐
+                  </button>
+                  <button
+                    type="button"
+                    className="workflow-secondary-action"
+                    disabled={busyId === paper.id || !paper.dedupeKey}
+                    onClick={() => runAction(paper.id, () => onDismissRecentClassic(paper))}
+                  >
+                    不感兴趣
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function PastWeeksReview({ pastRuns }) {
+  const [open, setOpen] = useState(false);
+  if (!Array.isArray(pastRuns) || pastRuns.length === 0) return null;
+  return (
+    <section className="workflow-past-weeks" aria-label="往期推荐回看">
+      <button
+        type="button"
+        className="workflow-evidence-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {open ? "收起往期推荐" : `回看往期推荐（${pastRuns.length} 期）`}
       </button>
       {open ? (
         <div className="workflow-past-weeks-list">
@@ -757,6 +831,8 @@ function CandidateReview({
   onResumeJournalRun,
   onRetryPaperDocument,
   pastRuns = [],
+  onAddRecentClassics,
+  onDismissRecentClassic,
   readOnly = false,
   readOnlyQuiet = false,
 }) {
@@ -858,18 +934,18 @@ function CandidateReview({
               {hasLiveCandidates
                 ? "真实扫描结果"
                 : scanInProgress
-                  ? "本周扫描进行中"
+                  ? "本月扫描进行中"
                   : liveScanStarted
-                    ? "本周扫描未产生候选"
+                    ? "本月扫描未产生候选"
                     : hasFixtureCandidates
-                      ? "本周扫描完成"
-                      : "等待开始本周扫描"}
+                      ? "本月扫描完成"
+                      : "等待开始本月扫描"}
             </span>
-            <h2 id="review-title">选择本周要读的论文</h2>
+            <h2 id="review-title">选择本月要读的论文</h2>
             {(() => {
-              const windowLabel = weekWindowLabel(liveRun?.windowKey, liveRun?.createdAt);
+              const windowLabel = monthWindowLabel(liveRun?.createdAt);
               return windowLabel ? (
-                <p className="workflow-week-window">本周窗口：{windowLabel}（仅此区间内发表的算本周新论文）</p>
+                <p className="workflow-week-window">本月发现窗口：{windowLabel}（此区间内发表的算本月新论文）</p>
               ) : null;
             })()}
             {scanSummary ? (
@@ -930,7 +1006,7 @@ function CandidateReview({
                   ? "扫描与筛选仍在进行，完成后会在这里显示结果。"
                   : journalRunState?.error
                     ? "本次真实扫描没有完成。修复连接后重新扫描，不会改用示例论文。"
-                    : "运行本周扫描后，候选论文会在这里出现。"}
+                    : "运行本月扫描后，候选论文会在这里出现。"}
               </p>
             </div>
           </div>
@@ -994,7 +1070,7 @@ function CandidateReview({
                   {paper.isDemo === false ? (
                     <p className="workflow-paper-status-row">
                       <span className={paper.isNew === false || paper.publishedThisWeek === false ? "is-classic" : "is-new"}>
-                        {paper.discoveryType ?? (paper.isNew === false ? "经典回顾 · 非本周新论文" : "本周新论文")}
+                        {paper.discoveryType ?? (paper.isNew === false ? "经典回顾 · 非本月新论文" : "本月新论文")}
                       </span>
                       <span className={`is-${mineru.tone}`}>{mineru.label}</span>
                     </p>
@@ -1072,6 +1148,14 @@ function CandidateReview({
         </div>
       </div>
 
+      {readOnly ? null : (
+        <RecentClassicsSection
+          recentClassics={liveRun?.recentClassics ?? null}
+          onAddRecentClassics={onAddRecentClassics}
+          onDismissRecentClassic={onDismissRecentClassic}
+        />
+      )}
+
       {readOnly ? null : <PastWeeksReview pastRuns={pastRuns} />}
 
       {readOnly && readOnlyQuiet ? null : (
@@ -1085,7 +1169,7 @@ function CandidateReview({
                 {unavailableGuideCount > 0 ? ` 另有 ${unavailableGuideCount} 篇正文尚未准备完成。` : ""}
               </p>
               <div>
-                <button className="workflow-secondary-action" type="button" onClick={onSkipRun}>本周不处理</button>
+                <button className="workflow-secondary-action" type="button" onClick={onSkipRun}>本月不处理</button>
                 <button className="workflow-primary-action" type="button" onClick={onPrepareGuides} disabled={selectedCount === 0}>
                   {guideFailure ? "重新生成五分钟导读" : "生成五分钟导读"} <ArrowRight size={15} weight="bold" aria-hidden="true" />
                 </button>
@@ -1507,7 +1591,7 @@ export function RestartReadingDialog({ pending, error, onCancel, onConfirm }) {
           <span><BookOpen size={20} aria-hidden="true" /></span>
           <div>
             <h2 id="restart-reading-title">从导读重新开始？</h2>
-            <p>这是一次重置操作。完成后会回到本周推荐文章列表。</p>
+            <p>这是一次重置操作。完成后会回到本月推荐文章列表。</p>
           </div>
         </header>
         <div className="restart-reading-scope">
@@ -2087,7 +2171,7 @@ function CompletedStage({ proposals, onReset }) {
           return <span key={proposal.id}><Icon size={16} aria-hidden="true" />{meta.description}</span>;
         })}
       </div>
-      {onReset ? <button className="workflow-secondary-action" type="button" onClick={onReset}>重新运行本周 Run</button> : null}
+      {onReset ? <button className="workflow-secondary-action" type="button" onClick={onReset}>重新运行本月 Run</button> : null}
     </section>
   );
 }
@@ -2110,10 +2194,10 @@ function CompletedNoWriteStage({ onReset }) {
     <section className="workflow-stage workflow-result-stage is-no-write" aria-labelledby="no-write-title">
       <CheckCircle size={36} weight="fill" aria-hidden="true" />
       <span className="workflow-stage-label">正常结束</span>
-      <h2 id="no-write-title">本周没有选择处理论文</h2>
+      <h2 id="no-write-title">本月没有选择处理论文</h2>
       <p>扫描结果和可靠游标已经保留；Zotero、Obsidian 与项目状态均未发生变化。</p>
-      <div className="workflow-demo-notice"><ShieldCheck size={18} aria-hidden="true" /><div><strong>扫描结果已保留</strong><p>本轮没有写入任何外部位置；下次运行仍可参考本周发现记录。</p></div></div>
-      {onReset ? <button className="workflow-secondary-action" type="button" onClick={onReset}>重新运行本周 Run</button> : null}
+      <div className="workflow-demo-notice"><ShieldCheck size={18} aria-hidden="true" /><div><strong>扫描结果已保留</strong><p>本轮没有写入任何外部位置；下次运行仍可参考本月发现记录。</p></div></div>
+      {onReset ? <button className="workflow-secondary-action" type="button" onClick={onReset}>重新运行本月 Run</button> : null}
     </section>
   );
 }
@@ -2125,6 +2209,8 @@ export function WorkflowWorkspace({
   onGenerateCandidateSummaries,
   journalRunState,
   pastRuns = [],
+  onAddRecentClassics,
+  onDismissRecentClassic,
   guideState,
   readerTarget,
   onOpenPaper,
@@ -2237,7 +2323,7 @@ export function WorkflowWorkspace({
     projectStateUiState,
   });
   const requestedStepIndex = WORKFLOW_STEPS.findIndex((step) => step.id === viewStepId);
-  // 每周追踪的固定落点是候选审阅页：精读进行中的过程只从左栏「论文研读」
+  // 每月追踪的固定落点是候选审阅页：精读进行中的过程只从左栏「论文研读」
   // 列表进入，不再作为工作流视图的默认画面；步骤条上的「精读」仍可显式查看。
   const pinnedToReview = currentStep.id === "reading" && availableStepIds.has("review");
   const defaultStep = pinnedToReview ? WORKFLOW_STEPS[0] : currentStep;
@@ -2274,7 +2360,7 @@ export function WorkflowWorkspace({
       setRestartDialog({
         open: true,
         pending: false,
-        error: error?.message ?? "暂时无法返回本周推荐文章",
+        error: error?.message ?? "暂时无法返回本月推荐文章",
       });
     }
   };
@@ -2291,7 +2377,7 @@ export function WorkflowWorkspace({
         : JOURNAL_PHASE_LABELS[journalRunState?.run?.phase];
 
   let content = null;
-  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onResumeJournalRun={onResumeJournalRun} onRetryPaperDocument={onRetryPaperDocument} pastRuns={pastRuns} />;
+  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onResumeJournalRun={onResumeJournalRun} onRetryPaperDocument={onRetryPaperDocument} pastRuns={pastRuns} onAddRecentClassics={onAddRecentClassics} onDismissRecentClassic={onDismissRecentClassic} />;
   if (status === "preparing_guides") {
     content = <PreparingGuides run={run} selectedPapers={selectedPapers} journalRunState={journalRunState} />;
   }
@@ -2466,7 +2552,7 @@ export function WorkflowWorkspace({
         <div className="workflow-history-bar" role="status">
           <span>
             {pinnedLanding
-              ? `本周推荐的论文都在这里；精读从左侧「论文研读」列表继续，当前进度在「${currentStep.label}」。`
+              ? `本月推荐的论文都在这里；精读从左侧「论文研读」列表继续，当前进度在「${currentStep.label}」。`
               : `正在查看已完成的「${viewedStep.label}」步骤，当前流程仍在「${currentStep.label}」。`}
           </span>
           <div>

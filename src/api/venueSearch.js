@@ -204,7 +204,7 @@ export async function addVenueSearchPapersToWeekly({
     signal,
   });
   const body = await jsonResponse(response, "本地服务返回了无法解析的加入结果");
-  if (!response.ok) throw requestError(response, body, "无法加入本周推荐");
+  if (!response.ok) throw requestError(response, body, "无法加入本月推荐");
   return {
     run: mapJournalRun(body.run),
     conversation: mapVenueSearchConversation(body.conversation),

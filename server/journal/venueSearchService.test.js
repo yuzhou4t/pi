@@ -472,7 +472,7 @@ test("accepted search papers join the current weekly run once with retrieval lab
       title: "Weekly Paper",
       rank: 1,
       candidate_origin: "weekly_scan",
-      display_label: "本周新论文",
+      display_label: "本月新论文",
     }],
     mineru: { status: "ready", batch_id: null, papers: { "weekly-1": { status: "ready" } } },
   });
@@ -506,7 +506,7 @@ test("accepted search papers join the current weekly run once with retrieval lab
   );
   assert.equal(added.length, 1);
   assert.equal(added[0].paper_id, "search-1");
-  assert.equal(added[0].display_label, "主题检索推荐 · 非本周新论文");
+  assert.equal(added[0].display_label, "主题检索推荐 · 非本月新论文");
   assert.equal(added[0].rank, 2);
   assert.equal(
     result.run.mineru.papers["search-1"].status,

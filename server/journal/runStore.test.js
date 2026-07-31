@@ -6,7 +6,7 @@ import test from "node:test";
 import {
   createRunStore,
   JOURNAL_RUN_SCHEMA_VERSION,
-  journalWeekWindowKey,
+  journalMonthWindowKey,
 } from "./runStore.js";
 
 test("run store creates, updates, lists, and restores a run", async () => {
@@ -20,7 +20,7 @@ test("run store creates, updates, lists, and restores a run", async () => {
   const created = await store.createRun({ sourceIds: ["jmlr", "acl"] });
   assert.equal(created.run_id, "journal-2026-07-23T08-00-00-000Z-12345678");
   assert.equal(created.project_id, "pi-agent-product");
-  assert.equal(created.window_key, "2026-07-20");
+  assert.equal(created.window_key, "2026-07-01");
   assert.equal(created.status, "scanning");
   assert.deepEqual(created.guides, {
     status: "not_started",
@@ -113,14 +113,18 @@ test("run records migrate version zero and reject future schema versions", async
   assert.equal(await readFile(runPath, "utf8"), futureContent);
 });
 
-test("journal week windows start on Monday and active runs are reused atomically", async () => {
+test("journal month windows start on the first day and active runs are reused atomically", async () => {
   assert.equal(
-    journalWeekWindowKey("2026-07-27T00:00:00.000Z"),
-    "2026-07-27",
+    journalMonthWindowKey("2026-07-27T00:00:00.000Z"),
+    "2026-07-01",
   );
   assert.equal(
-    journalWeekWindowKey("2026-08-02T23:59:59.000Z"),
-    "2026-07-27",
+    journalMonthWindowKey("2026-07-01T00:00:00.000Z"),
+    "2026-07-01",
+  );
+  assert.equal(
+    journalMonthWindowKey("2026-08-02T23:59:59.000Z"),
+    "2026-08-01",
   );
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-run-window-"));
   let createdCount = 0;

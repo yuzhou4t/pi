@@ -1,4 +1,4 @@
-export const CLASSIC_REVIEW_LABEL = "经典回顾 · 非本周新论文";
+export const CLASSIC_REVIEW_LABEL = "经典回顾 · 非本月新论文";
 
 export const CLASSIC_PAPERS = Object.freeze([
   {

@@ -68,7 +68,7 @@ export function DeleteTopicConversationDialog({
         </header>
 
         <p className="conversation-delete-note">
-          此操作不可恢复。已加入「本周推荐」的论文不受影响，会继续留在每周追踪里。
+          此操作不可恢复。已加入「本月推荐」的论文不受影响，会继续留在每月追踪里。
         </p>
         {error ? <p className="conversation-delete-error" role="alert">{error}</p> : null}
 

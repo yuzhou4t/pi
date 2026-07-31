@@ -41,7 +41,7 @@ test("resurfaces unread past candidates newest run first with stable labels", ()
   assert.equal(result[0].candidate_origin, "resurfaced_unread");
   assert.equal(result[0].display_label, RESURFACE_LABEL);
   assert.equal(result[0].is_new, false);
-  assert.equal(result[0].published_this_week, false);
+  assert.equal(result[0].published_this_month, false);
   assert.equal(result[0].resurfaced_from_run_id, "run-new");
   assert.equal(result[0].observed_at, "2026-07-30T00:00:00Z");
 });

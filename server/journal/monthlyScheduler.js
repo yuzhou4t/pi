@@ -7,7 +7,6 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 
-const WEEK_MS = 7 * 24 * 60 * 60 * 1_000;
 const RETRY_MS = 5 * 60 * 1_000;
 
 function boundedInteger(value, fallback, min, max) {
@@ -17,15 +16,15 @@ function boundedInteger(value, fallback, min, max) {
     : fallback;
 }
 
-function localDateKey(date) {
+function monthKeyOf(date) {
   return [
     String(date.getFullYear()).padStart(4, "0"),
     String(date.getMonth() + 1).padStart(2, "0"),
-    String(date.getDate()).padStart(2, "0"),
   ].join("-");
 }
 
-export function weeklyScheduleWindow(nowValue, {
+// day 限定 1-28，避免月末溢出；due 为本月第 day 天 hour:minute，未到则回退到上一个月。
+export function monthlyScheduleWindow(nowValue, {
   day = 1,
   hour = 8,
   minute = 0,
@@ -33,14 +32,14 @@ export function weeklyScheduleWindow(nowValue, {
   const now = new Date(nowValue);
   const due = new Date(now);
   due.setHours(hour, minute, 0, 0);
-  const daysSinceDueDay = (due.getDay() - day + 7) % 7;
-  due.setDate(due.getDate() - daysSinceDueDay);
+  due.setDate(day);
   if (due.getTime() > now.getTime()) {
-    due.setDate(due.getDate() - 7);
+    due.setMonth(due.getMonth() - 1);
   }
-  const nextDue = new Date(due.getTime() + WEEK_MS);
+  const nextDue = new Date(due);
+  nextDue.setMonth(nextDue.getMonth() + 1);
   return {
-    weekKey: localDateKey(due),
+    monthKey: monthKeyOf(due),
     dueAt: due.toISOString(),
     nextDueAt: nextDue.toISOString(),
   };
@@ -67,7 +66,7 @@ async function readState(filePath) {
   }
 }
 
-export function createWeeklyJournalScheduler({
+export function createMonthlyJournalScheduler({
   workflowService,
   dataDir,
   env = process.env,
@@ -82,11 +81,11 @@ export function createWeeklyJournalScheduler({
     throw new TypeError("dataDir is required");
   }
   const schedule = {
-    day: boundedInteger(env.PI_WEEKLY_RUN_DAY, 1, 0, 6),
-    hour: boundedInteger(env.PI_WEEKLY_RUN_HOUR, 8, 0, 23),
-    minute: boundedInteger(env.PI_WEEKLY_RUN_MINUTE, 0, 0, 59),
+    day: boundedInteger(env.PI_MONTHLY_RUN_DAY, 1, 1, 28),
+    hour: boundedInteger(env.PI_MONTHLY_RUN_HOUR, 8, 0, 23),
+    minute: boundedInteger(env.PI_MONTHLY_RUN_MINUTE, 0, 0, 59),
   };
-  const statePath = path.resolve(dataDir, "scheduler", "weekly.json");
+  const statePath = path.resolve(dataDir, "scheduler", "monthly.json");
   let timer = null;
   let stopped = false;
   let running = null;
@@ -105,9 +104,9 @@ export function createWeeklyJournalScheduler({
     if (running) return running;
     running = (async () => {
       const currentTime = now();
-      const window = weeklyScheduleWindow(currentTime, schedule);
+      const window = monthlyScheduleWindow(currentTime, schedule);
       const previous = await readState(statePath);
-      if (previous?.last_started_week_key === window.weekKey) {
+      if (previous?.last_started_month_key === window.monthKey) {
         arm(new Date(window.nextDueAt).getTime() - currentTime.getTime());
         return previous;
       }
@@ -116,7 +115,7 @@ export function createWeeklyJournalScheduler({
         const next = {
           schema_version: 1,
           schedule,
-          last_started_week_key: window.weekKey,
+          last_started_month_key: window.monthKey,
           last_started_run_id: run?.run_id ?? null,
           last_started_at: currentTime.toISOString(),
           last_error: null,
@@ -129,8 +128,8 @@ export function createWeeklyJournalScheduler({
         const failed = {
           schema_version: 1,
           schedule,
-          last_started_week_key:
-            previous?.last_started_week_key ?? null,
+          last_started_month_key:
+            previous?.last_started_month_key ?? null,
           last_started_run_id:
             previous?.last_started_run_id ?? null,
           last_started_at:
@@ -138,10 +137,10 @@ export function createWeeklyJournalScheduler({
           last_error: {
             code: typeof error?.code === "string"
               ? error.code
-              : "WEEKLY_RUN_START_FAILED",
+              : "MONTHLY_RUN_START_FAILED",
             message: typeof error?.message === "string"
               ? error.message.slice(0, 300)
-              : "每周追踪未能启动",
+              : "每月追踪未能启动",
             at: currentTime.toISOString(),
           },
           next_due_at: new Date(currentTime.getTime() + RETRY_MS).toISOString(),

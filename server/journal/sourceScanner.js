@@ -12,7 +12,8 @@ import { SOURCE_REGISTRY } from "./sourceRegistry.js";
 
 const MAX_PAPERS_PER_SOURCE = 80;
 const MAX_ENRICHMENT_PAPERS = 40;
-const WEEK_WINDOW_MS = 8 * 24 * 60 * 60 * 1000;
+// 本月新论文的发现窗口：近 30 天 + 1 天容差（时区/索引延迟）。
+const MONTH_WINDOW_MS = 31 * 24 * 60 * 60 * 1000;
 const SOURCE_FETCH_TIMEOUT_MS = 4 * 60 * 1000;
 
 function fetchSourceWithWatchdog(fetchSource, source, options, timeoutMs) {
@@ -50,13 +51,13 @@ export function publicationDiscovery(
   const published = Date.parse(publishedAt);
   const observed = Date.parse(observedAt);
   const age = observed - published;
-  const publishedThisWeek = inferredPrecision === "day"
+  const publishedThisMonth = inferredPrecision === "day"
     && Number.isFinite(age)
     && age >= -24 * 60 * 60 * 1000
-    && age <= WEEK_WINDOW_MS;
+    && age <= MONTH_WINDOW_MS;
   return {
-    published_this_week: publishedThisWeek,
-    display_label: publishedThisWeek ? "本周新论文" : "本周补发现 · 非本周新论文",
+    published_this_month: publishedThisMonth,
+    display_label: publishedThisMonth ? "本月新论文" : "本月补发现 · 非本月新论文",
   };
 }
 
@@ -230,6 +231,7 @@ export async function scanJournalSources({
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   openAlexMailto = "",
   deferCursorCommit = false,
+  dismissedKeys = [],
 } = {}) {
   if (!runId || !runStore || !sourceStateStore) {
     throw new Error("runId, runStore, and sourceStateStore are required");
@@ -398,12 +400,12 @@ export async function scanJournalSources({
       paper.publication_date_precision,
     ),
   }))));
-  const recentTopicCandidates = topicCandidates.filter((paper) => paper.published_this_week);
-  // 本周新论文不足时的回补顺序：本周补发现（本次扫描首次发现但非本周发表，
-  // 按发表时间降序）→ 往周未读回补 → 经典池。之前本周补发现被整体丢弃，
+  const recentTopicCandidates = topicCandidates.filter((paper) => paper.published_this_month);
+  // 本月新论文不足时的回补顺序：本月补发现（本次扫描首次发现但非本月发表，
+  // 按发表时间降序）→ 往期未读回补 → 经典池。之前补发现曾被整体丢弃，
   // 导致候选里全是多年前的经典论文。
   const historicalDiscoveries = topicCandidates
-    .filter((paper) => !paper.published_this_week)
+    .filter((paper) => !paper.published_this_month)
     .sort((left, right) => String(right.published_at ?? "").localeCompare(String(left.published_at ?? "")))
     .slice(0, Math.max(0, 5 - recentTopicCandidates.length));
   let resurfacedCandidates = [];
@@ -417,9 +419,10 @@ export async function scanJournalSources({
         currentRunId: runId,
         limit: 5 - filledCount,
         observedAt,
+        dismissedKeys,
       });
     } catch {
-      // 回补是锦上添花；历史 Run 读取失败不影响本周扫描。
+      // 回补是锦上添花；历史 Run 读取失败不影响本月扫描。
       resurfacedCandidates = [];
     }
   }
@@ -447,7 +450,7 @@ export async function scanJournalSources({
     recent_topic_candidate_count: recentTopicCandidates.length,
     historical_backfill_count: historicalDiscoveries.length,
     resurfaced_candidate_count: resurfacedCandidates.length,
-    historical_discovery_count: topicCandidates.filter((paper) => !paper.published_this_week).length,
+    historical_discovery_count: topicCandidates.filter((paper) => !paper.published_this_month).length,
     candidate_mode: candidateBatch.mode,
     fallback_reason: candidateBatch.fallback_reason,
   };

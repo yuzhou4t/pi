@@ -44,7 +44,7 @@ export function createInitialRunState() {
     runId: "run-demo-2026-w29",
     workflowId: workflowFixture.workflowId,
     status: RUN_STATUS.REVIEW_READY,
-    pausedReason: "等待选择本周论文",
+    pausedReason: "等待选择本月论文",
     selectedPaperIds: [],
     candidatePaperIds: workflowFixture.papers.map((paper) => paper.id),
     selectablePaperIds: Object.keys(workflowFixture.guides ?? {}),
@@ -334,7 +334,7 @@ export function runReducer(state, action) {
         workflowId: action.workflowId ?? state.workflowId,
         status,
         pausedReason: (staleFreshReview ? state.pausedReason : action.pausedReason) ?? (status === RUN_STATUS.REVIEW_READY
-          ? "等待选择本周论文"
+          ? "等待选择本月论文"
           : status === RUN_STATUS.PREPARING_GUIDES
             ? "正在生成五分钟导读"
             : "等待决定只收藏或进入精读"),

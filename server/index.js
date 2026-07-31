@@ -10,7 +10,7 @@ import { createJournalWorkflowService } from "./journal/workflowService.js";
 import { combineModelUsageReports } from "./journal/modelUsageService.js";
 import { createModelUsageLedger } from "./modelUsageLedger.js";
 import { SOURCE_REGISTRY, SOURCE_REGISTRY_VERSION } from "./journal/sourceRegistry.js";
-import { createWeeklyJournalScheduler } from "./journal/weeklyScheduler.js";
+import { createMonthlyJournalScheduler } from "./journal/monthlyScheduler.js";
 import {
   ProjectWorkError,
   projectWorkError,
@@ -826,6 +826,14 @@ export function publicRun(run) {
         && run.status !== "committing",
     }),
     candidates: Array.isArray(run.candidates) ? run.candidates.map(publicPaper) : [],
+    recent_classics: run.recent_classics && typeof run.recent_classics === "object"
+      ? {
+          ...run.recent_classics,
+          papers: Array.isArray(run.recent_classics.papers)
+            ? run.recent_classics.papers.map(publicPaper)
+            : [],
+        }
+      : null,
     guides,
     paper_decisions: run.paper_decisions && typeof run.paper_decisions === "object"
       ? { ...run.paper_decisions }
@@ -2964,7 +2972,7 @@ export function createApiServer({
         || !Array.isArray(body?.paper_ids)
         || Object.keys(body).some((key) => !allowedKeys.includes(key))
       ) {
-        throw new CandidateSummaryError("INVALID_REQUEST", "加入本周推荐的请求无效", 400);
+        throw new CandidateSummaryError("INVALID_REQUEST", "加入本月推荐的请求无效", 400);
       }
       const result = await journalWorkflowService.addVenueSearchPapersToWeekly({
         conversationId: body.conversation_id ?? null,
@@ -2976,7 +2984,68 @@ export function createApiServer({
         conversation: result.conversation,
       }, origin);
     } catch (error) {
-      sendWorkflowError(response, error, origin, "无法加入本周推荐");
+      sendWorkflowError(response, error, origin, "无法加入本月推荐");
+    }
+    return;
+  }
+
+  const journalRecentClassicsAddMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/recent-classics\/add$/,
+  );
+  if (request.method === "POST" && journalRecentClassicsAddMatch) {
+    try {
+      requireJournalMutationOrigin(origin);
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      const allowedKeys = ["schema_version", "paper_ids"];
+      if (
+        body?.schema_version !== 1
+        || !Array.isArray(body?.paper_ids)
+        || Object.keys(body).some((key) => !allowedKeys.includes(key))
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "加入本月推荐的请求无效", 400);
+      }
+      const run = await journalWorkflowService.addRecentClassicsToWeekly({
+        runId: journalRecentClassicsAddMatch[1],
+        paperIds: body.paper_ids,
+      });
+      sendJson(response, 200, publicRun(run), origin);
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法加入本月推荐");
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/v1/journal/dismissed-papers") {
+    try {
+      requireJournalMutationOrigin(origin);
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      const allowedKeys = ["schema_version", "run_id", "dedupe_key", "title"];
+      if (
+        body?.schema_version !== 1
+        || typeof body?.dedupe_key !== "string"
+        || !body.dedupe_key.trim()
+        || Object.keys(body).some((key) => !allowedKeys.includes(key))
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "不感兴趣的请求无效", 400);
+      }
+      const result = await journalWorkflowService.dismissJournalPaper({
+        runId: typeof body.run_id === "string" && body.run_id ? body.run_id : null,
+        dedupeKey: body.dedupe_key,
+        title: typeof body.title === "string" ? body.title : "",
+      });
+      sendJson(response, 200, {
+        schema_version: 1,
+        papers: result.papers,
+        run: result.run ? publicRun(result.run) : null,
+      }, origin);
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法标记不感兴趣");
     }
     return;
   }
@@ -4274,26 +4343,26 @@ const isMainModule = process.argv[1]
 if (isMainModule) {
   const server = createApiServer();
   let shuttingDown = false;
-  const weeklyScheduler = (
+  const monthlyScheduler = (
     !projectWorkRuntimeOnly
     && process.env.PI_JOURNAL_SCHEDULER_ENABLED !== "0"
   )
-    ? createWeeklyJournalScheduler({
+    ? createMonthlyJournalScheduler({
         workflowService: journalWorkflow,
         dataDir: piDataDir,
       })
     : null;
   server.listen(port, host, () => {
     console.log(`Pi Agent local API listening on http://${host}:${port} (${candidateSummaries.config.mode})`);
-    weeklyScheduler?.start().catch((error) => {
-      console.warn(`Pi Agent weekly scheduler could not start: ${error.message}`);
+    monthlyScheduler?.start().catch((error) => {
+      console.warn(`Pi Agent monthly scheduler could not start: ${error.message}`);
     });
   });
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.on(signal, () => {
       if (shuttingDown) return;
       shuttingDown = true;
-      weeklyScheduler?.dispose();
+      monthlyScheduler?.dispose();
       void shutdownApiServer({
         server,
         dispose: () => projectWork?.dispose?.(),

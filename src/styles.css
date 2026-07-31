@@ -14337,6 +14337,82 @@ h4.reader-rail-full-heading {
   overflow-wrap: anywhere;
 }
 
+.workflow-recent-classics {
+  margin-top: 14px;
+  display: grid;
+  gap: 10px;
+  justify-items: start;
+}
+
+.workflow-recent-classics-body {
+  width: 100%;
+  display: grid;
+  gap: 10px;
+}
+
+.workflow-recent-classics-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.workflow-recent-classics-error {
+  margin: 0;
+  color: var(--risk);
+  font-size: 12px;
+}
+
+.workflow-recent-classics-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.workflow-recent-classics-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 10px 12px;
+}
+
+.workflow-recent-classic-main {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.workflow-recent-classic-main strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.workflow-recent-classic-main small {
+  color: var(--muted);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.workflow-recent-classic-main p {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.workflow-recent-classic-actions {
+  display: grid;
+  gap: 6px;
+  justify-items: stretch;
+}
+
 .workflow-past-weeks {
   margin-top: 14px;
   display: grid;

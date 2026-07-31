@@ -26,7 +26,9 @@ import { createProjectStatePreviewService } from "./projectStatePreview.js";
 import { createReadingNoteActionService } from "./readingNoteAction.js";
 import { createReadingService } from "./readingService.js";
 import { createJournalModelUsageService } from "./modelUsageService.js";
-import { createRunStore, journalWeekWindowKey } from "./runStore.js";
+import { createRunStore, journalMonthWindowKey } from "./runStore.js";
+import { collectExclusionKeys, fetchRecentClassics } from "./recentClassics.js";
+import { createDismissedPapersStore } from "./dismissedPapersStore.js";
 import {
   commitJournalSourceScan,
   scanJournalSources,
@@ -224,6 +226,8 @@ export function createJournalWorkflowService({
   sourceStateStore = createSourceStateStore({ dataDir }),
   sourceScanner = scanJournalSources,
   sourceScanCommitter = commitJournalSourceScan,
+  recentClassicsFetcher = fetchRecentClassics,
+  dismissedPapersStore = createDismissedPapersStore({ dataDir }),
   candidateRanker = rankCandidates,
   guideGenerator = generateFiveMinuteGuide,
   translationGenerator = translatePaperBatch,
@@ -629,6 +633,7 @@ export function createJournalWorkflowService({
         fetchImpl,
         openAlexMailto: env.PI_OPENALEX_MAILTO || "",
         deferCursorCommit: true,
+        dismissedKeys: await dismissedPapersStore.listKeys().catch(() => []),
       });
       await update(runId, {
         status: "ranking",
@@ -671,9 +676,33 @@ export function createJournalWorkflowService({
       const candidates = ranking.candidates.map((paper) => ({
         ...paper,
         display_label: paper.candidate_origin === "classic_review"
-          ? "经典回顾 · 非本周新论文"
-          : paper.display_label ?? "本周新论文",
+          ? "经典回顾 · 非本月新论文"
+          : paper.display_label ?? "本月新论文",
       }));
+      // 近年高引经典栏目：确定性题录拉取，失败只降级为空栏目，不影响 Run。
+      let recentClassics = null;
+      try {
+        const [previousRuns, dismissedKeys] = await Promise.all([
+          runStore.listRuns(),
+          dismissedPapersStore.listKeys(),
+        ]);
+        recentClassics = await recentClassicsFetcher({
+          fetchImpl,
+          mailto: env.PI_OPENALEX_MAILTO || "",
+          excludeKeys: collectExclusionKeys({
+            previousRuns,
+            currentCandidates: candidates,
+            dismissedKeys,
+          }),
+        });
+      } catch (error) {
+        recentClassics = {
+          schema_version: 1,
+          status: "failed",
+          papers: [],
+          error: publicError(error),
+        };
+      }
       await runStore.writeArtifact(runId, "inputs/candidates.json", candidates);
       await runStore.writeArtifact(runId, "audit/candidate-ranking.json", {
         ...ranking,
@@ -686,6 +715,7 @@ export function createJournalWorkflowService({
         status: "preparing_documents",
         phase: "pdf_download",
         candidates,
+        recent_classics: recentClassics,
         ranking: {
           source: ranking.source,
           provider_id: ranking.provider_id ?? null,
@@ -781,7 +811,7 @@ export function createJournalWorkflowService({
     if (!Array.isArray(paperIds) || paperIds.length === 0) {
       throw artifactError(
         "VENUE_SEARCH_PAPER_IDS_REQUIRED",
-        "请先选择要加入本周推荐的论文",
+        "请先选择要加入本月推荐的论文",
         400,
       );
     }
@@ -798,15 +828,15 @@ export function createJournalWorkflowService({
       }
     }
     const runs = await runStore.listRuns();
-    const windowKey = journalWeekWindowKey(new Date().toISOString());
+    const windowKey = journalMonthWindowKey(new Date().toISOString());
     const targetRun = runs.find((run) => (
-      (run.window_key || journalWeekWindowKey(run.created_at)) === windowKey
+      (run.window_key || journalMonthWindowKey(run.created_at)) === windowKey
       && ["review_ready", "guide_ready", "reading", "draft_ready", "reading_ready"].includes(run.status)
     ));
     if (!targetRun) {
       throw artifactError(
         "WEEKLY_RUN_NOT_READY",
-        "本周运行还没有进入候选审阅，请先完成每周扫描",
+        "本月运行还没有进入候选审阅，请先完成本月扫描",
         409,
       );
     }
@@ -836,7 +866,7 @@ export function createJournalWorkflowService({
           ...paper,
           rank: nextRank,
           candidate_origin: "venue_search",
-          display_label: "主题检索推荐 · 非本周新论文",
+          display_label: "主题检索推荐 · 非本月新论文",
           title_zh: recommendation?.title_zh ?? paper.title_zh ?? null,
           selection_summary: recommendation?.reason
             ?? (paper.abstract
@@ -872,6 +902,120 @@ export function createJournalWorkflowService({
       paperIds,
     );
     return { run: updatedRun, conversation: updatedConversation };
+  }
+
+  // 把近年经典栏目里的论文加入当期候选；同一篇不重复加入，加入后从栏目中移除。
+  async function addRecentClassicsToWeekly({ runId, paperIds } = {}) {
+    if (!Array.isArray(paperIds) || paperIds.length === 0) {
+      throw artifactError(
+        "RECENT_CLASSIC_PAPER_IDS_REQUIRED",
+        "请先选择要加入本月推荐的经典论文",
+        400,
+      );
+    }
+    const run = await runStore.getRun(runId);
+    if (!run) throw artifactError("RUN_NOT_FOUND", "运行不存在", 404);
+    if (!["review_ready", "guide_ready", "reading", "draft_ready", "reading_ready"].includes(run.status)) {
+      throw artifactError(
+        "WEEKLY_RUN_NOT_READY",
+        "本月运行还没有进入候选审阅，请先完成本月扫描",
+        409,
+      );
+    }
+    const byId = new Map(
+      (run.recent_classics?.papers ?? []).map((paper) => [paper.paper_id, paper]),
+    );
+    for (const paperId of paperIds) {
+      if (!byId.has(paperId)) {
+        throw artifactError(
+          "RECENT_CLASSIC_PAPER_NOT_FOUND",
+          "所选论文不在近年经典栏目中",
+          404,
+        );
+      }
+    }
+    return update(runId, (current) => {
+      const existingIds = new Set(
+        (current.candidates ?? []).map((paper) => paper.paper_id),
+      );
+      const existingKeys = new Set(
+        (current.candidates ?? []).map((paper) => paper.dedupe_key).filter(Boolean),
+      );
+      let nextRank = (current.candidates ?? []).reduce(
+        (max, paper) => Math.max(max, Number(paper.rank) || 0),
+        0,
+      );
+      const added = [];
+      for (const paperId of paperIds) {
+        const paper = byId.get(paperId);
+        if (existingIds.has(paperId) || (paper.dedupe_key && existingKeys.has(paper.dedupe_key))) {
+          continue;
+        }
+        nextRank += 1;
+        added.push({
+          ...paper,
+          rank: nextRank,
+          candidate_origin: "recent_classic",
+          selection_summary: paper.selection_summary
+            ?? (paper.abstract
+              ? paper.abstract.slice(0, 220)
+              : `${paper.title}：近年高引经典，价值待全文核验。`),
+          project_impact: paper.project_impact ?? "对项目的具体作用待核验。",
+        });
+        existingIds.add(paperId);
+        if (paper.dedupe_key) existingKeys.add(paper.dedupe_key);
+      }
+      const remaining = (current.recent_classics?.papers ?? []).filter(
+        (paper) => !paperIds.includes(paper.paper_id),
+      );
+      if (added.length === 0) {
+        return {
+          recent_classics: { ...current.recent_classics, papers: remaining },
+        };
+      }
+      return {
+        candidates: [...(current.candidates ?? []), ...added],
+        recent_classics: { ...current.recent_classics, papers: remaining },
+        mineru: {
+          ...current.mineru,
+          papers: {
+            ...(current.mineru?.papers ?? {}),
+            ...Object.fromEntries(added.map((paper) => [
+              paper.paper_id,
+              { status: "pdf_not_prepared", error: null },
+            ])),
+          },
+        },
+      };
+    }, {
+      type: "recent_classics_added",
+      paper_ids: paperIds,
+    });
+  }
+
+  // 「不感兴趣」：持久排除；若论文还在当前 Run 的近年经典栏目里，同步移除。
+  async function dismissJournalPaper({ runId = null, dedupeKey, title = "" } = {}) {
+    const papers = await dismissedPapersStore.dismiss({ dedupeKey, title });
+    let run = null;
+    if (runId) {
+      run = await update(runId, (current) => {
+        const pool = current.recent_classics?.papers ?? [];
+        const remaining = pool.filter((paper) => paper.dedupe_key !== dedupeKey);
+        if (remaining.length === pool.length) return {};
+        return {
+          recent_classics: { ...current.recent_classics, papers: remaining },
+        };
+      }, { type: "paper_dismissed", dedupe_key: dedupeKey });
+    }
+    return { papers, run };
+  }
+
+  function listDismissedJournalPapers() {
+    return dismissedPapersStore.list();
+  }
+
+  function restoreDismissedJournalPaper(dedupeKey) {
+    return dismissedPapersStore.restore(dedupeKey);
   }
 
   async function startRun({
@@ -2733,6 +2877,10 @@ export function createJournalWorkflowService({
     submitVenueSearchTurn,
     getVenueSearchTurnProgress,
     addVenueSearchPapersToWeekly,
+    addRecentClassicsToWeekly,
+    dismissJournalPaper,
+    listDismissedJournalPapers,
+    restoreDismissedJournalPaper,
     retryPaperDocument,
     restartReadingFromGuide: reading.restartFromGuide,
     resetPaperReading: reading.resetPaperReading,

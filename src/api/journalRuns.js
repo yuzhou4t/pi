@@ -530,7 +530,7 @@ export function mapJournalRun(run) {
         projectImpact: paper.project_impact,
         candidateOrigin: paper.candidate_origin,
         isNew: paper.is_new,
-        publishedThisWeek: paper.published_this_week,
+        publishedThisMonth: paper.published_this_month ?? paper.published_this_week ?? false,
         pdfUrl: paper.pdf_url,
         mineruStatus: documentState.status ?? "not_started",
         mineruRunStatus: run.mineru?.status ?? "not_started",
@@ -540,6 +540,30 @@ export function mapJournalRun(run) {
         isDemo: false,
       };
     }),
+    recentClassics: run.recent_classics && typeof run.recent_classics === "object"
+      ? {
+          status: run.recent_classics.status ?? "failed",
+          fromYear: run.recent_classics.from_year ?? null,
+          coveredSourceIds: run.recent_classics.covered_source_ids ?? [],
+          uncoveredSourceIds: run.recent_classics.uncovered_source_ids ?? [],
+          error: run.recent_classics.error ?? null,
+          papers: (run.recent_classics.papers ?? []).map((paper) => ({
+            id: paper.paper_id,
+            dedupeKey: paper.dedupe_key ?? null,
+            title: paper.title,
+            titleZh: paper.title_zh ?? null,
+            authors: paper.authors ?? [],
+            venue: paper.venue,
+            publishedAt: paper.published_at,
+            citedByCount: paper.cited_by_count ?? null,
+            abstract: paper.abstract || "",
+            discoveryType: paper.display_label,
+            topicMatches: paper.topic_matches ?? [],
+            officialUrl: paper.official_url ?? paper.canonical_url ?? null,
+            pdfUrl: paper.pdf_url ?? null,
+          })),
+        }
+      : null,
   };
 }
 
@@ -850,6 +874,41 @@ export async function resumeJournalRun(runId, { signal } = {}) {
   const body = await jsonResponse(response, "本地期刊服务返回了无法解析的恢复状态");
   if (!response.ok) throw requestError(response, body, "无法恢复期刊运行");
   return mapJournalRun(body);
+}
+
+export async function addRecentClassicsToWeekly({ runId, paperIds, signal } = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/recent-classics/add`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ schema_version: 1, paper_ids: paperIds }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地期刊服务返回了无法解析的结果");
+  if (!response.ok) throw requestError(response, body, "无法加入本月推荐");
+  return mapJournalRun(body);
+}
+
+export async function dismissJournalPaper({ runId = null, dedupeKey, title = "", signal } = {}) {
+  const response = await fetch("/api/v1/journal/dismissed-papers", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      schema_version: 1,
+      ...(runId ? { run_id: runId } : {}),
+      dedupe_key: dedupeKey,
+      title,
+    }),
+    signal,
+  });
+  const body = await jsonResponse(response, "本地期刊服务返回了无法解析的结果");
+  if (!response.ok) throw requestError(response, body, "无法标记不感兴趣");
+  return {
+    papers: body.papers ?? [],
+    run: body.run ? mapJournalRun(body.run) : null,
+  };
 }
 
 export async function saveJournalPaperDecisions({

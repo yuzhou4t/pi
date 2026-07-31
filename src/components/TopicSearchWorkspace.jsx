@@ -108,7 +108,7 @@ function TurnCard({
                     {recommendation?.projectImpact ? (
                       <p className="topic-search-impact">{recommendation.projectImpact}</p>
                     ) : null}
-                    {added ? <em className="topic-search-added">已加入本周推荐</em> : null}
+                    {added ? <em className="topic-search-added">已加入本月推荐</em> : null}
                   </span>
                 </label>
               </li>
@@ -126,7 +126,7 @@ function TurnCard({
             {adding
               ? <CircleNotch className="spin" size={14} weight="bold" aria-hidden="true" />
               : null}
-            {adding ? "正在加入…" : `把选中的 ${selectedIds.length} 篇加入本周推荐`}
+            {adding ? "正在加入…" : `把选中的 ${selectedIds.length} 篇加入本月推荐`}
           </button>
           {addError ? <p className="topic-search-error" role="alert">{addError}</p> : null}
         </div>
@@ -135,7 +135,7 @@ function TurnCard({
         <div className="topic-search-web">
           <p className="topic-search-web-title">
             <Globe size={14} weight="regular" aria-hidden="true" />
-            联网发现 · 参考（不进入本周推荐）
+            联网发现 · 参考（不进入本月推荐）
           </p>
           <ul className="topic-search-web-list">
             {turn.web.results.map((item) => (

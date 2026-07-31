@@ -4,36 +4,46 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
-  createWeeklyJournalScheduler,
-  weeklyScheduleWindow,
-} from "./weeklyScheduler.js";
+  createMonthlyJournalScheduler,
+  monthlyScheduleWindow,
+} from "./monthlyScheduler.js";
 
-test("weekly schedule resolves the current local Monday window and next due time", () => {
+test("monthly schedule resolves the current local month window and next due time", () => {
   const now = new Date(2026, 6, 29, 9, 30);
-  const window = weeklyScheduleWindow(now, {
+  const window = monthlyScheduleWindow(now, {
     day: 1,
     hour: 8,
     minute: 0,
   });
-  assert.equal(window.weekKey, "2026-07-27");
+  assert.equal(window.monthKey, "2026-07");
   const due = new Date(window.dueAt);
   const next = new Date(window.nextDueAt);
-  assert.equal(due.getDay(), 1);
+  assert.equal(due.getDate(), 1);
   assert.equal(due.getHours(), 8);
-  assert.equal(next.getTime() - due.getTime(), 7 * 24 * 60 * 60 * 1_000);
+  assert.equal(next.getMonth(), (due.getMonth() + 1) % 12);
+  assert.equal(next.getDate(), 1);
 });
 
-test("scheduler catches up once on startup and does not duplicate the same week", async () => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-weekly-scheduler-"));
+test("monthly schedule before this month's due time falls back to last month", () => {
+  const window = monthlyScheduleWindow(new Date(2026, 7, 1, 7, 59), {
+    day: 1,
+    hour: 8,
+    minute: 0,
+  });
+  assert.equal(window.monthKey, "2026-07");
+});
+
+test("scheduler catches up once on startup and does not duplicate the same month", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-monthly-scheduler-"));
   let current = new Date(2026, 6, 29, 9, 30);
   const starts = [];
   const delays = [];
-  const scheduler = createWeeklyJournalScheduler({
+  const scheduler = createMonthlyJournalScheduler({
     dataDir,
     env: {
-      PI_WEEKLY_RUN_DAY: "1",
-      PI_WEEKLY_RUN_HOUR: "8",
-      PI_WEEKLY_RUN_MINUTE: "0",
+      PI_MONTHLY_RUN_DAY: "1",
+      PI_MONTHLY_RUN_HOUR: "8",
+      PI_MONTHLY_RUN_MINUTE: "0",
     },
     now: () => new Date(current),
     workflowService: {
@@ -53,22 +63,22 @@ test("scheduler catches up once on startup and does not duplicate the same week"
   await scheduler.start();
   await scheduler.tick();
   assert.deepEqual(starts, [{ run_id: "run-1" }]);
-  const statePath = path.join(dataDir, "scheduler", "weekly.json");
+  const statePath = path.join(dataDir, "scheduler", "monthly.json");
   const state = JSON.parse(await readFile(statePath, "utf8"));
-  assert.equal(state.last_started_week_key, "2026-07-27");
+  assert.equal(state.last_started_month_key, "2026-07");
   assert.equal(state.last_started_run_id, "run-1");
   assert.equal(delays.length >= 2, true);
 
-  current = new Date(2026, 7, 3, 8, 1);
+  current = new Date(2026, 7, 1, 8, 1);
   await scheduler.tick();
   assert.deepEqual(starts, [{ run_id: "run-1" }, { run_id: "run-2" }]);
   scheduler.dispose();
 });
 
-test("scheduler persists a retryable startup failure without advancing the week", async () => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-weekly-failure-"));
+test("scheduler persists a retryable startup failure without advancing the month", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-monthly-failure-"));
   let scheduledDelay = null;
-  const scheduler = createWeeklyJournalScheduler({
+  const scheduler = createMonthlyJournalScheduler({
     dataDir,
     now: () => new Date(2026, 6, 27, 9),
     workflowService: {
@@ -86,7 +96,7 @@ test("scheduler persists a retryable startup failure without advancing the week"
   });
 
   const state = await scheduler.start();
-  assert.equal(state.last_started_week_key, null);
+  assert.equal(state.last_started_month_key, null);
   assert.equal(state.last_error.code, "PROJECT_CONTEXT_MISSING");
   assert.equal(scheduledDelay, 5 * 60 * 1_000);
   scheduler.dispose();

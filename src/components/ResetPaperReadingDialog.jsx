@@ -68,7 +68,7 @@ export function ResetPaperReadingDialog({
         </header>
 
         <p className="conversation-delete-note">
-          此操作不可恢复。论文会回到「每周追踪」的本周候选里，可重新选择处理方式；全文和五分钟导读仍会保留。
+          此操作不可恢复。论文会回到「每月追踪」的本月候选里，可重新选择处理方式；全文和五分钟导读仍会保留。
         </p>
         {error ? <p className="conversation-delete-error" role="alert">{error}</p> : null}
 

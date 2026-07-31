@@ -423,7 +423,7 @@ test("live guide, paper workbench, and archive handoff render in the validated o
       run: readingRun,
     }));
     // 精读进行中的默认落点现在是候选审阅页；研读入口在左栏论文列表。
-    assert.match(readingHtml, /本周推荐的论文都在这里/);
+    assert.match(readingHtml, /本月推荐的论文都在这里/);
     assert.match(readingHtml, /查看精读进度/);
     assert.doesNotMatch(readingHtml, /选择一篇论文继续阅读/);
     assert.doesNotMatch(readingHtml, /Zotero collection/);
@@ -664,7 +664,7 @@ test("a reading run lands on the weekly candidate page instead of the reading st
     }));
 
     // 固定落点：候选审阅页 + 引导提示，而不是研读阶段画面。
-    assert.match(html, /本周推荐的论文都在这里/);
+    assert.match(html, /本月推荐的论文都在这里/);
     assert.match(html, /查看精读进度/);
     assert.match(html, /Memory Management for Reading Runs/);
     assert.doesNotMatch(html, /选择一篇论文继续阅读/);

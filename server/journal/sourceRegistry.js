@@ -101,6 +101,7 @@ export const SOURCE_REGISTRY = Object.freeze([
     fallback: dblpFallback("/db/conf/aaai/"),
     adapter: "aaai-ojs-archive",
     dblp_path: "conf/aaai",
+    openalex_source_id: "S4210191458",
   },
   {
     source_id: "conference-neurips",
@@ -117,6 +118,7 @@ export const SOURCE_REGISTRY = Object.freeze([
     fallback: dblpFallback("/db/conf/nips/"),
     adapter: "neurips-proceedings",
     dblp_path: "conf/nips",
+    openalex_source_id: "S4306420609",
   },
   {
     source_id: "conference-acl",
@@ -133,6 +135,7 @@ export const SOURCE_REGISTRY = Object.freeze([
     fallback: dblpFallback("/db/conf/acl/"),
     adapter: "acl-anthology-venue",
     dblp_path: "conf/acl",
+    openalex_source_id: "S4306420508",
   },
   {
     source_id: "conference-cvpr",
@@ -181,6 +184,7 @@ export const SOURCE_REGISTRY = Object.freeze([
     fallback: dblpFallback("/db/conf/icml/"),
     adapter: "pmlr-proceedings",
     dblp_path: "conf/icml",
+    openalex_source_id: "S4306419644",
   },
   {
     source_id: "conference-iclr",
@@ -197,6 +201,7 @@ export const SOURCE_REGISTRY = Object.freeze([
     fallback: dblpFallback("/db/conf/iclr/"),
     adapter: "openreview-iclr",
     dblp_path: "conf/iclr",
+    openalex_source_id: "S4306419637",
   },
 ]);
 

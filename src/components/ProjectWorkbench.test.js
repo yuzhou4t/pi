@@ -149,7 +149,7 @@ test("left rail shows the selected work type, nested conversations, and one proj
         id: "project-1",
         name: "Pi Agent 产品设计",
         state: "项目工作 · 论文研读",
-        updated: "本周",
+        updated: "本月",
       }, {
         id: "project-2",
         name: "方法研究",
@@ -235,7 +235,7 @@ test("paper reading conversations do not expose project-work deletion actions", 
         id: "paper-project",
         name: "期刊研读",
         state: "1 个会话",
-        updated: "本周",
+        updated: "本月",
       }],
       selectedId: "paper-project",
       conversations: [{
@@ -259,9 +259,9 @@ test("paper reading conversations do not expose project-work deletion actions", 
     }));
 
     assert.match(html, /精读 · Agent 论文/);
-    assert.match(html, /每周追踪/);
+    assert.match(html, /每月追踪/);
     assert.match(html, /论文研读/);
-    assert.ok(html.indexOf("每周追踪") < html.indexOf("精读 · Agent 论文"));
+    assert.ok(html.indexOf("每月追踪") < html.indexOf("精读 · Agent 论文"));
     assert.doesNotMatch(html, /更多操作|删除会话/);
   });
 });
@@ -273,7 +273,7 @@ test("paper reading rail keeps weekly tracking visible when no paper was selecte
         id: "paper-project",
         name: "长期研究项目",
         state: "0 篇论文 · 1 个追踪",
-        updated: "本周",
+        updated: "本月",
       }],
       selectedId: "paper-project",
       conversations: [],
@@ -289,7 +289,7 @@ test("paper reading rail keeps weekly tracking visible when no paper was selecte
       onAddProject() {},
     }));
 
-    assert.match(html, /每周追踪/);
+    assert.match(html, /每月追踪/);
     assert.match(html, /真实候选待审阅/);
     assert.match(html, /还没有选择研读的论文/);
     assert.match(html, /aria-label="论文研读"/);

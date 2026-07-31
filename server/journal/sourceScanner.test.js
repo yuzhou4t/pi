@@ -31,15 +31,15 @@ const sources = [
 test("publication labels distinguish weekly publication from historical first discovery", () => {
   assert.deepEqual(
     publicationDiscovery("2026-07-20", "2026-07-23T08:00:00.000Z"),
-    { published_this_week: true, display_label: "本周新论文" },
+    { published_this_month: true, display_label: "本月新论文" },
   );
   assert.deepEqual(
     publicationDiscovery("2025-09-17", "2026-07-23T08:00:00.000Z"),
-    { published_this_week: false, display_label: "本周补发现 · 非本周新论文" },
+    { published_this_month: false, display_label: "本月补发现 · 非本月新论文" },
   );
   assert.deepEqual(
     publicationDiscovery("2026-01-01", "2026-01-03T08:00:00.000Z", "year"),
-    { published_this_week: false, display_label: "本周补发现 · 非本周新论文" },
+    { published_this_month: false, display_label: "本月补发现 · 非本月新论文" },
   );
 });
 
@@ -130,7 +130,7 @@ test("historical first discoveries backfill candidates before the classic pool",
   const runStore = createRunStore({ dataDir });
   const sourceStateStore = createSourceStateStore({ dataDir });
   const run = await runStore.createRun({ sourceIds: ["source-ok"] });
-  // 两篇今年早些时候发表、本周才首次被发现的主题相关论文；没有本周新论文。
+  // 两篇今年早些时候发表、本月才首次被发现的主题相关论文；没有本月新论文。
   const result = await scanJournalSources({
     runId: run.run_id,
     runStore,
@@ -174,8 +174,8 @@ test("historical first discoveries backfill candidates before the classic pool",
   assert.equal(titles[0], "LLM Agent Memory in May");
   assert.equal(titles[1], "LLM Agent Planning in March");
   const backfill = result.candidateBatch.candidates[0];
-  assert.equal(backfill.published_this_week, false);
-  assert.equal(backfill.display_label, "本周补发现 · 非本周新论文");
+  assert.equal(backfill.published_this_month, false);
+  assert.equal(backfill.display_label, "本月补发现 · 非本月新论文");
   const classicCount = result.candidateBatch.candidates.filter(
     (paper) => paper.candidate_origin === "classic_review",
   ).length;

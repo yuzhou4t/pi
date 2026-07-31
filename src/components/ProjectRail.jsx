@@ -414,12 +414,12 @@ export function ProjectRail({
                     <button
                       className={`capability-row project-run-row${selectedRunId === activeRun.id ? " is-active" : ""}`}
                       type="button"
-                      aria-label={`打开本周追踪：${activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}`}
+                      aria-label={`打开每月追踪：${activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}`}
                       onClick={() => onSelectRun?.(activeRun.id)}
                     >
                       <PlayCircle size={17} weight="regular" aria-hidden="true" />
                       <span>
-                        <strong>每周追踪</strong>
+                        <strong>每月追踪</strong>
                         <small>{activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}</small>
                       </span>
                     </button>
@@ -557,12 +557,12 @@ export function ProjectRail({
                     <button
                       className={`capability-row project-run-row${selectedRunId === activeRun.id ? " is-active" : ""}`}
                       type="button"
-                      aria-label={`打开本周追踪：${activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}`}
+                      aria-label={`打开每月追踪：${activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}`}
                       onClick={() => onSelectRun?.(activeRun.id)}
                     >
                       <PlayCircle size={17} weight="regular" aria-hidden="true" />
                       <span>
-                        <strong>本周追踪</strong>
+                        <strong>每月追踪</strong>
                         <small>{activeRun.statusLabel ?? activeRun.status ?? "等待审阅"}</small>
                       </span>
                     </button>

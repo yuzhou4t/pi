@@ -132,10 +132,10 @@ export function ReadingWorkbench({
             className="header-meta-pill"
             type="button"
             onClick={onClose}
-            title="返回本周追踪，不清除研读进度"
+            title="返回每月追踪，不清除研读进度"
           >
             <ArrowLeft size={13} weight="regular" aria-hidden="true" />
-            <span>返回本周追踪</span>
+            <span>返回每月追踪</span>
           </button>
           {providers?.length ? (
             <ProviderMenu
