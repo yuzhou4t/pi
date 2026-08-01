@@ -17,6 +17,14 @@ export const API_PORT_END = 47_919;
 export const RUNTIME_PORT_START = 47_920;
 export const RUNTIME_PORT_END = 47_959;
 
+export function localServiceEnvironment(extraEnv = {}, webUrl = WEB_URL) {
+  return {
+    ...extraEnv,
+    PI_LOCAL_WEB_URL: webUrl,
+    PI_NOTIFICATION_RETURN_ENTRY_URL: webUrl,
+  };
+}
+
 const projectRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
@@ -207,10 +215,10 @@ async function run() {
         "--env-file-if-exists=.env.local",
         "server/index.js",
       ],
-      {
+      localServiceEnvironment({
         PI_API_PORT: String(runtimePort),
         PI_PROJECT_WORK_RUNTIME_ONLY: "1",
-      },
+      }),
     );
     await waitUntil(
       "Pi Runtime",
@@ -232,10 +240,10 @@ async function run() {
           "--env-file-if-exists=.env.local",
           "server/index.js",
         ],
-        {
+        localServiceEnvironment({
           PI_API_PORT: String(apiPort),
           PI_PROJECT_WORK_RUNTIME_URL: `http://${WEB_HOST}:${runtimePort}`,
-        },
+        }),
       );
       await waitUntil(
         "Pi Agent API",

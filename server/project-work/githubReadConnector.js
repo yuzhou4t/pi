@@ -1,8 +1,10 @@
+import { execFile as nodeExecFile } from "node:child_process";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ProjectWorkError, projectWorkError } from "./errors.js";
 
 const GITHUB_API_ORIGIN = "https://api.github.com";
+const GITHUB_CLI_HOST = "github.com";
 const GITHUB_API_VERSION = "2022-11-28";
 const DEFAULT_TIMEOUT_MS = 8_000;
 const MAX_TIMEOUT_MS = 20_000;
@@ -45,12 +47,226 @@ function githubToken(env) {
     : "";
 }
 
+function keychainCliEnv(env) {
+  const childEnv = { ...(env ?? {}) };
+  for (const key of [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+  ]) {
+    delete childEnv[key];
+  }
+  return {
+    ...childEnv,
+    GH_PROMPT_DISABLED: "1",
+    GH_PAGER: "cat",
+    NO_COLOR: "1",
+    NO_UPDATE_NOTIFIER: "1",
+    PAGER: "cat",
+  };
+}
+
+function githubCliEndpoint(url) {
+  assertGitHubUrl(url);
+  const segments = url.pathname.split("/").filter(Boolean);
+  if (segments.length === 1 && segments[0] === "user" && !url.search) {
+    return url.pathname;
+  }
+  if (segments.length < 5 || segments[0] !== "repos") {
+    throw projectWorkError(
+      "PROJECT_WORK_GITHUB_COMMAND_BLOCKED",
+      "GitHub CLI 只允许固定的只读接口",
+      400,
+      false,
+    );
+  }
+  let owner;
+  let repo;
+  try {
+    owner = decodeURIComponent(segments[1]);
+    repo = decodeURIComponent(segments[2]);
+  } catch {
+    throw inputError("GitHub CLI 接口格式无效");
+  }
+  normalizeRepository({ owner, repo });
+  const exactNumber = (value) => /^\d+$/u.test(value)
+    && Number.isSafeInteger(Number(value))
+    && Number(value) > 0;
+  const singleResource = (
+    segments.length === 5
+    && !url.search
+    && exactNumber(segments[4])
+    && (segments[3] === "issues" || segments[3] === "pulls")
+  );
+  const reviewComments = (
+    segments.length === 6
+    && segments[3] === "pulls"
+    && exactNumber(segments[4])
+    && segments[5] === "comments"
+  );
+  let checkRuns = false;
+  if (
+    segments.length === 6
+    && segments[3] === "commits"
+    && segments[5] === "check-runs"
+  ) {
+    try {
+      normalizeRef(decodeURIComponent(segments[4]));
+      checkRuns = true;
+    } catch {
+      checkRuns = false;
+    }
+  }
+  if (singleResource) return `${url.pathname}${url.search}`;
+  if (reviewComments || checkRuns) {
+    const keys = [...url.searchParams.keys()];
+    if (
+      keys.some((key) => key !== "per_page" && key !== "page")
+      || url.searchParams.getAll("per_page").length > 1
+      || url.searchParams.getAll("page").length > 1
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_GITHUB_COMMAND_BLOCKED",
+        "GitHub CLI 只允许固定的只读分页参数",
+        400,
+        false,
+      );
+    }
+    for (const key of ["per_page", "page"]) {
+      const value = url.searchParams.get(key);
+      const maximum = key === "per_page" ? MAX_PER_PAGE : MAX_PAGES;
+      if (
+        value !== null
+        && (!/^\d+$/u.test(value) || Number(value) < 1 || Number(value) > maximum)
+      ) {
+        throw inputError(`${key} 必须是 1 到 ${maximum} 的整数`);
+      }
+    }
+    return `${url.pathname}${url.search}`;
+  }
+  throw projectWorkError(
+    "PROJECT_WORK_GITHUB_COMMAND_BLOCKED",
+    "GitHub CLI 只允许固定的只读接口",
+    400,
+    false,
+  );
+}
+
+export function createGitHubCliRunner({
+  execFileImpl = nodeExecFile,
+  binary = "gh",
+  cwd = process.cwd(),
+  env = process.env,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+  const requestTimeoutMs = resolveTimeoutMs(timeoutMs);
+  return Object.freeze({
+    async request(url) {
+      const endpoint = githubCliEndpoint(url);
+      const args = [
+        "api",
+        "--method",
+        "GET",
+        "--hostname",
+        GITHUB_CLI_HOST,
+        "--header",
+        "Accept: application/vnd.github+json",
+        "--header",
+        `X-GitHub-Api-Version: ${GITHUB_API_VERSION}`,
+        endpoint,
+      ];
+      return new Promise((resolve) => {
+        execFileImpl(binary, args, {
+          cwd,
+          env: keychainCliEnv(env),
+          timeout: requestTimeoutMs,
+          maxBuffer: MAX_RESPONSE_BYTES,
+          windowsHide: true,
+          shell: false,
+        }, (error, stdout = "", stderr = "") => {
+          resolve({
+            exitCode: error ? (Number.isInteger(error.code) ? error.code : 1) : 0,
+            stdout: String(stdout),
+            stderr: String(stderr),
+            missing: error?.code === "ENOENT",
+            timedOut: error?.killed === true
+              || error?.code === "ETIMEDOUT"
+              || error?.signal === "SIGTERM",
+            tooLarge: error?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+          });
+        });
+      });
+    },
+  });
+}
+
+function cliFailureStatus(result) {
+  const message = String(result?.stderr ?? "");
+  const match = message.match(/(?:HTTP|status(?: code)?)\s*[: ]\s*(\d{3})/iu);
+  return match ? Number(match[1]) : null;
+}
+
+export async function probeGitHubReadHealth(options = {}) {
+  if (githubToken(options.env ?? process.env)) {
+    return Object.freeze({
+      available: true,
+      reasonCode: "TOKEN_CONFIGURED",
+      source: "dedicated_token",
+    });
+  }
+  const runner = options.runner ?? createGitHubCliRunner(options);
+  let result;
+  try {
+    result = await runner.request(new URL("/user", GITHUB_API_ORIGIN));
+  } catch {
+    return Object.freeze({ available: false, reasonCode: "CHECK_FAILED" });
+  }
+  if (result?.missing) {
+    return Object.freeze({ available: false, reasonCode: "CLI_MISSING" });
+  }
+  if (result?.timedOut) {
+    return Object.freeze({ available: false, reasonCode: "CLI_TIMEOUT" });
+  }
+  if (result?.tooLarge) {
+    return Object.freeze({ available: false, reasonCode: "RESPONSE_TOO_LARGE" });
+  }
+  if (result?.exitCode !== 0) {
+    return Object.freeze({ available: false, reasonCode: "AUTH_OR_UPSTREAM" });
+  }
+  try {
+    const data = JSON.parse(String(result.stdout ?? ""));
+    const identity = typeof data?.login === "string" ? data.login.trim() : "";
+    return Object.freeze(identity
+      ? {
+          available: true,
+          reasonCode: "READY",
+          source: "gh_keychain",
+          identity,
+        }
+      : { available: false, reasonCode: "RESPONSE_INVALID" });
+  } catch {
+    return Object.freeze({ available: false, reasonCode: "RESPONSE_INVALID" });
+  }
+}
+
 export function getGitHubReadCapability({
   env = process.env,
+  health,
   enabledForTurn = false,
 } = {}) {
-  const configured = Boolean(githubToken(env));
+  const tokenConfigured = Boolean(githubToken(env));
+  const cliConfigured = !tokenConfigured && health?.available === true;
+  const configured = tokenConfigured || cliConfigured;
   const enabled = configured && enabledForTurn === true;
+  const unavailableReason = health?.reasonCode === "CLI_MISSING"
+    ? "本机未找到 GitHub CLI"
+    : health?.reasonCode === "CLI_TIMEOUT"
+      ? "GitHub CLI 连接检查超时"
+      : health?.reasonCode === "RESPONSE_INVALID"
+        || health?.reasonCode === "RESPONSE_TOO_LARGE"
+        ? "GitHub CLI 连接检查返回异常"
+        : "GitHub CLI 尚未登录或当前不可用";
   return Object.freeze({
     id: "github_read",
     label: "GitHub 只读",
@@ -62,8 +278,12 @@ export function getGitHubReadCapability({
     effects: Object.freeze(["network_read"]),
     toolNames: GITHUB_READ_TOOL_NAMES,
     reason: configured
-      ? (enabled ? "本轮已启用 GitHub 只读连接" : "GitHub 只读连接已配置，需逐回合启用")
-      : "GitHub 只读连接尚未配置专用 Token",
+      ? (enabled
+          ? "本轮已启用 GitHub 只读连接"
+          : cliConfigured
+            ? "GitHub CLI 已连接，需逐回合启用"
+            : "GitHub 只读连接已配置，需逐回合启用")
+      : unavailableReason,
   });
 }
 
@@ -491,10 +711,21 @@ export function createGitHubReadConnector({
   env = process.env,
   enabledForTurn = false,
   fetchImpl = globalThis.fetch,
+  runner,
+  health,
+  cliFallbackReady = false,
   timeoutMs,
 } = {}) {
   const token = githubToken(env);
-  const capability = getGitHubReadCapability({ env, enabledForTurn });
+  const cliReady = !token && (cliFallbackReady || health?.available === true);
+  const cliRunner = cliReady
+    ? (runner ?? createGitHubCliRunner({ env, timeoutMs }))
+    : null;
+  const capability = getGitHubReadCapability({
+    env,
+    health: cliReady ? { available: true, reasonCode: "READY" } : health,
+    enabledForTurn,
+  });
   const requestTimeoutMs = resolveTimeoutMs(timeoutMs);
   const secrets = token ? [token] : [];
 
@@ -502,7 +733,7 @@ export function createGitHubReadConnector({
     if (!capability.available) {
       throw projectWorkError(
         "PROJECT_WORK_GITHUB_UNAVAILABLE",
-        "GitHub 只读连接尚未配置专用 Token",
+        "GitHub 只读连接尚未配置可用凭据",
         503,
         false,
       );
@@ -515,7 +746,15 @@ export function createGitHubReadConnector({
         false,
       );
     }
-    if (typeof fetchImpl !== "function") {
+    if (token && typeof fetchImpl !== "function") {
+      throw projectWorkError(
+        "PROJECT_WORK_GITHUB_UNAVAILABLE",
+        "GitHub 只读连接当前不可用",
+        503,
+        false,
+      );
+    }
+    if (!token && (!cliRunner || typeof cliRunner.request !== "function")) {
       throw projectWorkError(
         "PROJECT_WORK_GITHUB_UNAVAILABLE",
         "GitHub 只读连接当前不可用",
@@ -534,6 +773,74 @@ export function createGitHubReadConnector({
       }
     }
     assertGitHubUrl(url);
+    const allowedBytes = Math.min(MAX_RESPONSE_BYTES, remainingBytes);
+    if (!token) {
+      let result;
+      try {
+        result = await cliRunner.request(url);
+      } catch {
+        throw projectWorkError(
+          "PROJECT_WORK_GITHUB_UPSTREAM_FAILED",
+          "GitHub 暂时无法完成只读请求",
+          502,
+          true,
+        );
+      }
+      if (result?.missing) {
+        throw projectWorkError(
+          "PROJECT_WORK_GITHUB_UNAVAILABLE",
+          "本机未找到 GitHub CLI",
+          503,
+          false,
+        );
+      }
+      if (result?.timedOut) {
+        throw projectWorkError(
+          "PROJECT_WORK_GITHUB_TIMEOUT",
+          "GitHub CLI 只读请求超时",
+          504,
+          true,
+        );
+      }
+      if (result?.tooLarge) {
+        throw projectWorkError(
+          "PROJECT_WORK_GITHUB_RESPONSE_TOO_LARGE",
+          "GitHub 返回内容超过只读连接的大小限制",
+          502,
+          false,
+        );
+      }
+      if (result?.exitCode !== 0) {
+        const status = cliFailureStatus(result);
+        if (status) throw upstreamError(status);
+        throw projectWorkError(
+          "PROJECT_WORK_GITHUB_UPSTREAM_FAILED",
+          "GitHub 暂时无法完成只读请求",
+          502,
+          true,
+        );
+      }
+      const text = String(result?.stdout ?? "");
+      const bytes = Buffer.byteLength(text, "utf8");
+      if (bytes > allowedBytes) {
+        throw projectWorkError(
+          "PROJECT_WORK_GITHUB_RESPONSE_TOO_LARGE",
+          "GitHub 返回内容超过只读连接的大小限制",
+          502,
+          false,
+        );
+      }
+      try {
+        return { data: JSON.parse(text), bytes };
+      } catch {
+        throw projectWorkError(
+          "PROJECT_WORK_GITHUB_RESPONSE_INVALID",
+          "GitHub 返回了无法解析的数据",
+          502,
+          false,
+        );
+      }
+    }
     const controller = new AbortController();
     let timeout;
     const deadline = new Promise((_, reject) => {
@@ -573,7 +880,6 @@ export function createGitHubReadConnector({
               false,
             );
           }
-          const allowedBytes = Math.min(MAX_RESPONSE_BYTES, remainingBytes);
           const { text, bytes } = await readBoundedText(response, allowedBytes);
           try {
             return { data: JSON.parse(text), bytes };

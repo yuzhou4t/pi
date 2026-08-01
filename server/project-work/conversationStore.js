@@ -125,9 +125,23 @@ export function createConversationStore({ storageRoot } = {}) {
         const migrated = {
           ...value,
           schemaVersion: CONVERSATION_RECORD_SCHEMA_VERSION,
+          workType: value.workType === "worker" ? "worker" : "project_work",
         };
         await writeJsonAtomic(target, migrated);
         return migrated;
+      }
+      if (value.workType === undefined) {
+        const migrated = { ...value, workType: "project_work" };
+        await writeJsonAtomic(target, migrated);
+        return migrated;
+      }
+      if (!["project_work", "worker"].includes(value.workType)) {
+        throw projectWorkError(
+          "PROJECT_WORK_CONVERSATION_RECORD_CORRUPT",
+          "工作会话记录包含无效工作类型，需要恢复后继续",
+          500,
+          true,
+        );
       }
       return value;
     } catch (error) {

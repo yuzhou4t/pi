@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   GITHUB_READ_TOOL_NAMES,
+  createGitHubCliRunner,
   createGitHubReadConnector,
   createGitHubReadTools,
   getGitHubReadCapability,
+  probeGitHubReadHealth,
 } from "./githubReadConnector.js";
 
 const TOKEN = "github-test-token-that-must-never-be-returned";
@@ -28,6 +30,110 @@ function connectorWith(fetchImpl, options = {}) {
   });
 }
 
+function cliResult(value, overrides = {}) {
+  return {
+    exitCode: 0,
+    stdout: JSON.stringify(value),
+    stderr: "",
+    missing: false,
+    timedOut: false,
+    tooLarge: false,
+    ...overrides,
+  };
+}
+
+test("GitHub CLI runner is shell-free, GET-only, fixed-host, bounded, and ignores ambient token overrides", async () => {
+  const calls = [];
+  const runner = createGitHubCliRunner({
+    env: {
+      PATH: "/usr/bin:/bin",
+      GH_TOKEN: "ambient-gh-token",
+      GITHUB_TOKEN: "ambient-github-token",
+      GH_ENTERPRISE_TOKEN: "ambient-enterprise-token",
+      GITHUB_ENTERPRISE_TOKEN: "ambient-github-enterprise-token",
+    },
+    execFileImpl(file, args, options, callback) {
+      calls.push({ file, args, options });
+      callback(null, JSON.stringify({ login: "octocat" }), "");
+    },
+  });
+  const result = await runner.request(new URL(
+    "https://api.github.com/repos/openai/codex/issues/1",
+  ));
+  assert.equal(result.exitCode, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, "gh");
+  assert.deepEqual(calls[0].args, [
+    "api",
+    "--method",
+    "GET",
+    "--hostname",
+    "github.com",
+    "--header",
+    "Accept: application/vnd.github+json",
+    "--header",
+    "X-GitHub-Api-Version: 2022-11-28",
+    "/repos/openai/codex/issues/1",
+  ]);
+  assert.equal(calls[0].options.shell, false);
+  assert.equal(calls[0].options.maxBuffer, 512 * 1024);
+  assert.equal(calls[0].options.env.GH_TOKEN, undefined);
+  assert.equal(calls[0].options.env.GITHUB_TOKEN, undefined);
+  assert.equal(calls[0].options.env.GH_ENTERPRISE_TOKEN, undefined);
+  assert.equal(calls[0].options.env.GITHUB_ENTERPRISE_TOKEN, undefined);
+  assert.equal(calls[0].options.env.GH_PROMPT_DISABLED, "1");
+  await assert.rejects(
+    runner.request(new URL("https://evil.example/repos/openai/codex/issues/1")),
+    { code: "PROJECT_WORK_GITHUB_DESTINATION_BLOCKED" },
+  );
+  await assert.rejects(
+    runner.request(new URL("https://api.github.com/repos/openai/codex/issues")),
+    { code: "PROJECT_WORK_GITHUB_COMMAND_BLOCKED" },
+  );
+  await assert.rejects(
+    runner.request(new URL("https://api.github.com/repos/openai/codex/pulls/1/comments?per_page=31")),
+    { code: "PROJECT_WORK_GITHUB_INPUT_INVALID" },
+  );
+  assert.equal(calls.length, 1);
+});
+
+test("GitHub health prefers the dedicated token and otherwise probes only the gh Keychain identity", async () => {
+  let runnerCalls = 0;
+  const tokenHealth = await probeGitHubReadHealth({
+    env: { PI_GITHUB_TOKEN: TOKEN },
+    runner: {
+      async request() {
+        runnerCalls += 1;
+        return cliResult({ login: "must-not-run" });
+      },
+    },
+  });
+  assert.deepEqual(tokenHealth, {
+    available: true,
+    reasonCode: "TOKEN_CONFIGURED",
+    source: "dedicated_token",
+  });
+  assert.equal(runnerCalls, 0);
+
+  let endpoint;
+  const keychainHealth = await probeGitHubReadHealth({
+    env: {},
+    runner: {
+      async request(url) {
+        endpoint = url.toString();
+        return cliResult({ login: "octocat", token: "must-not-be-used" });
+      },
+    },
+  });
+  assert.deepEqual(keychainHealth, {
+    available: true,
+    reasonCode: "READY",
+    source: "gh_keychain",
+    identity: "octocat",
+  });
+  assert.equal(endpoint, "https://api.github.com/user");
+});
+
 test("GitHub capability is dedicated, read-only, and disabled until this turn enables it", () => {
   const ambientOnly = getGitHubReadCapability({
     env: {
@@ -38,6 +144,15 @@ test("GitHub capability is dedicated, read-only, and disabled until this turn en
   });
   assert.equal(ambientOnly.available, false);
   assert.equal(ambientOnly.enabledForTurn, false);
+
+  const keychainConfigured = getGitHubReadCapability({
+    env: {},
+    health: { available: true, reasonCode: "READY", identity: "must-not-leak" },
+  });
+  assert.equal(keychainConfigured.available, true);
+  assert.equal(keychainConfigured.enabledForTurn, false);
+  assert.equal(keychainConfigured.reason, "GitHub CLI 已连接，需逐回合启用");
+  assert.doesNotMatch(JSON.stringify(keychainConfigured), /must-not-leak/);
 
   const configured = getGitHubReadCapability({
     env: { PI_GITHUB_TOKEN: TOKEN },
@@ -91,6 +206,111 @@ test("GitHub connector blocks missing configuration and missing per-turn enablem
     { code: "PROJECT_WORK_GITHUB_DISABLED" },
   );
   assert.equal(fetchCalls, 0);
+});
+
+test("GitHub connector uses the Keychain CLI fallback for a real read tool when no dedicated token exists", async () => {
+  const requests = [];
+  let fetchCalls = 0;
+  const tools = createGitHubReadTools({
+    env: {},
+    cliFallbackReady: true,
+    enabledForTurn: true,
+    fetchImpl: async () => {
+      fetchCalls += 1;
+      return jsonResponse({});
+    },
+    runner: {
+      async request(url) {
+        requests.push(url.toString());
+        return cliResult({
+          number: 17,
+          title: "Read through gh Keychain",
+          state: "open",
+        });
+      },
+    },
+  });
+  assert.deepEqual(tools.map((tool) => tool.name), GITHUB_READ_TOOL_NAMES);
+  const result = await tools[0].execute("tool-call", {
+    owner: "openai",
+    repo: "codex",
+    number: 17,
+  });
+  assert.equal(fetchCalls, 0);
+  assert.deepEqual(requests, [
+    "https://api.github.com/repos/openai/codex/issues/17",
+  ]);
+  assert.equal(result.details.issue.number, 17);
+});
+
+test("GitHub Keychain fallback stays disabled per turn and maps bounded CLI failures safely", async () => {
+  let runnerCalls = 0;
+  const disabled = createGitHubReadConnector({
+    env: {},
+    cliFallbackReady: true,
+    enabledForTurn: false,
+    runner: {
+      async request() {
+        runnerCalls += 1;
+        return cliResult({ number: 1 });
+      },
+    },
+  });
+  await assert.rejects(
+    disabled.readIssue({ owner: "openai", repo: "codex", number: 1 }),
+    { code: "PROJECT_WORK_GITHUB_DISABLED" },
+  );
+  assert.equal(runnerCalls, 0);
+
+  for (const [overrides, code] of [
+    [{ timedOut: true }, "PROJECT_WORK_GITHUB_TIMEOUT"],
+    [{ tooLarge: true }, "PROJECT_WORK_GITHUB_RESPONSE_TOO_LARGE"],
+    [{ exitCode: 1, stderr: "gh: Not Found (HTTP 404)" }, "PROJECT_WORK_GITHUB_NOT_FOUND"],
+    [{ stdout: "not-json" }, "PROJECT_WORK_GITHUB_RESPONSE_INVALID"],
+  ]) {
+    const connector = createGitHubReadConnector({
+      env: {},
+      cliFallbackReady: true,
+      enabledForTurn: true,
+      runner: {
+        async request() {
+          return cliResult({ number: 1 }, overrides);
+        },
+      },
+    });
+    await assert.rejects(
+      connector.readIssue({ owner: "openai", repo: "codex", number: 1 }),
+      { code },
+    );
+  }
+});
+
+test("GitHub connector keeps the dedicated token transport ahead of the CLI fallback", async () => {
+  let runnerCalls = 0;
+  let fetchCalls = 0;
+  const connector = createGitHubReadConnector({
+    env: { PI_GITHUB_TOKEN: TOKEN },
+    cliFallbackReady: true,
+    enabledForTurn: true,
+    runner: {
+      async request() {
+        runnerCalls += 1;
+        return cliResult({ number: 99 });
+      },
+    },
+    fetchImpl: async () => {
+      fetchCalls += 1;
+      return jsonResponse({ number: 18, title: "Dedicated token", state: "open" });
+    },
+  });
+  const result = await connector.readIssue({
+    owner: "openai",
+    repo: "codex",
+    number: 18,
+  });
+  assert.equal(result.issue.number, 18);
+  assert.equal(fetchCalls, 1);
+  assert.equal(runnerCalls, 0);
 });
 
 test("GitHub connector validates owner, repo, number, ref, and pagination before fetch", async () => {

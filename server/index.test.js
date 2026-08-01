@@ -1119,6 +1119,10 @@ test("standalone project-work conversation routes use the global scope and retur
     lifecycle: "idle",
     id: "conversation-standalone",
     projectId: null,
+    workType: "project_work",
+    workerId: null,
+    sourceProjectId: null,
+    sourceProjectLabel: null,
     workspaceKind: "scratch",
     scope: "standalone",
     rootLabel: "未连接文件夹",
@@ -1240,6 +1244,127 @@ test("standalone project-work conversation routes use the global scope and retur
   ]);
 });
 
+test("project-work creation applies only an explicit valid auto-review default", async (t) => {
+  const calls = [];
+  const conversation = (id, projectId, mode = "manual_review") => ({
+    id,
+    projectId,
+    workspaceKind: projectId === null ? "scratch" : "bound_project",
+    scope: projectId === null ? "standalone" : "project",
+    rootLabel: projectId === null ? "未连接文件夹" : "测试项目",
+    title: "新工作会话",
+    status: "idle",
+    providerId: "deepseek",
+    modelId: "deepseek-v4-pro",
+    thinkingLevel: "medium",
+    executionPolicy: {
+      mode,
+      revision: 1,
+      policyVersion: 1,
+    },
+    pendingChangeFileCount: 0,
+    unreadCount: 0,
+    latestMessageSeq: 0,
+    lastReadMessageSeq: 0,
+    lastEventSeq: 0,
+  });
+  const projectWorkService = {
+    createStandaloneConversation: async (options) => {
+      calls.push({ action: "create-standalone", options });
+      return conversation(
+        "conversation-auto-standalone",
+        null,
+        options.executionPolicyMode,
+      );
+    },
+    createConversation: async (projectId, options) => {
+      calls.push({ action: "create-bound", projectId, options });
+      return conversation(
+        "conversation-auto-bound",
+        projectId,
+        options.executionPolicyMode,
+      );
+    },
+  };
+  const server = await startTestServer({}, candidateSummaryService, projectWorkService);
+  t.after(server.close);
+  const headers = {
+    "content-type": "application/json",
+    origin: "http://127.0.0.1:4173",
+  };
+
+  const standaloneResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        schema_version: 1,
+        provider_id: "deepseek",
+        model_id: "deepseek-v4-pro",
+        execution_policy_mode: "auto_review",
+      }),
+    },
+  );
+  assert.equal(standaloneResponse.status, 201);
+  assert.equal(
+    (await standaloneResponse.json()).executionPolicy.mode,
+    "auto_review",
+  );
+
+  const boundResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/projects/project-auto/conversations`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        schema_version: 1,
+        provider_id: "deepseek",
+        model_id: "deepseek-v4-pro",
+        execution_policy_mode: "auto_review",
+      }),
+    },
+  );
+  assert.equal(boundResponse.status, 201);
+  assert.equal((await boundResponse.json()).executionPolicy.mode, "auto_review");
+  const invalidResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        schema_version: 1,
+        execution_policy_mode: "full_access",
+      }),
+    },
+  );
+  assert.equal(invalidResponse.status, 400);
+  assert.equal(
+    (await invalidResponse.json()).error.code,
+    "PROJECT_WORK_EXECUTION_POLICY_INVALID",
+  );
+  assert.deepEqual(calls, [{
+    action: "create-standalone",
+    options: {
+      title: undefined,
+      providerId: "deepseek",
+      modelId: "deepseek-v4-pro",
+      thinkingLevel: undefined,
+      executionPolicyMode: "auto_review",
+    },
+  }, {
+    action: "create-bound",
+    projectId: "project-auto",
+    options: {
+      title: undefined,
+      providerId: "deepseek",
+      modelId: "deepseek-v4-pro",
+      thinkingLevel: undefined,
+      executionPolicyMode: "auto_review",
+    },
+  }]);
+});
+
 test("project-work message routes accept bounded images and forward one-turn settings", async (t) => {
   const calls = [];
   const projectWorkService = {
@@ -1276,6 +1401,7 @@ test("project-work message routes accept bounded images and forward one-turn set
       schema_version: 1,
       client_request_id: "project-message:image-route",
       text: "检查截图",
+      checkpoint_message_id: "checkpoint-message-1",
       workflow_id: "screenshot_review",
       capabilities: ["web_search"],
       images: [{
@@ -1305,6 +1431,7 @@ test("project-work message routes accept bounded images and forward one-turn set
     conversationId: "conversation-image",
     options: {
       text: "检查截图",
+      checkpointId: "checkpoint-message-1",
       context: [{
         path: "src/App.jsx",
         contentHash: "sha256:source",
@@ -1329,6 +1456,26 @@ test("project-work message routes accept bounded images and forward one-turn set
       clientRequestId: "project-message:image-route",
     },
   });
+
+  const invalidCheckpoint = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: "http://127.0.0.1:4173",
+    },
+    body: JSON.stringify({
+      schema_version: 1,
+      client_request_id: "project-message:invalid-checkpoint",
+      text: "继续",
+      checkpoint_message_id: "",
+    }),
+  });
+  assert.equal(invalidCheckpoint.status, 400);
+  assert.equal(
+    (await invalidCheckpoint.json()).error.code,
+    "PROJECT_WORK_MESSAGE_REQUEST_INVALID",
+  );
+  assert.equal(calls.length, 1);
 
   const oversizedConfiguration = await fetch(
     `${server.baseUrl}/api/v1/project-work/conversations/conversation-image/configuration`,
@@ -1835,7 +1982,7 @@ test("project-work follow-up and ask-user routes keep queueing separate from ans
   }]);
 });
 
-test("project-work turn, read, retry, and repair-resume routes preserve durable request ids", async (t) => {
+test("project-work turn, read, retry, fork, and repair-resume routes preserve durable request ids", async (t) => {
   const calls = [];
   const state = {
     schemaVersion: 1,
@@ -1870,6 +2017,20 @@ test("project-work turn, read, retry, and repair-resume routes preserve durable 
     retryLastTurn: async (conversationId, options) => {
       calls.push({ method: "retryLastTurn", conversationId, options });
       return state;
+    },
+    forkConversationFromCheckpoint: async (conversationId, options) => {
+      calls.push({
+        method: "forkConversationFromCheckpoint",
+        conversationId,
+        options,
+      });
+      return {
+        ...state,
+        conversation: {
+          ...state.conversation,
+          id: "conversation-history-fork",
+        },
+      };
     },
     resumeVerificationRepair: async (conversationId, options) => {
       calls.push({
@@ -1918,9 +2079,53 @@ test("project-work turn, read, retry, and repair-resume routes preserve durable 
     body: JSON.stringify({
       schema_version: 1,
       client_request_id: "retry:history-1",
+      checkpoint_id: "checkpoint-history-1",
     }),
   });
   assert.equal(retry.status, 202);
+
+  const fork = await fetch(`${base}/forks`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      schema_version: 1,
+      client_request_id: "fork:history-1",
+      checkpoint_id: "checkpoint-history-1",
+    }),
+  });
+  assert.equal(fork.status, 201);
+  assert.equal((await fork.json()).conversation.id, "conversation-history-fork");
+
+  const invalidFork = await fetch(`${base}/forks`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      schema_version: 1,
+      client_request_id: "fork:history-invalid",
+      checkpoint_id: "checkpoint-history-1",
+      pi_entry_id: "must-not-cross-http",
+    }),
+  });
+  assert.equal(invalidFork.status, 400);
+  assert.equal(
+    (await invalidFork.json()).error.code,
+    "PROJECT_WORK_FORK_REQUEST_INVALID",
+  );
+
+  const invalidRetry = await fetch(`${base}/retry-last-turn`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      schema_version: 1,
+      client_request_id: "retry:history-invalid",
+      checkpoint_id: "",
+    }),
+  });
+  assert.equal(invalidRetry.status, 400);
+  assert.equal(
+    (await invalidRetry.json()).error.code,
+    "PROJECT_WORK_RETRY_REQUEST_INVALID",
+  );
 
   const resume = await fetch(
     `${base}/verification-repairs/operation%2Frepair-1/resume`,
@@ -1948,7 +2153,17 @@ test("project-work turn, read, retry, and repair-resume routes preserve durable 
   }, {
     method: "retryLastTurn",
     conversationId: "conversation-history",
-    options: { clientRequestId: "retry:history-1" },
+    options: {
+      clientRequestId: "retry:history-1",
+      checkpointId: "checkpoint-history-1",
+    },
+  }, {
+    method: "forkConversationFromCheckpoint",
+    conversationId: "conversation-history",
+    options: {
+      clientRequestId: "fork:history-1",
+      checkpointId: "checkpoint-history-1",
+    },
   }, {
     method: "resumeVerificationRepair",
     conversationId: "conversation-history",
@@ -3441,6 +3656,7 @@ test("project-work file routes forward bounded paging and serve validated image 
   const imageBytes = Buffer.from([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
   ]);
+  const officeBytes = Buffer.from("PK validated office package");
   const projectWorkService = {
     async getConversationTree(conversationId, options) {
       calls.push({ action: "tree", conversationId, options });
@@ -3478,6 +3694,16 @@ test("project-work file routes forward bounded paging and serve validated image 
         byteLength: imageBytes.length,
         hash: "sha256:generated-image",
         bytes: imageBytes,
+      };
+    },
+    async readGeneratedOfficeArtifact(conversationId, artifactId) {
+      calls.push({ action: "generated-office", conversationId, artifactId });
+      return {
+        fileName: "项目报告.docx",
+        mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        byteLength: officeBytes.length,
+        hash: "sha256:generated-office",
+        bytes: officeBytes,
       };
     },
   };
@@ -3529,6 +3755,21 @@ test("project-work file routes forward bounded paging and serve validated image 
     Buffer.from(await generatedImageResponse.arrayBuffer()),
     imageBytes,
   );
+  const officeResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-files/generated-office/office-1/download`,
+  );
+  assert.equal(officeResponse.status, 200);
+  assert.equal(
+    officeResponse.headers.get("content-type"),
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  );
+  assert.equal(officeResponse.headers.get("cache-control"), "private, no-store");
+  assert.equal(officeResponse.headers.get("x-content-type-options"), "nosniff");
+  assert.match(
+    officeResponse.headers.get("content-disposition"),
+    /^attachment; filename="____\.docx"; filename\*=UTF-8''/u,
+  );
+  assert.deepEqual(Buffer.from(await officeResponse.arrayBuffer()), officeBytes);
   assert.deepEqual(calls, [{
     action: "tree",
     conversationId: "conversation-files",
@@ -3549,5 +3790,9 @@ test("project-work file routes forward bounded paging and serve validated image 
     action: "generated-image",
     conversationId: "conversation-files",
     imageId: "image-1",
+  }, {
+    action: "generated-office",
+    conversationId: "conversation-files",
+    artifactId: "office-1",
   }]);
 });

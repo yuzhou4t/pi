@@ -5,6 +5,7 @@ import {
   isPiAgentHealth,
   isPiAgentHtml,
   isPiRuntimeHealth,
+  localServiceEnvironment,
 } from "./pi-agent-local.mjs";
 
 test("the page marker and health payload must both identify Pi Agent", () => {
@@ -61,5 +62,19 @@ test("the internal API reports exhaustion instead of reusing another service", a
       check: async () => false,
     }),
     /内部端口 47880-47881 均被占用/,
+  );
+});
+
+test("both local services receive the exact web origin used for CORS and notification returns", () => {
+  assert.deepEqual(
+    localServiceEnvironment(
+      { PI_API_PORT: "47880" },
+      "http://127.0.0.1:4317/",
+    ),
+    {
+      PI_API_PORT: "47880",
+      PI_LOCAL_WEB_URL: "http://127.0.0.1:4317/",
+      PI_NOTIFICATION_RETURN_ENTRY_URL: "http://127.0.0.1:4317/",
+    },
   );
 });

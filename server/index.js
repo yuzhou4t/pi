@@ -9,6 +9,15 @@ import { HttpRangeError, parseByteRange } from "./httpRange.js";
 import { createJournalWorkflowService } from "./journal/workflowService.js";
 import { combineModelUsageReports } from "./journal/modelUsageService.js";
 import { createModelUsageLedger } from "./modelUsageLedger.js";
+import {
+  createLarkCliNotificationTransport,
+  createLifecycleNotificationDispatcher,
+  createNotificationService,
+} from "./notifications/index.js";
+import {
+  createNotificationHttpApi,
+  sendNotificationHttpError,
+} from "./notifications/httpApi.js";
 import { SOURCE_REGISTRY, SOURCE_REGISTRY_VERSION } from "./journal/sourceRegistry.js";
 import { createMonthlyJournalScheduler } from "./journal/monthlyScheduler.js";
 import {
@@ -26,13 +35,21 @@ import {
   migrateRuntimeEnvelope,
   RUNTIME_SCHEMA_VERSION,
 } from "./runtimeSchema.js";
+import { createAllowedLocalWebOrigins } from "./localWebOrigin.js";
+import {
+  createCliConnectionAdapter,
+  createCliDeliveryExecutor,
+  createControlledCliRunner,
+  createWorkerService,
+} from "./worker/index.js";
+import {
+  createWorkerHttpApi,
+  sendWorkerHttpError,
+} from "./worker/httpApi.js";
 
 const host = "127.0.0.1";
 const port = Number(process.env.PI_API_PORT ?? process.env.PORT ?? 8787);
-const allowedOrigins = new Set([
-  "http://127.0.0.1:4173",
-  "http://localhost:4173",
-]);
+const allowedOrigins = createAllowedLocalWebOrigins(process.env.PI_LOCAL_WEB_URL);
 const projectWorkClientRequestIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const journalClientRequestIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const sha256Pattern = /^sha256:[a-f0-9]{64}$/;
@@ -50,9 +67,41 @@ const projectWorkRuntimeOnly = process.env.PI_PROJECT_WORK_RUNTIME_ONLY === "1";
 const configuredProjectWorkRuntimeUrl = normalizeProjectWorkRuntimeUrl(
   process.env.PI_PROJECT_WORK_RUNTIME_URL,
 );
+const localRuntimeServicesEnabled = !configuredProjectWorkRuntimeUrl;
+const notificationService = localRuntimeServicesEnabled
+  ? createNotificationService({
+      storageRoot: piDataDir,
+      returnEntryBaseUrl: process.env.PI_NOTIFICATION_RETURN_ENTRY_URL,
+      transport: createLarkCliNotificationTransport({
+        binary: process.env.PI_LARK_CLI_BIN || "lark-cli",
+      }),
+    })
+  : null;
+const notificationDispatcher = notificationService
+  ? createLifecycleNotificationDispatcher({ notificationService })
+  : null;
+const workerCliRunner = localRuntimeServicesEnabled
+  ? createControlledCliRunner({
+      binaries: {
+        lark: process.env.PI_LARK_CLI_BIN || "lark-cli",
+        agent_mail: process.env.PI_AGENTLY_CLI_BIN || "agently-cli",
+        ima: process.env.PI_IMA_NODE_BIN || process.execPath,
+      },
+      cwd: path.resolve(piDataDir, "worker", "files"),
+    })
+  : null;
+const worker = workerCliRunner
+  ? createWorkerService({
+      storageRoot: piDataDir,
+      executor: createCliDeliveryExecutor({ runner: workerCliRunner }),
+      connections: createCliConnectionAdapter({ runner: workerCliRunner }),
+    })
+  : null;
 const projectWork = configuredProjectWorkRuntimeUrl
   ? null
-  : createProjectWorkService();
+  : createProjectWorkService({
+      onLifecycleEvent: notificationDispatcher?.dispatch,
+    });
 
 export function shutdownApiServer({
   server,
@@ -881,6 +930,27 @@ function sendProjectWorkImage(response, image, origin) {
   response.end(body);
 }
 
+function sendProjectWorkOfficeArtifact(response, artifact, origin) {
+  const body = Buffer.isBuffer(artifact.bytes)
+    ? artifact.bytes
+    : Buffer.from(artifact.bytes);
+  const fileName = path.basename(String(artifact.fileName ?? "download"))
+    .replaceAll(/[\u0000-\u001f\u007f"\\]/gu, "_");
+  const asciiName = fileName.replaceAll(/[^\x20-\x7e]/gu, "_") || "download";
+  const encodedName = encodeURIComponent(fileName)
+    .replaceAll("'", "%27");
+  response.writeHead(200, {
+    "content-type": artifact.mimeType,
+    "content-length": String(body.length),
+    "content-disposition": `attachment; filename="${asciiName}"; filename*=UTF-8''${encodedName}`,
+    "cache-control": "private, no-store",
+    "content-security-policy": "default-src 'none'; sandbox",
+    "x-content-type-options": "nosniff",
+    ...corsHeaders(origin),
+  });
+  response.end(body);
+}
+
 function sendWorkflowError(response, error, origin, fallback) {
   sendJson(response, Number.isInteger(error?.status) ? error.status : 500, {
     error: {
@@ -933,6 +1003,51 @@ async function readProjectWorkJson(request, options) {
   }
 }
 
+async function readWorkerBytes(request, { maxBytes = 25 * 1024 * 1024 } = {}) {
+  const contentType = String(request.headers["content-type"] || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  if (contentType !== "application/octet-stream") {
+    throw projectWorkError(
+      "WORKER_FILE_CONTENT_TYPE_INVALID",
+      "Worker 附件内容必须使用 application/octet-stream",
+      415,
+    );
+  }
+  const declared = Number(request.headers["content-length"]);
+  if (
+    request.headers["content-length"] !== undefined
+    && (!Number.isSafeInteger(declared) || declared < 0 || declared > maxBytes)
+  ) {
+    throw projectWorkError("WORKER_FILE_SIZE_INVALID", "Worker 附件大小无效", 413);
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      throw projectWorkError(
+        "WORKER_FILE_TOO_LARGE",
+        "单个 Worker 附件不能超过 25 MiB",
+        413,
+      );
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+function projectWorkCreationPolicyMode(value) {
+  if (value === undefined || value === null) return null;
+  if (["manual_review", "auto_review"].includes(value)) return value;
+  throw projectWorkError(
+    "PROJECT_WORK_EXECUTION_POLICY_INVALID",
+    "执行策略无效",
+    400,
+  );
+}
+
 function decodeProjectWorkSegment(value) {
   try {
     return decodeURIComponent(value);
@@ -970,6 +1085,10 @@ function publicProjectWorkConversationSummary(value) {
     }),
     id: conversation?.id ?? null,
     projectId: conversation?.projectId ?? null,
+    workType: conversation?.workType === "worker" ? "worker" : "project_work",
+    workerId: conversation?.workerId ?? null,
+    sourceProjectId: conversation?.sourceProjectId ?? null,
+    sourceProjectLabel: conversation?.sourceProjectLabel ?? null,
     workspaceKind: conversation?.workspaceKind ?? null,
     scope: conversation?.scope ?? null,
     rootLabel: conversation?.rootLabel ?? null,
@@ -978,6 +1097,22 @@ function publicProjectWorkConversationSummary(value) {
     providerId: conversation?.providerId ?? null,
     modelId: conversation?.modelId ?? null,
     thinkingLevel: conversation?.thinkingLevel ?? null,
+    ...(conversation?.executionPolicy ? {
+      executionPolicy: {
+        mode: conversation.executionPolicy.mode === "auto_review"
+          ? "auto_review"
+          : "manual_review",
+        revision: Number.isSafeInteger(conversation.executionPolicy.revision)
+          && conversation.executionPolicy.revision > 0
+          ? conversation.executionPolicy.revision
+          : 1,
+        policyVersion: Number.isSafeInteger(
+          conversation.executionPolicy.policyVersion,
+        ) && conversation.executionPolicy.policyVersion > 0
+          ? conversation.executionPolicy.policyVersion
+          : 1,
+      },
+    } : {}),
     pendingChangeFileCount: conversation?.pendingChangeFileCount ?? 0,
     unreadCount: Number.isSafeInteger(conversation?.unreadCount)
       ? conversation.unreadCount
@@ -1122,11 +1257,35 @@ export function createApiServer({
   candidateSummaryService = candidateSummaries,
   journalWorkflowService = journalWorkflow,
   projectWorkService = projectWork,
+  workerService = worker,
+  notificationSubscriptionService = notificationService,
   projectWorkRuntimeUrl = configuredProjectWorkRuntimeUrl,
   projectWorkRuntimeHealthProbe = probeProjectWorkRuntime,
   runtimeOnly = projectWorkRuntimeOnly,
   allowMissingJournalMutationOrigin = false,
 } = {}) {
+  const localWorkerService = projectWorkRuntimeUrl ? null : workerService;
+  const localNotificationService = projectWorkRuntimeUrl
+    ? null
+    : notificationSubscriptionService;
+  const workerHttpApi = projectWorkService && localWorkerService
+    ? createWorkerHttpApi({
+        workerService: localWorkerService,
+        projectWorkService,
+        readJson: readProjectWorkJson,
+        readBytes: readWorkerBytes,
+        sendJson,
+        requireMutationOrigin: requireProjectWorkMutationOrigin,
+      })
+    : null;
+  const notificationHttpApi = localNotificationService
+    ? createNotificationHttpApi({
+        notificationService: localNotificationService,
+        readJson: readProjectWorkJson,
+        sendJson,
+        requireMutationOrigin: requireProjectWorkMutationOrigin,
+      })
+    : null;
   return http.createServer(async (request, response) => {
   const origin = request.headers.origin;
   if (origin && !allowedOrigins.has(origin)) {
@@ -1189,6 +1348,8 @@ export function createApiServer({
           : "embedded",
       journal_workflow: runtimeOnly ? "unavailable" : "available",
       project_work: runtimeAvailable ? "available" : "recovering",
+      worker: runtimeAvailable ? "available" : "recovering",
+      notifications: runtimeAvailable ? "available" : "recovering",
       runtime_reachable: runtimeAvailable,
       runtime_worker_role: runtimeHealth.runtimeRole,
       runtime_worker_schema_version: runtimeHealth.runtimeSchemaVersion,
@@ -1266,14 +1427,69 @@ export function createApiServer({
     return;
   }
 
-  if (runtimeOnly && !url.pathname.startsWith("/api/v1/project-work")) {
+  const runtimeRoute = [
+    "/api/v1/project-work",
+    "/api/v1/worker",
+    "/api/v1/connections",
+    "/api/v1/notification-subscriptions",
+  ].some((prefix) => url.pathname.startsWith(prefix));
+  if (runtimeOnly && !runtimeRoute) {
     sendJson(response, 404, {
       error: {
         code: "RUNTIME_ROUTE_NOT_FOUND",
-        message: "Pi Runtime 仅提供项目工作接口",
+        message: "Pi Runtime 仅提供正常工作、Worker 与提醒接口",
         retryable: false,
       },
     }, origin);
+    return;
+  }
+
+  const auxiliaryRuntimeRoute = [
+    "/api/v1/worker",
+    "/api/v1/connections",
+    "/api/v1/notification-subscriptions",
+  ].some((prefix) => url.pathname.startsWith(prefix));
+  if (auxiliaryRuntimeRoute && projectWorkRuntimeUrl) {
+    await proxyProjectWorkRequest(
+      request,
+      response,
+      projectWorkRuntimeUrl,
+    );
+    return;
+  }
+
+  if (
+    url.pathname.startsWith("/api/v1/worker")
+    || url.pathname.startsWith("/api/v1/connections")
+  ) {
+    try {
+      if (await workerHttpApi?.handle(request, response, url, origin)) return;
+      sendJson(response, 404, {
+        error: {
+          code: "WORKER_ROUTE_NOT_FOUND",
+          message: "Worker 接口不存在",
+          retryable: false,
+        },
+      }, origin);
+    } catch (error) {
+      sendWorkerHttpError(response, error, origin, sendJson);
+    }
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/v1/notification-subscriptions")) {
+    try {
+      if (await notificationHttpApi?.handle(request, response, url, origin)) return;
+      sendJson(response, 404, {
+        error: {
+          code: "NOTIFICATION_ROUTE_NOT_FOUND",
+          message: "提醒接口不存在",
+          retryable: false,
+        },
+      }, origin);
+    } catch (error) {
+      sendNotificationHttpError(response, error, origin, sendJson);
+    }
     return;
   }
 
@@ -1454,11 +1670,15 @@ export function createApiServer({
       ) {
         requireProjectWorkMutationOrigin(origin);
         const payload = await readProjectWorkJson(request);
+        const requestedPolicyMode = projectWorkCreationPolicyMode(
+          payload.execution_policy_mode,
+        );
         const conversation = await projectWorkService.createStandaloneConversation({
           title: payload.title,
           providerId: payload.provider_id,
           modelId: payload.model_id,
           thinkingLevel: payload.thinking_level,
+          executionPolicyMode: requestedPolicyMode ?? undefined,
         });
         sendJson(
           response,
@@ -1529,11 +1749,15 @@ export function createApiServer({
         requireProjectWorkMutationOrigin(origin);
         const projectId = decodeProjectWorkSegment(projectConversationsMatch[1]);
         const payload = await readProjectWorkJson(request);
+        const requestedPolicyMode = projectWorkCreationPolicyMode(
+          payload.execution_policy_mode,
+        );
         const result = await projectWorkService.createConversation(projectId, {
           title: payload.title,
           providerId: payload.provider_id,
           modelId: payload.model_id,
           thinkingLevel: payload.thinking_level,
+          executionPolicyMode: requestedPolicyMode ?? undefined,
         });
         sendJson(
           response,
@@ -1660,6 +1884,25 @@ export function createApiServer({
           await projectWorkService.readGeneratedImage(
             conversationId,
             imageId,
+          ),
+          origin,
+        );
+        return;
+      }
+
+      const generatedOfficeMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/generated-office\/([^/]+)\/download$/,
+      );
+      if (generatedOfficeMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(
+          generatedOfficeMatch[1],
+        );
+        const artifactId = decodeProjectWorkSegment(generatedOfficeMatch[2]);
+        sendProjectWorkOfficeArtifact(
+          response,
+          await projectWorkService.readGeneratedOfficeArtifact(
+            conversationId,
+            artifactId,
           ),
           origin,
         );
@@ -2255,8 +2498,18 @@ export function createApiServer({
           || !projectWorkClientRequestIdPattern.test(
             String(payload?.client_request_id ?? ""),
           )
+          || (
+            payload?.checkpoint_id !== undefined
+            && !projectWorkClientRequestIdPattern.test(
+              String(payload.checkpoint_id),
+            )
+          )
           || Object.keys(payload).some(
-            (key) => !["schema_version", "client_request_id"].includes(key),
+            (key) => ![
+              "schema_version",
+              "client_request_id",
+              "checkpoint_id",
+            ].includes(key),
           )
         ) {
           throw projectWorkError(
@@ -2271,7 +2524,58 @@ export function createApiServer({
           publicProjectWorkConversationState(
             await projectWorkService.retryLastTurn(conversationId, {
               clientRequestId: payload.client_request_id,
+              ...(payload.checkpoint_id
+                ? { checkpointId: payload.checkpoint_id }
+                : {}),
             }),
+          ),
+          origin,
+        );
+        return;
+      }
+
+      const conversationForkMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/forks$/,
+      );
+      if (conversationForkMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          conversationForkMatch[1],
+        );
+        const payload = await readProjectWorkJson(request);
+        if (
+          payload?.schema_version !== 1
+          || !projectWorkClientRequestIdPattern.test(
+            String(payload?.client_request_id ?? ""),
+          )
+          || !projectWorkClientRequestIdPattern.test(
+            String(payload?.checkpoint_id ?? ""),
+          )
+          || Object.keys(payload).some(
+            (key) => ![
+              "schema_version",
+              "client_request_id",
+              "checkpoint_id",
+            ].includes(key),
+          )
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_FORK_REQUEST_INVALID",
+            "从检查点新建会话的请求无效",
+            400,
+          );
+        }
+        sendJson(
+          response,
+          201,
+          publicProjectWorkConversationState(
+            await projectWorkService.forkConversationFromCheckpoint(
+              conversationId,
+              {
+                clientRequestId: payload.client_request_id,
+                checkpointId: payload.checkpoint_id,
+              },
+            ),
           ),
           origin,
         );
@@ -2293,8 +2597,23 @@ export function createApiServer({
         );
         let result;
         if (action === "messages") {
+          if (
+            payload?.checkpoint_message_id !== undefined
+            && !projectWorkClientRequestIdPattern.test(
+              String(payload.checkpoint_message_id),
+            )
+          ) {
+            throw projectWorkError(
+              "PROJECT_WORK_MESSAGE_REQUEST_INVALID",
+              "消息检查点无效",
+              400,
+            );
+          }
           result = await projectWorkService.sendMessage(conversationId, {
             text: payload.text,
+            ...(payload.checkpoint_message_id
+              ? { checkpointId: payload.checkpoint_message_id }
+              : {}),
             context: Array.isArray(payload.contexts)
               ? payload.contexts.map((context) => ({
                   path: context?.path,
@@ -4423,6 +4742,7 @@ const isMainModule = process.argv[1]
 if (isMainModule) {
   const server = createApiServer();
   let shuttingDown = false;
+  let notificationTimer = null;
   const monthlyScheduler = (
     !projectWorkRuntimeOnly
     && process.env.PI_JOURNAL_SCHEDULER_ENABLED !== "0"
@@ -4434,6 +4754,15 @@ if (isMainModule) {
     : null;
   server.listen(port, host, () => {
     console.log(`Pi Agent local API listening on http://${host}:${port} (${candidateSummaries.config.mode})`);
+    if (projectWork && notificationService) {
+      const processNotifications = () => notificationService.processDue()
+        .catch((error) => {
+          console.warn(`Pi Agent notification delivery paused: ${error.message}`);
+        });
+      void processNotifications();
+      notificationTimer = setInterval(processNotifications, 3_000);
+      notificationTimer.unref?.();
+    }
     monthlyScheduler?.start().catch((error) => {
       console.warn(`Pi Agent monthly scheduler could not start: ${error.message}`);
     });
@@ -4442,6 +4771,7 @@ if (isMainModule) {
     process.on(signal, () => {
       if (shuttingDown) return;
       shuttingDown = true;
+      if (notificationTimer) clearInterval(notificationTimer);
       monthlyScheduler?.dispose();
       void shutdownApiServer({
         server,

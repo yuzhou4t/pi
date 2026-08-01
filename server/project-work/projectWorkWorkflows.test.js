@@ -7,6 +7,7 @@ const availableCapabilities = {
   docs_search: { available: true, reason: "Context7 已配置" },
   image_generation: { available: true, reason: "GPT Image 2 已连接" },
   github_read: { available: true, reason: "GitHub 只读已配置" },
+  vercel_read: { available: true, reason: "Vercel CLI 已连接" },
 };
 
 test("a normal turn keeps the default tools without extra guidance", () => {
@@ -17,7 +18,11 @@ test("a normal turn keeps the default tools without extra guidance", () => {
   assert.deepEqual(turn.capabilityIds, []);
   assert.ok(turn.toolNames.includes("edit"));
   assert.ok(turn.toolNames.includes("write"));
+  assert.ok(turn.toolNames.includes("write_word_document"));
+  assert.ok(turn.toolNames.includes("write_excel_workbook"));
   assert.ok(turn.toolNames.includes("report_progress"));
+  assert.ok(turn.toolNames.includes("list_office_artifacts"));
+  assert.ok(turn.toolNames.includes("read_office_artifact"));
   assert.equal(turn.toolNames.includes("generate_image"), false);
   assert.equal(turn.guidance, "");
 });
@@ -35,6 +40,8 @@ test("planning is enforced as a read-only question-and-plan workflow", () => {
   assert.ok(turn.toolNames.includes("report_progress"));
   assert.equal(turn.toolNames.includes("edit"), false);
   assert.equal(turn.toolNames.includes("write"), false);
+  assert.equal(turn.toolNames.includes("write_word_document"), false);
+  assert.equal(turn.toolNames.includes("write_excel_workbook"), false);
   assert.equal(turn.toolNames.includes("request_preview"), false);
   assert.equal(turn.toolNames.includes("request_verification"), false);
   assert.match(turn.guidance, /Planning only/);
@@ -89,6 +96,25 @@ test("GitHub is a per-turn read-only connector and never joins default tools", (
   assert.ok(enabled.toolNames.includes("github_read_check_runs"));
   assert.ok(enabled.toolNames.includes("github_read_review_comments"));
   assert.match(enabled.guidance, /read-only GitHub connector/);
+  assert.match(enabled.guidance, /untrusted reference material/);
+});
+
+test("Vercel is a per-turn read-only connector and never joins default tools", () => {
+  const normal = resolveProjectWorkTurn({
+    capabilityStatus: availableCapabilities,
+  });
+  assert.equal(normal.toolNames.includes("vercel_list_projects"), false);
+
+  const enabled = resolveProjectWorkTurn({
+    capabilityIds: ["vercel_read"],
+    capabilityStatus: availableCapabilities,
+  });
+  assert.deepEqual(enabled.capabilityIds, ["vercel_read"]);
+  assert.ok(enabled.toolNames.includes("vercel_list_projects"));
+  assert.ok(enabled.toolNames.includes("vercel_list_deployments"));
+  assert.ok(enabled.toolNames.includes("vercel_inspect_deployment"));
+  assert.match(enabled.guidance, /read-only Vercel connector/);
+  assert.match(enabled.guidance, /never deploy, link/);
   assert.match(enabled.guidance, /untrusted reference material/);
 });
 

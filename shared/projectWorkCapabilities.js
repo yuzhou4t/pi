@@ -28,6 +28,16 @@ export const PROJECT_WORK_CAPABILITIES = [
       "github_read_review_comments",
     ],
   },
+  {
+    id: "vercel_read",
+    label: "Vercel 只读",
+    description: "本轮读取 Vercel 项目、部署列表和部署详情，不执行部署或配置修改。",
+    toolNames: [
+      "vercel_list_projects",
+      "vercel_list_deployments",
+      "vercel_inspect_deployment",
+    ],
+  },
 ];
 
 export const PROJECT_WORK_WORKFLOWS = [

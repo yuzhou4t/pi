@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   symlink,
   utimes,
@@ -28,7 +29,9 @@ import {
   createProjectWorkTurnGuidanceExtension,
   createPiSessionFactory,
   createProjectWorkTools,
+  forkProjectWorkSessionFromCheckpoint,
   getProjectWorkDefaultThinkingLevel,
+  getSessionMessageEntryId,
   getProjectWorkThinkingLevels,
   PROJECT_WORK_DEFAULT_TOOL_NAMES,
   PROJECT_WORK_IMAGE_TOOL_NAME,
@@ -38,8 +41,20 @@ import {
   PROJECT_WORK_SUBAGENT_TOOL_NAME,
   PROJECT_WORK_ULTRA_THINKING_LEVEL,
   readProjectWorkOverlayTextFile,
+  restoreProjectWorkSessionEntry,
 } from "./piSessionHost.js";
 import { createContainedSubagentToolDefinitions } from "./subagentContainedTools.js";
+import { GITHUB_READ_TOOL_NAMES } from "./githubReadConnector.js";
+import { VERCEL_READ_TOOL_NAMES } from "./vercelReadConnector.js";
+
+const unavailableVercelReadProbe = async () => ({
+  available: false,
+  reasonCode: "CLI_MISSING",
+});
+const unavailableGitHubReadProbe = async () => ({
+  available: false,
+  reasonCode: "CLI_MISSING",
+});
 
 function toolByName(tools, name) {
   const tool = tools.find((item) => item.name === name);
@@ -67,10 +82,21 @@ test("project-work model catalog exposes safe external capability status", async
         PI_GITHUB_TOKEN: "github-token-must-not-appear-in-catalog",
       },
     },
+    vercelReadProbe: async () => ({
+      available: true,
+      reasonCode: "READY",
+      identity: "must-not-appear-in-catalog",
+      token: "must-not-appear-in-catalog",
+    }),
     imageGenerationProbe: async () => ({
       available: true,
       status: "ready",
       reasonCode: "CHATGPT_SUBSCRIPTION",
+    }),
+    officeArtifactProbe: async () => ({
+      available: true,
+      reason: "Word / Excel 本机生成与校验运行时可用",
+      runtimePath: "must-not-appear-in-catalog",
     }),
   });
   const catalog = await factory.listModels();
@@ -86,6 +112,10 @@ test("project-work model catalog exposes safe external capability status", async
     image_generation: {
       available: true,
       reason: "GPT Image 2 · ChatGPT 订阅已连接",
+    },
+    office_generation: {
+      available: true,
+      reason: "Word / Excel 本机生成与校验运行时可用",
     },
     github_read: {
       id: "github_read",
@@ -104,8 +134,90 @@ test("project-work model catalog exposes safe external capability status", async
       ],
       reason: "GitHub 只读连接已配置，需逐回合启用",
     },
+    vercel_read: {
+      id: "vercel_read",
+      label: "Vercel 只读",
+      available: true,
+      enabledForTurn: false,
+      defaultEnabled: false,
+      activation: "per_turn",
+      access: "read_only",
+      effects: ["network_read"],
+      toolNames: VERCEL_READ_TOOL_NAMES,
+      reason: "Vercel CLI 已连接，需逐回合启用",
+    },
   });
   assert.doesNotMatch(JSON.stringify(catalog), /must-not-appear-in-catalog/);
+});
+
+test("project-work model catalog exposes only sanitized Vercel health", async () => {
+  const factory = createPiSessionFactory({
+    modelRuntime: {
+      async getAvailable() {
+        return [];
+      },
+      getProvider() {
+        return null;
+      },
+    },
+    githubReadProbe: unavailableGitHubReadProbe,
+    vercelReadProbe: async () => ({
+      available: true,
+      reasonCode: "READY",
+      username: "vercel-private-user",
+      token: "vercel-private-token",
+    }),
+  });
+  const catalog = await factory.listModels();
+  assert.deepEqual(catalog.capabilities.vercel_read, {
+    id: "vercel_read",
+    label: "Vercel 只读",
+    available: true,
+    enabledForTurn: false,
+    defaultEnabled: false,
+    activation: "per_turn",
+    access: "read_only",
+    effects: ["network_read"],
+    toolNames: VERCEL_READ_TOOL_NAMES,
+    reason: "Vercel CLI 已连接，需逐回合启用",
+  });
+  assert.doesNotMatch(JSON.stringify(catalog), /vercel-private/u);
+});
+
+test("project-work model catalog exposes sanitized GitHub Keychain health", async () => {
+  const factory = createPiSessionFactory({
+    modelRuntime: {
+      async getAvailable() {
+        return [];
+      },
+      getProvider() {
+        return null;
+      },
+    },
+    githubReadOptions: { env: {} },
+    githubReadProbe: async () => ({
+      available: true,
+      reasonCode: "READY",
+      source: "gh_keychain",
+      identity: "github-private-user",
+      token: "github-private-token",
+    }),
+    vercelReadProbe: unavailableVercelReadProbe,
+  });
+  const catalog = await factory.listModels();
+  assert.deepEqual(catalog.capabilities.github_read, {
+    id: "github_read",
+    label: "GitHub 只读",
+    available: true,
+    enabledForTurn: false,
+    defaultEnabled: false,
+    activation: "per_turn",
+    access: "read_only",
+    effects: ["network_read"],
+    toolNames: GITHUB_READ_TOOL_NAMES,
+    reason: "GitHub CLI 已连接，需逐回合启用",
+  });
+  assert.doesNotMatch(JSON.stringify(catalog), /github-private/u);
 });
 
 test("project-work model catalog reports Image2 unavailable without exposing auth details", async () => {
@@ -124,6 +236,8 @@ test("project-work model catalog reports Image2 unavailable without exposing aut
       reasonCode: "CODEX_AUTH_NOT_CHATGPT",
       token: "must-not-appear",
     }),
+    githubReadProbe: unavailableGitHubReadProbe,
+    vercelReadProbe: unavailableVercelReadProbe,
   });
   const catalog = await factory.listModels();
   assert.deepEqual(catalog.capabilities.image_generation, {
@@ -159,6 +273,8 @@ test("project-work model catalog derives image support from Pi model input modal
           : null;
       },
     },
+    githubReadProbe: unavailableGitHubReadProbe,
+    vercelReadProbe: unavailableVercelReadProbe,
   });
   const catalog = await factory.listModels();
   const models = catalog.providers[0].models;
@@ -209,6 +325,8 @@ test("project-work model catalog exposes only safe rate-card metadata", async ()
         return { name: "GPT · ChatGPT 订阅" };
       },
     },
+    githubReadProbe: unavailableGitHubReadProbe,
+    vercelReadProbe: unavailableVercelReadProbe,
   });
 
   const catalog = await factory.listModels();
@@ -366,9 +484,181 @@ test("project-work session host retries by branching before the last durable use
   const source = await readFile(new URL("./piSessionHost.js", import.meta.url), "utf8");
   assert.match(source, /retryLastTurn\(options = \{\}\)/);
   assert.match(source, /session\.getUserMessagesForForking\(\)\.at\(-1\)/);
-  assert.match(source, /session\.navigateTree\(target\.entryId,\s*\{\s*summarize: false/);
+  assert.match(source, /return retryFromEntry\(target\.entryId, options\)/);
+  assert.match(source, /session\.navigateTree\(entryId,\s*\{\s*summarize: false/);
   assert.match(source, /session\.sendUserMessage\(content\)/);
+  assert.match(source, /getActiveEntryId\(\)\s*\{\s*return sessionManager\.getLeafId\(\)/);
+  assert.match(source, /restoreSessionEntry\(piEntryId\)/);
   assert.doesNotMatch(source, /child_process.*retryLastTurn/s);
+});
+
+test("Pi message entry lookup binds only the exact persisted message object", () => {
+  const manager = SessionManager.inMemory("/private/pi-entry-lookup");
+  const message = {
+    role: "user",
+    content: [{ type: "text", text: "检查当前项目" }],
+    timestamp: Date.now(),
+  };
+  const entryId = manager.appendMessage(message);
+
+  assert.equal(getSessionMessageEntryId(manager, message), entryId);
+  assert.equal(
+    getSessionMessageEntryId(manager, structuredClone(message)),
+    null,
+    "structurally similar messages must not guess a Pi entry",
+  );
+});
+
+test("checkpoint restore keeps the exact assistant, user, and custom-message leaf", () => {
+  const manager = SessionManager.inMemory("/private/pi-exact-entry-restore");
+  const userMessage = {
+    role: "user",
+    content: [{ type: "text", text: "检查当前项目" }],
+    timestamp: 1,
+  };
+  const assistantMessage = {
+    role: "assistant",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    content: [{ type: "text", text: "检查完成" }],
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: 2,
+  };
+  const userEntryId = manager.appendMessage(userMessage);
+  const assistantEntryId = manager.appendMessage(assistantMessage);
+  const customEntryId = manager.appendCustomMessageEntry(
+    "pi_agent_current_files_notice",
+    "重新检查当前项目文件",
+    false,
+  );
+  const session = {
+    agent: {
+      state: {
+        messages: [],
+      },
+    },
+  };
+
+  for (const entryId of [assistantEntryId, userEntryId, customEntryId]) {
+    restoreProjectWorkSessionEntry({
+      sessionManager: manager,
+      session,
+      piEntryId: entryId,
+    });
+    assert.equal(manager.getLeafId(), entryId);
+    assert.deepEqual(
+      session.agent.state.messages,
+      manager.buildSessionContext().messages,
+    );
+  }
+});
+
+test("checkpoint session fork keeps the source tree unchanged and resumes only the selected path", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-session-fork-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sourceWorkspace = path.join(temporaryRoot, "source-workspace");
+  const sourceSessions = path.join(temporaryRoot, "source-sessions");
+  const targetWorkspace = path.join(temporaryRoot, "target-workspace");
+  const targetSessions = path.join(temporaryRoot, "target-sessions");
+  await Promise.all([
+    mkdir(sourceWorkspace),
+    mkdir(sourceSessions),
+    mkdir(targetWorkspace),
+    mkdir(targetSessions),
+  ]);
+
+  const manager = SessionManager.create(sourceWorkspace, sourceSessions);
+  const userMessage = (text, timestamp) => ({
+    role: "user",
+    content: [{ type: "text", text }],
+    timestamp,
+  });
+  const assistantMessage = (text, timestamp) => ({
+    role: "assistant",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    content: [{ type: "text", text }],
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp,
+  });
+  const rootUserId = manager.appendMessage(userMessage("共同起点", 1));
+  const rootAssistantId = manager.appendMessage(
+    assistantMessage("共同回答", 2),
+  );
+  const selectedUserId = manager.appendMessage(userMessage("方案甲", 3));
+  const selectedAssistantId = manager.appendMessage(
+    assistantMessage("方案甲回答", 4),
+  );
+  manager.branch(rootAssistantId);
+  const siblingUserId = manager.appendMessage(userMessage("方案乙", 5));
+  const siblingAssistantId = manager.appendMessage(
+    assistantMessage("方案乙回答", 6),
+  );
+  const sourceLeafBefore = manager.getLeafId();
+  const sourceFile = manager.getSessionFile();
+  const sourceBytesBefore = await readFile(sourceFile);
+
+  const forked = await forkProjectWorkSessionFromCheckpoint({
+    sessionManager: manager,
+    piAssistantEntryId: selectedAssistantId,
+    targetWorkspaceRoot: targetWorkspace,
+    targetSessionDir: targetSessions,
+  });
+
+  assert.equal(manager.getLeafId(), sourceLeafBefore);
+  assert.equal(manager.getLeafId(), siblingAssistantId);
+  assert.deepEqual(await readFile(sourceFile), sourceBytesBefore);
+  assert.deepEqual(forked.entryPathIds, [
+    rootUserId,
+    rootAssistantId,
+    selectedUserId,
+    selectedAssistantId,
+  ]);
+
+  const canonicalTargetWorkspace = await realpath(targetWorkspace);
+  const restored = SessionManager.continueRecent(
+    canonicalTargetWorkspace,
+    targetSessions,
+  );
+  assert.equal(restored.getSessionId(), forked.sessionId);
+  assert.equal(restored.getCwd(), canonicalTargetWorkspace);
+  assert.ok(restored.getEntry(rootUserId));
+  assert.ok(restored.getEntry(rootAssistantId));
+  assert.ok(restored.getEntry(selectedUserId));
+  assert.ok(restored.getEntry(selectedAssistantId));
+  assert.equal(restored.getEntry(siblingUserId), undefined);
+  assert.equal(restored.getEntry(siblingAssistantId), undefined);
+  const notice = restored.getLeafEntry();
+  assert.equal(notice.type, "custom_message");
+  assert.equal(notice.customType, "pi_agent_current_files_notice");
+  assert.equal(notice.display, false);
+  assert.match(String(notice.content), /did not rewind or copy project files/);
+  assert.deepEqual(
+    restored.getBranch().map((entry) => entry.id),
+    [
+      rootUserId,
+      rootAssistantId,
+      selectedUserId,
+      selectedAssistantId,
+      notice.id,
+    ],
+  );
 });
 
 test("verification repair exposes only contained overlay tools and a hidden bound failure turn", async () => {
@@ -422,6 +712,10 @@ test("public progress is a bounded non-mutating tool available to normal and rep
       };
     },
   });
+  assert.deepEqual(
+    VERCEL_READ_TOOL_NAMES.filter((name) => tools.some((tool) => tool.name === name)),
+    VERCEL_READ_TOOL_NAMES,
+  );
   const reportProgress = toolByName(tools, PROJECT_WORK_PROGRESS_TOOL_NAME);
   const result = await reportProgress.execute("progress-1", {
     summary: "正在检查事件链",
@@ -449,6 +743,57 @@ test("public progress is a bounded non-mutating tool available to normal and rep
   );
   const source = await readFile(new URL("./piSessionHost.js", import.meta.url), "utf8");
   assert.match(source, /never expose private reasoning, hidden chain-of-thought, secrets/);
+  assert.match(source, /Every contained project-tool path must be relative/);
+  assert.match(source, /Every contained file-tool path must be relative/);
+  assert.match(source, /for the root directory; never pass an absolute/);
+});
+
+test("project-work turn creates and executes GitHub Keychain read tools without a dedicated token", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-github-keychain-tool-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const baseRoot = path.join(temporaryRoot, "base");
+  const workspaceRoot = path.join(temporaryRoot, "workspace");
+  await Promise.all([
+    mkdir(projectRoot),
+    mkdir(baseRoot),
+    mkdir(workspaceRoot),
+  ]);
+  const requests = [];
+  const tools = await createProjectWorkTools({
+    projectRoot,
+    baseRoot,
+    workspaceRoot,
+    githubReadOptions: {
+      env: {},
+      runner: {
+        async request(url) {
+          requests.push(url.toString());
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              number: 21,
+              title: "Keychain-backed turn",
+              state: "open",
+            }),
+            stderr: "",
+          };
+        },
+      },
+    },
+  });
+  assert.deepEqual(
+    GITHUB_READ_TOOL_NAMES.filter((name) => tools.some((tool) => tool.name === name)),
+    GITHUB_READ_TOOL_NAMES,
+  );
+  const result = await toolByName(tools, "github_read_issue").execute(
+    "github-keychain-call",
+    { owner: "openai", repo: "codex", number: 21 },
+  );
+  assert.deepEqual(requests, [
+    "https://api.github.com/repos/openai/codex/issues/21",
+  ]);
+  assert.equal(result.details.issue.title, "Keychain-backed turn");
 });
 
 test("verification tool exposes recipe ids without arbitrary command arguments", async () => {
@@ -1135,6 +1480,12 @@ test("controlled Uvicorn, Vite, and static previews use closed schemas and stay 
     requestHash: `sha256:${"1".repeat(64)}`,
   });
   assert.deepEqual(
+    tools.filter((tool) => tool.parameters?.type !== "object").map((tool) => tool.name),
+    [],
+    "every project-work tool must expose an object-root JSON Schema",
+  );
+  assert.equal(requestPreview.parameters.type, "object");
+  assert.deepEqual(
     requestPreview.parameters.anyOf.map((variant) => ({
       runtime: variant.properties.runtime.const,
       additionalProperties: variant.additionalProperties,
@@ -1328,6 +1679,103 @@ test("generate_image is an explicit conversation-owned tool with no project writ
     PROJECT_WORK_DEFAULT_TOOL_NAMES.includes(PROJECT_WORK_IMAGE_TOOL_NAME),
     false,
   );
+});
+
+test("Office tools create conversation artifacts while generated Office reads stay revision-bound", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-office-tools-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const baseRoot = path.join(temporaryRoot, "base");
+  const workspaceRoot = path.join(temporaryRoot, "workspace");
+  await Promise.all([
+    mkdir(projectRoot),
+    mkdir(baseRoot),
+    mkdir(workspaceRoot),
+  ]);
+  const requests = [];
+  const tools = await createProjectWorkTools({
+    projectRoot,
+    baseRoot,
+    workspaceRoot,
+    officeArtifactAccess: {
+      list: async () => [{
+        artifact_id: "office-1",
+        artifact_revision: `sha256:${"a".repeat(64)}`,
+        kind: "word",
+      }],
+      read: async (request) => ({
+        artifact_id: request.artifactId,
+        artifact_revision: request.revision,
+        offset: request.offset ?? 0,
+        end_offset: 8,
+        has_more: false,
+        content: "标题\n正文",
+      }),
+    },
+    onWordArtifactRequest: async (request) => {
+      requests.push({ kind: "word", ...request });
+      return { id: "office-word-1", fileName: "报告.docx" };
+    },
+    onExcelArtifactRequest: async (request) => {
+      requests.push({ kind: "excel", ...request });
+      return { id: "office-excel-1", fileName: "数据.xlsx" };
+    },
+  });
+  const word = toolByName(tools, "write_word_document");
+  const excel = toolByName(tools, "write_excel_workbook");
+  const list = toolByName(tools, "list_office_artifacts");
+  const read = toolByName(tools, "read_office_artifact");
+  const controller = new AbortController();
+  const wordRequest = {
+    fileName: "报告.docx",
+    title: "项目报告",
+    sections: [{ heading: "结论", paragraphs: ["已完成。"] }],
+  };
+  const excelRequest = {
+    fileName: "数据.xlsx",
+    title: "项目数据",
+    sheets: [{ name: "汇总", rows: [["项目", "数量"], ["A", 2]] }],
+  };
+
+  const wordResult = await word.execute("word-call", wordRequest, controller.signal);
+  const excelResult = await excel.execute("excel-call", excelRequest, controller.signal);
+  const listed = await list.execute("office-list", {});
+  const revision = `sha256:${"a".repeat(64)}`;
+  const readResult = await read.execute("office-read", {
+    artifact_id: "office-1",
+    artifact_revision: revision,
+  });
+
+  assert.deepEqual(requests.map(({ kind, request, toolCallId, signal }) => ({
+    kind,
+    request,
+    toolCallId,
+    signal,
+  })), [{
+    kind: "word",
+    request: wordRequest,
+    toolCallId: "word-call",
+    signal: controller.signal,
+  }, {
+    kind: "excel",
+    request: excelRequest,
+    toolCallId: "excel-call",
+    signal: controller.signal,
+  }]);
+  assert.match(wordResult.content[0].text, /no project file was written/i);
+  assert.match(excelResult.content[0].text, /no project file was written/i);
+  assert.equal(listed.details.artifacts[0].artifact_id, "office-1");
+  assert.deepEqual(readResult.details, {
+    artifactId: "office-1",
+    artifactRevision: revision,
+    offset: 0,
+    endOffset: 8,
+    hasMore: false,
+  });
+  assert.equal(PROJECT_WORK_DEFAULT_TOOL_NAMES.includes("write_word_document"), true);
+  assert.equal(PROJECT_WORK_DEFAULT_TOOL_NAMES.includes("write_excel_workbook"), true);
+  assert.equal(word.parameters.properties.sections.maxItems, 40);
+  assert.equal(excel.parameters.properties.sheets.maxItems, 8);
 });
 
 test("contained read loads only enabled Skill text resources outside the project", async (t) => {
