@@ -16,6 +16,7 @@ const expectedPrompts = [
   "evidence",
   "five-minute-guide",
     "method",
+    "paper-project-impact",
     "project-relation",
     "reading-chat",
     "reading-follow-up",

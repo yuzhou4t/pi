@@ -64,6 +64,28 @@ export function publicationDiscovery(
   };
 }
 
+function candidateExclusions(previousRuns, dismissedKeys) {
+  const paperIds = new Set();
+  const dedupeKeys = new Set(
+    dismissedKeys.filter((key) => typeof key === "string" && key),
+  );
+  for (const run of previousRuns) {
+    const decisions = run?.paper_decisions;
+    if (!decisions || typeof decisions !== "object" || Array.isArray(decisions)) continue;
+    for (const paper of Array.isArray(run.candidates) ? run.candidates : []) {
+      if (!["read", "collect"].includes(decisions[paper.paper_id])) continue;
+      if (paper.paper_id) paperIds.add(paper.paper_id);
+      if (paper.dedupe_key) dedupeKeys.add(paper.dedupe_key);
+    }
+  }
+  return { paperIds, dedupeKeys };
+}
+
+function isExcludedCandidate(paper, exclusions) {
+  return exclusions.paperIds.has(paper.paper_id)
+    || exclusions.dedupeKeys.has(paper.dedupe_key);
+}
+
 function errorRecord(error) {
   return {
     code: typeof error?.code === "string"
@@ -412,20 +434,57 @@ export async function scanJournalSources({
       }
     }
   });
+  const scannedRecords = sourceScans
+    .filter((scan) => scan.status === "success" && scan.output_persisted)
+    .flatMap((scan) => scan.papers);
   const newRecords = deduplicatePapers(
-    sourceScans
-      .filter((scan) => scan.status === "success" && scan.output_persisted)
-      .flatMap((scan) => scan.papers.filter((paper) => paper.is_new)),
+    scannedRecords.filter((paper) => paper.is_new),
   );
-  const likelyRelevant = filterTopicCandidates(newRecords);
+  let previousRuns = [];
+  if (typeof runStore.listRuns === "function") {
+    try {
+      previousRuns = await runStore.listRuns();
+    } catch {
+      previousRuns = [];
+    }
+  }
+  const exclusions = candidateExclusions(previousRuns, dismissedKeys);
+  // Source cursors keep first-discovery semantics, but a paper that is still in the
+  // live publication window must not disappear merely because an earlier scan saw it.
+  // Read, collected, and explicitly dismissed identities remain excluded.
+  const reconsideredRecords = deduplicatePapers(
+    scannedRecords
+      .filter((paper) => !paper.is_new)
+      .filter((paper) => publicationDiscovery(
+        paper.published_at,
+        observedAt,
+        paper.publication_date_precision,
+      ).published_this_month)
+      .filter((paper) => !isExcludedCandidate(paper, exclusions)),
+  );
+  const candidateRecords = deduplicatePapers([
+    ...newRecords,
+    ...reconsideredRecords,
+  ]).filter((paper) => !isExcludedCandidate(paper, exclusions));
+  const likelyRelevant = filterTopicCandidates(candidateRecords);
   // 丰富选题面：除了窄主题命中，还优先把“领域视野”命中的论文纳入富化池，
   // 让它们有机会成为候选；剩余名额再用其他新记录补齐。
-  const fieldRelevant = filterFieldCandidates(newRecords)
+  const fieldRelevant = filterFieldCandidates(candidateRecords)
     .filter((paper) => !likelyRelevant.includes(paper));
+  const isInPublicationWindow = (paper) => publicationDiscovery(
+    paper.published_at,
+    observedAt,
+    paper.publication_date_precision,
+  ).published_this_month;
+  const currentRelevant = deduplicatePapers([
+    ...likelyRelevant.filter(isInPublicationWindow),
+    ...fieldRelevant.filter(isInPublicationWindow),
+  ]);
   const enrichmentPool = deduplicatePapers([
+    ...currentRelevant,
     ...likelyRelevant,
     ...fieldRelevant,
-    ...newRecords.filter(
+    ...candidateRecords.filter(
       (paper) => !likelyRelevant.includes(paper) && !fieldRelevant.includes(paper),
     ),
   ]).slice(0, MAX_ENRICHMENT_PAPERS);
@@ -474,9 +533,8 @@ export async function scanJournalSources({
     .slice(0, Math.max(0, 5 - recentSelected.length));
   let resurfacedCandidates = [];
   const filledCount = recentSelected.length + historicalDiscoveries.length;
-  if (filledCount < 5 && typeof runStore.listRuns === "function") {
+  if (filledCount < 5 && previousRuns.length > 0) {
     try {
-      const previousRuns = await runStore.listRuns();
       resurfacedCandidates = selectResurfaceCandidates({
         previousRuns,
         currentCandidates: [...recentSelected, ...topicCandidates, ...fieldCandidates],
@@ -510,6 +568,7 @@ export async function scanJournalSources({
       0,
     ),
     new_record_count: newRecords.length,
+    reconsidered_record_count: reconsideredRecords.length,
     topic_candidate_count: topicCandidates.length,
     recent_topic_candidate_count: recentCore.length,
     field_candidate_count: fieldCandidates.length,

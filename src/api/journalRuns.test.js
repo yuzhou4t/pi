@@ -96,6 +96,7 @@ const runBody = {
     authors: ["A. Author"],
     venue: "ICLR",
     published_at: "2023",
+    publication_date_precision: "year",
     first_seen_at: null,
     display_label: "经典回顾 · 非本月新论文",
     candidate_origin: "classic_review",
@@ -120,6 +121,7 @@ test("journal runs keep classic origin and MinerU state visible", () => {
   assert.equal(run.candidates[0].discoveryType, "经典回顾 · 非本月新论文");
   assert.equal(run.candidates[0].isNew, false);
   assert.equal(run.candidates[0].publishedThisMonth, false);
+  assert.equal(run.candidates[0].publicationDatePrecision, "year");
   assert.equal(run.candidates[0].abstractZh, "一段中文摘要");
   assert.equal(run.candidates[0].mineruStatus, "ready");
   assert.equal(run.candidates[0].mineruRunStatus, "partial");
@@ -136,6 +138,48 @@ test("journal runs keep classic origin and MinerU state visible", () => {
   assert.equal(run.phase, "candidate_review");
   assert.equal(run.scanSummary.source_count, 11);
   assert.equal(run.candidateRefresh.lastError.message, "刷新暂时失败");
+});
+
+test("journal run maps recent-classic summaries, impacts, and date precision", () => {
+  const run = mapJournalRun({
+    ...runBody,
+    recent_classics: {
+      schema_version: 1,
+      status: "success",
+      papers: [{
+        paper_id: "classic-1",
+        title: "Reliable Agents",
+        title_zh: "可靠的 Agent",
+        abstract: "We study reliable agents.",
+        abstract_zh: "我们研究可靠的 Agent。",
+        selection_summary: "讨论可核验的 Agent。",
+        project_impact: "可用于核验项目的恢复设计。",
+        published_at: "2026-06",
+        publication_date_precision: "month",
+      }],
+    },
+  });
+
+  assert.equal(run.recentClassics.papers[0].selectionSummary, "讨论可核验的 Agent。");
+  assert.equal(run.recentClassics.papers[0].projectImpact, "可用于核验项目的恢复设计。");
+  assert.equal(run.recentClassics.papers[0].publicationDatePrecision, "month");
+});
+
+test("legacy ACL January placeholders display as year-only evidence", () => {
+  const run = mapJournalRun({
+    ...runBody,
+    candidates: [{
+      ...runBody.candidates[0],
+      published_at: "2026-01-01",
+      publication_date_precision: null,
+      publication_date_source: null,
+      source_ids: ["conference-acl"],
+      official_url: "https://aclanthology.org/2026.acl-long.11/",
+    }],
+  });
+
+  assert.equal(run.candidates[0].publishedAt, "2026");
+  assert.equal(run.candidates[0].publicationDatePrecision, "year");
 });
 
 test("journal run summaries keep the active paper conversation for read-only resume", () => {

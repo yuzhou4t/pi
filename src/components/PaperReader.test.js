@@ -7,14 +7,20 @@ import { createServer } from "vite";
 
 const STYLES_URL = new URL("../styles.css", import.meta.url);
 
-function renderBlock(PaperReaderFullBlock, block, { resolved, active = true }) {
+function renderBlock(PaperReaderFullBlock, block, {
+  resolved,
+  active = true,
+  zh = null,
+  language = "bilingual",
+}) {
   return renderToStaticMarkup(React.createElement(PaperReaderFullBlock, {
     block,
     section: null,
     active,
     activeRef: null,
     onActivate() {},
-    language: "bilingual",
+    language,
+    zh,
     translationResolved: resolved,
   }));
 }
@@ -94,6 +100,61 @@ test("ready passthrough blocks do not show a false untranslated warning", async 
       renderBlock(PaperReaderFullBlock, translated, { resolved: true, active: false }),
       /tabindex=|role="button"|aria-label=/,
     );
+  });
+});
+
+test("headings and figure captions share the Spark translation view", async () => {
+  await withPaperReader(({ documentTranslationView, PaperReaderFullBlock }) => {
+    const heading = {
+      id: "heading",
+      kind: "heading",
+      text: "Introduction",
+    };
+    const figure = {
+      id: "figure",
+      kind: "image",
+      text: "Figure 1. System overview.",
+      imageUrl: "/api/v1/papers/paper-1/assets/figure-1.png",
+    };
+    const document = {
+      revision: "sha256:paper-structure",
+      blocks: [heading, figure],
+    };
+    const view = documentTranslationView(document, {
+      documentRevision: document.revision,
+      blocks: {
+        heading: "引言",
+        figure: "图 1：系统总览。",
+      },
+    });
+
+    assert.equal(view.blocks.heading, "引言");
+    assert.equal(view.blocks.figure, "图 1：系统总览。");
+    assert.equal(view.resolvedBlockIds.has(heading.id), true);
+    assert.equal(view.resolvedBlockIds.has(figure.id), true);
+
+    const headingHtml = renderBlock(PaperReaderFullBlock, heading, {
+      resolved: true,
+      zh: view.blocks.heading,
+    });
+    assert.match(headingHtml, /Introduction/);
+    assert.match(headingHtml, /引言/);
+
+    const bilingualFigureHtml = renderBlock(PaperReaderFullBlock, figure, {
+      resolved: true,
+      zh: view.blocks.figure,
+    });
+    assert.match(bilingualFigureHtml, /figure-1\.png/);
+    assert.match(bilingualFigureHtml, /Figure 1\. System overview\./);
+    assert.match(bilingualFigureHtml, /图 1：系统总览。/);
+
+    const chineseFigureHtml = renderBlock(PaperReaderFullBlock, figure, {
+      resolved: true,
+      zh: view.blocks.figure,
+      language: "zh",
+    });
+    assert.match(chineseFigureHtml, /alt="图 1：系统总览。"/);
+    assert.doesNotMatch(chineseFigureHtml, />Figure 1\. System overview\.</);
   });
 });
 

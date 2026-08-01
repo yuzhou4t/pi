@@ -16,7 +16,7 @@ function textBlock(index, text) {
   return { block_id: blockId(index), kind: "text", text };
 }
 
-test("translation batches skip images, headings, math-only and cached blocks", () => {
+test("translation batches include headings and image captions while skipping math-only and cached blocks", () => {
   const blocks = [
     { block_id: blockId(1), kind: "heading", text: "Introduction" },
     textBlock(2, "First paragraph."),
@@ -24,13 +24,16 @@ test("translation batches skip images, headings, math-only and cached blocks", (
     { block_id: blockId(4), kind: "text", text: "$$x = y + 1$$" },
     textBlock(5, "Second paragraph."),
   ];
-  assert.equal(isTranslatableBlock(blocks[0]), false);
-  assert.equal(isTranslatableBlock(blocks[2]), false);
+  assert.equal(isTranslatableBlock(blocks[0]), true);
+  assert.equal(isTranslatableBlock(blocks[2]), true);
   assert.equal(isMathOnlyBlock(blocks[3]), true);
 
   const batches = translationBatches(blocks, new Set([blockId(5)]));
   assert.equal(batches.length, 1);
-  assert.deepEqual(batches[0].map((block) => block.block_id), [blockId(2)]);
+  assert.deepEqual(
+    batches[0].map((block) => block.block_id),
+    [blockId(1), blockId(2), blockId(3)],
+  );
 });
 
 test("translation batches stay bounded by block count", () => {

@@ -95,6 +95,23 @@ function displayEvidenceScope(scope, documentStatus) {
   return `${sourceScope}；全文已解析，尚未完成精读核验`;
 }
 
+function mapPublicationDate(paper) {
+  const value = paper.published_at ?? null;
+  const precision = paper.publication_date_precision ?? null;
+  const legacyAclPlaceholder = /^\d{4}-01-01$/.test(value ?? "")
+    && !paper.publication_date_source
+    && (paper.source_ids ?? []).includes("conference-acl")
+    && /\/\d{4}\.acl-long\.\d+\/?$/i.test(paper.official_url ?? "");
+  if (legacyAclPlaceholder) {
+    return { value: value.slice(0, 4), precision: "year", source: null };
+  }
+  return {
+    value,
+    precision,
+    source: paper.publication_date_source ?? null,
+  };
+}
+
 function mapZoteroTarget(target) {
   if (!target || typeof target !== "object" || typeof target.id !== "string") {
     throw new Error("Zotero collection 格式无效");
@@ -511,13 +528,16 @@ export function mapJournalRun(run) {
     ranking: run.ranking,
     candidates: (run.candidates ?? []).map((paper) => {
       const documentState = mineruPapers[paper.paper_id] ?? {};
+      const publication = mapPublicationDate(paper);
       return {
         id: paper.paper_id,
         title: paper.title,
         titleZh: paper.title_zh ?? null,
         authors: paper.authors ?? [],
         venue: paper.venue,
-        publishedAt: paper.published_at,
+        publishedAt: publication.value,
+        publicationDatePrecision: publication.precision,
+        publicationDateSource: publication.source,
         firstSeenAt: paper.first_seen_at,
         discoveryType: paper.display_label,
         abstract: paper.abstract || "当前来源没有提供摘要，完整内容以正文解析结果为准。",
@@ -549,22 +569,29 @@ export function mapJournalRun(run) {
           coveredSourceIds: run.recent_classics.covered_source_ids ?? [],
           uncoveredSourceIds: run.recent_classics.uncovered_source_ids ?? [],
           error: run.recent_classics.error ?? null,
-          papers: (run.recent_classics.papers ?? []).map((paper) => ({
-            id: paper.paper_id,
-            dedupeKey: paper.dedupe_key ?? null,
-            title: paper.title,
-            titleZh: paper.title_zh ?? null,
-            authors: paper.authors ?? [],
-            venue: paper.venue,
-            publishedAt: paper.published_at,
-            citedByCount: paper.cited_by_count ?? null,
-            abstract: paper.abstract || "",
-            abstractZh: paper.abstract_zh ?? null,
-            discoveryType: paper.display_label,
-            topicMatches: paper.topic_matches ?? [],
-            officialUrl: paper.official_url ?? paper.canonical_url ?? null,
-            pdfUrl: paper.pdf_url ?? null,
-          })),
+          papers: (run.recent_classics.papers ?? []).map((paper) => {
+            const publication = mapPublicationDate(paper);
+            return {
+              id: paper.paper_id,
+              dedupeKey: paper.dedupe_key ?? null,
+              title: paper.title,
+              titleZh: paper.title_zh ?? null,
+              authors: paper.authors ?? [],
+              venue: paper.venue,
+              publishedAt: publication.value,
+              publicationDatePrecision: publication.precision,
+              publicationDateSource: publication.source,
+              citedByCount: paper.cited_by_count ?? null,
+              abstract: paper.abstract || "",
+              abstractZh: paper.abstract_zh ?? null,
+              selectionSummary: paper.selection_summary ?? null,
+              projectImpact: paper.project_impact ?? null,
+              discoveryType: paper.display_label,
+              topicMatches: paper.topic_matches ?? [],
+              officialUrl: paper.official_url ?? paper.canonical_url ?? null,
+              pdfUrl: paper.pdf_url ?? null,
+            };
+          }),
         }
       : null,
     candidateRefresh: run.candidate_refresh && typeof run.candidate_refresh === "object"

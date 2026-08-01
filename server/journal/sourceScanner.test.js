@@ -335,7 +335,7 @@ test("historical first discoveries backfill candidates before the classic pool",
   assert.equal(classicCount, 3);
 });
 
-test("source scanner persists reliable results, keeps failed sources visible, and avoids a second new batch", async () => {
+test("source scanner reconsiders current-window records without marking them newly discovered", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-source-scanner-"));
   const now = () => new Date("2026-07-23T08:00:00.000Z");
   const ids = [
@@ -405,12 +405,82 @@ test("source scanner persists reliable results, keeps failed sources visible, an
     observedAt: "2026-07-30T08:00:00.000Z",
   });
   assert.equal(second.summary.new_record_count, 0);
-  assert.equal(second.candidateBatch.mode, "classic_review");
+  assert.equal(second.summary.reconsidered_record_count, 1);
+  assert.equal(second.candidateBatch.mode, "mixed_review");
   assert.equal(second.candidateBatch.candidates.length, 5);
-  assert.equal(second.candidateBatch.candidates.every((paper) => paper.is_new === false), true);
+  const reconsidered = second.candidateBatch.candidates.find(
+    (paper) => paper.title === "Reliable LLM Agent Evaluation",
+  );
+  assert.ok(reconsidered);
+  assert.equal(reconsidered.is_new, false);
+  assert.equal(reconsidered.candidate_origin, "previously_seen");
+  assert.equal(reconsidered.published_this_month, true);
 
   const state = await sourceStateStore.load();
   assert.equal(state.sources["source-failed"].cursor ?? null, null);
+});
+
+test("current-window reconsideration excludes papers already handled or dismissed", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-source-reconsider-"));
+  const now = () => new Date("2026-07-30T08:00:00.000Z");
+  const runStore = createRunStore({ dataDir, now });
+  const sourceStateStore = createSourceStateStore({ dataDir, now });
+  const papers = [
+    ["available", "Unprocessed LLM Agent Memory"],
+    ["handled", "Handled LLM Agent Planning"],
+    ["dismissed", "Dismissed LLM Agent Evaluation"],
+  ].map(([id, title], index) => ({
+    title,
+    authors: ["A. Author"],
+    venue: "ACL",
+    published_at: `2026-07-${String(20 + index).padStart(2, "0")}`,
+    official_id: `conf/acl/${id}`,
+    official_url: `https://aclanthology.org/2026.acl.${id}/`,
+    abstract: "A current-window language agent paper.",
+  }));
+  const fetchSource = async () => ({
+    fetched_at: "2026-07-30T08:00:00.000Z",
+    index_url: "https://aclanthology.org/venues/acl/",
+    target_urls: ["https://aclanthology.org/2026.acl-long/"],
+    papers,
+  });
+
+  const firstRun = await runStore.createRun({ sourceIds: ["source-ok"] });
+  const first = await scanJournalSources({
+    runId: firstRun.run_id,
+    runStore,
+    sourceStateStore,
+    sources: [sources[0]],
+    fetchSource,
+    observedAt: "2026-07-30T08:00:00.000Z",
+  });
+  const handled = first.candidateBatch.candidates.find(
+    (paper) => paper.title === "Handled LLM Agent Planning",
+  );
+  await runStore.updateRun(firstRun.run_id, {
+    candidates: first.candidateBatch.candidates,
+    paper_decisions: { [handled.paper_id]: "read" },
+  });
+
+  const dismissed = first.candidateBatch.candidates.find(
+    (paper) => paper.title === "Dismissed LLM Agent Evaluation",
+  );
+  const secondRun = await runStore.createRun({ sourceIds: ["source-ok"] });
+  const second = await scanJournalSources({
+    runId: secondRun.run_id,
+    runStore,
+    sourceStateStore,
+    sources: [sources[0]],
+    fetchSource,
+    observedAt: "2026-07-30T08:00:00.000Z",
+    dismissedKeys: [dismissed.dedupe_key],
+  });
+  const titles = second.candidateBatch.candidates.map((paper) => paper.title);
+
+  assert.equal(titles.includes("Unprocessed LLM Agent Memory"), true);
+  assert.equal(titles.includes("Handled LLM Agent Planning"), false);
+  assert.equal(titles.includes("Dismissed LLM Agent Evaluation"), false);
+  assert.equal(second.summary.reconsidered_record_count, 1);
 });
 
 test("global source state stays unchanged when a required run artifact is not durable", async () => {

@@ -349,6 +349,20 @@ test("live mode uses the model for plan and recommendation and falls back on mod
             usage: { input_tokens: 12, output_tokens: 8 },
           };
         }
+        if (Object.hasOwn(schema.properties, "impacts")) {
+          return {
+            value: {
+              impacts: input.papers.map((paper) => ({
+                request_id: paper.request_id,
+                project_impact: "Spark 判断：可用于核验项目的评估设计。",
+              })),
+            },
+            provider_id: "codex-subscription",
+            model_id: "gpt-5.3-codex-spark",
+            operation_id: "op-impact",
+            usage: { input_tokens: 9, output_tokens: 6 },
+          };
+        }
         assert.equal(input.papers.length, 1);
         return {
           value: {
@@ -383,10 +397,11 @@ test("live mode uses the model for plan and recommendation and falls back on mod
   assert.equal(turn.plan.source, "model");
   assert.equal(turn.recommendation_source, "model");
   assert.equal(turn.recommendations[0].paper_id, "p1");
-  // 规划 + 推荐 + 翻译共三次有界调用。
-  assert.equal(calls.length, 3);
-  // 推荐已提供中文标题，优先保留推荐的译名。
-  assert.equal(turn.papers[0].title_zh, "面向可验证 Agent 评估的系统化协议");
+  // 规划 + 推荐 + Spark 翻译 + Spark 项目作用，共四次有界调用。
+  assert.equal(calls.length, 4);
+  assert.equal(turn.papers[0].title_zh, "中文：Reliable Agents");
+  assert.equal(turn.recommendations[0].project_impact, "Spark 判断：可用于核验项目的评估设计。");
+  assert.equal(turn.language_artifact.project_impact.provenance.model_id, "gpt-5.3-codex-spark");
 
   const failing = createVenueSearchService({
     dataDir: await mkdtemp(path.join(os.tmpdir(), "pi-agent-venue-search-fb-")),
@@ -455,8 +470,15 @@ test("Spark translation fills non-recommended paper titles and web references", 
   // 翻译固定走 Codex 5.3 Spark，不受会话所选模型影响。
   assert.equal(translateModel, "gpt-5.3-codex-spark");
   assert.equal(turn.papers[0].title_zh, "译:Agentic Retrieval Benchmarks");
+  assert.equal(
+    turn.papers[0].abstract_zh,
+    "译:A study of reliable language agents with verifiable evaluation.",
+  );
   assert.equal(turn.web.results[0].title_zh, "译:Skills Documentation");
   assert.equal(turn.web.results[0].excerpt_zh, "译:Skills are self-contained packages");
+  assert.equal(turn.language_artifact.provenance.provider_id, "codex-subscription");
+  assert.equal(turn.language_artifact.provenance.model_id, "gpt-5.3-codex-spark");
+  assert.equal(turn.language_artifact.provenance.reasoning_effort, "low");
 });
 
 test("accepted search papers join the current weekly run once with retrieval labels", async () => {

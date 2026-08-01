@@ -7,6 +7,7 @@ import {
   Plus,
   SidebarSimple,
 } from "@phosphor-icons/react";
+import { PaperDiscoveryCard } from "./PaperDiscoveryCard.jsx";
 import { ProviderMenu } from "./ProviderMenu.jsx";
 
 function venueCoverage(turn) {
@@ -29,14 +30,6 @@ function topicPhaseLabel(progress) {
     default:
       return "正在检索注册刊物与联网并整理推荐…";
   }
-}
-
-function paperMeta(paper) {
-  return [
-    paper.venue,
-    paper.publishedAt ? paper.publishedAt.slice(0, 10) : null,
-    Number.isInteger(paper.citedByCount) ? `引用 ${paper.citedByCount}` : null,
-  ].filter(Boolean).join(" · ");
 }
 
 function TurnCard({
@@ -78,43 +71,38 @@ function TurnCard({
         ) : null}
       </div>
       {orderedPapers.length > 0 ? (
-        <ul className="topic-search-papers">
+        <div className="topic-search-papers">
           {orderedPapers.map((paper) => {
             const recommendation = recommendationsById.get(paper.id);
             const added = turn.addedPaperIds.includes(paper.id);
             return (
-              <li
+              <PaperDiscoveryCard
                 key={paper.id}
                 className={`topic-search-paper${recommendation ? " is-recommended" : ""}`}
-              >
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={added || selection.has(paper.id)}
-                    disabled={added}
-                    onChange={() => onToggleSelect(turn.turnId, paper.id)}
-                  />
-                  <span className="topic-search-paper-body">
-                    <strong>{recommendation?.titleZh || paper.titleZh || paper.title}</strong>
-                    {(recommendation?.titleZh || paper.titleZh) ? (
-                      <small className="topic-search-paper-original">{paper.title}</small>
-                    ) : null}
-                    <small>{paperMeta(paper)}</small>
-                    {recommendation ? (
-                      <p className="topic-search-reason">{recommendation.reason}</p>
-                    ) : paper.abstract ? (
-                      <p className="topic-search-reason">{paper.abstract.slice(0, 160)}</p>
-                    ) : null}
-                    {recommendation?.projectImpact ? (
-                      <p className="topic-search-impact">{recommendation.projectImpact}</p>
-                    ) : null}
-                    {added ? <em className="topic-search-added">已加入本月推荐</em> : null}
-                  </span>
-                </label>
-              </li>
+                paper={paper}
+                href={paper.officialUrl ?? paper.pdfUrl}
+                presentationOverrides={{
+                  titleZh: recommendation?.titleZh ?? paper.titleZh,
+                  summary: recommendation?.reason ?? paper.abstractZh ?? paper.abstract,
+                  projectImpact: recommendation?.projectImpact,
+                }}
+                badge={recommendation ? "推荐" : null}
+                leading={(
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={added || selection.has(paper.id)}
+                      disabled={added}
+                      onChange={() => onToggleSelect(turn.turnId, paper.id)}
+                    />
+                    <span className="sr-only">选择《{paper.title}》</span>
+                  </label>
+                )}
+                statuses={added ? <em className="topic-search-added">已加入本月推荐</em> : null}
+              />
             );
           })}
-        </ul>
+        </div>
       ) : null}
       {orderedPapers.some((paper) => !turn.addedPaperIds.includes(paper.id)) ? (
         <div className="topic-search-actions">

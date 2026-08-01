@@ -4,6 +4,10 @@ import path from "node:path";
 import { createWebSearchRunner } from "../project-work/externalRetrieval.js";
 import { resolveProjectWorkDoubaoQuotaFilePath } from "../project-work/projectWorkPaths.js";
 import { promptRegistry } from "../promptRegistry.js";
+import {
+  PROJECT_IMPACT_FALLBACK,
+  createPaperLanguageService,
+} from "./paperLanguageService.js";
 import { searchRegisteredVenues } from "./venueSearch.js";
 
 const CONVERSATION_ID = "topic-search";
@@ -17,18 +21,7 @@ const MAX_WEB_EXCERPT_CHARS = 400;
 const MAX_CONVERSATIONS = 50;
 const MAX_TITLE_CHARS = 60;
 const DEFAULT_CONVERSATION_TITLE = "新的检索";
-// 标题/摘要的中文翻译走 Codex 订阅，不受当前会话所选模型影响。
-// 默认固定使用当前目录中可选的 GPT-5.3 Codex Spark，
-// 可用 PI_JOURNAL_TRANSLATION_MODEL 显式覆盖。
-const TRANSLATION_PROVIDER_ID = "codex-subscription";
-const DEFAULT_TRANSLATION_MODEL_ID = "gpt-5.3-codex-spark";
-const MAX_TRANSLATION_ITEMS = 40;
 const MAX_PLAN_QUERIES = 4;
-
-// 含连续英文字母才需要翻译；纯中文/纯数字不消耗翻译额度。
-function looksTranslatable(text) {
-  return typeof text === "string" && /[A-Za-z]{4,}/.test(text);
-}
 
 export class VenueSearchServiceError extends Error {
   constructor(code, message, status = 409, retryable = false) {
@@ -182,6 +175,7 @@ export function createVenueSearchService({
   fetchImpl = globalThis.fetch,
   modelProviders = null,
   modelMode = "fixture",
+  paperLanguageService = null,
   projectContextReader = null,
   venueSearcher = searchRegisteredVenues,
   webSearcher = null,
@@ -192,10 +186,11 @@ export function createVenueSearchService({
   if (typeof dataDir !== "string" || !dataDir.trim()) {
     throw new TypeError("dataDir is required");
   }
-  const translationModelId = (typeof env.PI_JOURNAL_TRANSLATION_MODEL === "string"
-    && env.PI_JOURNAL_TRANSLATION_MODEL.trim())
-    ? env.PI_JOURNAL_TRANSLATION_MODEL.trim()
-    : DEFAULT_TRANSLATION_MODEL_ID;
+  const paperLanguage = paperLanguageService ?? createPaperLanguageService({
+    env,
+    modelProviders,
+    modelMode,
+  });
   const legacyPath = path.resolve(dataDir, "venue-search", "conversation.json");
   const storePath = path.resolve(dataDir, "venue-search", "conversations.json");
   // 联网发现与普通项目工作共用同一份豆包月度额度台账。
@@ -493,62 +488,53 @@ export function createVenueSearchService({
     }
   }
 
-  // 用 Codex Spark 把标题/摘要里的英文批量翻成中文；尽力而为，失败就保留原文。
+  // 标题、论文摘要与联网摘录共用统一的 Spark 字段翻译合同；失败保留原文。
   async function translateDiscoveries({ papers, webResults, onEvent = null }) {
-    const empty = { titles: new Map(), webTitles: new Map(), webExcerpts: new Map() };
-    if (modelMode !== "live" || !modelProviders?.completeStructured) return empty;
+    const empty = {
+      titles: new Map(),
+      abstracts: new Map(),
+      webTitles: new Map(),
+      webExcerpts: new Map(),
+      status: "not_required",
+      provenance: null,
+      error: null,
+    };
     const items = [];
     papers.forEach((paper, index) => {
-      if (looksTranslatable(paper.title)) {
-        items.push({ id: `p${index}`, text: compact(paper.title, 300) });
-      }
+      items.push({ requestId: `p${index}t`, field: "title", text: paper.title });
+      items.push({ requestId: `p${index}a`, field: "abstract", text: paper.abstract });
     });
     webResults.forEach((item, index) => {
-      if (looksTranslatable(item.title)) {
-        items.push({ id: `wt${index}`, text: compact(item.title, 300) });
-      }
-      if (looksTranslatable(item.excerpt)) {
-        items.push({ id: `we${index}`, text: compact(item.excerpt, MAX_WEB_EXCERPT_CHARS) });
-      }
+      items.push({ requestId: `w${index}t`, field: "web_title", text: item.title });
+      items.push({ requestId: `w${index}e`, field: "web_excerpt", text: item.excerpt });
     });
     if (items.length === 0) return empty;
-    const bounded = items.slice(0, MAX_TRANSLATION_ITEMS);
-    try {
-      const prompt = promptRegistry.loadPrompt("venue-search-translate");
-      const generated = await modelProviders.completeStructured({
-        providerId: TRANSLATION_PROVIDER_ID,
-        modelId: translationModelId,
-        reasoningEffort: "low",
-        system: prompt.system,
-        prompt: prompt.body,
-        input: { items: bounded },
-        schema: prompt.schema,
-        ...(typeof onEvent === "function" ? { onEvent } : {}),
-      });
-      const byId = new Map();
-      for (const entry of generated.value?.translations ?? []) {
-        const id = typeof entry?.id === "string" ? entry.id : "";
-        const zh = compact(entry?.zh, 600);
-        if (id && zh) byId.set(id, zh);
-      }
-      const titles = new Map();
-      const webTitles = new Map();
-      const webExcerpts = new Map();
-      papers.forEach((_, index) => {
-        const zh = byId.get(`p${index}`);
-        if (zh) titles.set(index, zh);
-      });
-      webResults.forEach((_, index) => {
-        const zhTitle = byId.get(`wt${index}`);
-        const zhExcerpt = byId.get(`we${index}`);
-        if (zhTitle) webTitles.set(index, zhTitle);
-        if (zhExcerpt) webExcerpts.set(index, zhExcerpt);
-      });
-      return { titles, webTitles, webExcerpts };
-    } catch {
-      // 翻译是锦上添花；失败时保留英文原文，不影响检索结果。
-      return empty;
-    }
+    const result = await paperLanguage.translateFields(items, { onEvent });
+    const titles = new Map();
+    const abstracts = new Map();
+    const webTitles = new Map();
+    const webExcerpts = new Map();
+    papers.forEach((_, index) => {
+      const title = result.byRequestId.get(`p${index}t`)?.zh;
+      const abstract = result.byRequestId.get(`p${index}a`)?.zh;
+      if (title) titles.set(index, title);
+      if (abstract) abstracts.set(index, abstract);
+    });
+    webResults.forEach((_, index) => {
+      const title = result.byRequestId.get(`w${index}t`)?.zh;
+      const excerpt = result.byRequestId.get(`w${index}e`)?.zh;
+      if (title) webTitles.set(index, title);
+      if (excerpt) webExcerpts.set(index, excerpt);
+    });
+    return {
+      titles,
+      abstracts,
+      webTitles,
+      webExcerpts,
+      status: result.status,
+      provenance: result.provenance,
+      error: result.error,
+    };
   }
 
   async function recommend(question, projectContext, papers, webResults, { providerId, modelId, reasoningEffort, onEvent = null }) {
@@ -691,11 +677,6 @@ export function createVenueSearchService({
       );
       // 把标题/摘要里的英文翻成中文（尽力而为）。
       setTurnProgress(clientRequestId, { phase: "translating" });
-      const recommendedTitleZh = new Map(
-        (recommendation.recommendations ?? [])
-          .filter((item) => item.title_zh)
-          .map((item) => [item.paper_id, item.title_zh]),
-      );
       const translations = await translateDiscoveries({
         papers: search.papers,
         webResults: web.results,
@@ -704,12 +685,62 @@ export function createVenueSearchService({
           if (patch) setTurnProgress(clientRequestId, patch);
         },
       });
+      const paperIndexById = new Map(
+        search.papers.map((paper, index) => [paper.paper_id, index]),
+      );
+      const impactInputs = (recommendation.recommendations ?? [])
+        .map((item, index) => {
+          const paper = search.papers[paperIndexById.get(item.paper_id)];
+          return paper ? {
+            requestId: `v${index}i`,
+            paperId: paper.paper_id,
+            title: paper.title,
+            abstract: paper.abstract,
+            venue: paper.venue,
+            publishedAt: paper.published_at,
+            topicMatches: paper.topic_matches,
+          } : null;
+        })
+        .filter(Boolean);
+      const projectImpacts = await paperLanguage.generateProjectImpacts({
+        papers: impactInputs,
+        projectContext,
+      });
+      const useSparkImpacts = ["ready", "partial"].includes(projectImpacts.status);
+      const localizedRecommendations = (recommendation.recommendations ?? []).map((item) => {
+        const paperIndex = paperIndexById.get(item.paper_id);
+        const impactInput = impactInputs.find((input) => input.paperId === item.paper_id);
+        return {
+          ...item,
+          title_zh: translations.titles.get(paperIndex) ?? item.title_zh ?? null,
+          project_impact: (useSparkImpacts
+            && impactInput
+            && projectImpacts.byRequestId.get(impactInput.requestId)?.project_impact
+              !== PROJECT_IMPACT_FALLBACK
+            ? projectImpacts.byRequestId.get(impactInput.requestId)?.project_impact
+            : null)
+            || item.project_impact
+            || PROJECT_IMPACT_FALLBACK,
+        };
+      });
+      const recommendedTitleZh = new Map(
+        localizedRecommendations
+          .filter((item) => item.title_zh)
+          .map((item) => [item.paper_id, item.title_zh]),
+      );
       const translatedPapers = search.papers.map((paper, index) => {
-        const titleZh = recommendedTitleZh.get(paper.paper_id)
-          ?? translations.titles.get(index)
+        const titleZh = translations.titles.get(index)
+          ?? recommendedTitleZh.get(paper.paper_id)
           ?? paper.title_zh
           ?? null;
-        return titleZh ? { ...paper, title_zh: titleZh } : paper;
+        const abstractZh = translations.abstracts.get(index)
+          ?? paper.abstract_zh
+          ?? null;
+        return {
+          ...paper,
+          ...(titleZh ? { title_zh: titleZh } : {}),
+          ...(abstractZh ? { abstract_zh: abstractZh } : {}),
+        };
       });
       const translatedWeb = web.results.map((item, index) => {
         const next = { ...item };
@@ -751,12 +782,23 @@ export function createVenueSearchService({
           error: web.error,
         },
         answer: recommendation.answer,
-        recommendations: recommendation.recommendations,
+        recommendations: localizedRecommendations,
         recommendation_source: recommendation.source,
         provider_id: recommendation.provider_id ?? null,
         model_id: recommendation.model_id ?? null,
         usage: recommendation.usage ?? null,
         recommendation_error: recommendation.error ?? null,
+        language_artifact: {
+          schema_version: 1,
+          status: translations.status,
+          provenance: translations.provenance,
+          error: translations.error,
+          project_impact: {
+            status: projectImpacts.status,
+            provenance: projectImpacts.provenance,
+            error: projectImpacts.error,
+          },
+        },
         added_paper_ids: [],
       };
       const current = await readStore();

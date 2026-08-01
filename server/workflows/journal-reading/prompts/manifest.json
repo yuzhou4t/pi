@@ -16,6 +16,7 @@
     "reading-follow-up": "reading-follow-up.v1",
     "reading-chat": "reading-chat.v4",
     "translation": "translation.v1",
+    "paper-project-impact": "paper-project-impact.v1",
     "venue-search-plan": "venue-search-plan.v2",
     "venue-search-recommend": "venue-search-recommend.v2",
     "venue-search-translate": "venue-search-translate.v1"
@@ -104,6 +105,10 @@
     "translation.v1": {
       "file": "translation.v1.md",
       "schema": "translation.v1.json"
+    },
+    "paper-project-impact.v1": {
+      "file": "paper-project-impact.v1.md",
+      "schema": "paper-project-impact.v1.json"
     },
     "reading-chat.v3": {
       "file": "reading-chat.v3.md",

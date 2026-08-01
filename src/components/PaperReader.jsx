@@ -87,9 +87,7 @@ export function documentTranslationView(document, translation) {
   for (const block of document.blocks) {
     const source = blockCopy(block);
     if (
-      block.kind === "heading"
-      || block.kind === "image"
-      || !source
+      !source
       || MATH_ONLY_BLOCK_PATTERN.test(source)
     ) {
       resolvedBlockIds.add(block.id);
@@ -109,6 +107,41 @@ export function documentTranslationView(document, translation) {
     blocks[block.id] = zh;
   }
   return { blocks, resolvedBlockIds };
+}
+
+function PaperReaderImageContent({ block, copy, zh, language, translationPending }) {
+  const originalCaption = copy || (block.imageUrl ? "论文图表" : "请在原版论文中查看这一图表。");
+  const translatedCaption = typeof zh === "string" && zh.trim() ? zh.trim() : null;
+  const chineseOnly = language === "zh" && translatedCaption;
+  return (
+    <>
+      {block.imageUrl ? (
+        <img
+          className="paper-reader-figure-img"
+          src={block.imageUrl}
+          alt={chineseOnly ? translatedCaption : originalCaption}
+          loading="lazy"
+        />
+      ) : (
+        <span>图表</span>
+      )}
+      <figcaption data-source-start="0" data-source-end={String(copy.length)}>
+        {chineseOnly ? (
+          <span data-reader-zh="true">{translatedCaption}</span>
+        ) : originalCaption}
+        {language === "bilingual" && translatedCaption ? (
+          <span className="paper-reader-figure-translation" data-reader-zh="true">
+            {translatedCaption}
+          </span>
+        ) : null}
+        {translationPending ? (
+          <span className="paper-reader-translation-fallback" role="status">
+            本图注尚未翻译，暂时显示原文。
+          </span>
+        ) : null}
+      </figcaption>
+    </>
+  );
 }
 
 function locationLabel(block) {
@@ -136,6 +169,8 @@ export function PaperReaderFullBlock({
   const translationPending = active && language !== "original" && !translationResolved;
   if (block.kind === "heading") {
     const Heading = section?.level >= 3 ? "h4" : "h3";
+    const translatedHeading = typeof zh === "string" && zh.trim() ? zh.trim() : null;
+    const chineseOnly = language === "zh" && translatedHeading;
     return (
       <Heading
         ref={active ? activeRef : null}
@@ -146,7 +181,17 @@ export function PaperReaderFullBlock({
         data-source-end={String(copy.length)}
         aria-current={active ? "location" : undefined}
       >
-        {copy}
+        {chineseOnly ? (
+          <span data-reader-zh="true">{translatedHeading}</span>
+        ) : copy}
+        {language === "bilingual" && translatedHeading ? (
+          <span className="paper-reader-heading-translation" data-reader-zh="true">
+            {translatedHeading}
+          </span>
+        ) : null}
+        {translationPending ? (
+          <span className="paper-reader-heading-pending" role="status">本标题尚未翻译</span>
+        ) : null}
       </Heading>
     );
   }
@@ -166,19 +211,13 @@ export function PaperReaderFullBlock({
           ? (event) => activateOnKeyboard(event, () => onActivate(block.id))
           : undefined}
       >
-        {block.imageUrl ? (
-          <img
-            className="paper-reader-figure-img"
-            src={block.imageUrl}
-            alt={copy || "论文图表"}
-            loading="lazy"
-          />
-        ) : (
-          <span>图表</span>
-        )}
-        <figcaption data-source-start="0" data-source-end={String(copy.length)}>
-          {copy || (block.imageUrl ? "论文图表" : "请在原版论文中查看这一图表。")}
-        </figcaption>
+        <PaperReaderImageContent
+          block={block}
+          copy={copy}
+          zh={zh}
+          language={language}
+          translationPending={translationPending}
+        />
       </figure>
     );
   }
@@ -524,6 +563,21 @@ export function PaperReader({
   const translationBlocks = translationView.blocks;
   const translationUsable = Object.keys(translationBlocks).length > 0;
   const effectiveLanguage = translationUsable ? language : "original";
+  const originalPaperTitle = paperDocument?.title ?? paper.title ?? "";
+  const documentTitleBlock = (paperDocument?.blocks ?? []).find((block) => (
+    block.kind === "heading"
+    && comparableBlockText(blockCopy(block)) === comparableBlockText(originalPaperTitle)
+  ));
+  const translatedPaperTitle = (
+    (documentTitleBlock ? translationBlocks[documentTitleBlock.id] : null)
+    ?? paper.titleZh
+    ?? paper.title_zh
+    ?? null
+  );
+  const displayPaperTitle = translatedPaperTitle || originalPaperTitle;
+  const documentHeadingTitle = effectiveLanguage === "original"
+    ? originalPaperTitle
+    : displayPaperTitle;
   const readable = useMemo(
     () => readingBlocks(paperDocument?.blocks ?? []),
     [paperDocument?.blocks],
@@ -848,7 +902,10 @@ export function PaperReader({
               {closeReading ? "论文工作台 · 研读中" : orientationMode ? "论文工作台 · 快速定向" : "论文工作台"}
             </span>
           ) : null}
-          <h2 id="paper-reader-title">{paper.title ?? paperDocument?.title}</h2>
+          <h2 id="paper-reader-title" title={originalPaperTitle}>{displayPaperTitle}</h2>
+          {translatedPaperTitle && comparableBlockText(translatedPaperTitle) !== comparableBlockText(originalPaperTitle) ? (
+            <small className="paper-reader-original-title">{originalPaperTitle}</small>
+          ) : null}
           {chromeOpen ? (
             <p>
               {paper.venue}
@@ -1171,24 +1228,38 @@ export function PaperReader({
                 onKeyUp={(event) => captureSelection(event.currentTarget)}
               >
                 <h3 ref={contentTitleRef} tabIndex="-1">{focusedContentLabel}</h3>
-                {effectiveLanguage !== "zh" || !activeTranslation ? (
-                  <PaperRichText content={blockCopy(activeBlock)} />
-                ) : null}
-                {effectiveLanguage === "zh" && activeTranslation ? (
-                  <div className="paper-reader-zh is-only" data-reader-zh="true">
-                    <PaperRichText content={activeTranslation} />
-                  </div>
-                ) : null}
-                {effectiveLanguage === "bilingual" && activeTranslation ? (
-                  <div className="paper-reader-zh" data-reader-zh="true">
-                    <PaperRichText content={activeTranslation} />
-                  </div>
-                ) : null}
-                {activeTranslationPending ? (
-                  <p className="paper-reader-translation-fallback" role="status">
-                    本段尚未翻译，暂时显示原文。
-                  </p>
-                ) : null}
+                {activeBlock?.kind === "image" ? (
+                  <figure className="paper-reader-figure is-focused">
+                    <PaperReaderImageContent
+                      block={activeBlock}
+                      copy={blockCopy(activeBlock)}
+                      zh={activeTranslation}
+                      language={effectiveLanguage}
+                      translationPending={activeTranslationPending}
+                    />
+                  </figure>
+                ) : (
+                  <>
+                    {effectiveLanguage !== "zh" || !activeTranslation ? (
+                      <PaperRichText content={blockCopy(activeBlock)} />
+                    ) : null}
+                    {effectiveLanguage === "zh" && activeTranslation ? (
+                      <div className="paper-reader-zh is-only" data-reader-zh="true">
+                        <PaperRichText content={activeTranslation} />
+                      </div>
+                    ) : null}
+                    {effectiveLanguage === "bilingual" && activeTranslation ? (
+                      <div className="paper-reader-zh" data-reader-zh="true">
+                        <PaperRichText content={activeTranslation} />
+                      </div>
+                    ) : null}
+                    {activeTranslationPending ? (
+                      <p className="paper-reader-translation-fallback" role="status">
+                        本段尚未翻译，暂时显示原文。
+                      </p>
+                    ) : null}
+                  </>
+                )}
               </article>
 
               <button
@@ -1231,7 +1302,12 @@ export function PaperReader({
             >
               <header className="paper-reader-document-heading">
                 <span>结构化全文</span>
-                <h3 ref={contentTitleRef} tabIndex="-1">{paperDocument.title ?? paper.title}</h3>
+                <h3 ref={contentTitleRef} tabIndex="-1">{documentHeadingTitle}</h3>
+                {effectiveLanguage === "bilingual"
+                  && translatedPaperTitle
+                  && comparableBlockText(translatedPaperTitle) !== comparableBlockText(originalPaperTitle) ? (
+                  <small className="paper-reader-document-original-title">{originalPaperTitle}</small>
+                ) : null}
                 <p>点击段落可记录当前位置；选择同一段文字，可连同原文位置一起交给论文 Agent。</p>
               </header>
               {(paperDocument.blocks ?? []).map((block) => (

@@ -420,7 +420,10 @@ test("refreshRunCandidates resumes a failed cursor commit without rescanning or 
   let translationCalls = 0;
   let commitCalls = 0;
   const service = createJournalWorkflowService({
-    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "live" },
+    env: {
+      PI_DATA_DIR: dataDir,
+      PI_MODEL_MODE: "live",
+    },
     dataDir,
     runStore,
     sourceStateStore: createSourceStateStore({ dataDir }),
@@ -482,6 +485,16 @@ test("refreshRunCandidates resumes a failed cursor commit without rescanning or 
   assert.equal(recovered.candidates.filter(
     (paper) => paper.paper_id === "recoverable-paper",
   ).length, 1);
+  const recoveredPaper = recovered.candidates.find(
+    (paper) => paper.paper_id === "recoverable-paper",
+  );
+  assert.equal(recoveredPaper.title_zh, "中文:A Recoverable Refresh Paper");
+  assert.equal(recoveredPaper.abstract_zh, "中文:A durable refresh result.");
+  assert.equal(recoveredPaper.selection_summary, "中文:A durable refresh result.");
+  assert.equal(
+    recovered.candidate_refresh.language_artifact.provenance.model_id,
+    "gpt-5.3-codex-spark",
+  );
   assert.equal(scanCalls, 1);
   assert.equal(translationCalls, 1);
   assert.equal(commitCalls, 2);
@@ -552,7 +565,34 @@ test("refreshRunCandidates honors a paper dismissed while translation is running
 
 test("translateJournalRunLibrary backfills Chinese titles and abstracts via Codex 5.3 Spark", async () => {
   const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-translate-lib-");
+  await writeFile(path.join(dataDir, "project_state.md"), [
+    "# 项目状态",
+    "",
+    "## 当前目标",
+    "",
+    "构建可核验的论文工作流。",
+    "",
+    "## 已确认决定",
+    "",
+    "- 中文展示使用固定语言服务。",
+    "",
+    "## 开放问题",
+    "",
+    "- 如何核验项目作用？",
+    "",
+    "## 下一步",
+    "",
+    "- 回填历史论文。",
+  ].join("\n"), "utf8");
+  const beforeTranslation = await runStore.getRun(runId);
   await runStore.updateRun(runId, {
+    candidates: beforeTranslation.candidates.map((paper, index) => index === 0
+      ? {
+          ...paper,
+          selection_summary: "A concise explanation of the paper contribution.",
+          project_impact: "Useful for verifiable workflow design.",
+        }
+      : paper),
     recent_classics: {
       schema_version: 1,
       status: "success",
@@ -570,14 +610,18 @@ test("translateJournalRunLibrary backfills Chinese titles and abstracts via Code
   let translationCalls = 0;
   let insertedConcurrentCandidate = false;
   const service = createJournalWorkflowService({
-    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "live" },
+    env: {
+      PI_DATA_DIR: dataDir,
+      PI_PROJECT_ROOT: dataDir,
+      PI_MODEL_MODE: "live",
+    },
     dataDir,
     runStore,
     sourceStateStore,
     modelRegistry: supportedModelRegistry(),
     modelProviders: {
       supports: () => true,
-      completeStructured: async ({ input, modelId, reasoningEffort }) => {
+      completeStructured: async ({ input, schema, modelId, reasoningEffort }) => {
         translationCalls += 1;
         usedModelId = modelId;
         usedReasoningEffort = reasoningEffort;
@@ -591,6 +635,20 @@ test("translateJournalRunLibrary backfills Chinese titles and abstracts via Code
               title: "Inserted While Translation Was Running",
             }, ...(current.candidates ?? [])],
           });
+        }
+        if (Object.hasOwn(schema.properties, "impacts")) {
+          return {
+            value: {
+              impacts: input.papers.map((paper) => ({
+                request_id: paper.request_id,
+                project_impact: "可用于核验当前项目的论文工作流。",
+              })),
+            },
+            provider_id: "codex-subscription",
+            model_id: modelId,
+            operation_id: "op-impact",
+            usage: null,
+          };
         }
         return {
           value: { translations: input.items.map((item) => ({ id: item.id, zh: `中文:${item.text.slice(0, 8)}` })) },
@@ -609,10 +667,14 @@ test("translateJournalRunLibrary backfills Chinese titles and abstracts via Code
   ]);
   assert.equal(usedModelId, "gpt-5.3-codex-spark");
   assert.equal(usedReasoningEffort, "low");
-  assert.equal(translationCalls, 1);
+  assert.equal(translationCalls, 3);
   assert.equal(duplicate.updated_at, translated.updated_at);
   assert.ok(translated.recent_classics.papers[0].title_zh?.startsWith("中文:"));
   assert.ok(translated.recent_classics.papers[0].abstract_zh?.startsWith("中文:"));
+  assert.equal(
+    translated.recent_classics.papers[0].project_impact,
+    "可用于核验当前项目的论文工作流。",
+  );
   assert.equal(
     translated.candidates.find((paper) => paper.paper_id === "late-candidate")?.title_zh,
     null,
@@ -620,6 +682,14 @@ test("translateJournalRunLibrary backfills Chinese titles and abstracts via Code
   assert.ok(translated.candidates
     .filter((paper) => paper.paper_id !== "late-candidate")
     .every((paper) => paper.title_zh?.startsWith("中文:")));
+  assert.ok(translated.candidates
+    .filter((paper) => paper.paper_id !== "late-candidate")
+    .every((paper) => paper.abstract_zh?.startsWith("中文:")));
+  assert.ok(translated.candidates[1].selection_summary?.startsWith("中文:"));
+  assert.ok(translated.candidates[1].project_impact?.startsWith("中文:"));
+  assert.equal(translated.library_translation.provenance.provider_id, "codex-subscription");
+  assert.equal(translated.library_translation.provenance.model_id, "gpt-5.3-codex-spark");
+  assert.equal(translated.library_translation.provenance.reasoning_effort, "low");
 });
 
 test("addPastRunPapersToWeekly moves an unread past paper into the current-month run", async () => {
@@ -636,6 +706,7 @@ test("addPastRunPapersToWeekly moves an unread past paper into the current-month
       venue: "NeurIPS",
       published_at: "2026-05-01",
       abstract: "Past abstract.",
+      abstract_zh: "往期中文摘要。",
       rank: 1,
     }],
   });
@@ -654,6 +725,7 @@ test("addPastRunPapersToWeekly moves an unread past paper into the current-month
   const added = updated.candidates.find((paper) => paper.paper_id === "past-1");
   assert.ok(added);
   assert.equal(added.candidate_origin, "resurfaced_unread");
+  assert.equal(added.selection_summary, "往期中文摘要。");
   assert.equal(updated.mineru.papers["past-1"].status, "pdf_not_prepared");
 });
 
@@ -1822,7 +1894,7 @@ test("full-text translation reports formula passthrough separately from model pr
   });
 
   const initial = await service.getPaperTranslation(runId, "paper-1");
-  assert.equal(initial.total_blocks, 2);
+  assert.equal(initial.total_blocks, 4);
   assert.equal(initial.translated_blocks, 0);
   assert.equal(initial.passthrough_blocks, 1);
 
@@ -1830,10 +1902,10 @@ test("full-text translation reports formula passthrough separately from model pr
   await service.waitForTranslation(runId, "paper-1");
   const done = await service.getPaperTranslation(runId, "paper-1");
   assert.equal(done.status, "ready");
-  assert.equal(done.total_blocks, 2);
-  assert.equal(done.translated_blocks, 2);
+  assert.equal(done.total_blocks, 4);
+  assert.equal(done.translated_blocks, 4);
   assert.equal(done.passthrough_blocks, 1);
-  assert.equal(Object.keys(done.blocks).length, 3);
+  assert.equal(Object.keys(done.blocks).length, 5);
 });
 
 test("full-text translation pauses after the active batch and resumes with the locked profile", async () => {

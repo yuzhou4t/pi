@@ -21,6 +21,11 @@ import {
   translationBatches,
 } from "./translationGenerator.js";
 import { createObsidianPreviewService } from "./obsidianPreview.js";
+import {
+  PROJECT_IMPACT_FALLBACK,
+  createPaperLanguageService,
+  needsPaperTranslation,
+} from "./paperLanguageService.js";
 import { createProjectContextReader } from "./projectContext.js";
 import { createProjectStatePreviewService } from "./projectStatePreview.js";
 import { createReadingNoteActionService } from "./readingNoteAction.js";
@@ -231,6 +236,7 @@ export function createJournalWorkflowService({
   candidateRanker = rankCandidates,
   guideGenerator = generateFiveMinuteGuide,
   translationGenerator = translatePaperBatch,
+  paperLanguageService = null,
   modelProviders = createModelProviderRegistry({
     env,
     fetchImpl,
@@ -280,6 +286,11 @@ export function createJournalWorkflowService({
   // A missing mode must fail closed through the real adapters instead of
   // silently turning a desktop run into fixture data.
   const modelMode = resolveModelMode(env);
+  const paperLanguage = paperLanguageService ?? createPaperLanguageService({
+    env,
+    modelProviders,
+    modelMode,
+  });
   const defaults = providerDefaults(env);
   const activeGuidePrompt = guideGenerator === generateFiveMinuteGuide
     ? promptRegistry.loadPrompt("five-minute-guide")
@@ -308,6 +319,7 @@ export function createJournalWorkflowService({
     fetchImpl,
     modelProviders,
     modelMode,
+    paperLanguageService: paperLanguage,
     projectContextReader: projectContext,
     mailto: env.PI_OPENALEX_MAILTO || "",
   });
@@ -628,52 +640,68 @@ export function createJournalWorkflowService({
     }
   }
 
-  // 标题/摘要的中文翻译走 Codex 订阅，固定使用当前目录中可选的
-  // GPT-5.3 Codex Spark；可用 PI_JOURNAL_TRANSLATION_MODEL 显式覆盖。
-  const translationModelId = (typeof env.PI_JOURNAL_TRANSLATION_MODEL === "string"
-    && env.PI_JOURNAL_TRANSLATION_MODEL.trim())
-    ? env.PI_JOURNAL_TRANSLATION_MODEL.trim()
-    : "gpt-5.3-codex-spark";
   // 本月保留的“领域视野”名额（拓宽选题面），可用 PI_JOURNAL_FIELD_SLOTS 调整，0 则关闭。
   const journalFieldSlots = Number.isInteger(Number(env.PI_JOURNAL_FIELD_SLOTS))
     ? Math.max(0, Math.min(Number(env.PI_JOURNAL_FIELD_SLOTS), 4))
     : undefined;
-  async function translateTextsWithSpark(items) {
-    if (
-      modelMode !== "live"
-      || !modelProviders?.completeStructured
-      || !Array.isArray(items)
-      || items.length === 0
-    ) {
-      return new Map();
-    }
-    const translatable = items
-      .filter((item) => /[A-Za-z]{4,}/.test(item.text))
-      .slice(0, 40);
-    if (translatable.length === 0) return new Map();
-    try {
-      const prompt = promptRegistry.loadPrompt("venue-search-translate");
-      const generated = await modelProviders.completeStructured({
-        providerId: "codex-subscription",
-        modelId: translationModelId,
-        reasoningEffort: "low",
-        system: prompt.system,
-        prompt: prompt.body,
-        input: { items: translatable },
-        schema: prompt.schema,
-      });
-      return new Map(
-        (generated.value?.translations ?? [])
-          .filter((entry) => typeof entry?.id === "string" && typeof entry?.zh === "string")
-          .map((entry) => [entry.id, entry.zh.trim()]),
-      );
-    } catch {
-      return new Map();
-    }
+
+  function languageArtifact(result) {
+    return {
+      status: result.status,
+      provenance: result.provenance,
+      error: result.error,
+    };
   }
 
-  // 近年经典：标题和摘要都翻成中文，让栏目和每月追踪一样能看懂大概内容。
-  async function translateRecentClassicTitles(recentClassics) {
+  // 所有候选入口共用同一份中文展示字段：Spark 翻译标题、摘要与候选说明，
+  // 并在项目状态可用时单独生成项目作用。失败时保留排名阶段已有的有效产物。
+  async function enrichCandidatePresentation(candidates, projectState = null) {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return { papers: candidates ?? [], artifact: null };
+    }
+    const translation = await paperLanguage.translateFields(
+      candidates.flatMap((paper, index) => [
+        { requestId: `p${index}t`, field: "title", text: paper.title },
+        { requestId: `p${index}a`, field: "abstract", text: paper.abstract },
+        { requestId: `p${index}s`, field: "selection_summary", text: paper.selection_summary },
+      ]),
+    );
+    const impacts = await paperLanguage.generateProjectImpacts({
+      papers: candidates.map((paper, index) => ({
+        requestId: `p${index}i`,
+        title: paper.title,
+        abstract: paper.abstract,
+        venue: paper.venue,
+        publishedAt: paper.published_at,
+        topicMatches: paper.topic_matches,
+      })),
+      projectContext: projectState,
+    });
+    const useGeneratedImpacts = ["ready", "partial"].includes(impacts.status);
+    return {
+      papers: candidates.map((paper, index) => ({
+        ...paper,
+        title_zh: translation.byRequestId.get(`p${index}t`)?.zh || paper.title_zh || null,
+        abstract_zh: translation.byRequestId.get(`p${index}a`)?.zh || paper.abstract_zh || null,
+        selection_summary: translation.byRequestId.get(`p${index}s`)?.zh
+          || paper.selection_summary,
+        project_impact: (useGeneratedImpacts
+          && impacts.byRequestId.get(`p${index}i`)?.project_impact !== PROJECT_IMPACT_FALLBACK
+          ? impacts.byRequestId.get(`p${index}i`)?.project_impact
+          : null)
+          || paper.project_impact
+          || PROJECT_IMPACT_FALLBACK,
+      })),
+      artifact: {
+        schema_version: 1,
+        translation: languageArtifact(translation),
+        project_impact: languageArtifact(impacts),
+      },
+    };
+  }
+
+  // 近年经典：统一翻译标题与摘要；只有读到项目状态时才生成项目作用。
+  async function enrichRecentClassics(recentClassics, projectState = null) {
     if (
       recentClassics?.status !== "success"
       || (recentClassics.papers ?? []).length === 0
@@ -681,18 +709,36 @@ export function createJournalWorkflowService({
       return recentClassics;
     }
     const items = recentClassics.papers.flatMap((paper, index) => [
-      { id: `p${index}`, text: String(paper.title ?? "").slice(0, 300) },
-      { id: `a${index}`, text: String(paper.abstract ?? "").slice(0, 500) },
-    ]).filter((item) => item.text);
-    const byId = await translateTextsWithSpark(items);
-    if (byId.size === 0) return recentClassics;
+      { requestId: `c${index}t`, field: "title", text: paper.title },
+      { requestId: `c${index}a`, field: "abstract", text: paper.abstract },
+    ]);
+    const translation = await paperLanguage.translateFields(items);
+    const impacts = await paperLanguage.generateProjectImpacts({
+      papers: recentClassics.papers.map((paper, index) => ({
+        requestId: `c${index}i`,
+        title: paper.title,
+        abstract: paper.abstract,
+        venue: paper.venue,
+        publishedAt: paper.published_at,
+        topicMatches: paper.topic_matches,
+      })),
+      projectContext: projectState,
+    });
     return {
       ...recentClassics,
       papers: recentClassics.papers.map((paper, index) => ({
         ...paper,
-        title_zh: byId.get(`p${index}`) || paper.title_zh || null,
-        abstract_zh: byId.get(`a${index}`) || paper.abstract_zh || null,
+        title_zh: translation.byRequestId.get(`c${index}t`)?.zh || paper.title_zh || null,
+        abstract_zh: translation.byRequestId.get(`c${index}a`)?.zh || paper.abstract_zh || null,
+        project_impact: impacts.byRequestId.get(`c${index}i`)?.project_impact
+          || paper.project_impact
+          || PROJECT_IMPACT_FALLBACK,
       })),
+      language_artifact: {
+        schema_version: 1,
+        translation: languageArtifact(translation),
+        project_impact: languageArtifact(impacts),
+      },
     };
   }
 
@@ -729,16 +775,16 @@ export function createJournalWorkflowService({
       }
       if (currentProjectContext) {
         try {
-        ranking = await candidateRanker({
-          papers: scan.candidateBatch.candidates,
-          projectContext: currentProjectContext.state,
-          providerId,
-          modelId,
-          modelProviders: rankingProviders,
-          modelMode,
-        });
-        ranking.project_context_source_path = currentProjectContext.source_path;
-        ranking.project_context_revision = currentProjectContext.revision;
+          ranking = await candidateRanker({
+            papers: scan.candidateBatch.candidates,
+            projectContext: currentProjectContext.state,
+            providerId,
+            modelId,
+            modelProviders: rankingProviders,
+            modelMode,
+          });
+          ranking.project_context_source_path = currentProjectContext.source_path;
+          ranking.project_context_revision = currentProjectContext.revision;
         } catch (error) {
           ranking = {
             candidates: deterministicCandidateRanking(scan.candidateBatch.candidates),
@@ -747,7 +793,11 @@ export function createJournalWorkflowService({
           };
         }
       }
-      const candidates = ranking.candidates.map((paper) => ({
+      const candidatePresentation = await enrichCandidatePresentation(
+        ranking.candidates,
+        currentProjectContext?.state ?? null,
+      );
+      const candidates = candidatePresentation.papers.map((paper) => ({
         ...paper,
         display_label: paper.candidate_origin === "classic_review"
           ? "经典回顾 · 非本月新论文"
@@ -769,7 +819,10 @@ export function createJournalWorkflowService({
             dismissedKeys,
           }),
         });
-        recentClassics = await translateRecentClassicTitles(recentClassics);
+        recentClassics = await enrichRecentClassics(
+          recentClassics,
+          currentProjectContext?.state ?? null,
+        );
       } catch (error) {
         recentClassics = {
           schema_version: 1,
@@ -790,6 +843,7 @@ export function createJournalWorkflowService({
         status: "preparing_documents",
         phase: "pdf_download",
         candidates,
+        candidate_language: candidatePresentation.artifact,
         recent_classics: recentClassics,
         ranking: {
           source: ranking.source,
@@ -951,10 +1005,10 @@ export function createJournalWorkflowService({
           display_label: "主题检索推荐 · 非本月新论文",
           title_zh: recommendation?.title_zh ?? paper.title_zh ?? null,
           selection_summary: recommendation?.reason
-            ?? (paper.abstract
-              ? paper.abstract.slice(0, 220)
+            ?? (paper.abstract_zh || paper.abstract
+              ? (paper.abstract_zh || paper.abstract).slice(0, 220)
               : `${paper.title}：来自主题检索，价值待全文核验。`),
-          project_impact: recommendation?.project_impact ?? "对项目的具体作用待核验。",
+          project_impact: recommendation?.project_impact ?? PROJECT_IMPACT_FALLBACK,
         });
         existingIds.add(paperId);
         if (paper.dedupe_key) existingKeys.add(paper.dedupe_key);
@@ -1046,10 +1100,10 @@ export function createJournalWorkflowService({
           rank: nextRank,
           candidate_origin: "recent_classic",
           selection_summary: paper.selection_summary
-            ?? (paper.abstract
-              ? paper.abstract.slice(0, 220)
+            ?? (paper.abstract_zh || paper.abstract
+              ? (paper.abstract_zh || paper.abstract).slice(0, 220)
               : `${paper.title}：近年高引经典，价值待全文核验。`),
-          project_impact: paper.project_impact ?? "对项目的具体作用待核验。",
+          project_impact: paper.project_impact ?? PROJECT_IMPACT_FALLBACK,
         });
         existingIds.add(paperId);
         if (paper.dedupe_key) existingKeys.add(paper.dedupe_key);
@@ -1082,7 +1136,7 @@ export function createJournalWorkflowService({
     });
   }
 
-  // 回填翻译：把已落盘 Run 里还是英文的近年经典（标题+摘要）与候选（标题）补上中文；
+  // 回填翻译：把已落盘 Run 里的英文标题、摘要、候选说明与项目作用补上中文；
   // 显式用户动作才会调用模型，已有中文的不重复翻译，失败保留英文。
   async function performJournalRunLibraryTranslation(runId) {
     const run = await runStore.getRun(runId);
@@ -1090,27 +1144,97 @@ export function createJournalWorkflowService({
     const classicPapers = run.recent_classics?.papers ?? [];
     const candidatePapers = run.candidates ?? [];
     const requests = [];
-    const addRequest = (kind, paper, field, limit) => {
+    const addRequest = (kind, paper, field) => {
+      const limits = {
+        title: 300,
+        abstract: 500,
+        selection_summary: 600,
+        project_impact: 600,
+      };
+      const limit = limits[field] ?? 600;
       const text = String(paper[field] ?? "").slice(0, limit);
-      if (!text) return;
-      const id = `${kind}${createHash("sha256")
+      if (!text || !needsPaperTranslation(text)) return;
+      const requestId = `${kind}${createHash("sha256")
         .update(`${paper.paper_id}\0${field}\0${text}`)
         .digest("hex")
         .slice(0, 19)}`;
-      requests.push({ id, paperId: paper.paper_id, field, text });
+      requests.push({ requestId, paperId: paper.paper_id, field, text });
     };
     classicPapers.forEach((paper) => {
-      if (!paper.title_zh && paper.title) addRequest("t", paper, "title", 300);
-      if (!paper.abstract_zh && paper.abstract) addRequest("a", paper, "abstract", 500);
+      if (!paper.title_zh && paper.title) addRequest("t", paper, "title");
+      if (!paper.abstract_zh && paper.abstract) addRequest("a", paper, "abstract");
+      addRequest("s", paper, "selection_summary");
+      addRequest("p", paper, "project_impact");
     });
     candidatePapers.forEach((paper) => {
-      if (!paper.title_zh && paper.title) addRequest("c", paper, "title", 300);
+      if (!paper.title_zh && paper.title) addRequest("c", paper, "title");
+      if (!paper.abstract_zh && paper.abstract) addRequest("b", paper, "abstract");
+      addRequest("u", paper, "selection_summary");
+      addRequest("i", paper, "project_impact");
     });
-    if (requests.length === 0) return run;
-    const byId = await translateTextsWithSpark(
-      requests.map(({ id, text }) => ({ id, text })),
+    const needsGeneratedImpact = (paper) => {
+      const value = String(paper.project_impact ?? "").trim();
+      return !value || value === PROJECT_IMPACT_FALLBACK;
+    };
+    const classicImpactTargets = classicPapers.filter(needsGeneratedImpact);
+    const candidateImpactTargets = candidatePapers.filter(needsGeneratedImpact);
+    if (
+      requests.length === 0
+      && classicImpactTargets.length === 0
+      && candidateImpactTargets.length === 0
+    ) return run;
+    let currentProjectState = null;
+    if (classicImpactTargets.length > 0 || candidateImpactTargets.length > 0) {
+      try {
+        currentProjectState = (await projectContext.read()).state;
+      } catch {
+        // 历史翻译仍可继续；没有可靠项目状态时，项目作用保持明确的待核验状态。
+      }
+    }
+    const translation = await paperLanguage.translateFields(
+      requests.map(({ requestId, field, text }) => ({ requestId, field, text })),
     );
-    if (byId.size === 0) {
+    const impactRequests = (papers, prefix) => papers.map((paper) => ({
+      requestId: `${prefix}${createHash("sha256")
+        .update(String(paper.paper_id))
+        .digest("hex")
+        .slice(0, 19)}`,
+      paperId: paper.paper_id,
+      title: paper.title,
+      abstract: paper.abstract,
+      venue: paper.venue,
+      publishedAt: paper.published_at,
+      topicMatches: paper.topic_matches,
+    }));
+    const classicImpactRequests = impactRequests(classicImpactTargets, "k");
+    const candidateImpactRequests = impactRequests(candidateImpactTargets, "q");
+    const [classicImpacts, candidateImpacts] = await Promise.all([
+      paperLanguage.generateProjectImpacts({
+        papers: classicImpactRequests,
+        projectContext: currentProjectState,
+      }),
+      paperLanguage.generateProjectImpacts({
+        papers: candidateImpactRequests,
+        projectContext: currentProjectState,
+      }),
+    ]);
+    const generatedImpactByPaper = new Map();
+    const collectGeneratedImpacts = (impactResult, impactInputs) => {
+      if (!["ready", "partial"].includes(impactResult.status)) return;
+      impactInputs.forEach((input) => {
+        const value = impactResult.byRequestId.get(input.requestId)?.project_impact;
+        if (value && value !== PROJECT_IMPACT_FALLBACK) {
+          generatedImpactByPaper.set(input.paperId, value);
+        }
+      });
+    };
+    collectGeneratedImpacts(classicImpacts, classicImpactRequests);
+    collectGeneratedImpacts(candidateImpacts, candidateImpactRequests);
+    if (
+      translation.byRequestId.size === 0
+      && ["failed", "unavailable"].includes(translation.status)
+      && generatedImpactByPaper.size === 0
+    ) {
       throw artifactError(
         "TRANSLATION_UNAVAILABLE",
         "翻译服务暂时不可用，请稍后重试",
@@ -1119,47 +1243,68 @@ export function createJournalWorkflowService({
     }
     const translatedRequests = new Map(
       requests
-        .filter((request) => byId.has(request.id))
+        .filter((request) => translation.byRequestId.has(request.requestId))
         .map((request) => [
           `${request.paperId}\0${request.field}`,
-          { ...request, translated: byId.get(request.id) },
+          {
+            ...request,
+            ...translation.byRequestId.get(request.requestId),
+          },
         ]),
     );
+    const translatedValue = (paper, field) => {
+      const translated = translatedRequests.get(`${paper.paper_id}\0${field}`);
+      if (!translated) return null;
+      const current = String(paper[field] ?? "").trim().replaceAll(/\s+/g, " ");
+      return current.slice(0, translated.source_text.length) === translated.source_text
+        ? translated.zh
+        : null;
+    };
     return update(runId, (current) => {
-      const patch = {};
+      const patch = {
+        library_translation: {
+          schema_version: 1,
+          translated_at: new Date().toISOString(),
+          ...languageArtifact(translation),
+          translation: languageArtifact(translation),
+          project_impact: {
+            classics: languageArtifact(classicImpacts),
+            candidates: languageArtifact(candidateImpacts),
+          },
+        },
+      };
       const currentClassics = current.recent_classics?.papers ?? [];
       if (currentClassics.length > 0) {
         patch.recent_classics = {
           ...current.recent_classics,
           papers: currentClassics.map((paper) => {
-            const title = translatedRequests.get(`${paper.paper_id}\0title`);
-            const abstract = translatedRequests.get(`${paper.paper_id}\0abstract`);
             return {
               ...paper,
-              title_zh: paper.title_zh
-                || (title && String(paper.title ?? "").slice(0, 300) === title.text
-                  ? title.translated
-                  : null),
-              abstract_zh: paper.abstract_zh
-                || (abstract && String(paper.abstract ?? "").slice(0, 500) === abstract.text
-                  ? abstract.translated
-                  : null),
+              title_zh: paper.title_zh || translatedValue(paper, "title"),
+              abstract_zh: paper.abstract_zh || translatedValue(paper, "abstract"),
+              selection_summary: translatedValue(paper, "selection_summary")
+                || paper.selection_summary,
+              project_impact: translatedValue(paper, "project_impact")
+                || generatedImpactByPaper.get(paper.paper_id)
+                || paper.project_impact
+                || PROJECT_IMPACT_FALLBACK,
             };
           }),
         };
       }
       const currentCandidates = current.candidates ?? [];
       if (currentCandidates.length > 0) {
-        patch.candidates = currentCandidates.map((paper) => {
-          const title = translatedRequests.get(`${paper.paper_id}\0title`);
-          return {
-            ...paper,
-            title_zh: paper.title_zh
-              || (title && String(paper.title ?? "").slice(0, 300) === title.text
-                ? title.translated
-                : null),
-          };
-        });
+        patch.candidates = currentCandidates.map((paper) => ({
+          ...paper,
+          title_zh: paper.title_zh || translatedValue(paper, "title"),
+          abstract_zh: paper.abstract_zh || translatedValue(paper, "abstract"),
+          selection_summary: translatedValue(paper, "selection_summary")
+            || paper.selection_summary,
+          project_impact: translatedValue(paper, "project_impact")
+            || generatedImpactByPaper.get(paper.paper_id)
+            || paper.project_impact
+            || PROJECT_IMPACT_FALLBACK,
+        }));
       }
       return patch;
     }, { type: "library_translated" });
@@ -1260,10 +1405,10 @@ export function createJournalWorkflowService({
           display_label: "往期未读回补 · 非本月新论文",
           resurfaced_from_run_id: sourceRunId,
           selection_summary: paper.selection_summary
-            ?? (paper.abstract
-              ? paper.abstract.slice(0, 220)
+            ?? (paper.abstract_zh || paper.abstract
+              ? (paper.abstract_zh || paper.abstract).slice(0, 220)
               : `${paper.title}：来自往期推荐，价值待全文核验。`),
-          project_impact: paper.project_impact ?? "对项目的具体作用待核验。",
+          project_impact: paper.project_impact ?? PROJECT_IMPACT_FALLBACK,
         });
         existingIds.add(paperId);
         if (paper.dedupe_key) existingKeys.add(paper.dedupe_key);
@@ -1365,25 +1510,41 @@ export function createJournalWorkflowService({
                 !existingIds.has(paper.paper_id)
                 && (!paper.dedupe_key || !existingKeys.has(paper.dedupe_key))
               ));
-            const translationRequests = fresh.map((paper) => {
-              const text = String(paper.title ?? "").slice(0, 300);
-              return {
-                id: `r${createHash("sha256")
-                  .update(`${paper.paper_id}\0${text}`)
-                  .digest("hex")
-                  .slice(0, 19)}`,
-                paperId: paper.paper_id,
-                text,
+            const translationRequests = [];
+            fresh.forEach((paper) => {
+              const addRequest = (field, text, prefix) => {
+                const normalized = String(text ?? "").trim();
+                if (!normalized || !needsPaperTranslation(normalized)) return;
+                translationRequests.push({
+                  requestId: `${prefix}${createHash("sha256")
+                    .update(`${paper.paper_id}\0${field}\0${normalized}`)
+                    .digest("hex")
+                    .slice(0, 19)}`,
+                  paperId: paper.paper_id,
+                  field,
+                  text: normalized,
+                });
               };
+              if (!paper.title_zh) addRequest("title", paper.title, "r");
+              if (!paper.abstract_zh) addRequest("abstract", paper.abstract, "a");
             });
-            const titleMap = await translateTextsWithSpark(
-              translationRequests.map(({ id, text }) => ({ id, text })),
+            const translation = await paperLanguage.translateFields(
+              translationRequests.map(({ requestId, field, text }) => ({
+                requestId,
+                field,
+                text,
+              })),
             );
-            const translatedTitles = new Map(
-              translationRequests
-                .filter((request) => titleMap.has(request.id))
-                .map((request) => [request.paperId, titleMap.get(request.id)]),
-            );
+            const translatedByPaper = new Map();
+            translationRequests.forEach((request) => {
+              const translated = translation.byRequestId.get(request.requestId)?.zh;
+              if (!translated) return;
+              const existing = translatedByPaper.get(request.paperId) ?? {};
+              translatedByPaper.set(request.paperId, {
+                ...existing,
+                [request.field]: translated,
+              });
+            });
             const appliedAt = new Date().toISOString();
             const appliedRun = await update(runId, async (current) => {
               if (!CANDIDATE_MUTABLE_RUN_STATUSES.includes(current.status)) {
@@ -1420,12 +1581,25 @@ export function createJournalWorkflowService({
                 added.push({
                   ...paper,
                   rank: nextRank,
-                  title_zh: translatedTitles.get(paper.paper_id) ?? paper.title_zh ?? null,
+                  title_zh: translatedByPaper.get(paper.paper_id)?.title
+                    ?? paper.title_zh
+                    ?? null,
+                  abstract_zh: translatedByPaper.get(paper.paper_id)?.abstract
+                    ?? paper.abstract_zh
+                    ?? null,
                   display_label: paper.display_label ?? "本月新论文",
-                  selection_summary: paper.abstract
-                    ? paper.abstract.slice(0, 220)
+                  selection_summary: (
+                    translatedByPaper.get(paper.paper_id)?.abstract
+                    ?? paper.abstract_zh
+                    ?? paper.abstract
+                  )
+                    ? (
+                      translatedByPaper.get(paper.paper_id)?.abstract
+                      ?? paper.abstract_zh
+                      ?? paper.abstract
+                    ).slice(0, 220)
                     : `${paper.title}：本次刷新新增，价值待全文核验。`,
-                  project_impact: "对项目的具体作用待核验。",
+                  project_impact: PROJECT_IMPACT_FALLBACK,
                 });
                 currentIds.add(paper.paper_id);
                 if (paper.dedupe_key) currentKeys.add(paper.dedupe_key);
@@ -1437,6 +1611,7 @@ export function createJournalWorkflowService({
                 last_scan_key: scanKey,
                 last_added_count: added.length,
                 last_added_paper_ids: added.map((paper) => paper.paper_id),
+                language_artifact: languageArtifact(translation),
                 last_error: null,
               };
               if (added.length === 0) return { candidate_refresh: refreshRecord };

@@ -58,7 +58,9 @@ export const OFFICIAL_ADAPTER_CONFIGS = Object.freeze({
     ],
   }),
   "acl-anthology-venue": Object.freeze({
+    navigation: /\/volumes\/\d{4}\.acl-long\/?$/i,
     detail: /\/\d{4}\.[a-z0-9-]+\.\d+\/?$/i,
+    acl_volume_records: true,
   }),
   "cvf-cvpr": Object.freeze({
     navigation: /\/CVPR\d{4}\/?(?:\?[^#]*)?$/i,
@@ -70,6 +72,9 @@ export const OFFICIAL_ADAPTER_CONFIGS = Object.freeze({
   }),
   "pmlr-proceedings": Object.freeze({
     navigation: /\/v\d+\/?$/i,
+    navigation_list_items: true,
+    navigation_title: /\b(?:Proceedings of ICML \d{4}|ICML \d{4} Proceedings)\b/i,
+    navigation_page: /\bInternational Conference on Machine Learning\b/i,
     detail: /\/v\d+\/[^/?#]+\.html$/i,
   }),
   "openreview-iclr": Object.freeze({
@@ -210,6 +215,16 @@ function normalizedPublicationDate(value) {
   }
   if (/^\d{4}-\d{2}$/.test(text)) {
     return { value: text, precision: "month" };
+  }
+  match = text.match(/^(\d{4})\/(\d{1,2})$/);
+  if (match) {
+    const month = Number(match[2]);
+    if (month >= 1 && month <= 12) {
+      return {
+        value: `${match[1]}-${String(month).padStart(2, "0")}`,
+        precision: "month",
+      };
+    }
   }
   if (/^\d{4}$/.test(text)) {
     return { value: text, precision: "year" };
@@ -557,7 +572,77 @@ function extractedLinks(html, pageUrl, allowedHosts) {
   return links;
 }
 
-function newestNavigationLinks(links, pattern) {
+function pmlrVolumeLinks(html, pageUrl, allowedHosts) {
+  const links = [];
+  for (const match of html.matchAll(/<li\b[^>]*>([\s\S]*?)<\/li>/gi)) {
+    const [link] = extractedLinks(match[0], pageUrl, allowedHosts);
+    if (!link) continue;
+    links.push({
+      ...link,
+      title: cleanHtml(match[1]),
+    });
+  }
+  return links;
+}
+
+function definitionValue(html, label) {
+  const match = html.match(new RegExp(
+    `<dt\\b[^>]*>\\s*${label}:?\\s*</dt>\\s*<dd\\b[^>]*>([\\s\\S]*?)</dd>`,
+    "i",
+  ));
+  return cleanHtml(match?.[1]);
+}
+
+function monthNumber(value) {
+  return MONTHS[compact(value).toLowerCase()] ?? null;
+}
+
+function aclVolumePublicationDate(html) {
+  const year = definitionValue(html, "Year");
+  const month = monthNumber(definitionValue(html, "Month"));
+  if (!/^\d{4}$/.test(year)) return null;
+  return month ? `${year}-${String(month).padStart(2, "0")}` : year;
+}
+
+function anchorTexts(html) {
+  return [...html.matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/gi)]
+    .map((match) => cleanHtml(match[1]))
+    .filter(Boolean);
+}
+
+function recordsFromAclVolume(html, context, allowedHosts, detailPattern) {
+  const publishedAt = aclVolumePublicationDate(html);
+  const records = [];
+  const entries = html.matchAll(
+    /<span\b[^>]*>\s*<strong>\s*<a\b([^>]*)>([\s\S]*?)<\/a>\s*<\/strong>\s*<br\s*\/?>([\s\S]*?)<\/span>\s*<\/div>\s*<div\b([^>]*)>\s*<div\b[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi,
+  );
+  for (const match of entries) {
+    const linkAttributes = attributes(match[1]);
+    const abstractAttributes = attributes(match[4]);
+    if (!compact(abstractAttributes.class).split(/\s+/).includes("abstract-collapse")) continue;
+    const officialUrl = safeHttpsUrl(linkAttributes.href, {
+      base: context.pageUrl,
+      allowedHosts,
+    });
+    if (!officialUrl || !detailPattern.test(officialUrl)) continue;
+    const paperSlug = new URL(officialUrl).pathname.split("/").filter(Boolean)[0];
+    if (!/^\d{4}\.[a-z0-9-]+\.\d+$/i.test(paperSlug)) continue;
+    records.push(officialRecord({
+      ...context,
+      evidenceKind: "official_volume_record",
+      title: match[2],
+      authors: anchorTexts(match[3]),
+      publishedAt,
+      doi: `10.18653/v1/${paperSlug}`,
+      officialUrl,
+      pdfUrl: `${officialUrl.replace(/\/$/, "")}.pdf`,
+      abstract: match[5],
+    }));
+  }
+  return records.filter(Boolean);
+}
+
+function newestNavigationLinks(links, pattern, titlePattern = null) {
   if (!pattern) return [];
   const recency = (url) => {
     const year = Number(url.match(/(?:19|20)\d{2}/)?.[0] ?? 0);
@@ -566,7 +651,10 @@ function newestNavigationLinks(links, pattern) {
     return year * 1_000_000_000 + volume * 1_000_000 + issue;
   };
   return links
-    .filter((link) => pattern.test(link.url))
+    .filter((link) => (
+      pattern.test(link.url)
+      && (!titlePattern || titlePattern.test(link.title))
+    ))
     .sort((left, right) => {
       return recency(right.url) - recency(left.url)
         || right.url.localeCompare(left.url);
@@ -690,13 +778,26 @@ export async function fetchOfficialSource(source, {
   let papers = detailLinks(firstLinks, config.detail);
 
   if (papers.length === 0) {
-    const [navigation] = newestNavigationLinks(firstLinks, config.navigation);
+    const navigationLinks = config.navigation_list_items
+      ? pmlrVolumeLinks(index.body, index.url, allowedHosts)
+      : firstLinks;
+    const [navigation] = newestNavigationLinks(
+      navigationLinks,
+      config.navigation,
+      config.navigation_title,
+    );
     if (navigation) {
       try {
         const nested = await fetchBoundedHtml(fetchImpl, navigation.url, {
           timeoutMs,
           allowedHosts,
         });
+        if (config.navigation_page && !config.navigation_page.test(nested.body)) {
+          throw new OfficialSourceError(
+            "OFFICIAL_NAVIGATION_MISMATCH",
+            `Official volume does not belong to ${source.source_id}`,
+          );
+        }
         targetUrls.push(nested.url);
         const nestedContext = {
           ...initialContext,
@@ -708,10 +809,21 @@ export async function fetchOfficialSource(source, {
             allowPageIdentity: false,
           }),
         );
-        papers = detailLinks(
-          extractedLinks(nested.body, nested.url, allowedHosts),
-          config.detail,
-        );
+        const volumeRecords = config.acl_volume_records
+          ? recordsFromAclVolume(
+              nested.body,
+              nestedContext,
+              allowedHosts,
+              config.detail,
+            )
+          : [];
+        records.push(...volumeRecords);
+        papers = volumeRecords.length > 0
+          ? []
+          : detailLinks(
+              extractedLinks(nested.body, nested.url, allowedHosts),
+              config.detail,
+            );
       } catch {
         // The fallback route remains available when the official nested index fails.
       }

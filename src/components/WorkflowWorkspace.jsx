@@ -21,6 +21,7 @@ import {
   XCircle,
 } from "@phosphor-icons/react";
 import { workflowFixture } from "../workflow/fixtures.js";
+import { PaperDiscoveryCard } from "./PaperDiscoveryCard.jsx";
 import { PaperReader } from "./PaperReader.jsx";
 import { PaperRichText } from "./PaperRichText.jsx";
 import { ProviderMenu } from "./ProviderMenu.jsx";
@@ -925,110 +926,97 @@ function CandidateReview({
             const evidenceExpanded = expandedEvidenceId === paper.id;
             const mineru = mineruDisplay(paper.mineruStatus, paper.mineruRunStatus);
             const canOpenFullText = paper.isDemo === false && paper.mineruStatus === "ready";
-            const publishedDate = String(paper.publishedAt ?? paper.published_at ?? "").slice(0, 10);
             return (
-              <article className={`workflow-candidate${selected ? " is-selected" : ""}`} key={paper.id}>
-                <label className="workflow-candidate-select">
-                  <input
-                    type="checkbox"
-                    checked={selected}
-                    disabled={readOnly || selectionFull || guideUnavailable}
-                    aria-label={readOnly
-                      ? `${paper.title}${selected ? "，当时已选择" : "，当时未选择"}`
-                      : `${selected ? "取消选择" : "选择"}${paper.title}${guideUnavailable ? "，正文尚未准备完成" : ""}`}
-                    title={guideUnavailable ? "正文准备完成后才可生成导读" : undefined}
-                    onChange={() => onTogglePaper?.(paper.id)}
-                  />
-                  <span>{selected ? <Check size={13} weight="bold" aria-hidden="true" /> : index + 1}</span>
-                </label>
-                <div className="workflow-candidate-main">
-                  <div className="workflow-candidate-title-row">
-                    <h3>{paper.titleZh && paper.titleZh !== paper.title ? paper.titleZh : paper.title}</h3>
-                    <span className="workflow-recommendation-badge">{paper.recommendation}</span>
-                  </div>
-                  {paper.titleZh && paper.titleZh !== paper.title ? (
-                    <p className="workflow-candidate-original-title">{paper.title}</p>
-                  ) : null}
-                  <p className="workflow-authors">
-                    {Array.isArray(paper.authors) ? paper.authors.join("、") : paper.authors}
-                    {publishedDate ? <span className="workflow-published-date"> · 发表于 {publishedDate}</span> : null}
+              <PaperDiscoveryCard
+                key={paper.id}
+                paper={paper}
+                className="workflow-candidate-entry"
+                selected={selected}
+                badge={<span className="workflow-recommendation-badge">{paper.recommendation}</span>}
+                leading={(
+                  <label className="workflow-candidate-select">
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      disabled={readOnly || selectionFull || guideUnavailable}
+                      aria-label={readOnly
+                        ? `${paper.title}${selected ? "，当时已选择" : "，当时未选择"}`
+                        : `${selected ? "取消选择" : "选择"}${paper.title}${guideUnavailable ? "，正文尚未准备完成" : ""}`}
+                      title={guideUnavailable ? "正文准备完成后才可生成导读" : undefined}
+                      onChange={() => onTogglePaper?.(paper.id)}
+                    />
+                    <span>{selected ? <Check size={13} weight="bold" aria-hidden="true" /> : index + 1}</span>
+                  </label>
+                )}
+                statuses={paper.isDemo === false ? (
+                  <p className="workflow-paper-status-row">
+                    <span className={paper.isNew === false || paper.publishedThisMonth === false ? "is-classic" : "is-new"}>
+                      {paper.discoveryType ?? (paper.isNew === false ? "经典回顾 · 非本月新论文" : "本月新论文")}
+                    </span>
+                    <span className={`is-${mineru.tone}`}>{mineru.label}</span>
                   </p>
-                  {paper.isDemo === false ? (
-                    <p className="workflow-paper-status-row">
-                      <span className={paper.isNew === false || paper.publishedThisMonth === false ? "is-classic" : "is-new"}>
-                        {paper.discoveryType ?? (paper.isNew === false ? "经典回顾 · 非本月新论文" : "本月新论文")}
-                      </span>
-                      <span className={`is-${mineru.tone}`}>{mineru.label}</span>
-                    </p>
-                  ) : null}
-                  {guideUnavailable ? <p className="workflow-unavailable-note">正文尚未准备完成，暂不能生成导读</p> : null}
-                  <dl className="workflow-candidate-summary">
-                    <div>
-                      <dt>论文讲什么</dt>
-                      <dd className="workflow-abstract-copy">{paper.selectionSummary ?? paper.selection_summary ?? paper.abstract}</dd>
-                    </div>
-                    <div className="is-project-impact">
-                      <dt>对项目的作用</dt>
-                      <dd className="workflow-relevance-copy">{paper.projectImpact ?? paper.project_impact ?? paper.relevance ?? paper.relevanceReason ?? paper.relevance_reason}</dd>
-                    </div>
-                  </dl>
-                  <div className="workflow-scan-model-row">
-                    <button
-                      className="workflow-evidence-toggle"
-                      type="button"
-                      aria-expanded={evidenceExpanded}
-                      aria-controls={`${paper.id}-evidence`}
-                      onClick={() => toggleEvidence(paper.id)}
-                    >
-                      {evidenceExpanded ? "收起依据" : "查看依据"}
-                    </button>
-                    {canOpenFullText ? (
+                ) : null}
+                footer={(
+                  <>
+                    {guideUnavailable ? <p className="workflow-unavailable-note">正文尚未准备完成，暂不能生成导读</p> : null}
+                    <div className="workflow-scan-model-row">
                       <button
                         className="workflow-evidence-toggle"
                         type="button"
-                        aria-label={`打开《${paper.title}》全文`}
-                        onClick={() => onOpenPaper?.(paper.id)}
+                        aria-expanded={evidenceExpanded}
+                        aria-controls={`${paper.id}-evidence`}
+                        onClick={() => toggleEvidence(paper.id)}
                       >
-                        打开全文
+                        {evidenceExpanded ? "收起依据" : "查看依据"}
                       </button>
-                    ) : null}
-                    {!readOnly && mineru.tone === "failed" && onRetryPaperDocument ? (
-                      <button
-                        className="workflow-evidence-toggle"
-                        type="button"
-                        disabled={Boolean(documentRetryState.paperId)}
-                        onClick={() => retryPaperDocument(paper.id)}
-                      >
-                        {documentRetryState.paperId === paper.id
-                          ? <CircleNotch className="spin" size={13} weight="bold" aria-hidden="true" />
-                          : null}
-                        {documentRetryState.paperId === paper.id
-                          ? "正在重试"
-                          : paper.mineruStatus === "pdf_not_prepared"
-                            ? "准备全文"
-                            : "重试全文准备"}
-                      </button>
-                    ) : null}
-                  </div>
-                  {documentRetryState.errors[paper.id] ? (
-                    <p className="workflow-unavailable-note is-error" role="alert">
-                      {documentRetryState.errors[paper.id]}
-                    </p>
-                  ) : null}
-                  {evidenceExpanded ? (
-                    <div className="workflow-candidate-evidence" id={`${paper.id}-evidence`}>
-                      <div>
-                        <strong>热度依据</strong>
-                        <ul>{(paper.heatSignals ?? paper.heat_signals ?? []).map((signal, signalIndex) => <li key={`${paper.id}-signal-${signalIndex}`}>{formatSignal(signal)}</li>)}</ul>
-                      </div>
-                      <div>
-                        <strong>证据范围</strong>
-                        <p>{paper.evidenceScope ?? paper.evidence_scope ?? "仅依据题录与摘要，尚未阅读全文"}</p>
-                      </div>
+                      {canOpenFullText ? (
+                        <button
+                          className="workflow-evidence-toggle"
+                          type="button"
+                          aria-label={`打开《${paper.title}》全文`}
+                          onClick={() => onOpenPaper?.(paper.id)}
+                        >
+                          打开全文
+                        </button>
+                      ) : null}
+                      {!readOnly && mineru.tone === "failed" && onRetryPaperDocument ? (
+                        <button
+                          className="workflow-evidence-toggle"
+                          type="button"
+                          disabled={Boolean(documentRetryState.paperId)}
+                          onClick={() => retryPaperDocument(paper.id)}
+                        >
+                          {documentRetryState.paperId === paper.id
+                            ? <CircleNotch className="spin" size={13} weight="bold" aria-hidden="true" />
+                            : null}
+                          {documentRetryState.paperId === paper.id
+                            ? "正在重试"
+                            : paper.mineruStatus === "pdf_not_prepared"
+                              ? "准备全文"
+                              : "重试全文准备"}
+                        </button>
+                      ) : null}
                     </div>
-                  ) : null}
-                </div>
-              </article>
+                    {documentRetryState.errors[paper.id] ? (
+                      <p className="workflow-unavailable-note is-error" role="alert">
+                        {documentRetryState.errors[paper.id]}
+                      </p>
+                    ) : null}
+                    {evidenceExpanded ? (
+                      <div className="workflow-candidate-evidence" id={`${paper.id}-evidence`}>
+                        <div>
+                          <strong>热度依据</strong>
+                          <ul>{(paper.heatSignals ?? paper.heat_signals ?? []).map((signal, signalIndex) => <li key={`${paper.id}-signal-${signalIndex}`}>{formatSignal(signal)}</li>)}</ul>
+                        </div>
+                        <div>
+                          <strong>证据范围</strong>
+                          <p>{paper.evidenceScope ?? paper.evidence_scope ?? "仅依据题录与摘要，尚未阅读全文"}</p>
+                        </div>
+                      </div>
+                    ) : null}
+                  </>
+                )}
+              />
             );
           })}
         </div>

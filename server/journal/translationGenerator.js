@@ -62,7 +62,7 @@ function allowsNonChinesePassthrough(source) {
 }
 
 export function isTranslatableBlock(block) {
-  if (!block || block.kind === "image" || block.kind === "heading") return false;
+  if (!block) return false;
   return Boolean(blockSource(block));
 }
 
@@ -73,6 +73,8 @@ export function isMathOnlyBlock(block) {
 /**
  * Split the document's translatable, non-math blocks into bounded batches
  * that each fit one structured model call.
+ * Headings and image captions are ordinary translatable blocks so the
+ * reader's Chinese and bilingual views do not leave structural English behind.
  */
 export function translationBatches(blocks, alreadyTranslated = new Set()) {
   const batches = [];
