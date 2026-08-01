@@ -6,7 +6,7 @@ Pi Agent 是一个本地 Agent 工作空间：长期项目保存持续状态，�
 
 ## 当前状态
 
-- 简体中文、桌面优先的三栏工作空间已经成立。左上选择 `正常工作` 或 `论文精读`；左栏管理对应项目和会话，中栏始终是 Agent，右栏按需展示当前工件。
+- 简体中文、桌面优先的三栏工作空间已经成立。左上选择 `正常工作`、`Worker` 或 `论文精读`；左栏管理当前工作类型的项目或任务，中栏始终是 Agent，右栏按需展示当前工件。
 - 日常启动器把项目工作 Runtime 从公共 API 中拆开监管。网页或 API 重启不会终止 Runtime 中的 turn；退出启动器时才受控停止并保存可恢复状态。
 - 两条工作流共用 `idle / running / awaiting_user / awaiting_review / verifying / recovering / stopped` 生命周期和版本化运行时合同，但各自保留业务状态。事件使用稳定 `seq`、snapshot watermark 和增量 SSE；操作失败不会把已经成功的 Agent 回答改写成整段会话失败。
 - `正常工作` 支持一级独立对话和已绑定本地项目。浏览器只收到安全标签与项目内相对路径；创建、打开、切换会话或工件、切换模型都不会调用模型，只有显式发送才启动 Pi。
@@ -19,7 +19,8 @@ Pi Agent 是一个本地 Agent 工作空间：长期项目保存持续状态，�
 - `预览`只接受注册式 Vite、静态站点或 Uvicorn recipe，由 supervisor 拥有进程。手动模式会先展示安全 recipe、相对 cwd、参数边界和请求指纹，只有明确确认后才启动回环预览。受控页面验收只能检查该 supervisor 当前拥有的同源 loopback 页面，固定采集桌面/移动截图、DOM/可访问性摘要、console 和失败请求；外部导航、上传、下载、凭据输入与页面写交互均被阻止。
 - `规划方案`是服务端只读工作流：可以检索项目、会话资料与明确启用的只读资料源，也可以提问和输出计划，但不会生成 ChangeSet、验证、预览或写操作。Agent 回答里的项目 `path:line` 仅在本轮确实读取且文件 hash 仍一致时可点击定位，文件变化后会明确显示引用已过期。
 - 已安装 Skill 会显示完整 `SKILL.md` 或升级差异，并声明真实所需运行时能力与效果范围；缺少工具时标为不兼容。Loop 只依据持久事件的序号发送一次本机通知，默认前台静默，通知不含代码、绝对路径、日志或密钥，也不能恢复任务或替代审批。
-- GitHub 是默认关闭、逐回合启用的只读 Connector，只读取 Issue、PR、CI check 和审查意见。写评论、建 PR、push 或 merge 均未开放，也不会藏进 Skill。
+- Worker 内置飞书文档、Agent 邮箱和 IMA 笔记三组持久任务；新任务直接在对应分组下创建。IMA 当前仅开放笔记本、笔记列表、搜索和正文读取，草稿留在 Pi，不提供 IMA 外部写入。Canva、Figma、Sketch 不接入；Zotero、Obsidian 仍只属于论文精读。
+- GitHub 与 Vercel 都是正常工作里默认关闭、逐回合启用的只读 Connector。GitHub 只读取 Issue、PR、CI check 和审查意见；Vercel 只读取项目、部署列表和部署详情。评论、建 PR、push、merge、deploy、link 或配置修改均未开放，也不会混入 Worker。
 - 论文监测使用 11 个来源各自声明的官方 primary adapter，Crossref/DBLP 只在失败时作为显式 fallback。Run 先持久化逐来源 staging、候选和 ranking 工件，再用 CAS 提交全局 cursor；缺少精确发布日期的记录不会算作本月新论文。
 - 最终五篇全文采用有限并发和逐篇恢复；下载、额度、上传、解析失败分别保存，成功论文不会重复处理。Live 模式遇到扫描失败、恢复中、无候选或缺少 `project_state.md` 时如实停住，不回退测试数据。
 - 追踪节奏为每月一次（默认每月 1 日，`PI_MONTHLY_RUN_DAY/HOUR/MINUTE` 可调）；发现窗口是以扫描时刻为终点的近 30 天滚动区间，候选页会明确展示该日期区间，只有在区间内以日精度发表的才算“本月新论文”。为避免只盯着项目窄主题而“坐井观天”，本月的五篇会在同样的 11 个刊物内预留最多 2 篇“领域视野”名额（`PI_JOURNAL_FIELD_SLOTS` 可调，0 则关闭）：除了命中窄主题词的论文，还纳入命中更宽 AI/ML 领域主题（推理、多模态、生成、强化学习、安全对齐等）的代表性好文，标为“领域视野”，仍由排序以项目相关为主。当月新论文不足五篇时按顺序回补：先用本次扫描首次发现但非本月发表的论文（“本月补发现”，含领域视野，按发表时间降序），再用往期未读回补，最后才用经典回顾补位；每类都有明确标签，不会把老论文伪装成本月新发现。
@@ -61,7 +62,7 @@ cd '/Users/yuzhou4tc/Public/pi Agent'
 npm run dev -- --host 127.0.0.1 --port 4173
 ```
 
-`npm run dev:api` 使用 Pi Agent 专用的开发端口 `8788`，默认 Vite 代理也指向该端口。它读取 `.env.local`，并在服务端代码变化后自动重启，避免前端命中旧版接口。论文语义步骤的 GPT 通道继续使用已登录的 Codex 订阅，DeepSeek 读取 `PI_DEEPSEEK_API_KEY`；项目工作会话直接读取 Pi 本机已配置且可用的模型目录，不读取或复制 Pi/Codex 凭据。MinerU Cloud 读取 `PI_MINERU_API_TOKEN`。GitHub 只读 Connector 仅在配置专用 `PI_GITHUB_TOKEN` 且用户为本轮显式启用时出现，不会把 Token 返回浏览器。Zotero Desktop 默认只通过 `http://127.0.0.1:23119` 连接本机，必要时可用 `PI_ZOTERO_BASE_URL` 覆盖。所有密钥只放在未跟踪的 `.env.local`，不要写入前端、聊天或 Git。
+`npm run dev:api` 使用 Pi Agent 专用的开发端口 `8788`，默认 Vite 代理也指向该端口。它读取 `.env.local`，并在服务端代码变化后自动重启，避免前端命中旧版接口。论文语义步骤的 GPT 通道继续使用已登录的 Codex 订阅，DeepSeek 读取 `PI_DEEPSEEK_API_KEY`；项目工作会话直接读取 Pi 本机已配置且可用的模型目录，不读取或复制 Pi/Codex 凭据。MinerU Cloud 读取 `PI_MINERU_API_TOKEN`。GitHub 只读 Connector 优先使用服务端专用 `PI_GITHUB_TOKEN`；缺少该配置时，可通过固定、无 Shell 的 `gh api` 只读适配器复用 GitHub CLI Keychain，且仍需用户为本轮显式启用。Vercel 只读 Connector 复用已登录的本机 Vercel CLI。Pi 不读取或复制这两个 CLI 的 Token，也不会把任何凭据返回浏览器。Zotero Desktop 默认只通过 `http://127.0.0.1:23119` 连接本机，必要时可用 `PI_ZOTERO_BASE_URL` 覆盖。所有独立密钥只放在未跟踪的 `.env.local`，不要写入前端、聊天或 Git。
 
 正常工作会话数据默认保存在 macOS `Application Support/Pi Agent/project-work`，可通过服务端环境变量 `PI_PROJECT_WORK_STORAGE_ROOT` 覆盖。该目录保存安全项目注册、会话状态、事件流、稀疏审阅层、独立对话私有草稿与 Pi JSONL 会话；不会进入浏览器或 Git。创建空会话只写轻量元数据，不扫描或复制项目，也不会启动 Pi。
 
