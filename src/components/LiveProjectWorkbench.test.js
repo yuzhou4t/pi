@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import test from "node:test";
+import test, { after } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
@@ -33,7 +33,10 @@ const artifactLayoutStub = {
   },
 };
 
-async function withLiveWorkbench(callback, { exposeArtifact = false } = {}) {
+let sharedWorkbench = null;
+let sharedArtifactWorkbench = null;
+
+async function createSharedWorkbench(exposeArtifact) {
   const vite = await createServer({
     root: process.cwd(),
     appType: "custom",
@@ -42,11 +45,34 @@ async function withLiveWorkbench(callback, { exposeArtifact = false } = {}) {
     server: { middlewareMode: true },
   });
   try {
-    return await callback(await vite.ssrLoadModule(COMPONENT_PATH));
-  } finally {
+    return {
+      vite,
+      module: await vite.ssrLoadModule(COMPONENT_PATH),
+    };
+  } catch (error) {
     await vite.close();
+    throw error;
   }
 }
+
+async function withLiveWorkbench(callback, { exposeArtifact = false } = {}) {
+  const key = exposeArtifact ? "artifact" : "standard";
+  let workbench = exposeArtifact ? sharedArtifactWorkbench : sharedWorkbench;
+  if (!workbench) {
+    workbench = createSharedWorkbench(exposeArtifact);
+    if (key === "artifact") sharedArtifactWorkbench = workbench;
+    else sharedWorkbench = workbench;
+  }
+  const loaded = await workbench;
+  return callback(loaded.module);
+}
+
+after(async () => {
+  const workbenches = await Promise.all(
+    [sharedWorkbench, sharedArtifactWorkbench].filter(Boolean),
+  );
+  await Promise.all(workbenches.map(({ vite }) => vite.close()));
+});
 
 function conversation(overrides = {}) {
   return {
@@ -127,8 +153,11 @@ test("live project workbench renders the honest empty states without starting wo
     assert.match(emptyConversationHtml, /命令显式运行/);
     assert.match(emptyConversationHtml, /只有显式发送才开始工作/);
     assert.match(emptyConversationHtml, /添加项目文件/);
-    assert.match(emptyConversationHtml, /上传 PDF 资料/);
-    assert.match(emptyConversationHtml, /普通文件由 AI 按需读取/);
+    assert.match(emptyConversationHtml, /添加本地资料/);
+    assert.match(emptyConversationHtml, /aria-label="选择要添加的本地资料"/);
+    assert.match(emptyConversationHtml, /type="file" multiple=""/);
+    assert.doesNotMatch(emptyConversationHtml, /accept=/);
+    assert.match(emptyConversationHtml, /会话资料由 AI 按需读取/);
     assert.doesNotMatch(emptyConversationHtml, /MinerU Cloud/);
     assert.doesNotMatch(emptyConversationHtml, /aria-label="项目工件"/);
     assert.doesNotMatch(emptyConversationHtml, /Zotero|Obsidian|阅读镜头/);
@@ -604,6 +633,50 @@ test("composer thinking control exposes only model-supported Chinese levels", as
   });
 });
 
+test("a pending model selection locks both thinking-strength entry points", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  assert.match(
+    source,
+    /const thinkingBusy = modelSelectionDisabled\s*\|\| conversationRunning/,
+  );
+  assert.match(
+    source,
+    /conversationRunning\s*\|\| modelSelectionDisabled\s*\|\| !snapshot\?\.id/,
+  );
+  assert.match(source, /thinkingDisabled=\{thinkingBusy \|\| thinkingSaving\}/);
+  assert.match(source, /<ProjectThinkingLevelControl[\s\S]*?running=\{thinkingBusy\}/);
+  assert.match(source, /&& !modelSelectionDisabled\s*&& uploadingAttachments/);
+  assert.match(
+    source,
+    /\|\| action\s*\|\| modelSelectionDisabled\s*\|\| uploadingAttachments/,
+  );
+  assert.match(
+    source,
+    /<ProjectAgentPane[\s\S]*?modelSelectionDisabled=\{modelSelectionDisabled\}/,
+  );
+
+  await withLiveWorkbench(({ ProjectAgentPane }) => {
+    const html = renderToStaticMarkup(React.createElement(ProjectAgentPane, {
+      conversation: conversation(),
+      draft: "这条消息必须等模型保存完成",
+      onDraftChange: () => {},
+      contextChips: [],
+      onRemoveContext: () => {},
+      selectedCapabilityIds: [],
+      onRemoveCapability: () => {},
+      selectedWorkflowId: null,
+      onRemoveWorkflow: () => {},
+      pendingImage: null,
+      onRemoveImage: () => {},
+      onSubmit: () => {},
+      onOpenArtifact: () => {},
+      action: null,
+      modelSelectionDisabled: true,
+    }));
+    assert.match(html, /type="submit"[^>]*disabled=""/);
+  });
+});
+
 test("current-message capability menu exposes retrieval, explicit image generation, and workflows", async () => {
   await withLiveWorkbench(({ ProjectCapabilityMenu }) => {
     const html = renderToStaticMarkup(React.createElement(
@@ -635,6 +708,9 @@ test("current-message capability menu exposes retrieval, explicit image generati
     assert.match(html, /本轮能力/);
     assert.match(html, /联网搜索/);
     assert.match(html, /生成图片/);
+    assert.match(html, /GitHub 只读/);
+    assert.match(html, /Vercel 只读/);
+    assert.doesNotMatch(html, /Canva|可画|Figma|Sketch|Zotero|Obsidian/);
     assert.match(html, /ChatGPT 订阅已连接/);
     assert.match(html, /aria-pressed="true"/);
     assert.match(html, /Context7 尚未配置/);
@@ -691,8 +767,7 @@ test("message payload controls stay frozen until image serialization and HTTP fi
       uploadingAttachments: [],
       onRemoveAttachment: () => {},
       onDropFiles: () => {},
-      imageInputRef: { current: null },
-      onSelectImage: () => {},
+      localFileInputRef: { current: null },
       supportsImages: true,
       onSubmit: () => {},
       onAbort: () => {},
@@ -702,9 +777,7 @@ test("message payload controls stay frozen until image serialization and HTTP fi
       modelLabel: "vision-model",
       thinkingLevelControl: null,
       contextUsageControl: null,
-      pdfInputRef: { current: null },
       uploadingPdf: null,
-      onUploadPdf: () => {},
       onRetryDocument: () => {},
       retryingDocumentId: null,
     }));
@@ -733,12 +806,13 @@ test("message payload controls stay frozen until image serialization and HTTP fi
     assert.match(html, /AI 按需读取 · 不预载全文/);
     assert.match(
       html,
-      /project-composer-attachment" type="button" disabled="" title="为当前消息添加一张/,
+      /project-composer-attachment" type="button" disabled="" title="从电脑选择资料；未知后缀会按实际内容检查/,
     );
     assert.match(
       html,
-      /type="file" accept="image\/png,image\/jpeg,image\/webp" disabled=""/,
+      /type="file" multiple="" disabled="" aria-label="选择要添加的本地资料"/,
     );
+    assert.doesNotMatch(html, /accept=/);
   });
 });
 
@@ -804,8 +878,7 @@ test("durable ask-user renders text and choice questions without becoming write 
       onRemoveWorkflow: () => {},
       pendingImage: null,
       onRemoveImage: () => {},
-      imageInputRef: { current: null },
-      onSelectImage: () => {},
+      localFileInputRef: { current: null },
       supportsImages: false,
       onSubmit: () => {},
       onAbort: () => {},
@@ -817,9 +890,7 @@ test("durable ask-user renders text and choice questions without becoming write 
       modelLabel: "deepseek-v4-flash",
       thinkingLevelControl: null,
       contextUsageControl: null,
-      pdfInputRef: { current: null },
       uploadingPdf: null,
-      onUploadPdf: () => {},
       onRetryDocument: () => {},
       retryingDocumentId: null,
     }));
@@ -911,8 +982,7 @@ test("running composer keeps steer separate from the durable follow-up queue", a
       onRemoveWorkflow: () => {},
       pendingImage: null,
       onRemoveImage: () => {},
-      imageInputRef: { current: null },
-      onSelectImage: () => {},
+      localFileInputRef: { current: null },
       supportsImages: false,
       onSubmit: () => {},
       onAbort: () => {},
@@ -926,9 +996,7 @@ test("running composer keeps steer separate from the durable follow-up queue", a
       modelLabel: "deepseek-v4-flash",
       thinkingLevelControl: null,
       contextUsageControl: null,
-      pdfInputRef: { current: null },
       uploadingPdf: null,
-      onUploadPdf: () => {},
       onRetryDocument: () => {},
       retryingDocumentId: null,
     }));
@@ -1100,6 +1168,63 @@ test("completed Image2 output renders in the conversation with subscription usag
     assert.match(html, /在文件中查看/);
     assert.doesNotMatch(html, /Users\/|generated_images/);
   });
+});
+
+test("completed Word and Excel outputs stay in Files with verified previews and downloads", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const revision = `sha256:${"c".repeat(64)}`;
+    const html = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      {
+        project,
+        conversation: conversation({
+          activeArtifactId: "files",
+          generatedOfficeArtifacts: [{
+            id: "office-word-1",
+            turnId: "turn-office-1",
+            kind: "word",
+            status: "completed",
+            title: "项目报告",
+            summary: "包含结论和下一步。",
+            fileName: "项目报告.docx",
+            mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            byteLength: 4096,
+            revision,
+            previewText: "title=项目报告\nheading=结论\n项目保持稳定。",
+            structureVerified: true,
+            renderVerified: true,
+            pageCount: 2,
+          }, {
+            id: "office-excel-1",
+            turnId: "turn-office-1",
+            kind: "excel",
+            status: "completed",
+            title: "项目数据",
+            summary: "包含一张汇总表。",
+            fileName: "项目数据.xlsx",
+            mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            byteLength: 8192,
+            revision: `sha256:${"d".repeat(64)}`,
+            previewText: "sheet=汇总\nA1=项目\nB1=数量",
+            structureVerified: true,
+            renderVerified: true,
+            sheetCount: 1,
+          }],
+        }),
+      },
+    ));
+
+    assert.match(html, /会话生成/);
+    assert.match(html, /项目报告\.docx/);
+    assert.match(html, /2 页/);
+    assert.match(html, /项目数据\.xlsx/);
+    assert.match(html, /1 个工作表/);
+    assert.doesNotMatch(html, /Users\//);
+    assert.match(source, /generatedOfficeDownloadUrl/);
+    assert.match(source, /结构、渲染与哈希读回均通过/);
+    assert.match(source, /下载文件/);
+  }, { exposeArtifact: true });
 });
 
 test("normal-work keeps context usage beside the composer model and out of the header", async () => {
@@ -1456,7 +1581,7 @@ test("pending changes can be verified inside the isolated workspace before apply
   }, { exposeArtifact: true });
 });
 
-test("settled turns expose paged history, unread state, retry, and per-turn evidence", async () => {
+test("settled turns expose paged history, unread state, one path entry, and one visible attempt", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
       project,
@@ -1468,16 +1593,55 @@ test("settled turns expose paged history, unread state, retry, and per-turn evid
           latestAssistantMessageSeq: 10,
           unreadCount: 2,
         },
+        sessionPath: {
+          activeLeafCheckpointId: "checkpoint-5b",
+          checkpoints: [{
+            id: "checkpoint-5a",
+            turnId: "turn-5",
+            turnSeq: 5,
+            userMessageId: "message-user-5",
+            assistantMessageId: "message-assistant-5a",
+            attempt: 1,
+            providerId: "deepseek",
+            modelId: "deepseek-v4-flash",
+            status: "completed",
+            branchable: true,
+          }, {
+            id: "checkpoint-5b",
+            turnId: "turn-5",
+            turnSeq: 5,
+            userMessageId: "message-user-5",
+            assistantMessageId: "message-assistant-5b",
+            attempt: 2,
+            providerId: "openai-codex",
+            modelId: "gpt-5.3-codex",
+            status: "completed",
+            branchable: true,
+          }],
+        },
         messages: [{
           id: "message-user-5",
           role: "user",
           kind: "message",
           content: "检查失败后修复",
-          messageSeq: 9,
+          messageSeq: 8,
           turnId: "turn-5",
           turnSeq: 5,
         }, {
-          id: "message-assistant-5",
+          id: "message-assistant-5a",
+          role: "assistant",
+          kind: "message",
+          content: "这是较早的 DeepSeek 方案。",
+          messageSeq: 9,
+          turnId: "turn-5",
+          turnSeq: 5,
+          attempt: 1,
+          turnEvidence: {
+            providerId: "deepseek",
+            modelId: "deepseek-v4-flash",
+          },
+        }, {
+          id: "message-assistant-5b",
           role: "assistant",
           kind: "message",
           content: "已经修复并复测通过。",
@@ -1500,21 +1664,220 @@ test("settled turns expose paged history, unread state, retry, and per-turn evid
 
     assert.match(html, /加载更早记录/);
     assert.match(html, /2 条未读/);
-    assert.match(html, /重试上一轮/);
+    assert.match(html, />路径</);
+    assert.doesNotMatch(html, /重试上一轮/);
+    assert.doesNotMatch(html, /这是较早的 DeepSeek 方案/);
+    assert.match(html, /已经修复并复测通过/);
     assert.doesNotMatch(html, /class="project-agent-header"/);
     assert.ok(
       html.indexOf("透明模式") < html.indexOf('class="project-agent-stream"'),
       "transparent mode should live in the shared top bar",
     );
     assert.ok(
-      html.indexOf("重试上一轮") < html.indexOf('class="project-agent-stream"'),
-      "retry should live in the shared top bar",
+      html.indexOf(">路径<") < html.indexOf('class="project-agent-stream"'),
+      "the compact path entry should live in the shared top bar",
     );
     assert.match(html, /openai-codex · gpt-5\.3-codex/);
     assert.match(html, /1,536 tokens/);
     assert.match(html, /\$0\.0123/);
-    assert.match(html, /第 2 次回答/);
+    assert.match(html, /方案 2\/2/);
   });
+});
+
+test("checkpoint selection is a local projection and preserves an unloaded older turn fallback", async () => {
+  await withLiveWorkbench(({ projectSessionMessageView }) => {
+    const messages = [{
+      id: "user-1",
+      role: "user",
+      turnId: "turn-1",
+      turnSeq: 1,
+      content: "给出两种方案",
+    }, {
+      id: "assistant-1a",
+      role: "assistant",
+      turnId: "turn-1",
+      turnSeq: 1,
+      attempt: 1,
+      content: "DeepSeek 方案",
+    }, {
+      id: "assistant-1b",
+      role: "assistant",
+      turnId: "turn-1",
+      turnSeq: 1,
+      attempt: 2,
+      content: "GPT 方案",
+    }, {
+      id: "user-2",
+      role: "user",
+      turnId: "turn-2",
+      turnSeq: 2,
+      content: "继续",
+    }, {
+      id: "assistant-2-visible",
+      role: "assistant",
+      turnId: "turn-2",
+      turnSeq: 2,
+      attempt: 2,
+      content: "当前已加载回答",
+    }];
+    const sessionPath = {
+      activeLeafCheckpointId: "checkpoint-1b",
+      checkpoints: [{
+        id: "checkpoint-1a",
+        turnId: "turn-1",
+        turnSeq: 1,
+        assistantMessageId: "assistant-1a",
+        attempt: 1,
+      }, {
+        id: "checkpoint-1b",
+        turnId: "turn-1",
+        turnSeq: 1,
+        assistantMessageId: "assistant-1b",
+        attempt: 2,
+      }, {
+        id: "checkpoint-2-unloaded",
+        turnId: "turn-2",
+        turnSeq: 2,
+        assistantMessageId: "assistant-2-not-loaded",
+        attempt: 1,
+      }],
+    };
+
+    const olderAttempt = projectSessionMessageView(
+      messages,
+      sessionPath,
+      "checkpoint-1a",
+    );
+    assert.deepEqual(
+      olderAttempt.messages.filter((message) => message.role === "assistant")
+        .map((message) => message.id),
+      ["assistant-1a", "assistant-2-visible"],
+    );
+
+    const latestAttempt = projectSessionMessageView(messages, sessionPath, null);
+    assert.deepEqual(
+      latestAttempt.messages.filter((message) => message.role === "assistant")
+        .map((message) => message.id),
+      ["assistant-1b", "assistant-2-visible"],
+    );
+  });
+});
+
+test("activity follows the selected model attempt instead of stacking sibling tool traces", async () => {
+  await withLiveWorkbench(({ activityEventsForTurnAttempt }) => {
+    const turn = { id: "user-7", turnId: "turn-7", turnSeq: 7 };
+    const events = [{
+      seq: 1,
+      type: "message.created",
+      messageId: "user-7",
+      turnId: "turn-7",
+      turnSeq: 7,
+      attempt: 1,
+    }, {
+      seq: 2,
+      type: "turn.started",
+      turnId: "turn-7",
+      turnSeq: 7,
+      attempt: 1,
+    }, {
+      seq: 3,
+      type: "tool.completed",
+      turnId: "turn-7",
+      attempt: 1,
+      title: "DeepSeek 文件读取",
+    }, {
+      seq: 4,
+      type: "operation.started",
+      turnId: "turn-7",
+      turnSeq: 7,
+      attempt: 2,
+    }, {
+      seq: 5,
+      type: "turn.started",
+      turnId: "turn-7",
+      turnSeq: 7,
+      attempt: 2,
+    }, {
+      seq: 6,
+      type: "tool.completed",
+      turnId: "turn-7",
+      attempt: 2,
+      title: "GPT 文件读取",
+    }];
+
+    assert.deepEqual(
+      activityEventsForTurnAttempt(events, turn, 1).map((event) => event.seq),
+      [1, 2, 3],
+    );
+    assert.deepEqual(
+      activityEventsForTurnAttempt(events, turn, 2).map((event) => event.seq),
+      [4, 5, 6],
+    );
+  });
+});
+
+test("activity keeps every internal model turn in one logical attempt", async () => {
+  await withLiveWorkbench(({ activityEventsForTurnAttempt }) => {
+    const turn = { id: "user-9", turnId: "turn-9", turnSeq: 9 };
+    const events = [{
+      seq: 1,
+      type: "message.created",
+      data: { id: "user-9", turnId: "turn-9", turnSeq: 9, attempt: 1 },
+    }, {
+      seq: 2,
+      type: "turn.started",
+      data: { turnId: "turn-9", turnSeq: 9, attempt: 1 },
+    }, {
+      seq: 3,
+      type: "agent.progress",
+      data: { turnId: "turn-9", attempt: 1, summary: "先确认项目入口。" },
+    }, {
+      seq: 4,
+      type: "tool.completed",
+      data: { turnId: "turn-9", attempt: 1 },
+      toolName: "read",
+      toolCallId: "read-1",
+      status: "completed",
+    }, {
+      seq: 5,
+      type: "turn.started",
+      data: { turnId: "turn-9", turnSeq: 9, attempt: 1 },
+    }, {
+      seq: 6,
+      type: "agent.progress",
+      data: { turnId: "turn-9", attempt: 1, summary: "入口已确认，继续核对状态。" },
+    }, {
+      seq: 7,
+      type: "tool.completed",
+      data: { turnId: "turn-9", attempt: 1 },
+      toolName: "grep",
+      toolCallId: "grep-1",
+      status: "completed",
+    }, {
+      seq: 8,
+      type: "turn.completed",
+      data: { turnId: "turn-9", turnSeq: 9, attempt: 1 },
+    }];
+
+    assert.deepEqual(
+      activityEventsForTurnAttempt(events, turn, 1).map((event) => event.seq),
+      [1, 2, 3, 4, 5, 6, 7, 8],
+    );
+  });
+});
+
+test("path actions wire checkpoint retry, read-only planning branch, and isolated fork", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  const appSource = await readFile(APP_URL, "utf8");
+
+  assert.match(source, /api\.retryCheckpoint\(\{[\s\S]*?checkpointId/);
+  assert.match(source, /api\.forkCheckpoint\(\{[\s\S]*?checkpointId/);
+  assert.match(source, /checkpointId: branchTarget\?\.id/);
+  assert.match(source, /workflowId: branchTarget \? "planning" : selectedWorkflowId/);
+  assert.match(source, /onConversationForked\?\.\(forkedConversation\)/);
+  assert.doesNotMatch(source, /canRetryFromHeader|const retryLastTurn/);
+  assert.match(appSource, /activateForkedProjectConversation/);
+  assert.match(appSource, /onConversationForked=\{activateForkedProjectConversation\}/);
 });
 
 test("interrupted verification repair waits for an explicit resume action", async () => {
@@ -1565,7 +1928,7 @@ test("a ready change event links to changes instead of matching read inside read
   });
 });
 
-test("settled activity is coalesced and collapsed above the final answer", async () => {
+test("latest settled activity is coalesced and remains open above the final answer", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const events = [
       { seq: 1, type: "message.created", status: "accepted" },
@@ -1594,18 +1957,87 @@ test("settled activity is coalesced and collapsed above the final answer", async
       }),
     }));
 
-    assert.match(html, /aria-expanded="false"/);
-    assert.match(html, /class="project-activity-body" hidden=""/);
+    assert.match(html, /aria-expanded="true"/);
+    assert.match(html, /class="project-activity-body">/);
     assert.match(html, /已完成/);
-    assert.match(html, /2 项 · 查看过程/);
+    assert.match(html, /3 项 · 查看过程/);
     assert.match(html, /透明模式/);
     assert.doesNotMatch(html, /Harness 快照/);
     assert.match(html, /查看与检索了 1 次/);
-    assert.equal((html.match(/思考完成/g) ?? []).length, 1);
+    assert.equal((html.match(/思考完成/g) ?? []).length, 0);
     assert.doesNotMatch(html, /agent\.thinking|37 条记录/);
     assert.ok(
       html.indexOf('aria-label="Pi Agent 活动"') < html.indexOf("这是本轮最终答案。"),
       "completed activity should render before the final answer",
+    );
+  });
+});
+
+test("non-final assistant messages render once in the activity timeline", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const intermediate = "目录已确认，现在写入修复。";
+    const finalAnswer = "修复已经完成。";
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        messages: [
+          {
+            id: "message-user",
+            role: "user",
+            turnId: "turn-1",
+            turnSeq: 1,
+            content: "修复入口",
+          },
+          {
+            id: "message-progress",
+            role: "assistant",
+            turnId: "turn-1",
+            turnSeq: 1,
+            content: intermediate,
+            isFinal: false,
+          },
+          {
+            id: "message-final",
+            role: "assistant",
+            turnId: "turn-1",
+            turnSeq: 1,
+            content: finalAnswer,
+            isFinal: true,
+          },
+        ],
+        events: [
+          {
+            seq: 1,
+            type: "message.created",
+            data: { id: "message-user", turnId: "turn-1", turnSeq: 1 },
+          },
+          {
+            seq: 2,
+            type: "message.completed",
+            data: { text: intermediate, isFinal: false, turnId: "turn-1" },
+          },
+          {
+            seq: 3,
+            type: "tool.completed",
+            toolName: "write",
+            toolCallId: "write-1",
+            path: "src/app.js",
+            status: "completed",
+          },
+          {
+            seq: 4,
+            type: "message.completed",
+            data: { text: finalAnswer, isFinal: true, turnId: "turn-1" },
+          },
+        ],
+      }),
+    }));
+
+    assert.equal((html.match(new RegExp(intermediate, "g")) ?? []).length, 1);
+    assert.equal((html.match(new RegExp(finalAnswer, "g")) ?? []).length, 1);
+    assert.ok(
+      html.indexOf(intermediate) < html.indexOf(finalAnswer),
+      "intermediate narration should stay in the activity before the final answer",
     );
   });
 });
@@ -1683,7 +2115,7 @@ test("loaded historical turns restore their durable activity events", async () =
   });
 });
 
-test("every executed user turn keeps its own collapsed public activity", async () => {
+test("every executed turn keeps its activity while only history starts collapsed", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
       project,
@@ -1756,7 +2188,7 @@ test("every executed user turn keeps its own collapsed public activity", async (
     assert.equal((html.match(/aria-label="Pi Agent 活动"/g) ?? []).length, 2);
     assert.equal(
       (html.match(/class="project-activity-body" hidden=""/g) ?? []).length,
-      2,
+      1,
     );
     assert.match(html, /正在核对第一处/);
     assert.match(html, /正在核对第二处/);
@@ -1765,6 +2197,158 @@ test("every executed user turn keeps its own collapsed public activity", async (
     assert.ok(html.indexOf("继续检查第二处") < html.indexOf("正在核对第二处"));
     assert.ok(html.indexOf("正在核对第二处") < html.indexOf("第二处已经检查"));
   });
+});
+
+test("the active plan stays pinned while the latest settled plan remains visible", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const messages = [
+      {
+        id: "user-plan-1",
+        role: "user",
+        turnId: "turn-plan-1",
+        turnSeq: 1,
+        content: "先检查入口",
+      },
+      {
+        id: "assistant-plan-1",
+        role: "assistant",
+        turnId: "turn-plan-1",
+        turnSeq: 1,
+        content: "入口已经检查。",
+      },
+      {
+        id: "user-plan-2",
+        role: "user",
+        turnId: "turn-plan-2",
+        turnSeq: 2,
+        content: "继续检查状态流",
+      },
+    ];
+    const events = [
+      {
+        seq: 1,
+        type: "message.created",
+        data: { id: "user-plan-1", turnId: "turn-plan-1", turnSeq: 1 },
+      },
+      {
+        seq: 2,
+        type: "plan.updated",
+        data: {
+          steps: [{ id: "old-plan", text: "第一轮对应计划", status: "completed" }],
+        },
+      },
+      {
+        seq: 3,
+        type: "message.completed",
+        data: { turnId: "turn-plan-1" },
+      },
+      {
+        seq: 4,
+        type: "message.created",
+        data: { id: "user-plan-2", turnId: "turn-plan-2", turnSeq: 2 },
+      },
+      {
+        seq: 5,
+        type: "plan.updated",
+        data: {
+          steps: [{ id: "new-plan", text: "第二轮对应计划", status: "in_progress" }],
+        },
+      },
+      {
+        seq: 6,
+        type: "agent.progress",
+        data: { summary: "正在检查第二轮。" },
+      },
+    ];
+    const currentPlan = [{
+      id: "new-plan",
+      title: "第二轮对应计划",
+      status: "in_progress",
+    }];
+    const runningHtml = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      {
+        project,
+        conversation: conversation({
+          status: "running",
+          turnStatus: "running",
+          messages,
+          events,
+          plan: currentPlan,
+        }),
+      },
+    ));
+
+    assert.equal((runningHtml.match(/>第一轮对应计划<\/span>/g) ?? []).length, 1);
+    assert.equal((runningHtml.match(/>第二轮对应计划<\/span>/g) ?? []).length, 1);
+    assert.equal((runningHtml.match(/project-plan-card is-pinned/g) ?? []).length, 1);
+    assert.equal((runningHtml.match(/project-plan-card is-history/g) ?? []).length, 1);
+
+    const settledHtml = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      {
+        project,
+        conversation: conversation({
+          status: "completed",
+          turnStatus: "completed",
+          messages: [
+            ...messages,
+            {
+              id: "assistant-plan-2",
+              role: "assistant",
+              turnId: "turn-plan-2",
+              turnSeq: 2,
+              content: "状态流已经检查。",
+            },
+          ],
+          events: [
+            ...events,
+            {
+              seq: 7,
+              type: "message.completed",
+              data: { turnId: "turn-plan-2" },
+            },
+          ],
+          plan: currentPlan,
+        }),
+      },
+    ));
+
+    assert.equal((settledHtml.match(/project-plan-card is-history/g) ?? []).length, 1);
+    assert.doesNotMatch(settledHtml, /project-plan-card is-pinned/);
+    assert.equal((settledHtml.match(/>第一轮对应计划<\/span>/g) ?? []).length, 1);
+    assert.equal((settledHtml.match(/>第二轮对应计划<\/span>/g) ?? []).length, 1);
+
+    const noNewPlanHtml = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      {
+        project,
+        conversation: conversation({
+          status: "running",
+          turnStatus: "running",
+          messages,
+          events: events.filter((event) => event.seq !== 5),
+          plan: [{
+            id: "old-plan",
+            title: "第一轮对应计划",
+            status: "completed",
+          }],
+        }),
+      },
+    ));
+    assert.equal((noNewPlanHtml.match(/>第一轮对应计划<\/span>/g) ?? []).length, 1);
+    assert.doesNotMatch(noNewPlanHtml, /project-plan-card is-pinned/);
+    assert.match(runningHtml, /aria-label="进行中：第二轮对应计划"/);
+  });
+
+  const styles = await readFile(STYLES_URL, "utf8");
+  const pinnedStart = styles.indexOf(".project-plan-card.is-pinned {");
+  const pinnedEnd = styles.indexOf("}", pinnedStart);
+  assert.notEqual(pinnedStart, -1);
+  assert.match(styles.slice(pinnedStart, pinnedEnd), /position: sticky/);
+  assert.match(styles.slice(pinnedStart, pinnedEnd), /top: 0/);
+  assert.match(styles.slice(pinnedStart, pinnedEnd), /max-height:/);
+  assert.match(styles.slice(pinnedStart, pinnedEnd), /overflow-y: auto/);
 });
 
 test("the current executed turn expands while prior activity stays collapsed", async () => {
@@ -2026,8 +2610,8 @@ test("public progress narration stays separate while its tool lifecycle remains 
       [
         "agent.progress",
         "activity.research_summary",
-        "agent.progress",
         "agent.thinking",
+        "agent.progress",
       ],
     );
     assert.equal(
@@ -2035,6 +2619,465 @@ test("public progress narration stays separate while its tool lifecycle remains 
       2,
     );
     assert.doesNotMatch(JSON.stringify(normalized), /report_progress/);
+  });
+});
+
+test("non-final assistant narration is interleaved with tools as public progress", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "read-1",
+        path: "src/app.js",
+        status: "completed",
+      },
+      {
+        seq: 3,
+        type: "message.completed",
+        data: {
+          text: "已经确认入口，接下来写入修复。",
+          isFinal: false,
+        },
+      },
+      {
+        seq: 4,
+        type: "tool.completed",
+        toolName: "write",
+        toolCallId: "write-1",
+        path: "src/app.js",
+        status: "completed",
+      },
+      {
+        seq: 5,
+        type: "message.completed",
+        data: { text: "修复完成。", isFinal: true },
+      },
+    ], false);
+
+    assert.deepEqual(
+      normalized.map((event) => event.type),
+      ["activity.research_summary", "agent.progress", "tool.completed"],
+    );
+    assert.equal(normalized[1].data.summary, "已经确认入口，接下来写入修复。");
+    assert.deepEqual(
+      normalized.map((event) => event.firstSeq ?? event.seq),
+      [2, 3, 4],
+    );
+  });
+});
+
+test("public narration splits tool summaries into their real contiguous batches", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "agent.progress",
+        data: { summary: "先确认入口。" },
+      },
+      {
+        seq: 3,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "read-before",
+        status: "completed",
+      },
+      {
+        seq: 4,
+        type: "agent.progress",
+        data: { summary: "入口已经确认，现在检查状态流。" },
+      },
+      {
+        seq: 5,
+        type: "tool.completed",
+        toolName: "grep",
+        toolCallId: "grep-after",
+        status: "completed",
+      },
+    ], true);
+
+    assert.deepEqual(
+      normalized.map((event) => event.type),
+      [
+        "agent.progress",
+        "activity.research_summary",
+        "agent.progress",
+        "activity.research_summary",
+      ],
+    );
+    assert.deepEqual(
+      normalized.map((event) => event.firstSeq),
+      [2, 3, 4, 5],
+    );
+    assert.deepEqual(
+      normalized.filter((event) => event.type === "activity.research_summary")
+        .map((event) => event.counts.project),
+      [1, 1],
+    );
+  });
+});
+
+test("the safe thinking lifecycle keeps its first chronological position", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      { seq: 2, type: "agent.thinking", status: "started" },
+      {
+        seq: 3,
+        type: "agent.progress",
+        data: { summary: "先确认入口。" },
+      },
+      {
+        seq: 4,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "read-after-thinking",
+        status: "completed",
+      },
+      {
+        seq: 5,
+        type: "agent.progress",
+        data: { summary: "再检查状态流。" },
+      },
+      {
+        seq: 6,
+        type: "tool.completed",
+        toolName: "grep",
+        toolCallId: "grep-after-thinking",
+        status: "completed",
+      },
+      { seq: 7, type: "agent.thinking", status: "finished" },
+    ], false);
+
+    assert.deepEqual(
+      normalized.map((event) => event.type),
+      [
+        "agent.thinking",
+        "agent.progress",
+        "activity.research_summary",
+        "agent.progress",
+        "activity.research_summary",
+      ],
+    );
+    assert.deepEqual(
+      normalized.map((event) => event.firstSeq),
+      [2, 3, 4, 5, 6],
+    );
+  });
+});
+
+test("reasoning cycles stay interleaved with their real tool batches", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      { seq: 2, type: "turn.started", providerId: "deepseek" },
+      { seq: 3, type: "agent.thinking", status: "active" },
+      { seq: 4, type: "agent.thinking", status: "finished" },
+      {
+        seq: 5,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "read-first",
+        status: "completed",
+      },
+      { seq: 6, type: "turn.completed", providerId: "deepseek" },
+      { seq: 7, type: "turn.started", providerId: "deepseek" },
+      { seq: 8, type: "agent.thinking", status: "active" },
+      { seq: 9, type: "agent.thinking", status: "finished" },
+      {
+        seq: 10,
+        type: "tool.completed",
+        toolName: "edit",
+        toolCallId: "edit-after-read",
+        status: "completed",
+      },
+      { seq: 11, type: "turn.completed", providerId: "deepseek" },
+      { seq: 12, type: "turn.started", providerId: "deepseek" },
+      { seq: 13, type: "agent.thinking", status: "active" },
+      { seq: 14, type: "agent.thinking", status: "finished" },
+      {
+        seq: 15,
+        type: "message.completed",
+        data: { text: "处理完成。", isFinal: true },
+      },
+      { seq: 16, type: "turn.completed", providerId: "deepseek" },
+    ], false);
+
+    assert.deepEqual(
+      normalized.map((event) => event.type),
+      [
+        "agent.thinking",
+        "activity.research_summary",
+        "agent.thinking",
+        "tool.completed",
+        "agent.thinking",
+      ],
+    );
+    assert.deepEqual(
+      normalized
+        .filter((event) => event.type === "agent.thinking")
+        .map((event) => event.firstSeq),
+      [3, 8, 13],
+    );
+    assert.match(normalized[2].detail, /刚完成的文件与资料检查/);
+    assert.match(normalized[4].detail, /工具结果/);
+  });
+});
+
+test("providers without native reasoning receive deterministic safe phases", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const makeEvents = (providerId) => [
+      { seq: 1, type: "message.created", status: "accepted" },
+      { seq: 2, type: "turn.started", providerId },
+      {
+        seq: 3,
+        type: "message.completed",
+        data: { text: "", isFinal: false },
+      },
+      {
+        seq: 4,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "read-provider-neutral",
+        status: "completed",
+      },
+      { seq: 5, type: "turn.completed", providerId },
+      { seq: 6, type: "turn.started", providerId },
+      {
+        seq: 7,
+        type: "message.completed",
+        data: { text: "检查完成。", isFinal: true },
+      },
+      { seq: 8, type: "turn.completed", providerId },
+    ];
+    const presentations = ["openai-codex", "deepseek", "provider-x"].map(
+      (providerId) => normalizeActivityEvents(makeEvents(providerId), false)
+        .map((event) => ({
+          type: event.type,
+          title: event.title ?? null,
+          detail: event.detail ?? null,
+          status: event.status,
+        })),
+    );
+
+    assert.deepEqual(presentations[1], presentations[0]);
+    assert.deepEqual(presentations[2], presentations[0]);
+    assert.deepEqual(
+      presentations[0].map((event) => event.type),
+      ["activity.phase", "activity.research_summary", "activity.phase"],
+    );
+    assert.equal(presentations[0][0].title, "已完成这一步分析");
+    assert.equal(presentations[0][2].title, "已结合刚查看的资料");
+  });
+});
+
+test("activity timeline adds bounded provider-neutral narration around real tools", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+      events: [
+        { seq: 1, type: "message.created", status: "accepted" },
+        { seq: 2, type: "turn.started", providerId: "deepseek" },
+        { seq: 3, type: "agent.thinking", status: "active" },
+        { seq: 4, type: "agent.thinking", status: "finished" },
+        {
+          seq: 5,
+          type: "tool.completed",
+          toolName: "read",
+          toolCallId: "read-1",
+          status: "completed",
+        },
+        { seq: 6, type: "turn.completed", providerId: "deepseek" },
+        { seq: 7, type: "turn.started", providerId: "deepseek" },
+        {
+          seq: 8,
+          type: "tool.completed",
+          toolName: "grep",
+          toolCallId: "grep-1",
+          status: "completed",
+        },
+        { seq: 9, type: "turn.completed", providerId: "deepseek" },
+      ],
+      running: false,
+      compact: false,
+      onOpenArtifact: () => {},
+    }));
+
+    assert.match(html, /我先确认任务范围，再按需查看相关资料/);
+    assert.match(html, /关键资料已经核对，正在整理结论与适用边界/);
+    assert.match(html, /查看与检索了 2 次/);
+    assert.doesNotMatch(html, /思考完成/);
+    assert.equal((html.match(/<article class="project-activity-progress/g) ?? []).length, 2);
+  });
+});
+
+test("provider-neutral narration never announces completion while a turn is running", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+      events: [
+        { seq: 1, type: "message.created", status: "accepted" },
+        { seq: 2, type: "turn.started", providerId: "deepseek" },
+        {
+          seq: 3,
+          type: "tool.completed",
+          toolName: "read",
+          toolCallId: "read-running",
+          status: "completed",
+        },
+      ],
+      running: true,
+      compact: false,
+      onOpenArtifact: () => {},
+    }));
+
+    assert.match(html, /我先确认任务范围，再按需查看相关资料/);
+    assert.doesNotMatch(html, /已经完成|已经核对|最终结果/);
+    assert.equal(
+      (html.match(/<article class="project-activity-progress/g) ?? []).length,
+      1,
+    );
+  });
+});
+
+test("a completed model turn still presents an overall failed turn as incomplete", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      { seq: 2, type: "turn.started", providerId: "provider-x" },
+      {
+        seq: 3,
+        type: "message.completed",
+        status: "failed",
+        data: { text: "", isFinal: true },
+      },
+      { seq: 4, type: "turn.completed", providerId: "provider-x" },
+      { seq: 5, type: "agent.status", status: "failed" },
+    ], false);
+
+    assert.equal(normalized.length, 1);
+    assert.equal(normalized[0].type, "activity.phase");
+    assert.equal(normalized[0].status, "incomplete");
+    assert.equal(normalized[0].title, "分析未完成");
+    assert.doesNotMatch(normalized[0].title, /已完成/);
+  });
+});
+
+test("a native reasoning event keeps the provisional phase identity", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const prefix = [
+      { seq: 1, type: "message.created", status: "accepted" },
+      { seq: 2, type: "turn.started", providerId: "provider-x" },
+    ];
+    const provisional = normalizeActivityEvents(prefix, true);
+    const native = normalizeActivityEvents([
+      ...prefix,
+      { seq: 3, type: "agent.thinking", status: "active" },
+    ], true);
+
+    assert.equal(provisional.length, 1);
+    assert.equal(native.length, 1);
+    assert.equal(provisional[0].type, "activity.phase");
+    assert.equal(native[0].type, "agent.thinking");
+    assert.equal(native[0].activityKey, provisional[0].activityKey);
+  });
+});
+
+test("long activity histories retain early failures instead of silently truncating", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "early-failure",
+        status: "failed",
+      },
+      ...Array.from({ length: 105 }, (_, index) => ({
+        seq: index + 3,
+        type: "agent.progress",
+        data: { summary: `公开进展 ${index + 1}` },
+      })),
+      { seq: 108, type: "error", status: "failed" },
+    ], false);
+
+    assert.equal(normalized.length, 107);
+    assert.equal(normalized[0].toolCallId, "early-failure");
+    assert.equal(normalized[0].status, "failed");
+    assert.equal(normalized.at(-1).type, "error");
+  });
+});
+
+test("tool batches retain lifecycle anchors and stop at failures or approval decisions", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "tool.started",
+        toolName: "read",
+        toolCallId: "read-lifecycle",
+      },
+      {
+        seq: 3,
+        type: "tool.progress",
+        toolName: "read",
+        toolCallId: "read-lifecycle",
+      },
+      {
+        seq: 4,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "read-lifecycle",
+        status: "completed",
+      },
+      {
+        seq: 5,
+        type: "auto_review.decision",
+        decision: "allow",
+      },
+      {
+        seq: 6,
+        type: "tool.completed",
+        toolName: "grep",
+        toolCallId: "grep-after-review",
+        status: "completed",
+      },
+      {
+        seq: 7,
+        type: "tool.completed",
+        toolName: "read",
+        toolCallId: "read-failed",
+        status: "failed",
+      },
+      {
+        seq: 8,
+        type: "tool.completed",
+        toolName: "find",
+        toolCallId: "find-after-failure",
+        status: "completed",
+      },
+    ], false);
+
+    assert.deepEqual(
+      normalized.map((event) => event.type),
+      [
+        "activity.research_summary",
+        "auto_review.decision",
+        "activity.research_summary",
+        "tool.completed",
+        "activity.research_summary",
+      ],
+    );
+    assert.equal(normalized[0].firstSeq, 2);
+    assert.equal(normalized[0].lastSeq, 4);
+    assert.equal(normalized[0].seq, 2);
+    assert.equal(normalized[1].firstSeq, 5);
+    assert.equal(normalized[2].firstSeq, 6);
+    assert.equal(normalized[3].toolCallId, "read-failed");
+    assert.equal(normalized[4].firstSeq, 8);
   });
 });
 
@@ -2204,8 +3247,8 @@ test("public progress narration uses comfortable desktop working text", async ()
 
   assert.notEqual(progressStart, -1);
   assert.notEqual(latestStart, -1);
-  assert.match(styles.slice(progressStart, progressEnd), /font-size: 13px/);
-  assert.match(styles.slice(latestStart, latestEnd), /font-size: 13\.5px/);
+  assert.match(styles.slice(progressStart, progressEnd), /font-size: 14px/);
+  assert.match(styles.slice(latestStart, latestEnd), /font-size: 14\.5px/);
 });
 
 test("activity normalization collapses tool lifecycles into counted public summaries", async () => {
@@ -2278,18 +3321,18 @@ test("activity normalization collapses tool lifecycles into counted public summa
     ], false);
 
     assert.equal(normalized.length, 3);
-    assert.equal(normalized[0].type, "activity.research_summary");
-    assert.equal(normalized[0].title, "查看与检索了 3 次");
-    assert.equal(normalized[0].detail, "项目资料 2 次 · 会话资料 1 次");
-    assert.deepEqual(normalized[0].counts, {
+    assert.equal(normalized[0].type, "agent.thinking");
+    assert.equal(normalized[0].status, "finished");
+    assert.equal(normalized[1].type, "activity.research_summary");
+    assert.equal(normalized[1].title, "查看与检索了 3 次");
+    assert.equal(normalized[1].detail, "项目资料 2 次 · 会话资料 1 次");
+    assert.deepEqual(normalized[1].counts, {
       project: 2,
       document: 1,
       retrieval: 0,
     });
-    assert.equal(normalized[1].toolCallId, "read-failed");
-    assert.equal(normalized[1].status, "failed");
-    assert.equal(normalized[2].type, "agent.thinking");
-    assert.equal(normalized[2].status, "finished");
+    assert.equal(normalized[2].toolCallId, "read-failed");
+    assert.equal(normalized[2].status, "failed");
   });
 });
 
@@ -2299,9 +3342,10 @@ test("activity normalization hides bookkeeping events without dropping public wo
       { seq: 1, type: "message.created", status: "accepted" },
       { seq: 2, type: "workspace.recorded", status: "completed" },
       { seq: 3, type: "conversation.read", status: "completed" },
-      { seq: 4, type: "agent.thinking", status: "active" },
+      { seq: 4, type: "apply_journal.prepared", status: "prepared" },
+      { seq: 5, type: "agent.thinking", status: "active" },
       {
-        seq: 5,
+        seq: 6,
         type: "tool.completed",
         toolName: "edit",
         toolCallId: "edit-1",
@@ -2309,21 +3353,21 @@ test("activity normalization hides bookkeeping events without dropping public wo
         status: "completed",
       },
       {
-        seq: 6,
+        seq: 7,
         type: "change_set.ready",
         status: "ready",
         data: { stats: { files: 1 } },
       },
-      { seq: 7, type: "agent.thinking", status: "finished" },
+      { seq: 8, type: "agent.thinking", status: "finished" },
     ], false);
 
     assert.deepEqual(
       normalized.map((event) => event.type),
-      ["tool.completed", "change_set.ready", "agent.thinking"],
+      ["agent.thinking", "tool.completed", "change_set.ready"],
     );
     assert.doesNotMatch(
       JSON.stringify(normalized),
-      /workspace\.recorded|conversation\.read/,
+      /workspace\.recorded|conversation\.read|apply_journal\.prepared/,
     );
   });
 });
@@ -2716,7 +3760,10 @@ test("adding file context only updates removable composer context until submit",
   assert.match(submitImplementation, /contexts: contextChips/);
   assert.match(submitImplementation, /images: pendingImage/);
   assert.match(submitImplementation, /capabilities: selectedCapabilityIds/);
-  assert.match(submitImplementation, /workflowId: selectedWorkflowId/);
+  assert.match(
+    submitImplementation,
+    /workflowId: branchTarget \? "planning" : selectedWorkflowId/,
+  );
   assert.match(submitImplementation, /const submittedDraft = draft/);
   assert.match(
     submitImplementation,
@@ -2739,6 +3786,14 @@ test("workspace status explains isolation and recovery without exposing runtime 
     assert.match(readyHtml, /修改在隔离副本中准备/);
     assert.match(readyHtml, /真实项目只会在你确认更改后更新/);
 
+    const forkHtml = renderToStaticMarkup(React.createElement(ProjectWorkspaceStatus, {
+      workspace: { status: "ready" },
+      fork: { status: "ready" },
+    }));
+    assert.match(forkHtml, /分支对话已隔离/);
+    assert.match(forkHtml, /继承检查点上下文/);
+    assert.match(forkHtml, /项目文件按当前状态重新读取/);
+
     const recoveringHtml = renderToStaticMarkup(React.createElement(ProjectWorkspaceStatus, {
       workspace: { status: "recovering" },
     }));
@@ -2751,7 +3806,7 @@ test("workspace status explains isolation and recovery without exposing runtime 
     assert.match(blockedHtml, /上次文件操作需要检查/);
     assert.match(blockedHtml, /role="alert"/);
 
-    const combinedHtml = `${readyHtml}${recoveringHtml}${blockedHtml}`;
+    const combinedHtml = `${readyHtml}${forkHtml}${recoveringHtml}${blockedHtml}`;
     assert.doesNotMatch(
       combinedHtml,
       /sparse_overlay|review_overlay|apply_journal_v1|\/Users\//,

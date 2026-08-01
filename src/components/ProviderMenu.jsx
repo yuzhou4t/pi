@@ -60,6 +60,7 @@ export function ProviderMenu({
   model,
   onProviderChange,
   onModelChange,
+  selectionDisabled = false,
   thinkingLevels = null,
   thinkingLevel = null,
   supportsThinking = false,
@@ -68,6 +69,7 @@ export function ProviderMenu({
   onThinkingLevelChange,
 }) {
   const activeProvider = providers.find((item) => item.id === providerId) ?? providers[0];
+  const ActiveProviderIcon = providerIcons[activeProvider.id] ?? Cloud;
   const levels = Array.isArray(thinkingLevels)
     ? thinkingLevels.filter((level) => typeof level === "string" && level)
     : null;
@@ -103,7 +105,7 @@ export function ProviderMenu({
         aria-haspopup="dialog"
         onClick={() => onOpenChange(!open)}
       >
-        <Sparkle size={13} weight="fill" aria-hidden="true" />
+        <ActiveProviderIcon size={13} weight="fill" aria-hidden="true" />
         <span>{triggerLabel}</span>
         <CaretDown size={11} weight="bold" aria-hidden="true" />
       </button>
@@ -127,7 +129,7 @@ export function ProviderMenu({
                   className={`provider-option${selected ? " is-selected" : ""}`}
                   type="button"
                   key={item.id}
-                  disabled={!item.available}
+                  disabled={!item.available || selectionDisabled}
                   title={item.available ? undefined : status}
                   onClick={() => onProviderChange(item.id)}
                 >
@@ -149,7 +151,11 @@ export function ProviderMenu({
             <select
               id="model-select"
               value={model}
-              disabled={!activeProvider.available || activeProvider.models.length === 0}
+              disabled={
+                selectionDisabled
+                || !activeProvider.available
+                || activeProvider.models.length === 0
+              }
               onChange={(event) => onModelChange(event.target.value)}
             >
               {activeProvider.models.map((item) => (
@@ -167,7 +173,7 @@ export function ProviderMenu({
               <span>思考强度</span>
               <select
                 id="provider-thinking-select"
-                aria-label="GPT 订阅思考强度"
+                aria-label="思考强度"
                 value={activeThinkingLevel}
                 disabled={thinkingControlDisabled}
                 onChange={(event) => onThinkingLevelChange?.(event.target.value)}

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowClockwise,
   ArrowSquareOut,
+  BookOpenText,
   CaretDown,
   CaretRight,
   ChartBar,
@@ -9,22 +10,28 @@ import {
   Command,
   Cpu,
   Database,
+  EnvelopeSimple,
+  FileText,
   FolderSimple,
   GearSix,
   Info,
   Key,
   Package,
   Palette,
+  PlugsConnected,
   ShieldCheck,
   SpinnerGap,
   Trash,
   X,
 } from "@phosphor-icons/react";
 import { projectWorkApi } from "../api/projectWork.js";
+import { workerApi } from "../api/worker.js";
+import { LarkNotificationSettings } from "./ProjectLoopNotifications.jsx";
 
 const sections = [
   { id: "general", label: "常规", icon: GearSix },
   { id: "providers", label: "模型服务商", icon: Cpu },
+  { id: "connections", label: "互联", icon: PlugsConnected },
   { id: "usage", label: "模型用量", icon: ChartBar },
   { id: "skills", label: "技能中心", icon: Package },
   { id: "appearance", label: "外观", icon: Palette },
@@ -63,7 +70,8 @@ export function SettingsQuickPanel({ providerName, model, onOpenFull, onOpenSkil
 
         <div className="quick-setting-list">
           <QuickSetting icon={Cpu} label="模型与服务商" detail={`${providerName} · ${model}`} onClick={() => onOpenFull("providers")} />
-          <QuickSetting icon={ChartBar} label="模型用量" detail="正常工作 + 论文精读" onClick={() => onOpenFull("usage")} />
+          <QuickSetting icon={ChartBar} label="模型用量" detail="正常工作 + Worker + 论文精读" onClick={() => onOpenFull("usage")} />
+          <QuickSetting icon={PlugsConnected} label="互联" detail="Worker 连接与飞书提醒" onClick={() => onOpenFull("connections")} />
           <QuickSetting icon={Package} label="技能中心" onClick={onOpenSkills ?? (() => onOpenFull("skills"))} />
           <QuickSetting icon={Palette} label="外观" detail="浅色 · 紧凑界面" onClick={() => onOpenFull("appearance")} />
           <QuickSetting icon={FolderSimple} label="项目与本地数据" detail="仅保存在本机" onClick={() => onOpenFull("data")} />
@@ -777,6 +785,162 @@ function ProviderSettingsContent({
   );
 }
 
+const workerConnectionDefinitions = Object.freeze([
+  Object.freeze({
+    id: "lark_doc",
+    name: "飞书文档 Worker",
+    description: "飞书工作身份，用于文档读取和确认后的精确交付",
+    icon: FileText,
+  }),
+  Object.freeze({
+    id: "agent_mail",
+    name: "Agent 邮箱 Worker",
+    description: "Agent 邮箱身份，用于邮件读取和确认后的发送",
+    icon: EnvelopeSimple,
+  }),
+  Object.freeze({
+    id: "ima_note",
+    name: "IMA 笔记 Worker",
+    description: "IMA 工作身份，用于笔记与笔记本的只读资料导入",
+    icon: BookOpenText,
+  }),
+]);
+
+const connectionStatusLabels = Object.freeze({
+  unchecked: "尚未检查",
+  checking: "正在检查",
+  connected: "连接正常",
+  degraded: "连接受限",
+  disconnected: "尚未连接",
+  unavailable: "连接不可用",
+});
+
+export function connectionStatusLabel(status) {
+  return connectionStatusLabels[status] ?? "状态未知";
+}
+
+export function ConnectionSettingsContent({ connectionClient = workerApi }) {
+  const [state, setState] = useState({
+    status: "loading",
+    connections: {},
+    error: null,
+  });
+
+  useEffect(() => {
+    const controller = new AbortController();
+    connectionClient.listConnections({ signal: controller.signal }).then((connections) => {
+      if (controller.signal.aborted) return;
+      setState({
+        status: "ready",
+        connections: Object.fromEntries(
+          connections.map((connection) => [connection.workerId, connection]),
+        ),
+        error: null,
+      });
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      setState({ status: "error", connections: {}, error: error.message });
+    });
+    return () => controller.abort();
+  }, [connectionClient]);
+
+  const checkConnection = async (workerId) => {
+    setState((current) => ({
+      ...current,
+      connections: {
+        ...current.connections,
+        [workerId]: {
+          ...current.connections[workerId],
+          workerId,
+          status: "checking",
+        },
+      },
+      error: null,
+    }));
+    try {
+      const connection = await connectionClient.checkConnection(workerId);
+      setState((current) => ({
+        ...current,
+        status: "ready",
+        connections: {
+          ...current.connections,
+          [workerId]: connection,
+        },
+      }));
+    } catch (error) {
+      setState((current) => ({
+        ...current,
+        status: "error",
+        error: error.message,
+        connections: {
+          ...current.connections,
+          [workerId]: {
+            ...current.connections[workerId],
+            workerId,
+            status: "unavailable",
+            verified: false,
+          },
+        },
+      }));
+    }
+  };
+
+  return (
+    <>
+      <div className="settings-section-heading">
+        <span className="eyebrow">连接控制台</span>
+        <h2>互联</h2>
+        <p>查看 Worker 工作身份与飞书提醒订阅。凭据由对应 CLI 或本机服务保管，不会返回到浏览器。</p>
+      </div>
+
+      <div className="connections-settings-grid">
+        {workerConnectionDefinitions.map(({ id, name, description, icon: Icon }) => {
+          const connection = state.connections[id] ?? {
+            status: "unchecked",
+            verified: false,
+            identity: null,
+          };
+          const checking = connection.status === "checking";
+          return (
+            <article className="connection-settings-card" key={id}>
+              <span className="notification-channel-icon">
+                <Icon size={17} aria-hidden="true" />
+              </span>
+              <div>
+                <strong>{name}</strong>
+                <span className={`is-${connection.status}`}>
+                  {connection.identity
+                    ? `${connection.identity} · ${connectionStatusLabel(connection.status)}`
+                    : connectionStatusLabel(connection.status)}
+                </span>
+                <small>{description}</small>
+              </div>
+              <button
+                type="button"
+                disabled={checking}
+                onClick={() => void checkConnection(id)}
+              >
+                {checking ? <SpinnerGap className="spin" size={14} aria-hidden="true" /> : <ArrowClockwise size={14} aria-hidden="true" />}
+                {checking ? "检查中" : "检查连接"}
+              </button>
+            </article>
+          );
+        })}
+      </div>
+      <p className="connections-settings-note">
+        <Info size={15} aria-hidden="true" />
+        连接检查状态仅在本次 Pi Agent 运行期间保留。只有点击“检查连接”才会运行对应的本机 CLI 健康检查，不会发送邮件、修改文档或投递消息。
+      </p>
+      {state.error ? (
+        <div className="notification-inline-error" role="alert">{state.error}</div>
+      ) : null}
+
+      <h3 className="settings-connection-subheading">正常工作提醒</h3>
+      <LarkNotificationSettings />
+    </>
+  );
+}
+
 function SettingsContent({
   section,
   providerName,
@@ -795,6 +959,10 @@ function SettingsContent({
         onConnectionsChanged={onConnectionsChanged}
       />
     );
+  }
+
+  if (section === "connections") {
+    return <ConnectionSettingsContent />;
   }
 
   if (section === "appearance") {

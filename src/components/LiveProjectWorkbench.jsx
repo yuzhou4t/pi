@@ -15,15 +15,21 @@ import {
   Check,
   CheckCircle,
   CircleNotch,
+  Cloud,
   Code,
+  DownloadSimple,
   ArrowClockwise,
   Brain,
   FileCode,
+  FileDoc,
   FilePdf,
+  FileXls,
   Files,
   Folder,
   Gauge,
+  GitBranch,
   GitDiff,
+  GithubLogo,
   GlobeSimple,
   ImageSquare,
   MagnifyingGlass,
@@ -71,6 +77,7 @@ import {
   ProviderMenu,
   THINKING_LEVEL_LABELS,
 } from "./ProviderMenu.jsx";
+import { ProjectSessionPathMenu } from "./ProjectSessionPathMenu.jsx";
 import { handleProjectComposerKeyDown } from "./projectComposerKeyboard.js";
 
 export { handleProjectComposerKeyDown } from "./projectComposerKeyboard.js";
@@ -150,6 +157,7 @@ const AUTO_REVIEW_REASON_LABELS = {
   change_set_file_limit: "修改文件数量超出自动审批范围",
   change_set_line_limit: "修改行数超出自动审批范围",
   change_set_unsafe_file: "修改包含不允许自动处理的文件",
+  model_turn_failed: "模型未完成本轮工作，失败前的修改已隔离且不可应用",
   change_set_not_auto_applied: "修改未通过自动审批，后续验证没有运行",
   safe_hash_bound_change_set: "修改已通过范围与哈希校验",
   verification_not_current_turn: "验证命令不属于当前任务",
@@ -176,6 +184,10 @@ const TOOL_LABELS = {
   list_attachments: "查看普通附件",
   search_attachments: "搜索普通附件",
   read_attachment: "读取普通附件",
+  list_office_artifacts: "查看生成的 Office 文件",
+  read_office_artifact: "读取 Office 结构预览",
+  write_word_document: "生成 Word 文档",
+  write_excel_workbook: "生成 Excel 工作簿",
   search_web: "搜索网页",
   resolve_library_id: "查找技术文档库",
   query_docs: "查询技术文档",
@@ -205,6 +217,8 @@ const RESEARCH_TOOL_GROUPS = {
   list_attachments: "document",
   search_attachments: "document",
   read_attachment: "document",
+  list_office_artifacts: "document",
+  read_office_artifact: "document",
   search_web: "retrieval",
   resolve_library_id: "retrieval",
   query_docs: "retrieval",
@@ -250,6 +264,7 @@ const QUIET_EVENT_TYPES = new Set([
   "harness.snapshot",
   "plan.updated",
   "workspace.recorded",
+  "apply_journal.prepared",
   "document.created",
   "document.uploaded",
   "document.parsing_started",
@@ -380,7 +395,7 @@ function statusClass(conversation) {
   return "ready";
 }
 
-function workspaceStatusCopy(workspace, standalone) {
+function workspaceStatusCopy(workspace, standalone, fork) {
   if (workspace?.status === "recovering") {
     return {
       tone: "recovering",
@@ -395,6 +410,13 @@ function workspaceStatusCopy(workspace, standalone) {
       detail: "请打开“更改”查看文件应用记录；系统不会自行继续写入。",
     };
   }
+  if (fork?.status === "ready") {
+    return {
+      tone: "ready",
+      title: "分支对话已隔离",
+      detail: "继承检查点上下文；项目文件按当前状态重新读取。",
+    };
+  }
   return {
     tone: "ready",
     title: standalone ? "私有草稿已隔离" : "修改在隔离副本中准备",
@@ -404,9 +426,13 @@ function workspaceStatusCopy(workspace, standalone) {
   };
 }
 
-export function ProjectWorkspaceStatus({ workspace, standalone = false }) {
+export function ProjectWorkspaceStatus({
+  workspace,
+  standalone = false,
+  fork = null,
+}) {
   if (!workspace) return null;
-  const copy = workspaceStatusCopy(workspace, standalone);
+  const copy = workspaceStatusCopy(workspace, standalone, fork);
   return (
     <section
       className={`project-workspace-status is-${copy.tone}`}
@@ -432,6 +458,104 @@ function messageText(content) {
     .filter((part) => part?.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("\n");
+}
+
+function sessionTurnKey(value, fallback = "") {
+  if (typeof value?.turnId === "string" && value.turnId) {
+    return `turn:${value.turnId}`;
+  }
+  if (Number.isSafeInteger(value?.turnSeq)) {
+    return `turn-seq:${value.turnSeq}`;
+  }
+  return fallback;
+}
+
+function compareSessionAttempts(left, right) {
+  const leftAttempt = Number.isSafeInteger(left?.attempt) ? left.attempt : 0;
+  const rightAttempt = Number.isSafeInteger(right?.attempt) ? right.attempt : 0;
+  if (leftAttempt !== rightAttempt) return leftAttempt - rightAttempt;
+  return left.index - right.index;
+}
+
+/**
+ * Projects the public Pi session tree into one visible answer per turn. Picking
+ * an older checkpoint changes only this projection; it never mutates the live
+ * runtime path or calls a model.
+ */
+export function projectSessionMessageView(
+  messages = [],
+  sessionPath = null,
+  selectedCheckpointId = null,
+) {
+  const safeMessages = Array.isArray(messages) ? messages : [];
+  const checkpoints = Array.isArray(sessionPath?.checkpoints)
+    ? sessionPath.checkpoints
+    : [];
+  const checkpointGroups = new Map();
+  checkpoints.forEach((checkpoint, index) => {
+    if (typeof checkpoint?.id !== "string" || !checkpoint.id) return;
+    const key = sessionTurnKey(checkpoint, `checkpoint:${checkpoint.id}`);
+    const group = checkpointGroups.get(key) ?? [];
+    group.push({ ...checkpoint, index });
+    checkpointGroups.set(key, group);
+  });
+  checkpointGroups.forEach((group) => group.sort(compareSessionAttempts));
+
+  const selectedCheckpoint = checkpoints.find(
+    (checkpoint) => checkpoint?.id === selectedCheckpointId,
+  );
+  const selectedTurnKey = selectedCheckpoint
+    ? sessionTurnKey(selectedCheckpoint, `checkpoint:${selectedCheckpoint.id}`)
+    : null;
+  const selectedAssistantByTurn = new Map();
+  const attemptMetaByTurn = new Map();
+
+  for (const [key, group] of checkpointGroups) {
+    const chosen = key === selectedTurnKey
+      ? group.find((checkpoint) => checkpoint.id === selectedCheckpointId)
+        ?? group.at(-1)
+      : group.at(-1);
+    if (!chosen) continue;
+    selectedAssistantByTurn.set(key, chosen.assistantMessageId ?? null);
+    attemptMetaByTurn.set(key, {
+      attempt: Number.isSafeInteger(chosen.attempt)
+        ? chosen.attempt
+        : group.indexOf(chosen) + 1,
+      count: group.length,
+      checkpointId: chosen.id,
+    });
+  }
+
+  const assistantGroups = new Map();
+  safeMessages.forEach((message, index) => {
+    if (message?.role !== "assistant" || message.isFinal === false) return;
+    const key = sessionTurnKey(message, `assistant:${message.id ?? index}`);
+    const group = assistantGroups.get(key) ?? [];
+    group.push({ message, index });
+    assistantGroups.set(key, group);
+  });
+
+  const visibleAssistantIds = new Set();
+  for (const [key, group] of assistantGroups) {
+    const selectedAssistantId = selectedAssistantByTurn.get(key);
+    const attemptMeta = attemptMetaByTurn.get(key);
+    const chosen = group.find(({ message }) => message.id === selectedAssistantId)
+      ?? group.find(({ message }) => (
+        attemptMeta
+        && Number.isSafeInteger(message.attempt)
+        && message.attempt === attemptMeta.attempt
+      ))
+      ?? group.at(-1);
+    if (chosen?.message?.id) visibleAssistantIds.add(chosen.message.id);
+  }
+
+  return {
+    messages: safeMessages.filter((message) => (
+      message?.role !== "assistant"
+      || (message.isFinal !== false && visibleAssistantIds.has(message.id))
+    )),
+    attemptMetaByTurn,
+  };
 }
 
 export function latestStreamingAssistant(events, messages, running) {
@@ -627,6 +751,58 @@ function progressNarration(event) {
   };
 }
 
+function safePhasePresentation(context, status = "active") {
+  if (status === "waiting") {
+    return {
+      title: "分析已暂停",
+      detail: "正在等待你的回答，再继续判断下一步",
+    };
+  }
+  if (status === "stopped") {
+    return {
+      title: "分析已停止",
+      detail: "本轮已停止，不会继续调用工具",
+    };
+  }
+  if (status === "incomplete") {
+    return {
+      title: "分析未完成",
+      detail: "本轮在完成下一步判断前中断",
+    };
+  }
+  const active = status === "active";
+  if (context === "research") {
+    return {
+      title: active ? "正在结合刚查看的资料" : "已结合刚查看的资料",
+      detail: active
+        ? "正在根据刚完成的文件与资料检查，判断下一步"
+        : "已根据刚完成的文件与资料检查整理下一步",
+    };
+  }
+  if (context === "command") {
+    return {
+      title: active ? "正在核对运行结果" : "已核对运行结果",
+      detail: active
+        ? "正在根据受控命令与验证结果，判断下一步"
+        : "已根据受控命令与验证结果整理下一步",
+    };
+  }
+  if (context === "action") {
+    return {
+      title: active ? "正在检查刚才的操作" : "已检查刚才的操作",
+      detail: active
+        ? "正在确认工具结果与后续动作"
+        : "已确认工具结果与后续动作",
+    };
+  }
+  return {
+    title: active ? "正在分析任务" : "已完成这一步分析",
+    detail: active
+      ? "正在理解当前任务并决定下一步"
+      : "已完成当前阶段的判断",
+  };
+}
+
 function eventDetail(event) {
   if (event.type === "auto_review.decision") {
     const reasonCode = event.reasonCode
@@ -786,28 +962,88 @@ function ActionError({ error }) {
   );
 }
 
-function PlanCard({ plan }) {
-  if (!Array.isArray(plan) || plan.length === 0) return null;
+function normalizeActivityPlan(plan) {
+  const steps = Array.isArray(plan)
+    ? plan
+    : Array.isArray(plan?.steps)
+      ? plan.steps
+      : [];
+  return steps.flatMap((step, index) => {
+    if (!step || typeof step !== "object") return [];
+    const title = [step.title, step.text, step.step]
+      .find((value) => typeof value === "string" && value.trim());
+    if (!title) return [];
+    return [{
+      id: step.id ?? step.stepId ?? `step-${index + 1}`,
+      title: title.trim(),
+      status: ["pending", "in_progress", "running", "completed"].includes(step.status)
+        ? step.status
+        : "pending",
+    }];
+  });
+}
+
+export function planFromActivityEvents(events) {
+  const planEvent = [...(Array.isArray(events) ? events : [])]
+    .reverse()
+    .find((event) => event?.type === "plan.updated");
+  return normalizeActivityPlan(planEvent?.data ?? planEvent);
+}
+
+function PlanSteps({ plan }) {
+  const statusLabels = {
+    pending: "待处理",
+    in_progress: "进行中",
+    running: "进行中",
+    completed: "已完成",
+  };
   return (
-    <section className="project-plan-card" aria-label="Agent 计划">
+    <ol>
+      {plan.map((step) => (
+        <li
+          aria-label={`${statusLabels[step.status] ?? "待处理"}：${step.title}`}
+          className={`is-${step.status}`}
+          key={step.id}
+        >
+          <span className="project-plan-status" aria-hidden="true">
+            {step.status === "completed" ? (
+              <Check size={12} weight="bold" />
+            ) : step.status === "in_progress" || step.status === "running" ? (
+              <CircleNotch size={12} weight="bold" />
+            ) : null}
+          </span>
+          <span>{step.title}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function PlanCard({ plan, pinned = false, historical = false }) {
+  if (!Array.isArray(plan) || plan.length === 0) return null;
+  const completed = plan.filter((step) => step.status === "completed").length;
+  if (historical) {
+    return (
+      <details className="project-plan-card is-history" aria-label="Agent 计划">
+        <summary>
+          <span>Agent 计划</span>
+          <small>{completed}/{plan.length}</small>
+          <CaretDown size={12} aria-hidden="true" />
+        </summary>
+        <PlanSteps plan={plan} />
+      </details>
+    );
+  }
+  return (
+    <section
+      className={`project-plan-card${pinned ? " is-pinned" : ""}`}
+      aria-label="Agent 计划"
+    >
       <header>
         <span>Agent 计划</span>
-        <small>{plan.filter((step) => step.status === "completed").length}/{plan.length}</small>
+        <small>{completed}/{plan.length}</small>
       </header>
-      <ol>
-        {plan.map((step) => (
-          <li className={`is-${step.status}`} key={step.id}>
-            <span className="project-plan-status" aria-hidden="true">
-              {step.status === "completed" ? (
-                <Check size={12} weight="bold" />
-              ) : step.status === "in_progress" || step.status === "running" ? (
-                <CircleNotch size={12} weight="bold" />
-              ) : null}
-            </span>
-            <span>{step.title}</span>
-          </li>
-        ))}
-      </ol>
+      <PlanSteps plan={plan} />
     </section>
   );
 }
@@ -815,6 +1051,8 @@ function PlanCard({ plan }) {
 function ActivityEvent({ event, isLatest, isLatestProgress = false, onOpenArtifact }) {
   const [open, setOpen] = useState(isLatest);
   const artifactId = eventArtifact(event);
+  const thinkingPhase = event.type === "agent.thinking"
+    || event.type === "activity.phase";
   const autoReviewDecision = event.type === "auto_review.decision";
   const autoReviewBlocked = autoReviewDecision
     && eventTitle(event) === "已阻止高风险操作";
@@ -845,7 +1083,7 @@ function ActivityEvent({ event, isLatest, isLatestProgress = false, onOpenArtifa
   return (
     <details
       className={[
-        event.type === "agent.thinking" ? "is-thinking" : "",
+        thinkingPhase ? "is-thinking" : "",
         autoReviewDecision ? "is-auto-review" : "",
         autoReviewBlocked ? "is-blocked" : "",
       ].filter(Boolean).join(" ") || undefined}
@@ -856,7 +1094,7 @@ function ActivityEvent({ event, isLatest, isLatestProgress = false, onOpenArtifa
         <span className="project-activity-dot" aria-hidden="true" />
         <span>{eventTitle(event)}</span>
         <small>
-          {event.type === "agent.thinking" || event.hideSequence ? "" : `#${event.seq}`}
+          {thinkingPhase || event.hideSequence ? "" : `#${event.seq}`}
         </small>
         <CaretDown size={12} aria-hidden="true" />
       </summary>
@@ -897,8 +1135,18 @@ function collapseToolActivity(events) {
   const toolIndexes = new Map();
 
   for (const event of events) {
+    const firstSeq = Number.isSafeInteger(event.firstSeq)
+      ? event.firstSeq
+      : event.seq;
+    const lastSeq = Number.isSafeInteger(event.lastSeq)
+      ? event.lastSeq
+      : event.seq;
     if (!TOOL_ACTIVITY_TYPES.has(event.type)) {
-      collapsed.push(event);
+      collapsed.push({
+        ...event,
+        firstSeq,
+        lastSeq,
+      });
       continue;
     }
 
@@ -908,6 +1156,9 @@ function collapseToolActivity(events) {
       toolIndexes.set(callKey, collapsed.length);
       collapsed.push({
         ...event,
+        seq: firstSeq,
+        firstSeq,
+        lastSeq,
         activityKey: `tool-${callKey}`,
         status: toolActivityStatus(event),
       });
@@ -915,9 +1166,13 @@ function collapseToolActivity(events) {
     }
 
     const existing = collapsed[existingIndex];
+    const lifecycleFirstSeq = existing.firstSeq ?? existing.seq;
     collapsed[existingIndex] = {
       ...existing,
       ...event,
+      seq: lifecycleFirstSeq,
+      firstSeq: lifecycleFirstSeq,
+      lastSeq: Math.max(existing.lastSeq ?? existing.seq, lastSeq),
       activityKey: existing.activityKey,
       detail: event.detail || existing.detail,
       path: event.path || existing.path,
@@ -932,7 +1187,7 @@ function updateResearchSummary(event, toolEvent, running) {
   const group = RESEARCH_TOOL_GROUPS[toolEvent.toolName];
   event.counts[group] += 1;
   event.artifactId = event.counts.project || event.counts.document ? "files" : null;
-  event.seq = Math.max(event.seq, toolEvent.seq);
+  event.lastSeq = Math.max(event.lastSeq, toolEvent.lastSeq ?? toolEvent.seq);
   event.status = event.status === "active" || toolEvent.status === "active"
     ? "active"
     : "completed";
@@ -955,7 +1210,7 @@ function updateCommandSummary(event, commandEvent, running) {
     event.ran += 1;
     if (commandEvent.type === "verification.started") event.active += 1;
   }
-  event.seq = Math.max(event.seq, commandEvent.seq);
+  event.lastSeq = Math.max(event.lastSeq, commandEvent.lastSeq ?? commandEvent.seq);
   event.title = event.active > 0 && running
     ? "正在运行验证命令"
     : event.ran > 0
@@ -988,6 +1243,7 @@ function activityTurnBoundary(event) {
       messageId: event.messageId ?? event.data?.id ?? null,
       turnId: event.turnId ?? event.data?.turnId ?? event.data?.id ?? null,
       turnSeq: event.turnSeq ?? event.data?.turnSeq ?? null,
+      attempt: event.attempt ?? event.data?.attempt ?? null,
     };
   }
   if (event?.type === "follow_up.delivered") {
@@ -998,6 +1254,15 @@ function activityTurnBoundary(event) {
         ?? event.data?.messageId
         ?? null,
       turnSeq: event.turnSeq ?? event.data?.turnSeq ?? null,
+      attempt: event.attempt ?? event.data?.attempt ?? null,
+    };
+  }
+  if (event?.type === "turn.started") {
+    return {
+      messageId: event.messageId ?? event.data?.messageId ?? null,
+      turnId: event.turnId ?? event.data?.turnId ?? null,
+      turnSeq: event.turnSeq ?? event.data?.turnSeq ?? null,
+      attempt: event.attempt ?? event.data?.attempt ?? null,
     };
   }
   return null;
@@ -1031,9 +1296,50 @@ export function activityTurnScopes(events) {
 }
 
 export function activityEventsForTurn(events, turn) {
-  return activityTurnScopes(events).find(({ boundary }) => (
+  return activityEventsForTurnAttempt(events, turn);
+}
+
+export function activityEventsForTurnAttempt(events, turn, attempt = null) {
+  const matchingScopes = activityTurnScopes(events).filter(({ boundary }) => (
     activityBoundaryMatchesTurn(boundary, turn)
-  ))?.events ?? [];
+  ));
+  if (matchingScopes.length === 0) return [];
+  const eventAttempt = (event) => (
+    event?.attempt
+    ?? event?.data?.attempt
+    ?? event?.data?.operation?.attempt
+    ?? null
+  );
+  const latestAttempt = [...matchingScopes]
+    .reverse()
+    .flatMap((scope) => [
+      scope.boundary?.attempt,
+      ...[...scope.events].reverse().map(eventAttempt),
+    ])
+    .find(Number.isSafeInteger);
+  const selectedAttempt = Number.isSafeInteger(attempt)
+    ? attempt
+    : latestAttempt;
+  const selected = new Map();
+  for (const scope of matchingScopes) {
+    const scopeAttempt = scope.boundary?.attempt;
+    for (const event of scope.events) {
+      const currentAttempt = eventAttempt(event);
+      if (
+        Number.isSafeInteger(selectedAttempt)
+        && (
+          Number.isSafeInteger(currentAttempt)
+            ? currentAttempt !== selectedAttempt
+            : Number.isSafeInteger(scopeAttempt)
+              && scopeAttempt !== selectedAttempt
+        )
+      ) {
+        continue;
+      }
+      selected.set(event.seq, event);
+    }
+  }
+  return [...selected.values()].sort((left, right) => left.seq - right.seq);
 }
 
 const ACTIVITY_TERMINAL_STATES = {
@@ -1197,40 +1503,166 @@ export function normalizeActivityEvents(
     terminalStatus,
   );
   const latestMessageSeq = currentTurn.latestMessageSeq;
-  const currentTurnEvents = currentTurn.events.filter(
-    (event) => !QUIET_EVENT_TYPES.has(event.type),
-  );
+  const turnStartsWithThinking = new Set();
+  const completedTurnStarts = new Set();
+  let scannedTurnStartSeq = null;
+  for (const event of currentTurn.events) {
+    if (event.type === "turn.started") {
+      scannedTurnStartSeq = event.seq;
+    } else if (event.type === "agent.thinking" && scannedTurnStartSeq !== null) {
+      turnStartsWithThinking.add(scannedTurnStartSeq);
+    } else if (event.type === "turn.completed" && scannedTurnStartSeq !== null) {
+      completedTurnStarts.add(scannedTurnStartSeq);
+    }
+  }
+  const currentTurnEvents = currentTurn.events
+    .map((event) => {
+      if (
+        event.type !== "message.completed"
+        || (
+          event.isFinal !== false
+          && event.data?.isFinal !== false
+        )
+      ) {
+        return event;
+      }
+      const text = [event.text, event.data?.text].find(
+        (value) => typeof value === "string" && value.trim(),
+      );
+      if (!text) return event;
+      return {
+        ...event,
+        type: "agent.progress",
+        data: {
+          summary: text.trim().slice(0, 500),
+          detail: null,
+          source: "intermediate_assistant_message",
+        },
+      };
+    })
+    .filter((event) => (
+      event.type === "turn.started"
+      || event.type === "turn.completed"
+      || !QUIET_EVENT_TYPES.has(event.type)
+    ));
+  const hasRuntimeFallback = currentTurnEvents.some((event) => (
+    event.type === "agent.progress"
+    && event.data?.source === "runtime_fallback"
+  ));
   const completedVerificationIds = new Set(
     currentTurnEvents
       .filter((event) => event.type === "verification.completed" && event.eventId)
       .map((event) => event.eventId),
   );
   const normalized = [];
-  let thinkingEvent = null;
+  let activeThinkingEvent = null;
+  let latestThinkingEvent = null;
+  let latestPhaseEvent = null;
   let researchEvent = null;
   let commandEvent = null;
+  let previousActivityKind = null;
+  let activeTurnStartSeq = null;
+  const thinkingCyclesByTurn = new Map();
+
+  const closeVisibleBatches = () => {
+    researchEvent = null;
+    commandEvent = null;
+  };
+
+  const finishActiveThinking = (status = "finished") => {
+    if (!activeThinkingEvent) return;
+    activeThinkingEvent.status = status;
+    activeThinkingEvent.detail = status === "finished"
+      ? safePhasePresentation(
+        activeThinkingEvent.phaseContext,
+        "finished",
+      ).detail
+      : terminalState.thinkingDetail;
+    activeThinkingEvent = null;
+  };
 
   for (const event of collapseToolActivity(currentTurnEvents)) {
+    if (event.type === "turn.started") {
+      finishActiveThinking();
+      if (!hasRuntimeFallback) closeVisibleBatches();
+      activeTurnStartSeq = event.firstSeq ?? event.seq;
+      if (
+        !hasRuntimeFallback
+        && !turnStartsWithThinking.has(activeTurnStartSeq)
+      ) {
+        const status = completedTurnStarts.has(activeTurnStartSeq)
+          ? "finished"
+          : running
+            ? "active"
+            : terminalState.key;
+        const presentation = safePhasePresentation(
+          previousActivityKind,
+          status,
+        );
+        latestPhaseEvent = {
+          type: "activity.phase",
+          seq: activeTurnStartSeq,
+          firstSeq: activeTurnStartSeq,
+          lastSeq: event.lastSeq ?? event.seq,
+          activityKey: `phase-${latestMessageSeq || "current"}-${activeTurnStartSeq}`,
+          hideSequence: true,
+          status,
+          phaseContext: previousActivityKind,
+          title: presentation.title,
+          detail: presentation.detail,
+        };
+        normalized.push(latestPhaseEvent);
+      }
+      continue;
+    }
+    if (event.type === "turn.completed") {
+      finishActiveThinking();
+      continue;
+    }
     if (event.type === "agent.progress") {
       const narration = progressNarration(event);
       if (!narration.summary) continue;
+      closeVisibleBatches();
       normalized.push({
         ...event,
         activityKey: event.activityKey ?? `progress-${event.eventId ?? event.seq}`,
         hideSequence: true,
       });
+      previousActivityKind = "progress";
       continue;
     }
     if (event.type === "agent.thinking") {
-      if (!thinkingEvent) {
-        thinkingEvent = {
-          ...event,
-          activityKey: `thinking-${latestMessageSeq || event.seq}`,
-          status: event.status,
+      if (hasRuntimeFallback) continue;
+      const status = event.status === "finished" ? "finished" : "active";
+      if (!activeThinkingEvent) {
+        closeVisibleBatches();
+        const turnKey = activeTurnStartSeq || event.firstSeq || event.seq;
+        const cycle = (thinkingCyclesByTurn.get(turnKey) ?? 0) + 1;
+        thinkingCyclesByTurn.set(turnKey, cycle);
+        activeThinkingEvent = {
+          type: "agent.thinking",
+          seq: event.firstSeq ?? event.seq,
+          firstSeq: event.firstSeq ?? event.seq,
+          lastSeq: event.lastSeq ?? event.seq,
+          activityKey: `phase-${latestMessageSeq || "current"}-${turnKey}${cycle > 1 ? `-${cycle}` : ""}`,
+          status,
+          phaseContext: previousActivityKind,
+          detail: safePhasePresentation(previousActivityKind, status).detail,
         };
-      } else if (event.status === "finished") {
-        thinkingEvent.status = "finished";
+        latestThinkingEvent = activeThinkingEvent;
+        normalized.push(activeThinkingEvent);
+      } else {
+        activeThinkingEvent.lastSeq = Math.max(
+          activeThinkingEvent.lastSeq,
+          event.lastSeq ?? event.seq,
+        );
+        activeThinkingEvent.status = status;
+        activeThinkingEvent.detail = safePhasePresentation(
+          activeThinkingEvent.phaseContext,
+          status,
+        ).detail;
       }
+      if (status === "finished") finishActiveThinking();
       continue;
     }
     if (
@@ -1253,11 +1685,15 @@ export function normalizeActivityEvents(
       && RESEARCH_TOOL_GROUPS[event.toolName]
       && event.status !== "failed"
     ) {
+      commandEvent = null;
       if (!researchEvent) {
+        const firstSeq = event.firstSeq ?? event.seq;
         researchEvent = {
           type: "activity.research_summary",
-          seq: event.seq,
-          activityKey: `research-${latestMessageSeq || event.seq}`,
+          seq: firstSeq,
+          firstSeq,
+          lastSeq: event.lastSeq ?? event.seq,
+          activityKey: `research-${firstSeq}`,
           artifactId: null,
           hideSequence: true,
           counts: { project: 0, document: 0, retrieval: 0 },
@@ -1266,6 +1702,7 @@ export function normalizeActivityEvents(
         normalized.push(researchEvent);
       }
       updateResearchSummary(researchEvent, event, running);
+      previousActivityKind = "research";
       continue;
     }
     if (
@@ -1283,11 +1720,15 @@ export function normalizeActivityEvents(
         && ["passed", "succeeded", "completed"].includes(event.status)
       )
     ) {
+      researchEvent = null;
       if (!commandEvent) {
+        const firstSeq = event.firstSeq ?? event.seq;
         commandEvent = {
           type: "activity.command_summary",
-          seq: event.seq,
-          activityKey: `commands-${latestMessageSeq || event.seq}`,
+          seq: firstSeq,
+          firstSeq,
+          lastSeq: event.lastSeq ?? event.seq,
+          activityKey: `commands-${firstSeq}`,
           artifactId: "run_result",
           hideSequence: true,
           prepared: 0,
@@ -1297,21 +1738,47 @@ export function normalizeActivityEvents(
         normalized.push(commandEvent);
       }
       updateCommandSummary(commandEvent, event, running);
+      previousActivityKind = "command";
       continue;
     }
+    closeVisibleBatches();
     normalized.push(event);
+    if (TOOL_ACTIVITY_TYPES.has(event.type)) {
+      previousActivityKind = "action";
+    }
   }
 
-  if (thinkingEvent) {
-    thinkingEvent.status = running ? "active" : terminalState.thinkingStatus;
-    thinkingEvent.detail = running
-      ? researchEvent
-        ? "正在结合刚查看的资料，判断下一步"
-        : commandEvent
-          ? "正在核对命令与结果，判断下一步"
-          : "正在分析任务并组织下一步"
+  if (activeThinkingEvent) {
+    const status = running ? "active" : terminalState.thinkingStatus;
+    activeThinkingEvent.status = status;
+    activeThinkingEvent.detail = status === "active"
+      ? safePhasePresentation(
+        activeThinkingEvent.phaseContext,
+        status,
+      ).detail
       : terminalState.thinkingDetail;
-    normalized.push(thinkingEvent);
+  }
+  const latestReasoningEvent = [latestThinkingEvent, latestPhaseEvent]
+    .filter(Boolean)
+    .sort((left, right) => (
+      (right.firstSeq ?? right.seq) - (left.firstSeq ?? left.seq)
+    ))[0];
+  if (
+    !running
+    && latestReasoningEvent
+    && terminalState.key !== "completed"
+  ) {
+    latestReasoningEvent.status = terminalState.thinkingStatus;
+    if (latestReasoningEvent.type === "activity.phase") {
+      const presentation = safePhasePresentation(
+        latestReasoningEvent.phaseContext,
+        terminalState.thinkingStatus,
+      );
+      latestReasoningEvent.title = presentation.title;
+      latestReasoningEvent.detail = presentation.detail;
+    } else {
+      latestReasoningEvent.detail = terminalState.thinkingDetail;
+    }
   }
   if (normalized.length === 0 && running) {
     const hasPartialAnswer = safeEvents.some((event) => (
@@ -1324,6 +1791,8 @@ export function normalizeActivityEvents(
     normalized.push({
       type: hasPartialAnswer ? "activity.responding" : "activity.preparing",
       seq: currentTurnEvents.at(-1)?.seq ?? latestMessageSeq ?? 0,
+      firstSeq: currentTurnEvents.at(-1)?.seq ?? latestMessageSeq ?? 0,
+      lastSeq: currentTurnEvents.at(-1)?.seq ?? latestMessageSeq ?? 0,
       activityKey: `phase-${latestMessageSeq || "current"}`,
       hideSequence: true,
       status: "active",
@@ -1350,6 +1819,12 @@ export function normalizeActivityEvents(
     normalized.push({
       type: "activity.turn_summary",
       seq: currentTurn.events.at(-1)?.seq ?? currentTurn.latestMessageSeq ?? 0,
+      firstSeq: currentTurn.events.at(-1)?.seq
+        ?? currentTurn.latestMessageSeq
+        ?? 0,
+      lastSeq: currentTurn.events.at(-1)?.seq
+        ?? currentTurn.latestMessageSeq
+        ?? 0,
       activityKey: `terminal-${currentTurn.latestMessageSeq || "turn"}`,
       hideSequence: true,
       status: terminalState.key,
@@ -1357,7 +1832,112 @@ export function normalizeActivityEvents(
       detail: terminalState.summaryDetail,
     });
   }
-  return normalized.slice(-100);
+  return normalized;
+}
+
+function fallbackProgressCopy(stage, toolNames) {
+  const hasResearch = toolNames.some((name) => RESEARCH_TOOL_GROUPS[name]);
+  const hasAction = toolNames.some((name) => (
+    !RESEARCH_TOOL_GROUPS[name]
+    && !HIDDEN_TOOL_ACTIVITY.has(name)
+  ));
+  if (stage === "start") {
+    return "我先确认任务范围，再按需查看相关资料。";
+  }
+  if (stage === "middle") {
+    if (hasResearch && !hasAction) {
+      return "已经查看了一批相关资料，正在交叉核对关键依据。";
+    }
+    if (hasAction) {
+      return "主要步骤已经推进，正在核对工具结果和剩余问题。";
+    }
+    return "当前步骤已经推进，正在确认下一步。";
+  }
+  if (hasResearch && !hasAction) {
+    return "关键资料已经核对，正在整理结论与适用边界。";
+  }
+  if (hasAction) {
+    return "关键操作已经完成，正在整理结果与验证证据。";
+  }
+  return "主要检查已经完成，正在整理最终结果。";
+}
+
+export function withRuntimeProgressFallback(events, running = false) {
+  const safeEvents = Array.isArray(events) ? events : [];
+  const currentTurn = currentTurnActivityEvents(safeEvents).events;
+  const hasPublicNarration = currentTurn.some((event) => (
+    event.type === "agent.progress"
+    || (
+      event.type === "message.completed"
+      && (event.isFinal === false || event.data?.isFinal === false)
+      && [event.text, event.data?.text].some(
+        (value) => typeof value === "string" && value.trim(),
+      )
+    )
+  ));
+  if (hasPublicNarration) return safeEvents;
+
+  const toolCalls = collapseToolActivity(
+    currentTurn.filter((event) => TOOL_ACTIVITY_TYPES.has(event.type)),
+  ).filter((event) => !HIDDEN_TOOL_ACTIVITY.has(event.toolName));
+  if (toolCalls.length === 0) return safeEvents;
+
+  const firstCall = toolCalls[0];
+  const lastCall = toolCalls.at(-1);
+  const toolNames = toolCalls.map((event) => event.toolName).filter(Boolean);
+  const milestones = [{
+    stage: "start",
+    position: "before",
+    seq: firstCall.firstSeq ?? firstCall.seq,
+    event: firstCall,
+  }];
+  if (toolCalls.length >= 4) {
+    const middleCall = toolCalls[Math.floor((toolCalls.length - 1) / 2)];
+    milestones.push({
+      stage: "middle",
+      position: "after",
+      seq: middleCall.lastSeq ?? middleCall.seq,
+      event: middleCall,
+    });
+  }
+  if (!running) {
+    milestones.push({
+      stage: "finish",
+      position: "after",
+      seq: lastCall.lastSeq ?? lastCall.seq,
+      event: lastCall,
+    });
+  }
+
+  const before = new Map();
+  const after = new Map();
+  for (const milestone of milestones) {
+    const target = milestone.position === "before" ? before : after;
+    const progress = {
+      seq: milestone.seq,
+      type: "agent.progress",
+      activityKey: `runtime-progress-${milestone.stage}-${milestone.seq}`,
+      hideSequence: true,
+      status: milestone.stage === "finish" ? "completed" : "active",
+      turnId: milestone.event.turnId ?? milestone.event.data?.turnId ?? null,
+      attempt: milestone.event.attempt ?? milestone.event.data?.attempt ?? null,
+      data: {
+        summary: fallbackProgressCopy(milestone.stage, toolNames),
+        detail: null,
+        source: "runtime_fallback",
+      },
+    };
+    target.set(milestone.seq, [
+      ...(target.get(milestone.seq) ?? []),
+      progress,
+    ]);
+  }
+
+  return safeEvents.flatMap((event) => [
+    ...(before.get(event.seq) ?? []),
+    event,
+    ...(after.get(event.seq) ?? []),
+  ]);
 }
 
 function HarnessSnapshot({ event }) {
@@ -1445,12 +2025,21 @@ export function ActivityTimeline({
   const [expanded, setExpanded] = useState(
     transparentMode ? true : !compact,
   );
-  const visibleEvents = normalizeActivityEvents(
-    events,
+  const normalizedEvents = normalizeActivityEvents(
+    withRuntimeProgressFallback(events, running),
     running,
     phase,
     terminalStatus,
   );
+  const hasPublicNarration = normalizedEvents.some(
+    (event) => event.type === "agent.progress",
+  );
+  const visibleEvents = transparentMode || !hasPublicNarration
+    ? normalizedEvents
+    : normalizedEvents.filter((event) => (
+      event.type !== "agent.thinking"
+      && event.type !== "activity.phase"
+    ));
   const currentTurn = currentTurnActivityEvents(events).events;
   const terminalState = activityTerminalState(currentTurn, terminalStatus);
   const harnessEvent = [...currentTurn]
@@ -1973,6 +2562,10 @@ export function ProjectCapabilityMenu({
                         <GlobeSimple size={15} aria-hidden="true" />
                       ) : capability.id === "image_generation" ? (
                         <ImageSquare size={15} aria-hidden="true" />
+                      ) : capability.id === "github_read" ? (
+                        <GithubLogo size={15} aria-hidden="true" />
+                      ) : capability.id === "vercel_read" ? (
+                        <Cloud size={15} aria-hidden="true" />
                       ) : (
                         <Files size={15} aria-hidden="true" />
                       )}
@@ -2346,7 +2939,7 @@ function formatTurnTokenCount(value) {
     : null;
 }
 
-function TurnEvidence({ message }) {
+function TurnEvidence({ message, attemptCount = 1 }) {
   const evidence = message.turnEvidence;
   const usage = evidence?.usage;
   const model = [evidence?.providerId, evidence?.modelId]
@@ -2364,8 +2957,8 @@ function TurnEvidence({ message }) {
     thinking ? `思考 ${thinking}` : null,
     totalTokens ? `${totalTokens} tokens` : null,
     cost,
-    Number.isFinite(message.attempt) && message.attempt > 1
-      ? `第 ${message.attempt} 次回答`
+    Number.isFinite(message.attempt) && attemptCount > 1
+      ? `方案 ${message.attempt}/${attemptCount}`
       : null,
   ].filter(Boolean);
   if (items.length === 0) return null;
@@ -2440,8 +3033,7 @@ export function ProjectAgentPane({
   uploadingAttachments = [],
   onRemoveAttachment,
   onDropFiles,
-  imageInputRef,
-  onSelectImage,
+  localFileInputRef,
   supportsImages,
   onSubmit,
   onLoadEarlier,
@@ -2459,16 +3051,18 @@ export function ProjectAgentPane({
   action,
   error,
   modelLabel,
+  modelSelectionDisabled = false,
   executionPolicyControl,
   thinkingLevelControl,
   contextUsageControl,
   transparentMode = false,
-  pdfInputRef,
   uploadingPdf,
-  onUploadPdf,
   onRetryDocument,
   retryingDocumentId,
   standalone = false,
+  selectedCheckpointId = null,
+  branchTarget = null,
+  onCancelBranch,
 }) {
   const running = isConversationRunning(conversation);
   const submitting = action === "message";
@@ -2484,9 +3078,15 @@ export function ProjectAgentPane({
   const dragDepthRef = useRef(0);
   const followLatestRef = useRef(true);
   const [dropActive, setDropActive] = useState(false);
+  const sessionView = useMemo(() => projectSessionMessageView(
+    conversation.messages,
+    conversation.sessionPath,
+    selectedCheckpointId,
+  ), [conversation.messages, conversation.sessionPath, selectedCheckpointId]);
+  const visibleMessages = sessionView.messages;
   const previousConversationIdRef = useRef(conversation.id);
   const previousRunningRef = useRef(running);
-  const userMessageCount = conversation.messages.filter(
+  const userMessageCount = visibleMessages.filter(
     (message) => message.role === "user",
   ).length;
   const previousUserMessageCountRef = useRef(userMessageCount);
@@ -2508,6 +3108,7 @@ export function ProjectAgentPane({
   const canSubmit = Boolean(
     draft.trim()
     && !action
+    && !modelSelectionDisabled
     && uploadingAttachments.length === 0
     && !imageUnsupported
     && !workflowImageMissing
@@ -2523,14 +3124,17 @@ export function ProjectAgentPane({
     ?? limitedSnapshotEvent?.data?.snapshot?.includedFiles;
   const activityByUserMessageId = new Map();
   let latestExecutedTurnStartSeq = 0;
-  const userMessages = conversation.messages.filter(
+  const userMessages = visibleMessages.filter(
     (message) => message.role === "user",
   );
-  const activityScopes = activityTurnScopes(conversation.events);
   for (const message of userMessages) {
-    const turnEvents = activityScopes.find(({ boundary }) => (
-      activityBoundaryMatchesTurn(boundary, message)
-    ))?.events ?? [];
+    const turnKey = sessionTurnKey(message, `user:${message.id}`);
+    const turnAttempt = sessionView.attemptMetaByTurn.get(turnKey)?.attempt;
+    const turnEvents = activityEventsForTurnAttempt(
+      conversation.events,
+      message,
+      turnAttempt,
+    );
     if (turnEvents.length === 0) continue;
     const startSeq = turnEvents[0].seq;
     activityByUserMessageId.set(message.id, { events: turnEvents, startSeq });
@@ -2642,7 +3246,7 @@ export function ProjectAgentPane({
         <div className="project-file-drop-overlay" role="status">
           <UploadSimple size={20} weight="bold" aria-hidden="true" />
           <strong>释放以添加到当前会话</strong>
-          <span>PDF 会解析；图片和文本文件仅随消息发送</span>
+          <span>PDF、Word、Excel、图片和文本资料都会留在当前会话</span>
         </div>
       ) : null}
       <div
@@ -2668,6 +3272,7 @@ export function ProjectAgentPane({
         <ProjectWorkspaceStatus
           workspace={conversation.workspace}
           standalone={standalone}
+          fork={conversation.fork}
         />
         {!standalone && snapshotIsLimited ? (
           <section className="project-agent-decision" role="status">
@@ -2683,7 +3288,7 @@ export function ProjectAgentPane({
             </div>
           </section>
         ) : null}
-        {conversation.messages.length === 0 ? (
+        {visibleMessages.length === 0 ? (
           <section className="project-agent-welcome">
             <Code size={24} weight="regular" aria-hidden="true" />
             <div>
@@ -2708,7 +3313,10 @@ export function ProjectAgentPane({
             </div>
           </section>
         ) : (
-          conversation.messages.map((message, index) => {
+          visibleMessages.map((message, index) => {
+            if (message.role === "assistant" && message.isFinal === false) {
+              return null;
+            }
             const text = messageText(message.content);
             const messageImages = Array.isArray(message.images)
               ? message.images
@@ -2722,8 +3330,12 @@ export function ProjectAgentPane({
             const isLatestExecutedTurn = turnActivity?.startSeq
               === latestExecutedTurnStartSeq;
             const turnRunning = Boolean(running && isLatestExecutedTurn);
+            const scopedPlan = turnActivity
+              ? planFromActivityEvents(turnActivity.events)
+              : [];
+            const turnPlan = scopedPlan;
             const isLastAssistantForTurn = message.role === "assistant"
-              && !conversation.messages.slice(index + 1).some((candidate) => (
+              && !visibleMessages.slice(index + 1).some((candidate) => (
                 candidate.role === "assistant"
                 && candidate.turnId === message.turnId
               ));
@@ -2731,6 +3343,11 @@ export function ProjectAgentPane({
               ? (conversation.generatedImages ?? []).filter((image) => (
                   image.status === "completed"
                   && image.turnId === message.turnId
+                  && (
+                    !Number.isSafeInteger(image.attempt)
+                    || !Number.isSafeInteger(message.attempt)
+                    || image.attempt === message.attempt
+                  )
                 ))
               : [];
             if (
@@ -2789,16 +3406,25 @@ export function ProjectAgentPane({
                     <div className="project-agent-plain-text">{text}</div>
                   )}
                   {message.role === "assistant" ? (
-                    <TurnEvidence message={message} />
+                    <TurnEvidence
+                      message={message}
+                      attemptCount={sessionView.attemptMetaByTurn.get(
+                        sessionTurnKey(message, `assistant:${message.id}`),
+                      )?.count ?? 1}
+                    />
                   ) : null}
                 </article>
                 {turnActivity ? (
                   <>
-                    {isLatestExecutedTurn ? <PlanCard plan={conversation.plan} /> : null}
+                    <PlanCard
+                      plan={turnPlan}
+                      pinned={turnRunning}
+                      historical={!isLatestExecutedTurn}
+                    />
                     <ActivityTimeline
                       events={turnActivity.events}
                       running={turnRunning}
-                      compact={!turnRunning}
+                      compact={!isLatestExecutedTurn}
                       transparentMode={transparentMode}
                       terminalStatus={isLatestExecutedTurn
                         ? activeStatus(conversation)
@@ -2813,17 +3439,14 @@ export function ProjectAgentPane({
         )}
 
         {submitting && !running ? (
-          <>
-            <PlanCard plan={conversation.plan} />
-            <ActivityTimeline
-              events={[]}
-              running
-              compact={false}
-              transparentMode={transparentMode}
-              phase="submitting"
-              onOpenArtifact={onOpenArtifact}
-            />
-          </>
+          <ActivityTimeline
+            events={[]}
+            running
+            compact={false}
+            transparentMode={transparentMode}
+            phase="submitting"
+            onOpenArtifact={onOpenArtifact}
+          />
         ) : null}
         {!submitting && hasUnscopedActivity ? (
           <ActivityTimeline
@@ -2939,7 +3562,13 @@ export function ProjectAgentPane({
                 <FileCode size={13} aria-hidden="true" />
                 <span>
                   <strong>{attachment.fileName}</strong>
-                  <small>AI 按需读取 · 不预载全文</small>
+                  <small>
+                    {attachment.contentKind === "office_word"
+                      ? "Word 结构已解析 · AI 按需读取"
+                      : attachment.contentKind === "office_workbook"
+                        ? "Excel 单元格已解析 · AI 按需读取"
+                        : "AI 按需读取 · 不预载全文"}
+                  </small>
                 </span>
                 <button
                   type="button"
@@ -2962,9 +3591,23 @@ export function ProjectAgentPane({
             ))}
           </div>
         ) : null}
-        {selectedWorkflow || selectedCapabilities.length > 0 ? (
+        {branchTarget || selectedWorkflow || selectedCapabilities.length > 0 ? (
           <div className="project-turn-chips" aria-label="当前消息使用的能力">
-            {selectedWorkflow ? (
+            {branchTarget ? (
+              <span className="is-branch">
+                <GitBranch size={13} aria-hidden="true" />
+                从检查点继续 · {branchTarget.label}
+                <button
+                  type="button"
+                  disabled={running || turnPayloadLocked}
+                  onClick={onCancelBranch}
+                  aria-label="取消从检查点继续"
+                >
+                  <X size={12} weight="bold" aria-hidden="true" />
+                </button>
+              </span>
+            ) : null}
+            {selectedWorkflow && !branchTarget ? (
               <span className="is-workflow">
                 <Code size={13} aria-hidden="true" />
                 流程 · {selectedWorkflow.label}
@@ -2984,6 +3627,10 @@ export function ProjectAgentPane({
                   <GlobeSimple size={13} aria-hidden="true" />
                 ) : capability.id === "image_generation" ? (
                   <ImageSquare size={13} aria-hidden="true" />
+                ) : capability.id === "github_read" ? (
+                  <GithubLogo size={13} aria-hidden="true" />
+                ) : capability.id === "vercel_read" ? (
+                  <Cloud size={13} aria-hidden="true" />
                 ) : (
                   <Files size={13} aria-hidden="true" />
                 )}
@@ -2999,6 +3646,11 @@ export function ProjectAgentPane({
               </span>
             ))}
           </div>
+        ) : null}
+        {branchTarget ? (
+          <small className="live-project-context-note project-branch-context-note">
+            只读规划分支会继承这里的对话上下文；项目文件仍按当前状态读取。
+          </small>
         ) : null}
         {pendingImage ? (
           <div className="project-pending-image">
@@ -3093,50 +3745,33 @@ export function ProjectAgentPane({
               <button
                 className="project-composer-tool project-composer-attachment"
                 type="button"
-                disabled={Boolean(uploadingPdf)}
-                onClick={() => pdfInputRef.current?.click()}
-                title="选择一份论文资料并解析"
+                disabled={
+                  running
+                  || turnPayloadLocked
+                  || Boolean(uploadingPdf)
+                  || uploadingAttachments.length > 0
+                }
+                onClick={() => localFileInputRef.current?.click()}
+                title="从电脑选择资料；未知后缀会按实际内容检查，也可用 ⌘⇧G 粘贴路径"
               >
-                {uploadingPdf ? (
+                {uploadingPdf || uploadingAttachments.length > 0 ? (
                   <CircleNotch className="spin" size={13} aria-hidden="true" />
                 ) : (
                   <UploadSimple size={13} aria-hidden="true" />
                 )}
-                上传 PDF 资料
-              </button>
-              <button
-                className="project-composer-tool project-composer-attachment"
-                type="button"
-                disabled={running || turnPayloadLocked}
-                onClick={() => imageInputRef.current?.click()}
-                title="为当前消息添加一张 PNG、JPEG 或 WebP 图片"
-              >
-                <ImageSquare size={13} aria-hidden="true" />
-                添加图片
+                添加本地资料
               </button>
               <input
                 className="sr-only"
-                ref={pdfInputRef}
+                ref={localFileInputRef}
                 type="file"
-                accept=".pdf,application/pdf"
-                aria-label="选择要解析的论文资料"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  event.target.value = "";
-                  if (file) onUploadPdf(file);
-                }}
-              />
-              <input
-                className="sr-only"
-                ref={imageInputRef}
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
+                multiple
                 disabled={running || turnPayloadLocked}
-                aria-label="为当前消息选择一张图片"
+                aria-label="选择要添加的本地资料"
                 onChange={(event) => {
-                  const file = event.target.files?.[0];
+                  const files = Array.from(event.target.files ?? []);
                   event.target.value = "";
-                  if (file) onSelectImage(file);
+                  if (files.length > 0) void onDropFiles?.(files);
                 }}
               />
               {executionPolicyControl}
@@ -3153,7 +3788,7 @@ export function ProjectAgentPane({
                   ? "发送会加入持久后续队列"
                   : running
                     ? "发送会立即调整当前 Agent 的方向"
-                    : "只有显式发送才开始工作 · 普通文件由 AI 按需读取"}
+                    : "只有显式发送才开始工作 · 会话资料由 AI 按需读取"}
               {" · Enter 发送 · Shift+Enter 换行"}
             </small>
           </div>
@@ -3192,6 +3827,7 @@ function FileArtifact({
   standalone = false,
   documents = [],
   generatedImages = [],
+  generatedOfficeArtifacts = [],
   api,
   selectedPath,
   requestedPath,
@@ -3210,6 +3846,7 @@ function FileArtifact({
   const [activePath, setActivePath] = useState(selectedPath ?? "");
   const [activeDocumentId, setActiveDocumentId] = useState("");
   const [activeGeneratedImageId, setActiveGeneratedImageId] = useState("");
+  const [activeGeneratedOfficeArtifactId, setActiveGeneratedOfficeArtifactId] = useState("");
   const [fileCache, setFileCache] = useState({});
   const [activeLineIndex, setActiveLineIndex] = useState(0);
   const [loadingTree, setLoadingTree] = useState(false);
@@ -3277,6 +3914,7 @@ function FileArtifact({
     if (!conversationId || !path) return null;
     setActiveDocumentId("");
     setActiveGeneratedImageId("");
+    setActiveGeneratedOfficeArtifactId("");
     setActivePath(path);
     setImageLoadFailed(false);
     if (PROJECT_FILE_IMAGE_PATTERN.test(path)) {
@@ -3376,6 +4014,7 @@ function FileArtifact({
     setActivePath("");
     setActiveDocumentId("");
     setActiveGeneratedImageId("");
+    setActiveGeneratedOfficeArtifactId("");
     setFileCache({});
     setDirectoryCursors({});
     setSearchDraft("");
@@ -3454,6 +4093,9 @@ function FileArtifact({
   const completedGeneratedImages = generatedImages.filter(
     (image) => image.status === "completed",
   );
+  const completedGeneratedOfficeArtifacts = generatedOfficeArtifacts.filter(
+    (artifact) => artifact.status === "completed",
+  );
   const selectedGeneratedImage = completedGeneratedImages.find(
     (image) => image.id === activeGeneratedImageId,
   ) ?? null;
@@ -3462,6 +4104,16 @@ function FileArtifact({
     ? api.generatedImageUrl({
         conversationId,
         imageId: selectedGeneratedImage.id,
+      })
+    : null;
+  const selectedGeneratedOfficeArtifact = completedGeneratedOfficeArtifacts.find(
+    (artifact) => artifact.id === activeGeneratedOfficeArtifactId,
+  ) ?? null;
+  const selectedGeneratedOfficeDownloadUrl = selectedGeneratedOfficeArtifact
+    && typeof api.generatedOfficeDownloadUrl === "function"
+    ? api.generatedOfficeDownloadUrl({
+        conversationId,
+        artifactId: selectedGeneratedOfficeArtifact.id,
       })
     : null;
   const addFileLineContext = useCallback((index) => {
@@ -3484,12 +4136,44 @@ function FileArtifact({
   return (
     <div className="project-file-artifact">
       <aside aria-label={standalone ? "私有草稿文件" : "项目文件"}>
-        {completedGeneratedImages.length > 0 ? (
+        {completedGeneratedImages.length > 0
+          || completedGeneratedOfficeArtifacts.length > 0 ? (
           <>
             <div className="project-file-section-heading">
-              <ImageSquare size={15} aria-hidden="true" />
+              <Files size={15} aria-hidden="true" />
               会话生成
             </div>
+            {completedGeneratedOfficeArtifacts.map((artifact) => {
+              const OfficeIcon = artifact.kind === "excel" ? FileXls : FileDoc;
+              return (
+                <button
+                  className={`project-generated-image-file project-generated-office-file${
+                    artifact.id === activeGeneratedOfficeArtifactId
+                      ? " is-active"
+                      : ""
+                  }`}
+                  type="button"
+                  key={artifact.id}
+                  onClick={() => {
+                    setActivePath("");
+                    setActiveDocumentId("");
+                    setActiveGeneratedImageId("");
+                    setActiveGeneratedOfficeArtifactId(artifact.id);
+                    setImageLoadFailed(false);
+                  }}
+                >
+                  <OfficeIcon size={15} aria-hidden="true" />
+                  <span>
+                    <strong>{artifact.fileName}</strong>
+                    <small>
+                      {artifact.kind === "excel"
+                        ? `${artifact.sheetCount ?? 1} 个工作表`
+                        : `${artifact.pageCount ?? 1} 页`}
+                    </small>
+                  </span>
+                </button>
+              );
+            })}
             {completedGeneratedImages.map((image) => (
               <button
                 className={`project-generated-image-file${
@@ -3500,6 +4184,7 @@ function FileArtifact({
                 onClick={() => {
                   setActivePath("");
                   setActiveDocumentId("");
+                  setActiveGeneratedOfficeArtifactId("");
                   setActiveGeneratedImageId(image.id);
                   setImageLoadFailed(false);
                 }}
@@ -3534,6 +4219,7 @@ function FileArtifact({
                   setActivePath("");
                   setActiveDocumentId(document.id);
                   setActiveGeneratedImageId("");
+                  setActiveGeneratedOfficeArtifactId("");
                 }}
               >
                 <FilePdf size={15} aria-hidden="true" />
@@ -3607,6 +4293,7 @@ function FileArtifact({
             key={entry.path}
             onClick={() => {
               setActiveGeneratedImageId("");
+              setActiveGeneratedOfficeArtifactId("");
               if (entry.kind === "directory") {
                 if (searchQuery) {
                   const segments = entry.path.split("/");
@@ -3704,6 +4391,7 @@ function FileArtifact({
           <div>
             <strong>
               {selectedGeneratedImage?.fileName
+                || selectedGeneratedOfficeArtifact?.fileName
                 || selectedDocument?.fileName
                 || activePath
                 || "选择一个文件"}
@@ -3713,6 +4401,8 @@ function FileArtifact({
                 ? `GPT Image 2 · ${
                     selectedGeneratedImage.width
                   } × ${selectedGeneratedImage.height} · 会话工件`
+                : selectedGeneratedOfficeArtifact
+                  ? `${selectedGeneratedOfficeArtifact.kind === "excel" ? "Excel 工作簿" : "Word 文档"} · 结构与渲染已核验 · 会话工件`
                 : selectedDocument
                 ? `${documentStatusLabel(selectedDocument)} · ${
                     formatDocumentSize(selectedDocument.byteLength)
@@ -3726,7 +4416,16 @@ function FileArtifact({
                   : "文件内容按需读取"}
             </small>
           </div>
-          {selectedDocument && canRetryDocument(selectedDocument) ? (
+          {selectedGeneratedOfficeDownloadUrl ? (
+            <a
+              className="project-office-download"
+              href={selectedGeneratedOfficeDownloadUrl}
+              download={selectedGeneratedOfficeArtifact.fileName}
+            >
+              <DownloadSimple size={14} aria-hidden="true" />
+              下载文件
+            </a>
+          ) : selectedDocument && canRetryDocument(selectedDocument) ? (
             <button
               type="button"
               disabled={retryingDocumentId === selectedDocument.id}
@@ -3753,7 +4452,49 @@ function FileArtifact({
             </button>
           ) : null}
         </header>
-        {selectedGeneratedImageUrl ? (
+        {selectedGeneratedOfficeArtifact ? (
+          <div className="project-office-detail project-document-detail">
+            <div className="project-document-detail-icon is-ready">
+              {selectedGeneratedOfficeArtifact.kind === "excel" ? (
+                <FileXls size={24} aria-hidden="true" />
+              ) : (
+                <FileDoc size={24} aria-hidden="true" />
+              )}
+            </div>
+            <div>
+              <span>会话生成文件</span>
+              <h3>{selectedGeneratedOfficeArtifact.title}</h3>
+              <p>{selectedGeneratedOfficeArtifact.summary}</p>
+            </div>
+            <dl>
+              <div>
+                <dt>文件</dt>
+                <dd>{selectedGeneratedOfficeArtifact.fileName}</dd>
+              </div>
+              <div>
+                <dt>大小</dt>
+                <dd>{formatDocumentSize(selectedGeneratedOfficeArtifact.byteLength)}</dd>
+              </div>
+              <div>
+                <dt>校验</dt>
+                <dd>结构、渲染与哈希读回均通过</dd>
+              </div>
+              <div>
+                <dt>版本</dt>
+                <dd>{selectedGeneratedOfficeArtifact.revision?.slice(0, 20)}…</dd>
+              </div>
+            </dl>
+            <section className="project-office-preview" aria-label="Office 文件结构预览">
+              <header>
+                <strong>结构预览</strong>
+                {selectedGeneratedOfficeArtifact.previewTruncated ? (
+                  <small>当前仅显示前段内容</small>
+                ) : null}
+              </header>
+              <pre>{selectedGeneratedOfficeArtifact.previewText}</pre>
+            </section>
+          </div>
+        ) : selectedGeneratedImageUrl ? (
           <div className="project-image-preview project-generated-image-preview">
             {imageLoadFailed ? (
               <div className="project-run-empty" role="alert">
@@ -4850,6 +5591,7 @@ function ArtifactPane({
               standalone={standalone}
               documents={conversation.documents ?? []}
               generatedImages={conversation.generatedImages ?? []}
+              generatedOfficeArtifacts={conversation.generatedOfficeArtifacts ?? []}
               api={api}
               requestedPath={requestedFilePath}
               requestedLine={requestedFileLine}
@@ -4954,6 +5696,7 @@ export function LiveProjectWorkbench({
   onProviderOpenChange,
   onProviderChange,
   onModelChange,
+  modelSelectionDisabled = false,
   onOpenSkills,
   installedSkillCount = 0,
   sidebarOpen = true,
@@ -4961,6 +5704,7 @@ export function LiveProjectWorkbench({
   api = projectWorkApi,
   pollIntervalMs = 1_000,
   onConversationChange,
+  onConversationForked,
   onError,
 }) {
   const [snapshot, setSnapshot] = useState(conversation);
@@ -4970,6 +5714,9 @@ export function LiveProjectWorkbench({
   const [contextUsageOpen, setContextUsageOpen] = useState(false);
   const [executionPolicyOpen, setExecutionPolicyOpen] = useState(false);
   const [capabilityOpen, setCapabilityOpen] = useState(false);
+  const [pathOpen, setPathOpen] = useState(false);
+  const [selectedCheckpointId, setSelectedCheckpointId] = useState(null);
+  const [branchTarget, setBranchTarget] = useState(null);
   const [transparentMode, setTransparentMode] = useState(readTransparentMode);
   const [selectedCapabilityIds, setSelectedCapabilityIds] = useState([]);
   const [selectedWorkflowId, setSelectedWorkflowId] = useState(null);
@@ -5013,8 +5760,7 @@ export function LiveProjectWorkbench({
   const snapshotRef = useRef(conversation);
   const conversationChangeRef = useRef(onConversationChange);
   const errorRef = useRef(onError);
-  const pdfInputRef = useRef(null);
-  const imageInputRef = useRef(null);
+  const localFileInputRef = useRef(null);
   const pdfUploadAbort = useRef(null);
   const pendingImageRef = useRef(null);
   const pendingAttachmentsRef = useRef([]);
@@ -5100,6 +5846,9 @@ export function LiveProjectWorkbench({
     setContextUsageOpen(false);
     setExecutionPolicyOpen(false);
     setCapabilityOpen(false);
+    setPathOpen(false);
+    setSelectedCheckpointId(null);
+    setBranchTarget(null);
     setSelectedCapabilityIds([]);
     setSelectedWorkflowId(null);
     setRunningMessageMode("steer");
@@ -5131,6 +5880,14 @@ export function LiveProjectWorkbench({
     replacePendingAttachments,
     replacePendingImage,
   ]);
+
+  useEffect(() => {
+    if (!selectedCheckpointId) return;
+    const exists = snapshot?.sessionPath?.checkpoints?.some(
+      (checkpoint) => checkpoint.id === selectedCheckpointId,
+    );
+    if (!exists) setSelectedCheckpointId(null);
+  }, [selectedCheckpointId, snapshot?.sessionPath?.checkpoints]);
 
   useEffect(() => {
     setSnapshot((current) => {
@@ -5401,6 +6158,7 @@ export function LiveProjectWorkbench({
       !text
       || !snapshot?.id
       || action
+      || modelSelectionDisabled
       || uploadingAttachments.length > 0
     ) return;
     if ((snapshot.askUserRequests ?? []).some(
@@ -5447,11 +6205,12 @@ export function LiveProjectWorkbench({
         : api.sendMessage({
             conversationId: snapshot.id,
             text,
+            checkpointId: branchTarget?.id,
             contexts: contextChips,
             images: pendingImage ? [pendingImage.file] : [],
             attachments: pendingAttachments,
             capabilities: selectedCapabilityIds,
-            workflowId: selectedWorkflowId,
+            workflowId: branchTarget ? "planning" : selectedWorkflowId,
             providerId: providerId || snapshot.providerId,
             modelId: modelId || snapshot.modelId,
             thinkingLevel: activeThinkingLevel,
@@ -5462,6 +6221,8 @@ export function LiveProjectWorkbench({
         current === submittedDraft ? "" : current
       ));
       if (!running) {
+        setBranchTarget(null);
+        if (branchTarget) setSelectedCheckpointId(null);
         setContextChips([]);
         setSelectedCapabilityIds([]);
         setSelectedWorkflowId(null);
@@ -5472,9 +6233,11 @@ export function LiveProjectWorkbench({
   }, [
     action,
     api,
+    branchTarget,
     contextChips,
     draft,
     executeAction,
+    modelSelectionDisabled,
     modelId,
     pendingAttachments,
     pendingImage,
@@ -5701,7 +6464,7 @@ export function LiveProjectWorkbench({
 
     if (grouped.unsupported.length > 0) {
       errors.push(new TypeError(
-        `暂不支持 ${grouped.unsupported.map((file) => file.name).join("、")}；可拖入 PDF、图片、文本或代码文件`,
+        `暂不支持 ${grouped.unsupported.map((file) => file.name).join("、")}；可拖入 PDF、Word、Excel、图片、文本或代码文件`,
       ));
     }
     if (grouped.image.length > 1) {
@@ -5859,12 +6622,67 @@ export function LiveProjectWorkbench({
     );
   }, [api, executeAction, openArtifact, snapshot?.id]);
 
-  const retryLastTurn = useCallback(() => {
-    if (typeof api.retryLastTurn !== "function") return;
-    executeAction("retry-last-turn", () => api.retryLastTurn({
-      conversationId: snapshot.id,
-    }));
+  const retryCheckpoint = useCallback((checkpointId) => {
+    if (!checkpointId || typeof api.retryCheckpoint !== "function") return;
+    executeAction(
+      `retry-checkpoint:${checkpointId}`,
+      () => api.retryCheckpoint({
+        conversationId: snapshot.id,
+        checkpointId,
+      }),
+    ).then((nextSnapshot) => {
+      if (nextSnapshot) setSelectedCheckpointId(null);
+    });
   }, [api, executeAction, snapshot?.id]);
+
+  const startCheckpointBranch = useCallback((checkpointId) => {
+    const checkpoint = snapshot?.sessionPath?.checkpoints?.find(
+      (item) => item.id === checkpointId,
+    );
+    if (!checkpoint) return;
+    const turnLabel = Number.isSafeInteger(checkpoint.turnSeq)
+      ? `第 ${checkpoint.turnSeq} 轮`
+      : "已选回答";
+    const attemptLabel = Number.isSafeInteger(checkpoint.attempt)
+      ? `方案 ${checkpoint.attempt}`
+      : "检查点";
+    setSelectedCheckpointId(checkpoint.id);
+    setBranchTarget({
+      id: checkpoint.id,
+      label: `${turnLabel} · ${attemptLabel}`,
+    });
+    setSelectedWorkflowId("planning");
+  }, [snapshot?.sessionPath?.checkpoints]);
+
+  const cancelCheckpointBranch = useCallback(() => {
+    setBranchTarget(null);
+    setSelectedWorkflowId((current) => current === "planning" ? null : current);
+  }, []);
+
+  const forkCheckpoint = useCallback(async (checkpointId) => {
+    if (
+      !checkpointId
+      || action
+      || !snapshot?.id
+      || typeof api.forkCheckpoint !== "function"
+    ) {
+      return;
+    }
+    setAction(`fork-checkpoint:${checkpointId}`);
+    setActionError(null);
+    try {
+      const forkedConversation = await api.forkCheckpoint({
+        conversationId: snapshot.id,
+        checkpointId,
+      });
+      onConversationForked?.(forkedConversation);
+    } catch (error) {
+      setActionError(error);
+      errorRef.current?.(error);
+    } finally {
+      setAction(null);
+    }
+  }, [action, api, onConversationForked, snapshot?.id]);
 
   const startPreview = useCallback(() => {
     const preview = snapshot?.preview;
@@ -5920,16 +6738,6 @@ export function LiveProjectWorkbench({
   const headerStatusLabel = STATUS_LABELS[headerStatus] ?? headerStatus;
   const queuedHeaderFollowUps = (snapshot?.followUpQueue ?? []).filter(
     (item) => item.status === "queued",
-  );
-  const awaitingHeaderAnswer = (snapshot?.askUserRequests ?? []).some(
-    (request) => request.status === "pending",
-  );
-  const canRetryFromHeader = Boolean(
-    snapshot
-    && !conversationRunning
-    && action !== "message"
-    && hasAssistantReply
-    && !awaitingHeaderAnswer,
   );
 
   useEffect(() => {
@@ -5994,6 +6802,10 @@ export function LiveProjectWorkbench({
   useEffect(() => {
     if (conversationRunning || action) setExecutionPolicyOpen(false);
   }, [action, conversationRunning]);
+
+  useEffect(() => {
+    if (providerOpen) setPathOpen(false);
+  }, [providerOpen]);
   const turnPayloadLocked = action === "message";
   const retryingDocumentId = action?.startsWith("document-retry:")
     ? action.slice("document-retry:".length)
@@ -6011,21 +6823,25 @@ export function LiveProjectWorkbench({
     : null;
   const thinkingSaving = action === "thinking-level";
   const executionPolicySaving = action === "execution-policy";
-  const thinkingBusy = conversationRunning || Boolean(action && !thinkingSaving);
+  const thinkingBusy = modelSelectionDisabled
+    || conversationRunning
+    || Boolean(action && !thinkingSaving);
   const thinkingHint = activeModelInfo?.supportsThinking !== true
     ? "当前模型不支持调节思考强度"
     : conversationRunning
       ? "Agent 工作期间不能切换思考强度"
-      : thinkingSaving
-        ? "正在保存思考强度"
-        : thinkingBusy
-          ? "当前操作完成后可切换思考强度"
-          : "选择下一轮使用的思考强度";
-  const showGptThinking = activeProviderId === "openai-codex"
-    && Boolean(activeModelId);
+      : modelSelectionDisabled
+        ? "正在保存模型选择"
+        : thinkingSaving
+          ? "正在保存思考强度"
+          : thinkingBusy
+            ? "当前操作完成后可切换思考强度"
+            : "选择下一轮使用的思考强度";
+  const showProviderThinking = Boolean(activeModelId);
   const changeThinkingLevel = useCallback((nextThinkingLevel) => {
     if (
       conversationRunning
+      || modelSelectionDisabled
       || !snapshot?.id
       || action
       || !availableThinkingLevels.includes(nextThinkingLevel)
@@ -6047,6 +6863,7 @@ export function LiveProjectWorkbench({
     availableThinkingLevels,
     conversationRunning,
     executeAction,
+    modelSelectionDisabled,
     snapshot?.id,
   ]);
   const changeExecutionPolicy = useCallback((nextMode) => {
@@ -6122,6 +6939,7 @@ export function LiveProjectWorkbench({
               setContextUsageOpen(false);
               setExecutionPolicyOpen(false);
               setCapabilityOpen(false);
+              setPathOpen(false);
             }
             onProviderOpenChange?.(open);
           }}
@@ -6130,7 +6948,10 @@ export function LiveProjectWorkbench({
           model={activeModelId}
           onProviderChange={onProviderChange}
           onModelChange={onModelChange}
-          thinkingLevels={showGptThinking ? availableThinkingLevels : null}
+          selectionDisabled={
+            modelSelectionDisabled || conversationRunning || turnPayloadLocked
+          }
+          thinkingLevels={showProviderThinking ? availableThinkingLevels : null}
           thinkingLevel={activeThinkingLevel}
           supportsThinking={activeModelInfo?.supportsThinking === true}
           thinkingDisabled={thinkingBusy || thinkingSaving}
@@ -6146,6 +6967,7 @@ export function LiveProjectWorkbench({
           if (open) {
             setContextUsageOpen(false);
             setExecutionPolicyOpen(false);
+            setPathOpen(false);
             onProviderOpenChange?.(false);
           }
         }}
@@ -6170,6 +6992,27 @@ export function LiveProjectWorkbench({
       />
       {snapshot ? (
         <>
+          <ProjectSessionPathMenu
+            open={pathOpen}
+            onOpenChange={(open) => {
+              setPathOpen(open);
+              if (open) {
+                setContextUsageOpen(false);
+                setExecutionPolicyOpen(false);
+                setCapabilityOpen(false);
+                onProviderOpenChange?.(false);
+              }
+            }}
+            sessionPath={snapshot.sessionPath}
+            messages={snapshot.messages}
+            selectedCheckpointId={selectedCheckpointId}
+            onSelectCheckpoint={setSelectedCheckpointId}
+            onRetryCheckpoint={retryCheckpoint}
+            onStartBranch={startCheckpointBranch}
+            onForkCheckpoint={forkCheckpoint}
+            busy={conversationRunning || Boolean(action)}
+            standalone={standalone}
+          />
           <ProjectLoopNotificationControl conversation={snapshot} />
           <button
             className={`header-meta-pill project-insight-toggle${transparentMode ? " is-active" : ""}`}
@@ -6198,22 +7041,6 @@ export function LiveProjectWorkbench({
             >
               <StopCircle size={13} aria-hidden="true" />
               {queuedHeaderFollowUps.length > 0 ? "停止并清空队列" : "停止"}
-            </button>
-          ) : null}
-          {canRetryFromHeader ? (
-            <button
-              className="header-meta-pill"
-              type="button"
-              onClick={retryLastTurn}
-              disabled={Boolean(action) || action === "retry-last-turn"}
-              title="重新执行上一轮，会再次调用当前模型"
-            >
-              <ArrowClockwise
-                className={action === "retry-last-turn" ? "spin" : undefined}
-                size={13}
-                aria-hidden="true"
-              />
-              {action === "retry-last-turn" ? "正在重试" : "重试上一轮"}
             </button>
           ) : null}
           {snapshot.unreadCount > 0 ? (
@@ -6304,8 +7131,7 @@ export function LiveProjectWorkbench({
           uploadingAttachments={uploadingAttachments}
           onRemoveAttachment={removePendingAttachment}
           onDropFiles={dropFiles}
-          imageInputRef={imageInputRef}
-          onSelectImage={selectImage}
+          localFileInputRef={localFileInputRef}
           supportsImages={supportsImages}
           onSubmit={submitMessage}
           onLoadEarlier={loadEarlierTurns}
@@ -6323,6 +7149,7 @@ export function LiveProjectWorkbench({
           action={action}
           error={actionError}
           modelLabel={activeModelId}
+          modelSelectionDisabled={modelSelectionDisabled}
           executionPolicyControl={(
             <ProjectExecutionPolicyControl
               open={executionPolicyOpen}
@@ -6332,6 +7159,7 @@ export function LiveProjectWorkbench({
                 if (open) {
                   setContextUsageOpen(false);
                   setCapabilityOpen(false);
+                  setPathOpen(false);
                   onProviderOpenChange?.(false);
                 }
               }}
@@ -6359,6 +7187,7 @@ export function LiveProjectWorkbench({
                 if (open) {
                   setExecutionPolicyOpen(false);
                   setCapabilityOpen(false);
+                  setPathOpen(false);
                   onProviderOpenChange?.(false);
                 }
               }}
@@ -6372,12 +7201,13 @@ export function LiveProjectWorkbench({
             />
           )}
           transparentMode={transparentMode}
-          pdfInputRef={pdfInputRef}
           uploadingPdf={uploadingPdf}
-          onUploadPdf={uploadPdf}
           onRetryDocument={retryDocument}
           retryingDocumentId={retryingDocumentId}
           standalone={standalone}
+          selectedCheckpointId={selectedCheckpointId}
+          branchTarget={branchTarget}
+          onCancelBranch={cancelCheckpointBranch}
         />
       )}
       artifact={(

@@ -173,6 +173,46 @@ test("settings exposes server-backed provider credentials and the Skill center e
   });
 });
 
+test("settings exposes Worker connections and keeps CLI health checks user-triggered", async () => {
+  await withSettingsPanel(({
+    SettingsDialog,
+    SettingsQuickPanel,
+    connectionStatusLabel,
+  }) => {
+    const html = renderToStaticMarkup(React.createElement(SettingsDialog, {
+      section: "connections",
+      onSectionChange: () => {},
+      providerName: "DeepSeek",
+      model: "DeepSeek V4 Pro",
+      onClose: () => {},
+    }));
+    assert.match(html, /连接控制台/);
+    assert.match(html, /飞书文档 Worker/);
+    assert.match(html, /Agent 邮箱 Worker/);
+    assert.match(html, /IMA 笔记 Worker/);
+    assert.doesNotMatch(html, /Canva|可画|Figma|Sketch|Zotero|Obsidian/);
+    assert.match(html, /尚未检查/);
+    assert.match(html, /检查连接/);
+    assert.match(html, /连接检查状态仅在本次 Pi Agent 运行期间保留/);
+    assert.doesNotMatch(html, /上次保存的状态/);
+    assert.match(html, /只有点击“检查连接”才会运行对应的本机 CLI 健康检查/);
+    assert.match(html, /正常工作提醒/);
+    assert.match(html, /正在读取提醒订阅/);
+    assert.doesNotMatch(html, /已发送测试消息|自动检查/u);
+    assert.equal(connectionStatusLabel("unavailable"), "连接不可用");
+    assert.equal(connectionStatusLabel("unexpected"), "状态未知");
+
+    const quickHtml = renderToStaticMarkup(React.createElement(SettingsQuickPanel, {
+      providerName: "DeepSeek",
+      model: "DeepSeek V4 Pro",
+      onOpenFull: () => {},
+      onClose: () => {},
+    }));
+    assert.match(quickHtml, /互联/);
+    assert.match(quickHtml, /Worker 连接与飞书提醒/);
+  });
+});
+
 test("usage loading state never labels stale period data as current", async () => {
   await withSettingsPanel(({
     beginUsageLoadState,

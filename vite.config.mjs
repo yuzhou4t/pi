@@ -2,6 +2,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 const apiTarget = process.env.PI_API_TARGET ?? "http://127.0.0.1:8788";
+const nodeTestContext = Boolean(process.env.NODE_TEST_CONTEXT);
 
 export default defineConfig({
   build: {
@@ -40,7 +41,7 @@ export default defineConfig({
       "/api": apiTarget,
     },
     warmup: {
-      clientFiles: ["./src/main.jsx"],
+      clientFiles: nodeTestContext ? [] : ["./src/main.jsx"],
     },
   },
   preview: {

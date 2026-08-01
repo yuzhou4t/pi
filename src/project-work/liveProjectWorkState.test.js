@@ -12,6 +12,7 @@ import {
   removeLiveConversation,
   replaceProjectConversationSlice,
   renameLiveConversation,
+  updateLiveConversationState,
   upsertLiveProject,
 } from "./liveProjectWorkState.js";
 
@@ -163,6 +164,86 @@ test("standalone creation and removal do not change any project conversation cou
   const removed = removeLiveConversation(created, "standalone-new");
   assert.equal(removed.projects[0].conversationCount, 1);
   assert.equal(removed.conversation, null);
+});
+
+test("accepted conversation configuration updates the active model and list immediately", () => {
+  const current = state({
+    conversations: [{
+      id: "conversation-old",
+      projectId: "project-1",
+      title: "已有会话",
+      status: "idle",
+      providerId: "openai-codex",
+      modelId: "gpt-5.6",
+      lastEventSeq: 4,
+      updatedAt: "2026-08-01T08:00:00.000Z",
+    }],
+    conversation: {
+      id: "conversation-old",
+      projectId: "project-1",
+      title: "已有会话",
+      status: "idle",
+      providerId: "openai-codex",
+      modelId: "gpt-5.6",
+      lastEventSeq: 4,
+      events: [{ seq: 4, type: "turn.completed" }],
+      updatedAt: "2026-08-01T08:00:00.000Z",
+    },
+  });
+
+  const next = updateLiveConversationState(current, {
+    ...current.conversation,
+    providerId: "deepseek",
+    modelId: "deepseek-v4-pro",
+    lastEventSeq: 5,
+    events: [{ seq: 5, type: "model.configuration_changed" }],
+    updatedAt: "2026-08-01T08:00:01.000Z",
+  });
+
+  assert.equal(next.conversation.providerId, "deepseek");
+  assert.equal(next.conversation.modelId, "deepseek-v4-pro");
+  assert.equal(next.conversations[0].providerId, "deepseek");
+  assert.equal(next.conversations[0].modelId, "deepseek-v4-pro");
+  assert.deepEqual(next.conversation.events.map((event) => event.seq), [4, 5]);
+});
+
+test("stale conversation configuration cannot overwrite the active model", () => {
+  const current = state({
+    conversations: [{
+      id: "conversation-old",
+      projectId: "project-1",
+      title: "已有会话",
+      status: "idle",
+      providerId: "deepseek",
+      modelId: "deepseek-v4-pro",
+      lastEventSeq: 5,
+      updatedAt: "2026-08-01T08:00:01.000Z",
+    }],
+    conversation: {
+      id: "conversation-old",
+      projectId: "project-1",
+      title: "已有会话",
+      status: "idle",
+      providerId: "deepseek",
+      modelId: "deepseek-v4-pro",
+      lastEventSeq: 5,
+      events: [{ seq: 5, type: "model.configuration_changed" }],
+      updatedAt: "2026-08-01T08:00:01.000Z",
+    },
+  });
+
+  const next = updateLiveConversationState(current, {
+    ...current.conversation,
+    providerId: "openai-codex",
+    modelId: "gpt-5.6",
+    lastEventSeq: 4,
+    events: [{ seq: 4, type: "turn.completed" }],
+    updatedAt: "2026-08-01T08:00:00.000Z",
+  });
+
+  assert.equal(next, current);
+  assert.equal(next.conversation.providerId, "deepseek");
+  assert.equal(next.conversation.modelId, "deepseek-v4-pro");
 });
 
 test("conversation created for a background project only updates its project count", () => {

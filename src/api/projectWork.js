@@ -7,9 +7,9 @@ export const PROJECT_WORK_IMAGE_TYPES = new Set([
   "image/png",
   "image/webp",
 ]);
+const PROJECT_WORK_IMAGE_EXTENSION_PATTERN = /\.(?:jpe?g|png|webp)$/i;
 export const MAX_PROJECT_WORK_TEXT_ATTACHMENTS = 5;
 export const MAX_PROJECT_WORK_TEXT_ATTACHMENT_BYTES = 5 * 1024 * 1024;
-const PROJECT_WORK_TEXT_ATTACHMENT_PATTERN = /\.(?:bash|c|cfg|cjs|conf|cpp|cs|css|csv|fish|go|gql|graphql|h|hpp|htm|html|ini|java|js|json|jsonl|jsx|kt|kts|less|log|md|mdx|mjs|php|py|rb|rs|scss|sh|sql|swift|toml|ts|tsv|tsx|txt|xml|ya?ml|zsh)$/i;
 const PROJECT_WORK_SENSITIVE_ATTACHMENT_PATTERN = /^(?:\.env(?:\..+)?|credentials?(?:\.[^.]+)?|secrets?(?:\.[^.]+)?|id_(?:dsa|ecdsa|ed25519|rsa)|.+\.(?:key|p12|pem|pfx))$/i;
 
 function pick(value, snakeKey, camelKey, fallback = null) {
@@ -44,12 +44,27 @@ function bytesToBase64(bytes) {
   return globalThis.btoa(binary);
 }
 
+function projectWorkImageMimeType(file) {
+  const type = typeof file?.type === "string" ? file.type.toLowerCase() : "";
+  if (PROJECT_WORK_IMAGE_TYPES.has(type)) return type;
+  const name = typeof file?.name === "string" ? file.name.toLowerCase() : "";
+  if (name.endsWith(".png")) return "image/png";
+  if (name.endsWith(".webp")) return "image/webp";
+  if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+  return type;
+}
+
 export function validateProjectWorkImageFile(file) {
+  const fileName = typeof file?.name === "string" ? file.name : "";
+  const mimeType = typeof file?.type === "string" ? file.type.toLowerCase() : "";
+  const hasSupportedType = PROJECT_WORK_IMAGE_TYPES.has(mimeType);
+  const mayUseExtensionFallback = !mimeType || mimeType === "application/octet-stream";
   if (
     !file
-    || typeof file.name !== "string"
-    || typeof file.type !== "string"
-    || !PROJECT_WORK_IMAGE_TYPES.has(file.type)
+    || !fileName
+    || (!hasSupportedType && !(
+      mayUseExtensionFallback && PROJECT_WORK_IMAGE_EXTENSION_PATTERN.test(fileName)
+    ))
     || !Number.isSafeInteger(file.size)
     || file.size < 1
   ) {
@@ -64,29 +79,23 @@ export function validateProjectWorkImageFile(file) {
 export function projectWorkDroppedFileKind(file) {
   const name = typeof file?.name === "string" ? file.name : "";
   const type = typeof file?.type === "string" ? file.type.toLowerCase() : "";
-  if (PROJECT_WORK_SENSITIVE_ATTACHMENT_PATTERN.test(name)) {
+  if (!name.trim() || PROJECT_WORK_SENSITIVE_ATTACHMENT_PATTERN.test(name)) {
     return "unsupported";
   }
   if (type === "application/pdf" || name.toLowerCase().endsWith(".pdf")) {
     return "pdf";
   }
-  if (PROJECT_WORK_IMAGE_TYPES.has(type)) return "image";
   if (
-    type.startsWith("text/")
-    || [
-      "application/graphql",
-      "application/json",
-      "application/sql",
-      "application/xml",
-      "application/x-httpd-php",
-      "application/x-sh",
-      "application/yaml",
-    ].includes(type)
-    || PROJECT_WORK_TEXT_ATTACHMENT_PATTERN.test(name)
+    PROJECT_WORK_IMAGE_TYPES.has(type)
+    || (!type && PROJECT_WORK_IMAGE_EXTENSION_PATTERN.test(name))
+    || (type === "application/octet-stream" && PROJECT_WORK_IMAGE_EXTENSION_PATTERN.test(name))
   ) {
-    return "text";
+    return "image";
   }
-  return "unsupported";
+  // Browsers often report an empty or generic MIME type for readable formats
+  // such as .drawio. The service verifies the actual bytes as safe UTF-8 text
+  // before the attachment becomes available to the Agent.
+  return "text";
 }
 
 export function validateProjectWorkTextAttachmentFile(file) {
@@ -98,7 +107,7 @@ export function validateProjectWorkTextAttachmentFile(file) {
     || file.size < 1
     || projectWorkDroppedFileKind(file) !== "text"
   ) {
-    throw new TypeError("请选择文本、代码、Markdown、JSON 或表格文件");
+    throw new TypeError("请选择不含敏感文件名的本地资料");
   }
   if (file.size > MAX_PROJECT_WORK_TEXT_ATTACHMENT_BYTES) {
     throw new TypeError(`文件 ${file.name} 不能超过 5 MB`);
@@ -132,7 +141,7 @@ export async function serializeProjectWorkImage(file) {
   }
   return {
     file_name: file.name,
-    mime_type: file.type,
+    mime_type: projectWorkImageMimeType(file),
     byte_length: file.size,
     data: bytesToBase64(bytes),
   };
@@ -519,6 +528,20 @@ function mapMessage(raw) {
     turnId: pick(raw, "turn_id", "turnId"),
     turnSeq: nullableNumber(raw, "turn_seq", "turnSeq"),
     attempt: nullableNumber(raw, "attempt", "attempt"),
+    checkpointId: pick(raw, "checkpoint_id", "checkpointId"),
+    parentCheckpointId: pick(
+      raw,
+      "parent_checkpoint_id",
+      "parentCheckpointId",
+    ),
+    branchId: pick(raw, "branch_id", "branchId"),
+    branchLabel: pick(raw, "branch_label", "branchLabel"),
+    branchFromCheckpointId: pick(
+      raw,
+      "branch_from_checkpoint_id",
+      "branchFromCheckpointId",
+    ),
+    inherited: Boolean(pick(raw, "inherited", "inherited", false)),
     isFinal: pick(raw, "is_final", "isFinal", true) !== false,
     retryOperationId: pick(
       raw,
@@ -536,6 +559,87 @@ function mapMessage(raw) {
     ),
     createdAt: pick(raw, "created_at", "createdAt"),
     status: pick(raw, "status", "status", "completed"),
+  };
+}
+
+function mapSessionCheckpoint(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const id = pick(raw, "checkpoint_id", "checkpointId", raw.id);
+  if (typeof id !== "string" || !id) return null;
+  return {
+    id,
+    parentId: pick(raw, "parent_id", "parentId"),
+    turnId: pick(raw, "turn_id", "turnId"),
+    turnSeq: nullableNumber(raw, "turn_seq", "turnSeq"),
+    userMessageId: pick(raw, "user_message_id", "userMessageId"),
+    assistantMessageId: pick(
+      raw,
+      "assistant_message_id",
+      "assistantMessageId",
+    ),
+    attempt: nullableNumber(raw, "attempt", "attempt"),
+    providerId: pick(raw, "provider_id", "providerId"),
+    modelId: pick(raw, "model_id", "modelId"),
+    thinkingLevel: pick(raw, "thinking_level", "thinkingLevel"),
+    status: pick(raw, "status", "status", "completed"),
+    title: pick(raw, "title", "title", ""),
+    branchable: Boolean(pick(raw, "branchable", "branchable", false)),
+    blockedReason: pick(raw, "blocked_reason", "blockedReason"),
+    createdAt: pick(raw, "created_at", "createdAt"),
+  };
+}
+
+function mapSessionPath(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {
+      activeLeafCheckpointId: null,
+      checkpoints: [],
+    };
+  }
+  return {
+    activeLeafCheckpointId: pick(
+      raw,
+      "active_leaf_checkpoint_id",
+      "activeLeafCheckpointId",
+    ),
+    checkpoints: asArray(raw.checkpoints)
+      .map(mapSessionCheckpoint)
+      .filter(Boolean),
+  };
+}
+
+function mapConversationFork(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const sourceConversationId = pick(
+    raw,
+    "source_conversation_id",
+    "sourceConversationId",
+  );
+  const sourceCheckpointId = pick(
+    raw,
+    "source_checkpoint_id",
+    "sourceCheckpointId",
+  );
+  if (
+    typeof sourceConversationId !== "string"
+    || !sourceConversationId
+    || typeof sourceCheckpointId !== "string"
+    || !sourceCheckpointId
+  ) {
+    return null;
+  }
+  return {
+    sourceConversationId,
+    sourceCheckpointId,
+    sourceAssistantMessageId: pick(
+      raw,
+      "source_assistant_message_id",
+      "sourceAssistantMessageId",
+    ),
+    status: pick(raw, "status", "status", "ready"),
+    contextMode: pick(raw, "context_mode", "contextMode", "pi_native_path"),
+    projectFiles: pick(raw, "project_files", "projectFiles", "current"),
+    createdAt: pick(raw, "created_at", "createdAt"),
   };
 }
 
@@ -563,6 +667,47 @@ function mapGeneratedImage(raw) {
     pricingStatus: pick(raw, "pricing_status", "pricingStatus"),
     usageStatus: pick(raw, "usage_status", "usageStatus", "unknown"),
     usage: mapTurnUsage(raw.usage),
+    error: pick(raw, "error", "error"),
+    createdAt: pick(raw, "created_at", "createdAt"),
+    completedAt: pick(raw, "completed_at", "completedAt"),
+  };
+}
+
+function mapGeneratedOfficeArtifact(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const id = pick(raw, "artifact_id", "artifactId", raw.id);
+  if (typeof id !== "string" || !id) return null;
+  const kind = pick(raw, "kind", "kind", "word");
+  return {
+    id,
+    turnId: pick(raw, "turn_id", "turnId"),
+    kind: kind === "excel" ? "excel" : "word",
+    status: pick(raw, "status", "status", "failed"),
+    title: pick(raw, "title", "title", ""),
+    summary: pick(raw, "summary", "summary", ""),
+    fileName: pick(raw, "file_name", "fileName"),
+    mimeType: pick(raw, "mime_type", "mimeType"),
+    byteLength: nullableNumber(raw, "byte_length", "byteLength"),
+    sha256: pick(raw, "sha256", "sha256"),
+    revision: pick(raw, "revision", "revision"),
+    previewText: pick(raw, "preview_text", "previewText", ""),
+    previewTruncated: Boolean(
+      pick(raw, "preview_truncated", "previewTruncated", false),
+    ),
+    structureVerified: Boolean(
+      pick(raw, "structure_verified", "structureVerified", false),
+    ),
+    renderVerified: Boolean(
+      pick(raw, "render_verified", "renderVerified", false),
+    ),
+    pageCount: nullableNumber(raw, "page_count", "pageCount"),
+    sheetCount: nullableNumber(raw, "sheet_count", "sheetCount"),
+    sourceArtifactId: pick(raw, "source_artifact_id", "sourceArtifactId"),
+    sourceArtifactRevision: pick(
+      raw,
+      "source_artifact_revision",
+      "sourceArtifactRevision",
+    ),
     error: pick(raw, "error", "error"),
     createdAt: pick(raw, "created_at", "createdAt"),
     completedAt: pick(raw, "completed_at", "completedAt"),
@@ -742,6 +887,16 @@ function mapEvent(raw) {
       "workflowId",
       pick(data, "workflow_id", "workflowId"),
     ),
+    turnId: pick(
+      raw,
+      "turn_id",
+      "turnId",
+      pick(data, "turn_id", "turnId"),
+    ),
+    turnSeq: nullableNumber(data, "turn_seq", "turnSeq")
+      ?? nullableNumber(raw, "turn_seq", "turnSeq"),
+    attempt: nullableNumber(data, "attempt", "attempt")
+      ?? nullableNumber(raw, "attempt", "attempt"),
     capabilities: asArray(
       pick(raw, "capabilities", "capabilities", data.capabilities),
     ).filter((capability) => typeof capability === "string" && capability),
@@ -1505,11 +1660,20 @@ function mapProjectWorkAttachment(raw) {
     id,
     fileName,
     mimeType: pick(raw, "mime_type", "mimeType", "text/plain"),
+    detectedMimeType: pick(raw, "detected_mime_type", "detectedMimeType"),
+    contentKind: pick(raw, "content_kind", "contentKind", "plain_text"),
+    readingHint: pick(raw, "reading_hint", "readingHint"),
+    representation: pick(raw, "representation", "representation", "source"),
     byteLength: Number(pick(raw, "byte_length", "byteLength", 0)) || 0,
     status: pick(raw, "status", "status", "awaiting_upload"),
     contentHash: pick(raw, "content_hash", "contentHash", revision),
     revision,
     lineCount: nullableNumber(raw, "line_count", "lineCount"),
+    projectionLineCount: nullableNumber(
+      raw,
+      "projection_line_count",
+      "projectionLineCount",
+    ),
     createdAt: pick(raw, "created_at", "createdAt"),
     updatedAt: pick(raw, "updated_at", "updatedAt"),
     readyAt: pick(raw, "ready_at", "readyAt"),
@@ -1645,6 +1809,16 @@ export function mapProjectWorkConversation(raw) {
     status: pick(source, "status", "status", "idle"),
     turnStatus: pick(source, "turn_status", "turnStatus"),
     activeTurnId: pick(source, "active_turn_id", "activeTurnId"),
+    sessionPath: mapSessionPath(
+      pick(source, "session_path", "sessionPath"),
+    ),
+    activeBranchId: pick(source, "active_branch_id", "activeBranchId"),
+    activeBranchLabel: pick(
+      source,
+      "active_branch_label",
+      "activeBranchLabel",
+    ),
+    fork: mapConversationFork(pick(source, "fork", "fork")),
     activeArtifactId: pick(source, "active_artifact_id", "activeArtifactId", "files"),
     messages: asArray(source.messages).map(mapMessage).filter(Boolean),
     hasMoreTurns: Boolean(
@@ -1745,6 +1919,14 @@ export function mapProjectWorkConversation(raw) {
     generatedImages: asArray(
       pick(source, "generated_images", "generatedImages", []),
     ).map(mapGeneratedImage).filter(Boolean),
+    generatedOfficeArtifacts: asArray(
+      pick(
+        source,
+        "generated_office_artifacts",
+        "generatedOfficeArtifacts",
+        [],
+      ),
+    ).map(mapGeneratedOfficeArtifact).filter(Boolean),
     followUpQueue: asArray(
       pick(source, "follow_up_queue", "followUpQueue", []),
     ).map(mapFollowUpItem).filter(Boolean),
@@ -2328,7 +2510,6 @@ export async function pickProjectWorkRoot({
 
 export async function registerProjectWorkProject({
   rootToken,
-  workspaceKind = "project_work",
   name,
   newFolderName,
   signal,
@@ -2340,7 +2521,6 @@ export async function registerProjectWorkProject({
     body: {
       schema_version: 1,
       root_token: rootToken,
-      workspace_kind: workspaceKind,
       ...(typeof name === "string" && name.trim() ? { name: name.trim() } : {}),
       ...(typeof newFolderName === "string" && newFolderName.trim()
         ? { new_folder_name: newFolderName.trim() }
@@ -2357,10 +2537,17 @@ export async function createProjectWorkConversation({
   providerId,
   modelId,
   thinkingLevel,
+  executionPolicyMode,
   signal,
   fetchImpl,
 } = {}) {
   requiredId(projectId, "projectId");
+  if (
+    executionPolicyMode !== undefined
+    && !["manual_review", "auto_review"].includes(executionPolicyMode)
+  ) {
+    throw new TypeError("executionPolicyMode 必须是 manual_review 或 auto_review");
+  }
   const payload = await requestJson(
     `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/conversations`,
     {
@@ -2370,6 +2557,9 @@ export async function createProjectWorkConversation({
         ...(providerId ? { provider_id: providerId } : {}),
         ...(modelId ? { model_id: modelId } : {}),
         ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
+        ...(executionPolicyMode
+          ? { execution_policy_mode: executionPolicyMode }
+          : {}),
       },
       signal,
       fetchImpl,
@@ -2382,9 +2572,16 @@ export async function createStandaloneProjectWorkConversation({
   providerId,
   modelId,
   thinkingLevel,
+  executionPolicyMode,
   signal,
   fetchImpl,
 } = {}) {
+  if (
+    executionPolicyMode !== undefined
+    && !["manual_review", "auto_review"].includes(executionPolicyMode)
+  ) {
+    throw new TypeError("executionPolicyMode 必须是 manual_review 或 auto_review");
+  }
   const payload = await requestJson(`${PROJECT_WORK_API_ROOT}/conversations`, {
     method: "POST",
     body: {
@@ -2392,6 +2589,9 @@ export async function createStandaloneProjectWorkConversation({
       ...(providerId ? { provider_id: providerId } : {}),
       ...(modelId ? { model_id: modelId } : {}),
       ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
+      ...(executionPolicyMode
+        ? { execution_policy_mode: executionPolicyMode }
+        : {}),
     },
     signal,
     fetchImpl,
@@ -2606,6 +2806,7 @@ export function subscribeProjectWorkConversation({
 export async function sendProjectWorkMessage({
   conversationId,
   text,
+  checkpointId,
   contexts = [],
   images = [],
   attachments = [],
@@ -2620,6 +2821,9 @@ export async function sendProjectWorkMessage({
 } = {}) {
   requiredId(conversationId, "conversationId");
   const requestId = requiredId(clientRequestId, "clientRequestId").trim();
+  const normalizedCheckpointId = checkpointId === undefined
+    ? null
+    : requiredId(checkpointId, "checkpointId").trim();
   if (typeof text !== "string" || !text.trim()) throw new TypeError("text 必须是非空字符串");
   if (!Array.isArray(images) || images.length > 1) {
     throw new TypeError("每条消息最多添加一张图片");
@@ -2644,6 +2848,9 @@ export async function sendProjectWorkMessage({
         schema_version: 1,
         client_request_id: requestId,
         text: text.trim(),
+        ...(normalizedCheckpointId
+          ? { checkpoint_message_id: normalizedCheckpointId }
+          : {}),
         images: serializedImages,
         attachments: serializedAttachments,
         capabilities: asArray(capabilities).filter(
@@ -2831,8 +3038,17 @@ export async function configureProjectWorkConversation({
   fetchImpl,
 } = {}) {
   requiredId(conversationId, "conversationId");
-  if (typeof thinkingLevel !== "string" || !thinkingLevel.trim()) {
+  if (
+    thinkingLevel !== undefined
+    && (typeof thinkingLevel !== "string" || !thinkingLevel.trim())
+  ) {
     throw new TypeError("thinkingLevel 必须是非空字符串");
+  }
+  const normalizedThinkingLevel = typeof thinkingLevel === "string"
+    ? thinkingLevel.trim()
+    : "";
+  if (!providerId && !modelId && !normalizedThinkingLevel) {
+    throw new TypeError("至少需要 providerId、modelId 或 thinkingLevel 之一");
   }
   const payload = await requestJson(
     `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/configuration`,
@@ -2842,7 +3058,9 @@ export async function configureProjectWorkConversation({
         schema_version: 1,
         ...(providerId ? { provider_id: providerId } : {}),
         ...(modelId ? { model_id: modelId } : {}),
-        thinking_level: thinkingLevel.trim(),
+        ...(normalizedThinkingLevel
+          ? { thinking_level: normalizedThinkingLevel }
+          : {}),
       },
       signal,
       fetchImpl,
@@ -3168,11 +3386,15 @@ export async function markProjectWorkConversationRead({
 
 export async function retryProjectWorkLastTurn({
   conversationId,
+  checkpointId,
   clientRequestId = createRequestId("project-retry"),
   signal,
   fetchImpl,
 } = {}) {
   requiredId(conversationId, "conversationId");
+  const normalizedCheckpointId = checkpointId === undefined
+    ? null
+    : requiredId(checkpointId, "checkpointId").trim();
   const payload = await requestJson(
     `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/retry-last-turn`,
     {
@@ -3180,6 +3402,42 @@ export async function retryProjectWorkLastTurn({
       body: {
         schema_version: 1,
         client_request_id: clientRequestId,
+        ...(normalizedCheckpointId
+          ? { checkpoint_id: normalizedCheckpointId }
+          : {}),
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
+}
+
+export function retryProjectWorkCheckpoint(options = {}) {
+  requiredId(options.checkpointId, "checkpointId");
+  return retryProjectWorkLastTurn(options);
+}
+
+export async function forkProjectWorkCheckpoint({
+  conversationId,
+  checkpointId,
+  clientRequestId = createRequestId("project-fork"),
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  const normalizedCheckpointId = requiredId(
+    checkpointId,
+    "checkpointId",
+  ).trim();
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/forks`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        client_request_id: clientRequestId,
+        checkpoint_id: normalizedCheckpointId,
       },
       signal,
       fetchImpl,
@@ -3324,6 +3582,17 @@ export function projectWorkGeneratedImageUrl({
   return `${PROJECT_WORK_API_ROOT}/conversations/${
     encodeURIComponent(conversationId)
   }/generated-images/${encodeURIComponent(imageId)}/content`;
+}
+
+export function projectWorkGeneratedOfficeDownloadUrl({
+  conversationId,
+  artifactId,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(artifactId, "artifactId");
+  return `${PROJECT_WORK_API_ROOT}/conversations/${
+    encodeURIComponent(conversationId)
+  }/generated-office/${encodeURIComponent(artifactId)}/download`;
 }
 
 export async function fetchProjectWorkFile({
@@ -3718,11 +3987,14 @@ export const projectWorkApi = {
   fetchTurns: fetchProjectWorkConversationTurns,
   markRead: markProjectWorkConversationRead,
   retryLastTurn: retryProjectWorkLastTurn,
+  retryCheckpoint: retryProjectWorkCheckpoint,
+  forkCheckpoint: forkProjectWorkCheckpoint,
   resumeVerificationRepair: resumeProjectWorkVerificationRepair,
   fetchTree: fetchProjectWorkTree,
   fetchFile: fetchProjectWorkFile,
   imageUrl: projectWorkImageUrl,
   generatedImageUrl: projectWorkGeneratedImageUrl,
+  generatedOfficeDownloadUrl: projectWorkGeneratedOfficeDownloadUrl,
   uploadAttachment: uploadProjectWorkAttachment,
   removeAttachment: removeProjectWorkAttachment,
   uploadPdf: uploadProjectWorkPdf,

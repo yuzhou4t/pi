@@ -20,6 +20,7 @@ import { DeleteConversationDialog } from "./components/DeleteConversationDialog.
 import { DeleteTopicConversationDialog } from "./components/DeleteTopicConversationDialog.jsx";
 import { ResetPaperReadingDialog } from "./components/ResetPaperReadingDialog.jsx";
 import { ProjectRail } from "./components/ProjectRail.jsx";
+import { WorkerRail, WorkerWorkspace } from "./components/WorkerWorkspace.jsx";
 import { RenameConversationDialog } from "./components/RenameConversationDialog.jsx";
 import { SettingsDialog, SettingsQuickPanel } from "./components/SettingsPanel.jsx";
 import { SkillCenter } from "./components/SkillCenter.jsx";
@@ -32,10 +33,10 @@ import {
   insertCreatedConversation,
   isProjectWorkConversationBusy,
   isProjectWorkConversationDeleteBlocked,
-  mergeFreshConversationSnapshot,
   removeLiveConversation,
   replaceProjectConversationSlice,
   renameLiveConversation,
+  updateLiveConversationState,
   upsertLiveProject,
 } from "./project-work/liveProjectWorkState.js";
 import {
@@ -79,6 +80,7 @@ import {
 import { getModelDisplayName, providers, skillCatalog } from "./data.js";
 import { usePersistentReducer } from "./hooks/usePersistentReducer.js";
 import { usePersistentState } from "./hooks/usePersistentState.js";
+import { useWorkerController } from "./worker/useWorkerController.js";
 import { workflowFixture } from "./workflow/fixtures.js";
 import { buildPaperReadingLibrary } from "./workflow/paperLibrary.js";
 import {
@@ -108,6 +110,34 @@ const JournalLibraryWorkspace = lazy(() => import(
   "./components/JournalLibraryWorkspace.jsx"
 ).then((module) => ({ default: module.JournalLibraryWorkspace })));
 const WORKFLOW_FIXTURES_ENABLED = import.meta.env.VITE_ENABLE_WORKFLOW_FIXTURES === "true";
+export const DEFAULT_PROJECT_WORK_EXECUTION_POLICY_MODE = "auto_review";
+const NOTIFICATION_CONVERSATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u;
+
+export function parseProjectWorkNotificationEntry(search = "") {
+  const parameters = new URLSearchParams(typeof search === "string" ? search : "");
+  const workTypes = parameters.getAll("work_type");
+  const conversationIds = parameters.getAll("conversation_id");
+  if (
+    workTypes.length !== 1
+    || workTypes[0] !== "project_work"
+    || conversationIds.length !== 1
+    || !NOTIFICATION_CONVERSATION_ID_PATTERN.test(conversationIds[0])
+  ) {
+    return null;
+  }
+  return {
+    workType: "project_work",
+    conversationId: conversationIds[0],
+  };
+}
+
+export function notificationEntryUrlWithoutControlParameters(locationLike = {}) {
+  const parameters = new URLSearchParams(locationLike.search ?? "");
+  parameters.delete("work_type");
+  parameters.delete("conversation_id");
+  const search = parameters.toString();
+  return `${locationLike.pathname || "/"}${search ? `?${search}` : ""}${locationLike.hash || ""}`;
+}
 
 const runStatusLabels = {
   [RUN_STATUS.REVIEW_READY]: "本月待审阅",
@@ -223,6 +253,88 @@ function normalizeProviderConfig(config, catalogProviders, defaultProviderId) {
   }
   const model = provider?.models.includes(config?.model) ? config.model : provider?.models[0] ?? "";
   return { providerId: provider?.id ?? "", model };
+}
+
+function modelPreferenceId(value, maxLength) {
+  return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+}
+
+export function normalizeProjectWorkModelPreference(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
+  const providerId = modelPreferenceId(source.providerId, 120);
+  const modelsByProvider = {};
+  if (
+    source.modelsByProvider
+    && typeof source.modelsByProvider === "object"
+    && !Array.isArray(source.modelsByProvider)
+  ) {
+    for (const [rawProviderId, rawModelId] of Object.entries(source.modelsByProvider)) {
+      const savedProviderId = modelPreferenceId(rawProviderId, 120);
+      const savedModelId = modelPreferenceId(rawModelId, 200);
+      if (savedProviderId && savedModelId) {
+        modelsByProvider[savedProviderId] = savedModelId;
+      }
+    }
+  }
+  const legacyModelId = modelPreferenceId(source.model, 200);
+  if (providerId && legacyModelId && !modelsByProvider[providerId]) {
+    modelsByProvider[providerId] = legacyModelId;
+  }
+  return { providerId, modelsByProvider };
+}
+
+export function rememberProjectWorkModelPreference(value, providerId, modelId) {
+  const current = normalizeProjectWorkModelPreference(value);
+  const nextProviderId = modelPreferenceId(providerId, 120);
+  const nextModelId = modelPreferenceId(modelId, 200);
+  if (!nextProviderId || !nextModelId) return current;
+  return {
+    providerId: nextProviderId,
+    modelsByProvider: {
+      ...current.modelsByProvider,
+      [nextProviderId]: nextModelId,
+    },
+  };
+}
+
+export function resolveProjectWorkModelSelection({
+  preference,
+  providers: availableProviders,
+  defaultProviderId,
+  defaultModelId,
+  conversation = null,
+}) {
+  const normalizedPreference = normalizeProjectWorkModelPreference(preference);
+  const providersList = Array.isArray(availableProviders) ? availableProviders : [];
+  const conversationProvider = providersList.find((provider) => (
+    provider?.available
+    && provider.id === conversation?.providerId
+    && provider.models?.includes(conversation?.modelId)
+  ));
+  if (conversationProvider) {
+    return {
+      providerId: conversationProvider.id,
+      modelId: conversation.modelId,
+    };
+  }
+  const provider = providersList.find((item) => (
+    item?.available && item.id === normalizedPreference.providerId
+  )) ?? providersList.find((item) => (
+    item?.available && item.id === defaultProviderId
+  )) ?? providersList.find((item) => item?.available)
+    ?? providersList[0];
+  const savedModel = normalizedPreference.modelsByProvider[provider?.id];
+  const modelId = provider?.models?.includes(savedModel)
+    ? savedModel
+    : provider?.id === defaultProviderId && provider?.models?.includes(defaultModelId)
+      ? defaultModelId
+      : provider?.models?.[0] ?? "";
+  return {
+    providerId: provider?.id ?? "",
+    modelId,
+  };
 }
 
 function createLoadingSummaryState() {
@@ -439,10 +551,16 @@ export function App() {
   const [rightRailWidth, setRightRailWidth] = useState(360);
   const [resizingSide, setResizingSide] = useState(null);
   const [selectedProjectId, setSelectedProjectId] = useState(BASE_PROJECTS[0].id);
-  const [workspaceKind, setWorkspaceKind] = usePersistentState(
+  const [workspaceMode, setWorkspaceMode] = usePersistentState(
     "pi-agent-workspace-kind-v1",
     "project_work",
   );
+  const notificationEntryRef = useRef(undefined);
+  if (notificationEntryRef.current === undefined) {
+    notificationEntryRef.current = typeof window === "undefined"
+      ? null
+      : parseProjectWorkNotificationEntry(window.location.search);
+  }
   const [registeredProjects, setRegisteredProjects] = usePersistentState(
     "pi-agent-registered-projects-v1",
     [],
@@ -458,10 +576,24 @@ export function App() {
         projectId: workflowFixture.project.id,
         conversationId: "workflow-run",
       },
+      worker: {
+        taskId: "",
+        workerId: "",
+      },
     },
   );
   const [projectQuery, setProjectQuery] = useState("");
   const isResizing = resizingSide !== null;
+
+  useEffect(() => {
+    if (!notificationEntryRef.current || typeof window === "undefined") return;
+    setWorkspaceMode("project_work");
+    window.history.replaceState(
+      window.history.state,
+      "",
+      notificationEntryUrlWithoutControlParameters(window.location),
+    );
+  }, [setWorkspaceMode]);
 
   const startResizing = useCallback((side) => (e) => {
     e.preventDefault();
@@ -543,6 +675,7 @@ export function App() {
   const [topicSearchAddErrors, setTopicSearchAddErrors] = useState({});
   const topicSearchLoadedRef = useRef(false);
   const [liveProjectWork, setLiveProjectWork] = useState(createLiveProjectWorkState);
+  const activeProjectWorkState = liveProjectWork.conversation;
   const [projectWorkModelCatalog, setProjectWorkModelCatalog] = useState({
     status: "loading",
     providers: [],
@@ -552,8 +685,10 @@ export function App() {
   });
   const [projectWorkProviderConfig, setProjectWorkProviderConfig] = usePersistentState(
     "pi-agent-project-work-provider-v1",
-    { providerId: "", model: "" },
+    { providerId: "", modelsByProvider: {} },
   );
+  const [projectWorkModelSelectionSaving, setProjectWorkModelSelectionSaving] = useState(false);
+  const projectWorkModelSelectionPendingRef = useRef(false);
   const projectWorkLoadRef = useRef(0);
   const activeConversationIdRef = useRef(activeConversationId);
   const selectedProjectIdRef = useRef(selectedProjectId);
@@ -646,11 +781,13 @@ export function App() {
     updated: item.updatedAt ? "本机" : "刚刚",
     removable: true,
   })), [liveProjectWork.projects]);
-  const projectItems = workspaceKind === "project_work"
+  const projectItems = workspaceMode === "project_work"
     ? liveProjectItems
-    : paperProjectItems;
+    : workspaceMode === "paper_reading"
+      ? paperProjectItems
+      : [];
   const project = (
-    workspaceKind === "project_work" && selectedProjectId === ""
+    workspaceMode === "project_work" && selectedProjectId === ""
       ? {
           id: "",
           name: "独立对话",
@@ -662,7 +799,11 @@ export function App() {
     ) ?? projectItems[0]
     ?? {
       id: "",
-      name: workspaceKind === "project_work" ? "尚未绑定项目" : "论文精读",
+      name: workspaceMode === "project_work"
+        ? "尚未绑定项目"
+        : workspaceMode === "worker"
+          ? "Worker"
+          : "论文精读",
       rootLabel: "",
       state: "0 个会话",
       updated: "",
@@ -740,20 +881,23 @@ export function App() {
       models: [],
     }] : []),
   ];
+  const preferredProjectWorkSelection = resolveProjectWorkModelSelection({
+    preference: projectWorkProviderConfig,
+    providers: projectWorkProviders,
+    defaultProviderId: projectWorkModelCatalog.defaultProviderId,
+    defaultModelId: projectWorkModelCatalog.defaultModelId,
+  });
+  const selectedProjectWorkSelection = resolveProjectWorkModelSelection({
+    preference: projectWorkProviderConfig,
+    providers: projectWorkProviders,
+    defaultProviderId: projectWorkModelCatalog.defaultProviderId,
+    defaultModelId: projectWorkModelCatalog.defaultModelId,
+    conversation: activeProjectWorkState,
+  });
   const selectedProjectWorkProvider = projectWorkProviders.find(
-    (item) => item.id === projectWorkProviderConfig.providerId && item.available,
-  ) ?? projectWorkProviders.find(
-    (item) => item.id === projectWorkModelCatalog.defaultProviderId && item.available,
-  ) ?? projectWorkProviders.find((item) => item.available)
-    ?? projectWorkProviders[0];
-  const selectedProjectWorkModel = selectedProjectWorkProvider?.models.includes(
-    projectWorkProviderConfig.model,
-  )
-    ? projectWorkProviderConfig.model
-    : selectedProjectWorkProvider?.id === projectWorkModelCatalog.defaultProviderId
-      && selectedProjectWorkProvider?.models.includes(projectWorkModelCatalog.defaultModelId)
-      ? projectWorkModelCatalog.defaultModelId
-      : selectedProjectWorkProvider?.models[0] ?? "";
+    (item) => item.id === selectedProjectWorkSelection.providerId,
+  ) ?? projectWorkProviders[0];
+  const selectedProjectWorkModel = selectedProjectWorkSelection.modelId;
   const selectedProjectWorkModelInfo = projectWorkModelCatalog.providers
     .find((provider) => provider.id === selectedProjectWorkProvider?.id)
     ?.models.find((model) => model.id === selectedProjectWorkModel);
@@ -805,20 +949,21 @@ export function App() {
   const paperConversationId = readerTarget
     ? `paper:${readerTarget.paperId}`
     : "paper-reading-entry";
-  const activeProjectWorkState = liveProjectWork.conversation;
-  const projectWorkMode = workspaceKind === "project_work";
+  const projectWorkMode = workspaceMode === "project_work";
+  const workerMode = workspaceMode === "worker";
+  const paperReadingMode = workspaceMode === "paper_reading";
   const readingMode = Boolean(readerPaper) && activeConversationId === paperConversationId;
-  const topicSearchMode = !projectWorkMode
+  const topicSearchMode = paperReadingMode
     && !readingMode
     && activeConversationId === "topic-search";
-  const journalLibraryView = !projectWorkMode && !readingMode
+  const journalLibraryView = paperReadingMode && !readingMode
     ? (activeConversationId === "journal-classics"
         ? "recent_classics"
         : activeConversationId === "journal-history"
           ? "past_runs"
           : null)
     : null;
-  const workflowMode = !projectWorkMode && !readingMode && !topicSearchMode && !journalLibraryView;
+  const workflowMode = paperReadingMode && !readingMode && !topicSearchMode && !journalLibraryView;
   // 近年经典优先取当前 Run；当前 Run 还没整理时退回最近一期有数据的 Run。
   const recentClassicsSource = useMemo(() => {
     if (journalRunState.run?.recentClassics) {
@@ -915,12 +1060,14 @@ export function App() {
       liveProjectWork.conversations,
     ],
   );
-  const conversations = workspaceKind === "project_work"
+  const conversations = workspaceMode === "project_work"
     ? liveProjectWorkConversations
-    : paperConversations;
+    : workspaceMode === "paper_reading"
+      ? paperConversations
+      : [];
   const visibleConversations = useMemo(
-    () => conversations.filter((conversation) => conversation.kind === workspaceKind),
-    [conversations, workspaceKind],
+    () => conversations.filter((conversation) => conversation.kind === workspaceMode),
+    [conversations, workspaceMode],
   );
 
   useEffect(() => {
@@ -960,14 +1107,6 @@ export function App() {
     readerTarget?.runId,
   ]);
 
-  const syncProjectWorkModel = useCallback((conversation) => {
-    if (!conversation?.providerId || !conversation?.modelId) return;
-    setProjectWorkProviderConfig({
-      providerId: conversation.providerId,
-      model: conversation.modelId,
-    });
-  }, [setProjectWorkProviderConfig]);
-
   const clearPreparingConversationSelection = useCallback(() => {
     preparingConversationSelectionRef.current = null;
     setPreparingConversationSelection(null);
@@ -976,6 +1115,7 @@ export function App() {
   const loadLiveProjectWork = useCallback(async ({
     preferredProjectId,
     preferredConversationId,
+    notificationConversationId,
   } = {}) => {
     clearPreparingConversationSelection();
     const requestId = projectWorkLoadRef.current + 1;
@@ -988,14 +1128,23 @@ export function App() {
       error: null,
     }));
     try {
-      const [projects, standaloneConversations] = await Promise.all([
+      const [projects, standaloneConversations, notificationConversation] = await Promise.all([
         projectWorkApi.listProjects(),
         projectWorkApi.listStandaloneConversations(),
+        notificationConversationId
+          ? projectWorkApi.fetchConversation({ conversationId: notificationConversationId })
+            .catch(() => null)
+          : Promise.resolve(null),
       ]);
-      const preferredStandalone = preferredProjectId === ""
+      const notificationProjectId = notificationConversation?.projectId ?? null;
+      const preferredStandalone = notificationConversation?.projectId === null
+        ? notificationConversation
+        : preferredProjectId === ""
         ? standaloneConversations.find((item) => item.id === preferredConversationId)
         : null;
-      const projectId = preferredStandalone
+      const projectId = notificationConversation
+        ? notificationProjectId ?? ""
+        : preferredStandalone
         ? ""
         : projects.some((item) => item.id === preferredProjectId)
           ? preferredProjectId
@@ -1003,14 +1152,25 @@ export function App() {
       const projectConversations = projectId
         ? await projectWorkApi.listConversations({ projectId })
         : [];
-      const nextConversations = [...standaloneConversations, ...projectConversations];
-      const conversationId = preferredStandalone?.id
+      const listedConversationIds = new Set([
+        ...standaloneConversations,
+        ...projectConversations,
+      ].map((item) => item.id));
+      const nextConversations = [
+        ...standaloneConversations,
+        ...projectConversations,
+        ...(notificationConversation && !listedConversationIds.has(notificationConversation.id)
+          ? [notificationConversation]
+          : []),
+      ];
+      const conversationId = notificationConversation?.id
+        ?? preferredStandalone?.id
         ?? (projectConversations.some((item) => item.id === preferredConversationId)
           ? preferredConversationId
           : projectConversations[0]?.id ?? standaloneConversations[0]?.id ?? "");
-      const conversation = conversationId
+      const conversation = notificationConversation ?? (conversationId
         ? await projectWorkApi.fetchConversation({ conversationId })
-        : null;
+        : null);
       if (projectWorkLoadRef.current !== requestId) return null;
       setLiveProjectWork({
         status: "ready",
@@ -1024,7 +1184,6 @@ export function App() {
       setSelectedProjectId(activeProjectId);
       activeConversationIdRef.current = conversationId;
       setActiveConversationId(conversationId);
-      syncProjectWorkModel(conversation);
       setMobileView("agent");
       return conversation;
     } catch (error) {
@@ -1039,7 +1198,6 @@ export function App() {
   }, [
     clearPreparingConversationSelection,
     setActiveConversationId,
-    syncProjectWorkModel,
   ]);
 
   const selectLiveProject = useCallback(async (projectId, preferredConversationId) => {
@@ -1076,7 +1234,6 @@ export function App() {
       }));
       activeConversationIdRef.current = conversationId;
       setActiveConversationId(conversationId);
-      syncProjectWorkModel(conversation);
       return conversation;
     } catch (error) {
       if (projectWorkLoadRef.current !== requestId) return null;
@@ -1090,7 +1247,6 @@ export function App() {
   }, [
     clearPreparingConversationSelection,
     setActiveConversationId,
-    syncProjectWorkModel,
   ]);
 
   const selectLiveConversation = useCallback(async (conversationId) => {
@@ -1136,7 +1292,6 @@ export function App() {
       setSelectedProjectId(nextProjectId);
       activeConversationIdRef.current = conversation.id;
       setActiveConversationId(conversation.id);
-      syncProjectWorkModel(conversation);
       setMobileView("agent");
       return conversation;
     } catch (error) {
@@ -1151,7 +1306,6 @@ export function App() {
   }, [
     clearPreparingConversationSelection,
     setActiveConversationId,
-    syncProjectWorkModel,
   ]);
 
   const updateLiveConversation = useCallback((conversation) => {
@@ -1161,45 +1315,24 @@ export function App() {
     ) {
       return;
     }
-    const acceptedConversation = activeProjectWorkState?.id === conversation.id
-      ? mergeFreshConversationSnapshot(activeProjectWorkState, conversation)
-      : conversation;
-    if (acceptedConversation !== conversation) return;
-    syncProjectWorkModel(conversation);
-    setLiveProjectWork((current) => {
-      const freshConversation = current.conversation?.id === conversation.id
-        ? mergeFreshConversationSnapshot(current.conversation, conversation)
-        : conversation;
-      if (freshConversation !== conversation) return current;
-      const summary = {
-        id: conversation.id,
-        projectId: conversation.projectId,
-        title: conversation.title,
-        status: conversation.status,
-        providerId: conversation.providerId,
-        modelId: conversation.modelId,
-        thinkingLevel: conversation.thinkingLevel,
-        lastEventSeq: conversation.lastEventSeq,
-        unreadCount: conversation.unreadCount,
-        latestMessageSeq: conversation.latestMessageSeq,
-        lastReadMessageSeq: conversation.lastReadMessageSeq,
-        pendingChangeFileCount: conversation.pendingChangeFileCount,
-        updatedAt: conversation.updatedAt,
-      };
-      const existing = current.conversations.some((item) => item.id === conversation.id);
-      return {
-        ...current,
-        status: "ready",
-        conversations: existing
-          ? current.conversations.map((item) => (
-              item.id === conversation.id ? { ...item, ...summary } : item
-            ))
-          : [summary, ...current.conversations],
-        conversation: freshConversation,
-        error: null,
-      };
-    });
-  }, [activeProjectWorkState, syncProjectWorkModel]);
+    setLiveProjectWork((current) => updateLiveConversationState(current, conversation));
+  }, []);
+
+  const activateForkedProjectConversation = useCallback((conversation) => {
+    if (!conversation?.id) return;
+    const nextProjectId = conversation.projectId ?? "";
+    selectedProjectIdRef.current = nextProjectId;
+    activeConversationIdRef.current = conversation.id;
+    setSelectedProjectId(nextProjectId);
+    setActiveConversationId(conversation.id);
+    setLiveProjectWork((current) => insertCreatedConversation(
+      current,
+      conversation,
+      { activate: true, include: true },
+    ));
+    setProviderOpen(false);
+    setMobileView("agent");
+  }, [setActiveConversationId]);
 
   useEffect(() => {
     activeConversationIdRef.current = activeConversationId;
@@ -1210,30 +1343,37 @@ export function App() {
   }, [selectedProjectId]);
 
   useEffect(() => {
-    if (workspaceKind !== "project_work") return;
+    if (workspaceMode !== "project_work") return;
     const savedSelection = workspaceSelection?.project_work;
+    const notificationEntry = notificationEntryRef.current;
     loadLiveProjectWork({
       preferredProjectId: savedSelection?.projectId,
       preferredConversationId: savedSelection?.conversationId,
+      notificationConversationId: notificationEntry?.conversationId,
+    }).finally(() => {
+      if (notificationEntryRef.current === notificationEntry) {
+        notificationEntryRef.current = null;
+      }
     });
   }, [
     loadLiveProjectWork,
-    workspaceKind,
+    workspaceMode,
   ]);
 
   useEffect(() => {
-    const selectionMatchesKind = workspaceKind === "project_work"
+    if (workspaceMode === "worker") return;
+    const selectionMatchesKind = workspaceMode === "project_work"
       ? projectWorkMode
       : !projectWorkMode;
     if (
       !selectionMatchesKind
-      || (workspaceKind === "project_work" && liveProjectWork.status !== "ready")
+      || (workspaceMode === "project_work" && liveProjectWork.status !== "ready")
     ) {
       return;
     }
     setWorkspaceSelection((current) => ({
       ...(current && typeof current === "object" ? current : {}),
-      [workspaceKind]: {
+      [workspaceMode]: {
         projectId: selectedProjectId,
         conversationId: activeConversationId,
       },
@@ -1244,7 +1384,7 @@ export function App() {
     selectedProjectId,
     setWorkspaceSelection,
     liveProjectWork.status,
-    workspaceKind,
+    workspaceMode,
   ]);
 
   const showToast = useCallback((message, tone = "success") => {
@@ -1255,6 +1395,45 @@ export function App() {
   const handleProjectWorkError = useCallback((error) => {
     showToast(error?.message || "项目工作操作没有完成", "warning");
   }, [showToast]);
+  const handleWorkerError = useCallback((error) => {
+    showToast(error?.message || "Worker 操作没有完成", "warning");
+  }, [showToast]);
+  const workerProjectOptions = useMemo(() => liveProjectItems.map((item) => ({
+    id: item.id,
+    label: item.name,
+  })), [liveProjectItems]);
+  const rememberWorkerSelection = useCallback(({ taskId, workerId }) => {
+    setWorkspaceSelection((current) => ({
+      ...(current && typeof current === "object" ? current : {}),
+      worker: { taskId, workerId },
+    }));
+  }, [setWorkspaceSelection]);
+  const workerController = useWorkerController({
+    active: workerMode,
+    preferredTaskId: workspaceSelection?.worker?.taskId ?? "",
+    projectOptions: workerProjectOptions,
+    defaultProviderId: preferredProjectWorkSelection.providerId,
+    defaultModelId: preferredProjectWorkSelection.modelId,
+    onSelectionChange: rememberWorkerSelection,
+    onError: handleWorkerError,
+  });
+
+  useEffect(() => {
+    if (workspaceMode !== "worker" || liveProjectWork.projects.length > 0) return undefined;
+    const controller = new AbortController();
+    projectWorkApi.listProjects({ signal: controller.signal }).then((projects) => {
+      if (controller.signal.aborted) return;
+      setLiveProjectWork((current) => ({
+        ...current,
+        projects,
+        error: null,
+      }));
+    }).catch((nextError) => {
+      if (controller.signal.aborted) return;
+      handleWorkerError(nextError);
+    });
+    return () => controller.abort();
+  }, [handleWorkerError, liveProjectWork.projects.length, workspaceMode]);
 
   const loadProjectContext = useCallback(() => {
     projectContextController.current?.abort();
@@ -1405,23 +1584,6 @@ export function App() {
         defaultModelId: catalog.defaultModelId,
         error: null,
       });
-      setProjectWorkProviderConfig((current) => {
-        const currentProvider = catalog.providers.find(
-          (provider) => provider.id === current?.providerId,
-        );
-        if (
-          currentProvider
-          && currentProvider.models.some((model) => model.id === current?.model)
-        ) {
-          return current;
-        }
-        return {
-          providerId: catalog.defaultProviderId ?? catalog.providers[0]?.id ?? "",
-          model: catalog.defaultModelId
-            ?? catalog.providers[0]?.models[0]?.id
-            ?? "",
-        };
-      });
     } catch (error) {
       if (signal?.aborted) return;
       setProjectWorkModelCatalog({
@@ -1432,7 +1594,7 @@ export function App() {
         error: error.message,
       });
     }
-  }, [setProjectWorkProviderConfig]);
+  }, []);
 
   const handleSkillStateChange = useCallback(({ installedCount }) => {
     setInstalledPackageSkillCount(Number(installedCount) || 0);
@@ -2194,7 +2356,7 @@ export function App() {
 
   useEffect(() => {
     if (
-      workspaceKind !== "paper_reading"
+      workspaceMode !== "paper_reading"
       || readerTarget
       || journalRunState.status === "restoring"
       || !String(activeConversationId).startsWith("paper:")
@@ -2217,7 +2379,7 @@ export function App() {
     paperConversations,
     readerTarget,
     setActiveConversationId,
-    workspaceKind,
+    workspaceMode,
   ]);
 
   const closeJournalPaper = useCallback(() => {
@@ -2784,23 +2946,55 @@ export function App() {
     setJournalThinkingLevelPref(level);
   };
 
+  const persistProjectWorkModelSelection = async (providerId, modelId) => {
+    if (!providerId || !modelId) return;
+    if (projectWorkModelSelectionPendingRef.current) {
+      showToast("模型正在切换，请稍候", "warning");
+      return;
+    }
+    const conversation = activeProjectWorkState;
+    if (conversation && isProjectWorkConversationBusy(conversation)) {
+      showToast("Agent 工作期间不能切换模型", "warning");
+      return;
+    }
+    projectWorkModelSelectionPendingRef.current = true;
+    setProjectWorkModelSelectionSaving(true);
+    try {
+      if (conversation?.id) {
+        const configured = await projectWorkApi.configureConversation({
+          conversationId: conversation.id,
+          providerId,
+          modelId,
+        });
+        updateLiveConversation(configured);
+      }
+      setProjectWorkProviderConfig((current) => (
+        rememberProjectWorkModelPreference(current, providerId, modelId)
+      ));
+    } catch (error) {
+      showToast(error.message || "无法保存模型选择", "warning");
+    } finally {
+      projectWorkModelSelectionPendingRef.current = false;
+      setProjectWorkModelSelectionSaving(false);
+    }
+  };
+
   const selectProjectWorkProvider = (providerId) => {
     const nextProvider = projectWorkProviders.find(
       (item) => item.id === providerId && item.available,
     );
     if (!nextProvider) return;
-    setProjectWorkProviderConfig({
-      providerId: nextProvider.id,
-      model: nextProvider.models[0] ?? "",
-    });
+    const preference = normalizeProjectWorkModelPreference(projectWorkProviderConfig);
+    const rememberedModel = preference.modelsByProvider[nextProvider.id];
+    const nextModel = nextProvider.models.includes(rememberedModel)
+      ? rememberedModel
+      : nextProvider.models[0] ?? "";
+    void persistProjectWorkModelSelection(nextProvider.id, nextModel);
   };
 
   const selectProjectWorkModel = (model) => {
     if (!selectedProjectWorkProvider?.models.includes(model)) return;
-    setProjectWorkProviderConfig({
-      providerId: selectedProjectWorkProvider.id,
-      model,
-    });
+    void persistProjectWorkModelSelection(selectedProjectWorkProvider.id, model);
   };
 
   const openQuickSettings = () => {
@@ -2873,8 +3067,9 @@ export function App() {
       try {
         const created = await projectWorkApi.createConversation({
           projectId,
-          providerId: selectedProjectWorkProvider?.id,
-          modelId: selectedProjectWorkModel || undefined,
+          providerId: preferredProjectWorkSelection.providerId || undefined,
+          modelId: preferredProjectWorkSelection.modelId || undefined,
+          executionPolicyMode: DEFAULT_PROJECT_WORK_EXECUTION_POLICY_MODE,
         });
         const projectStillSelected = selectedProjectIdRef.current === projectId;
         const shouldActivate = projectStillSelected
@@ -2888,16 +3083,12 @@ export function App() {
           setPreparingConversationSelection(null);
           activeConversationIdRef.current = created.id;
           setActiveConversationId(created.id);
-          syncProjectWorkModel(created);
         }
 
         projectWorkApi.fetchConversation({
           conversationId: created.id,
         }).then((conversation) => {
           setLiveProjectWork((current) => hydrateCreatedConversation(current, conversation));
-          if (activeConversationIdRef.current === conversation.id) {
-            syncProjectWorkModel(conversation);
-          }
         }).catch((error) => {
           if (activeConversationIdRef.current === created.id) {
             showToast(error.message || "会话已创建，详情暂时无法载入", "warning");
@@ -2928,8 +3119,9 @@ export function App() {
     projectConversationCreationLockRef.current.run("standalone", async () => {
       try {
         const created = await projectWorkApi.createStandaloneConversation({
-          providerId: selectedProjectWorkProvider?.id,
-          modelId: selectedProjectWorkModel || undefined,
+          providerId: preferredProjectWorkSelection.providerId || undefined,
+          modelId: preferredProjectWorkSelection.modelId || undefined,
+          executionPolicyMode: DEFAULT_PROJECT_WORK_EXECUTION_POLICY_MODE,
         });
         const shouldActivate = selectedProjectIdRef.current === ""
           && preparingConversationSelectionRef.current?.projectId === null;
@@ -2942,16 +3134,12 @@ export function App() {
           setPreparingConversationSelection(null);
           activeConversationIdRef.current = created.id;
           setActiveConversationId(created.id);
-          syncProjectWorkModel(created);
         }
 
         projectWorkApi.fetchConversation({
           conversationId: created.id,
         }).then((conversation) => {
           setLiveProjectWork((current) => hydrateCreatedConversation(current, conversation));
-          if (activeConversationIdRef.current === conversation.id) {
-            syncProjectWorkModel(conversation);
-          }
         }).catch((error) => {
           if (activeConversationIdRef.current === created.id) {
             showToast(error.message || "会话已创建，详情暂时无法载入", "warning");
@@ -3111,14 +3299,19 @@ export function App() {
     showToast("会话名称已更新");
   };
 
-  const selectWorkspaceKind = (nextKind) => {
-    if (!["project_work", "paper_reading"].includes(nextKind) || nextKind === workspaceKind) {
+  const selectWorkspaceMode = (nextKind) => {
+    if (!["project_work", "worker", "paper_reading"].includes(nextKind) || nextKind === workspaceMode) {
       return;
     }
     clearPreparingConversationSelection();
-    setWorkspaceKind(nextKind);
+    setWorkspaceMode(nextKind);
     setProjectQuery("");
     const savedSelection = workspaceSelection?.[nextKind];
+    if (nextKind === "worker") {
+      setReaderTarget(null);
+      setMobileView("agent");
+      return;
+    }
     if (nextKind === "paper_reading") {
       const nextProject = allProjects.find(
         (item) => item.id === savedSelection?.projectId && item.workspaceKinds.includes(nextKind),
@@ -3163,7 +3356,7 @@ export function App() {
 
   const addProject = async (nextProject) => {
     if (!nextProject?.id || !nextProject?.name || !nextProject?.rootLabel) return;
-    if (workspaceKind === "project_work") {
+    if (workspaceMode === "project_work") {
       const projectRecord = {
         ...nextProject,
         conversationCount: nextProject.conversationCount ?? 0,
@@ -3179,7 +3372,7 @@ export function App() {
       ...nextProject,
       workspaceKinds: Array.from(new Set([
         ...(nextProject.workspaceKinds ?? []),
-        workspaceKind,
+        workspaceMode,
       ])),
       seeded: false,
       updated: nextProject.updated ?? "刚刚",
@@ -3194,7 +3387,7 @@ export function App() {
           ...projectRecord,
           workspaceKinds: Array.from(new Set([
             ...(item.workspaceKinds ?? []),
-            workspaceKind,
+            workspaceMode,
           ])),
         }
         : item);
@@ -3202,11 +3395,11 @@ export function App() {
     setSelectedProjectId(projectRecord.id);
     setActiveConversationId("workflow-run");
     setMobileView("run");
-    showToast(`已添加到${workspaceKind === "paper_reading" ? "论文精读" : "正常工作"}`);
+    showToast(`已添加到${workspaceMode === "paper_reading" ? "论文精读" : "正常工作"}`);
   };
 
   const removeProject = async (projectId) => {
-    if (workspaceKind === "project_work") {
+    if (workspaceMode === "project_work") {
       const target = liveProjectWork.projects.find((item) => item.id === projectId);
       const confirmed = window.confirm(
         `解绑“${target?.name ?? "这个项目"}”会移除 Pi Agent 中的工作会话和快照，但不会删除本地文件。是否继续？`,
@@ -3235,12 +3428,12 @@ export function App() {
       .map((item) => item.id === projectId
         ? {
           ...item,
-          workspaceKinds: item.workspaceKinds.filter((kind) => kind !== workspaceKind),
+          workspaceKinds: item.workspaceKinds.filter((kind) => kind !== workspaceMode),
         }
         : item)
       .filter((item) => item.workspaceKinds.length > 0));
     const fallbackProject = BASE_PROJECTS.find(
-      (item) => item.workspaceKinds.includes(workspaceKind),
+      (item) => item.workspaceKinds.includes(workspaceMode),
     );
     if (fallbackProject) {
       setSelectedProjectId(fallbackProject.id);
@@ -3250,7 +3443,7 @@ export function App() {
     showToast("已从论文精读移除；本地文件未删除");
   };
 
-  const artifactMode = readingMode || projectWorkMode;
+  const artifactMode = readingMode || projectWorkMode || workerMode;
   const gridColumns = artifactMode
     ? `${sidebarOpen ? leftRailWidth : 0}px minmax(0, 1fr)`
     : `${sidebarOpen ? leftRailWidth : 0}px minmax(0, 1fr) ${contextRailOpen ? rightRailWidth : 0}px`;
@@ -3263,9 +3456,25 @@ export function App() {
       >
         <ProjectRail
           projects={projectItems}
+          workerRail={(
+            <WorkerRail
+              workers={workerController.definitions}
+              tasks={workerController.tasks}
+              connections={workerController.connections}
+              activeWorkerId={workerController.activeWorkerId}
+              activeTaskId={workerController.activeTaskId}
+              query={projectQuery}
+              onQueryChange={setProjectQuery}
+              onSelectWorker={workerController.selectWorker}
+              onSelectTask={workerController.selectTask}
+              onNewTask={workerController.createTask}
+              creatingTask={workerController.busyAction === "create_task"}
+            />
+          )}
           selectedId={selectedProjectId}
           onSelect={(projectId) => {
-            if (workspaceKind === "paper_reading") {
+            if (workspaceMode === "worker") return;
+            if (workspaceMode === "paper_reading") {
               setSelectedProjectId(projectId);
               setReaderTarget(null);
               setActiveConversationId("workflow-run");
@@ -3319,7 +3528,7 @@ export function App() {
           }}
           deletingConversationId={deletingConversationId}
           onNewConversation={(projectId) => {
-            if (workspaceKind === "project_work") {
+            if (workspaceMode === "project_work") {
               createWorkConversation(projectId).then((conversationId) => {
                 if (conversationId) showToast("正常工作会话已创建");
               });
@@ -3336,17 +3545,17 @@ export function App() {
               "warning",
             );
           }}
-          onRenameConversation={workspaceKind === "project_work"
+          onRenameConversation={workspaceMode === "project_work"
             ? setConversationToRename
             : undefined}
-          onDeleteConversation={workspaceKind === "project_work"
+          onDeleteConversation={workspaceMode === "project_work"
             ? requestDeleteWorkConversation
             : undefined}
-          onResetPaperConversation={workspaceKind === "paper_reading"
+          onResetPaperConversation={workspaceMode === "paper_reading"
             ? setPaperToReset
             : undefined}
-          workspaceKind={workspaceKind}
-          onWorkspaceKindChange={selectWorkspaceKind}
+          workspaceMode={workspaceMode}
+          onWorkspaceModeChange={selectWorkspaceMode}
           query={projectQuery}
           onQueryChange={setProjectQuery}
           onAddProject={() => setBindProjectOpen(true)}
@@ -3354,11 +3563,11 @@ export function App() {
           onOpenSettings={openQuickSettings}
           settingsOpen={Boolean(settingsView)}
           mobileActive={mobileView === "projects"}
-          activeRun={workspaceKind === "paper_reading"
+          activeRun={workspaceMode === "paper_reading"
             && project.id === workflowFixture.project.id
             ? activeRun
             : null}
-          selectedRunId={workspaceKind === "paper_reading"
+          selectedRunId={workspaceMode === "paper_reading"
             && workflowMode
             && project.id === workflowFixture.project.id
             ? activeRun.id
@@ -3369,17 +3578,17 @@ export function App() {
             closeJournalPaper();
           }}
           topicSearchActive={topicSearchMode}
-          onSelectTopicSearch={workspaceKind === "paper_reading"
+          onSelectTopicSearch={workspaceMode === "paper_reading"
             && project.id === workflowFixture.project.id
             ? openTopicSearch
             : undefined}
           recentClassicsActive={journalLibraryView === "recent_classics"}
-          onSelectRecentClassics={workspaceKind === "paper_reading"
+          onSelectRecentClassics={workspaceMode === "paper_reading"
             && project.id === workflowFixture.project.id
             ? openRecentClassics
             : undefined}
           pastRunsActive={journalLibraryView === "past_runs"}
-          onSelectPastRuns={workspaceKind === "paper_reading"
+          onSelectPastRuns={workspaceMode === "paper_reading"
             && project.id === workflowFixture.project.id
             ? openPastRuns
             : undefined}
@@ -3417,7 +3626,60 @@ export function App() {
             正在打开工作台…
           </main>
         )}>
-        {projectWorkMode ? (
+        {workerMode ? (
+          <WorkerWorkspace
+            key={workerController.activeTaskId || "worker-empty"}
+            state={workerController.state}
+            dispatch={workerController.dispatch}
+            loading={["idle", "loading", "loading_task"].includes(workerController.status)}
+            error={workerController.error}
+            projectOptions={workerProjectOptions}
+            providers={projectWorkProviders}
+            providerOpen={providerOpen}
+            onProviderOpenChange={(open) => {
+              setProviderOpen(open);
+              if (open) {
+                setSettingsView(null);
+                setSkillCenterOpen(false);
+              }
+            }}
+            onProviderChange={(providerId, modelId) => workerController.configureModel({
+              providerId,
+              modelId,
+              thinkingLevel: workerController.state?.thinkingLevel,
+            })}
+            onModelChange={(modelId, providerId) => workerController.configureModel({
+              providerId,
+              modelId,
+              thinkingLevel: workerController.state?.thinkingLevel,
+            })}
+            onProjectContextChange={workerController.updateProjectContext}
+            onSendMessage={workerController.sendMessage}
+            onUploadAttachment={workerController.uploadAttachment}
+            onRemovePendingAttachment={workerController.removePendingAttachment}
+            onUploadDeliveryAttachment={workerController.uploadDeliveryAttachment}
+            onRemoveDeliveryAttachment={workerController.removeDeliveryAttachment}
+            onReadSource={workerController.readSource}
+            onUseSource={workerController.useSource}
+            onDraftChange={workerController.invalidateDraftOnEdit}
+            onSaveDraft={workerController.saveDraft}
+            onProposeDelivery={workerController.proposeDelivery}
+            onConfirmDelivery={workerController.confirmDelivery}
+            onAbandonDelivery={workerController.abandonDelivery}
+            onRetryDelivery={workerController.retryDelivery}
+            onAbort={workerController.abort}
+            onRetryLastTurn={workerController.retryLastTurn}
+            onCompact={workerController.compact}
+            onAnswerAskUser={workerController.answerAskUser}
+            onCancelAskUser={workerController.cancelAskUser}
+            onCheckConnection={workerController.checkConnection}
+            busyAction={workerController.busyAction}
+            sidebarOpen={sidebarOpen}
+            onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
+            mobileActive={mobileView === "agent" || mobileView === "artifact"}
+            mobileView={mobileView}
+          />
+        ) : projectWorkMode ? (
           <LiveProjectWorkbench
             key={activeProjectWorkState?.id || project.id || "standalone-empty-workbench"}
             project={
@@ -3446,6 +3708,7 @@ export function App() {
             }}
             onProviderChange={selectProjectWorkProvider}
             onModelChange={selectProjectWorkModel}
+            modelSelectionDisabled={projectWorkModelSelectionSaving}
             onOpenSkills={() => {
               setProviderOpen(false);
               setSettingsView(null);
@@ -3455,6 +3718,7 @@ export function App() {
             sidebarOpen={sidebarOpen}
             onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
             onConversationChange={updateLiveConversation}
+            onConversationForked={activateForkedProjectConversation}
             onError={handleProjectWorkError}
           />
         ) : readingMode ? (
@@ -3726,9 +3990,9 @@ export function App() {
       <nav className="mobile-nav" aria-label="移动端主导航">
         <button className={mobileView === "projects" ? "is-active" : ""} type="button" onClick={() => setMobileView("projects")}>
           <FolderSimple size={19} weight={mobileView === "projects" ? "fill" : "regular"} aria-hidden="true" />
-          项目
+          {workerMode ? "Worker" : "项目"}
         </button>
-        {projectWorkMode ? (
+        {projectWorkMode || workerMode ? (
           <>
             <button className={mobileView === "agent" ? "is-active" : ""} type="button" onClick={() => setMobileView("agent")}>
               <ChatText size={19} weight={mobileView === "agent" ? "fill" : "regular"} aria-hidden="true" />
@@ -3763,7 +4027,7 @@ export function App() {
 
       <BindProjectDialog
         open={bindProjectOpen}
-        workspaceKind={workspaceKind}
+        workspaceMode={workspaceMode}
         onClose={() => setBindProjectOpen(false)}
         onBind={addProject}
       />
@@ -3803,10 +4067,11 @@ export function App() {
       {settingsView === "quick" ? (
         <SettingsQuickPanel
           providerName={projectWorkMode
+            || workerMode
             ? selectedProjectWorkProvider?.name ?? "Pi 本机模型"
             : selectedProvider.name}
           model={getModelDisplayName(
-            projectWorkMode ? selectedProjectWorkModel : selectedModel,
+            projectWorkMode || workerMode ? selectedProjectWorkModel : selectedModel,
           )}
           onOpenFull={openFullSettings}
           onClose={closeSettings}
@@ -3818,10 +4083,11 @@ export function App() {
           section={settingsSection}
           onSectionChange={setSettingsSection}
           providerName={projectWorkMode
+            || workerMode
             ? selectedProjectWorkProvider?.name ?? "Pi 本机模型"
             : selectedProvider.name}
           model={getModelDisplayName(
-            projectWorkMode ? selectedProjectWorkModel : selectedModel,
+            projectWorkMode || workerMode ? selectedProjectWorkModel : selectedModel,
           )}
           onOpenProvider={openProviderFromSettings}
           onConnectionsChanged={refreshProjectWorkModels}

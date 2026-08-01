@@ -94,6 +94,43 @@ export function mergeIncrementalConversationSnapshot(current, incoming) {
   return mergeFreshConversationSnapshot(current, incoming);
 }
 
+export function updateLiveConversationState(state, incoming) {
+  if (!incoming?.id) return state;
+  const currentConversation = state.conversation;
+  const freshConversation = currentConversation?.id === incoming.id
+    ? mergeFreshConversationSnapshot(currentConversation, incoming)
+    : incoming;
+  if (freshConversation === currentConversation) return state;
+
+  const summary = {
+    id: freshConversation.id,
+    projectId: freshConversation.projectId,
+    title: freshConversation.title,
+    status: freshConversation.status,
+    providerId: freshConversation.providerId,
+    modelId: freshConversation.modelId,
+    thinkingLevel: freshConversation.thinkingLevel,
+    lastEventSeq: freshConversation.lastEventSeq,
+    unreadCount: freshConversation.unreadCount,
+    latestMessageSeq: freshConversation.latestMessageSeq,
+    lastReadMessageSeq: freshConversation.lastReadMessageSeq,
+    pendingChangeFileCount: freshConversation.pendingChangeFileCount,
+    updatedAt: freshConversation.updatedAt,
+  };
+  const existing = state.conversations.some((item) => item.id === freshConversation.id);
+  return {
+    ...state,
+    status: "ready",
+    conversations: existing
+      ? state.conversations.map((item) => (
+          item.id === freshConversation.id ? { ...item, ...summary } : item
+        ))
+      : [summary, ...state.conversations],
+    conversation: freshConversation,
+    error: null,
+  };
+}
+
 export function upsertLiveProject(state, project) {
   const exists = state.projects.some((item) => item.id === project.id);
   return {

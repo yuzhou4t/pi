@@ -22,7 +22,7 @@ test("add project dialog offers an existing folder and a new project folder", as
   await withViteModule("/src/components/BindProjectDialog.jsx", ({ BindProjectDialog }) => {
     const html = renderToStaticMarkup(React.createElement(BindProjectDialog, {
       open: true,
-      workspaceKind: "project_work",
+      workspaceMode: "project_work",
       onClose() {},
       onBind() {},
     }));
@@ -40,7 +40,7 @@ test("add project dialog stays absent while closed", async () => {
   await withViteModule("/src/components/BindProjectDialog.jsx", ({ BindProjectDialog }) => {
     const html = renderToStaticMarkup(React.createElement(BindProjectDialog, {
       open: false,
-      workspaceKind: "paper_reading",
+      workspaceMode: "paper_reading",
     }));
 
     assert.equal(html, "");

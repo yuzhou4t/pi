@@ -28,7 +28,7 @@ function createProjectFolder(name) {
 
 export function BindProjectDialog({
   open,
-  workspaceKind = "project_work",
+  workspaceMode = "project_work",
   onClose,
   onBind,
   api = projectWorkApi,
@@ -50,17 +50,16 @@ export function BindProjectDialog({
 
   if (!open) return null;
 
-  const kindLabel = workspaceKind === "paper_reading" ? "论文精读" : "正常工作";
+  const kindLabel = workspaceMode === "paper_reading" ? "论文精读" : "正常工作";
 
   const confirmBinding = async () => {
     if (!selection) return;
     setBusy(true);
     setError("");
     try {
-      const project = workspaceKind === "project_work"
+      const project = workspaceMode === "project_work"
         ? await api.registerProject({
             rootToken: selection.rootToken,
-            workspaceKind,
             name: selection.source === "created_project" ? undefined : selection.name,
             newFolderName: selection.source === "created_project"
               ? selection.newFolderName
@@ -69,7 +68,7 @@ export function BindProjectDialog({
         : selection;
       await onBind?.({
         ...project,
-        workspaceKinds: [workspaceKind],
+        workspaceKinds: [workspaceMode],
         updated: "刚刚",
       });
       setStep("done");
@@ -84,7 +83,7 @@ export function BindProjectDialog({
     setBusy(true);
     setError("");
     try {
-      if (workspaceKind !== "project_work") {
+      if (workspaceMode !== "project_work") {
         setSelection(PAPER_SELECTED_FOLDER);
       } else {
         const picked = await api.pickRoot({ purpose: "existing" });
@@ -110,7 +109,7 @@ export function BindProjectDialog({
     setBusy(true);
     setError("");
     try {
-      if (workspaceKind !== "project_work") {
+      if (workspaceMode !== "project_work") {
         setSelection(createProjectFolder(projectName));
       } else {
         const picked = await api.pickRoot({ purpose: "create" });

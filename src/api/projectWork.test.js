@@ -7,6 +7,7 @@ import {
   confirmProjectWorkGitCloseout,
   configureProjectWorkConversation,
   configureProjectWorkExecutionPolicy,
+  createProjectWorkConversation,
   createStandaloneProjectWorkConversation,
   deleteProjectWorkConversation,
   enqueueProjectWorkFollowUp,
@@ -22,6 +23,7 @@ import {
   fetchModelUsage,
   fetchProjectWorkUsage,
   fetchProjectWorkWorkspace,
+  forkProjectWorkCheckpoint,
   listProjectWorkAskUserRequests,
   listProjectWorkApplyJournal,
   listProjectWorkFollowUps,
@@ -30,14 +32,17 @@ import {
   mapProjectWorkConversation,
   mapProjectWorkUsage,
   projectWorkGeneratedImageUrl,
+  projectWorkGeneratedOfficeDownloadUrl,
   projectWorkBrowserQaScreenshotUrl,
   projectWorkImageUrl,
   removeProjectWorkFollowUp,
   removeProjectWorkPdf,
   removeProjectWorkProviderCredential,
   renameProjectWorkConversation,
+  registerProjectWorkProject,
   resumeProjectWorkVerificationRepair,
   retryProjectWorkLastTurn,
+  retryProjectWorkCheckpoint,
   retryProjectWorkPdf,
   runProjectWorkBrowserQa,
   sendProjectWorkMessage,
@@ -62,6 +67,35 @@ function jsonResponse(body, status = 200) {
     headers: { "content-type": "application/json" },
   });
 }
+
+test("project registration omits the UI workspace selector", async () => {
+  let request = null;
+  const project = await registerProjectWorkProject({
+    rootToken: "root-token-1",
+    name: "  Existing project  ",
+    newFolderName: "  New folder  ",
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return jsonResponse({
+        project: {
+          id: "project-1",
+          name: "Existing project",
+          root_label: "Existing project",
+        },
+      }, 201);
+    },
+  });
+
+  assert.equal(request.url, "/api/v1/project-work/projects");
+  assert.equal(request.options.method, "POST");
+  assert.deepEqual(JSON.parse(request.options.body), {
+    schema_version: 1,
+    root_token: "root-token-1",
+    name: "Existing project",
+    new_folder_name: "New folder",
+  });
+  assert.equal(project.id, "project-1");
+});
 
 test("provider credential API sends the key only in the save request", async () => {
   const calls = [];
@@ -1684,12 +1718,18 @@ test("thinking level maps in conversation messages and uses snake-case mutation 
         providerId: "openai-codex",
         modelId: "gpt-5.3-codex",
         thinkingLevel: "high",
+        turnId: "turn-1",
+        turnSeq: 1,
+        attempt: 2,
       },
     }],
   });
   assert.equal(mapped.thinkingLevel, "high");
   assert.equal(mapped.messages[0].thinkingLevel, "high");
   assert.equal(mapped.events[0].thinkingLevel, "high");
+  assert.equal(mapped.events[0].turnId, "turn-1");
+  assert.equal(mapped.events[0].turnSeq, 1);
+  assert.equal(mapped.events[0].attempt, 2);
 
   const calls = [];
   const fetchImpl = async (url, options) => {
@@ -1712,6 +1752,7 @@ test("thinking level maps in conversation messages and uses snake-case mutation 
   await sendProjectWorkMessage({
     conversationId: "conversation-thinking",
     text: "检查项目",
+    checkpointId: "checkpoint-parent-1",
     clientRequestId: "project-message:test-thinking",
     workflowId: "code_review",
     capabilities: ["web_search"],
@@ -1740,23 +1781,152 @@ test("thinking level maps in conversation messages and uses snake-case mutation 
     "/api/v1/project-work/conversations/conversation-thinking/messages",
   );
   const messagePayload = JSON.parse(calls[1].options.body);
-  assert.equal(
-    messagePayload.client_request_id,
-    "project-message:test-thinking",
-  );
-  assert.equal(messagePayload.thinking_level, "high");
-  assert.equal(messagePayload.workflow_id, "code_review");
-  assert.deepEqual(messagePayload.capabilities, ["web_search"]);
-  assert.deepEqual(messagePayload.images, [{
-    file_name: "界面.png",
-    mime_type: "image/png",
-    byte_length: 4,
-    data: "iVBORw==",
-  }]);
-  assert.deepEqual(messagePayload.attachments, [{
-    attachment_id: "attachment-review",
-    attachment_revision: `sha256:${"a".repeat(64)}`,
-  }]);
+  assert.deepEqual(messagePayload, {
+    schema_version: 1,
+    client_request_id: "project-message:test-thinking",
+    text: "检查项目",
+    checkpoint_message_id: "checkpoint-parent-1",
+    images: [{
+      file_name: "界面.png",
+      mime_type: "image/png",
+      byte_length: 4,
+      data: "iVBORw==",
+    }],
+    attachments: [{
+      attachment_id: "attachment-review",
+      attachment_revision: `sha256:${"a".repeat(64)}`,
+    }],
+    capabilities: ["web_search"],
+    workflow_id: "code_review",
+    contexts: [],
+    provider_id: "openai-codex",
+    model_id: "gpt-5.3-codex",
+    thinking_level: "high",
+  });
+});
+
+test("session branch metadata maps through the public contract without Pi entry ids", () => {
+  const mapped = mapProjectWorkConversation({
+    conversation: {
+      id: "conversation-branch",
+      project_id: "project-1",
+      active_branch_id: "branch-deepseek",
+      active_branch_label: "DeepSeek 方案",
+      piEntryId: "private-conversation-entry",
+      messages: [{
+        id: "message-branch-answer",
+        role: "assistant",
+        text: "分支回答",
+        checkpoint_id: "checkpoint-2",
+        parent_checkpoint_id: "checkpoint-1",
+        branch_id: "branch-deepseek",
+        branch_label: "DeepSeek 方案",
+        branch_from_checkpoint_id: "checkpoint-1",
+        inherited: true,
+        pi_entry_id: "private-message-entry",
+      }],
+      session_path: {
+        active_leaf_checkpoint_id: "checkpoint-2",
+        checkpoints: [{
+          id: "checkpoint-2",
+          parent_id: "checkpoint-1",
+          turn_id: "turn-2",
+          turn_seq: 2,
+          user_message_id: "message-user-2",
+          assistant_message_id: "message-branch-answer",
+          attempt: 2,
+          provider_id: "deepseek",
+          model_id: "deepseek-v4-pro",
+          thinking_level: "high",
+          status: "completed",
+          title: "DeepSeek 方案",
+          branchable: true,
+          blocked_reason: null,
+          created_at: "2026-08-01T00:00:00.000Z",
+          piEntryId: "private-checkpoint-entry",
+        }],
+        piEntryId: "private-path-entry",
+      },
+      fork: {
+        source_conversation_id: "conversation-source",
+        source_checkpoint_id: "checkpoint-1",
+        source_assistant_message_id: "message-source-answer",
+        status: "ready",
+        context_mode: "pi_native_path",
+        project_files: "current",
+        created_at: "2026-08-01T00:01:00.000Z",
+        piEntryId: "private-fork-entry",
+      },
+    },
+  });
+
+  assert.deepEqual(mapped.messages[0], {
+    id: "message-branch-answer",
+    role: "assistant",
+    kind: "message",
+    content: "分支回答",
+    images: [],
+    attachments: [],
+    workflowId: null,
+    capabilities: [],
+    codeEvidence: [],
+    providerId: null,
+    modelId: null,
+    thinkingLevel: null,
+    messageSeq: null,
+    turnId: null,
+    turnSeq: null,
+    attempt: null,
+    checkpointId: "checkpoint-2",
+    parentCheckpointId: "checkpoint-1",
+    branchId: "branch-deepseek",
+    branchLabel: "DeepSeek 方案",
+    branchFromCheckpointId: "checkpoint-1",
+    inherited: true,
+    isFinal: true,
+    retryOperationId: null,
+    verificationRepairOperationId: null,
+    repairAttempt: null,
+    turnEvidence: null,
+    createdAt: null,
+    status: "completed",
+  });
+  assert.equal(mapped.activeBranchId, "branch-deepseek");
+  assert.equal(mapped.activeBranchLabel, "DeepSeek 方案");
+  assert.deepEqual(mapped.sessionPath, {
+    activeLeafCheckpointId: "checkpoint-2",
+    checkpoints: [{
+      id: "checkpoint-2",
+      parentId: "checkpoint-1",
+      turnId: "turn-2",
+      turnSeq: 2,
+      userMessageId: "message-user-2",
+      assistantMessageId: "message-branch-answer",
+      attempt: 2,
+      providerId: "deepseek",
+      modelId: "deepseek-v4-pro",
+      thinkingLevel: "high",
+      status: "completed",
+      title: "DeepSeek 方案",
+      branchable: true,
+      blockedReason: null,
+      createdAt: "2026-08-01T00:00:00.000Z",
+    }],
+  });
+  assert.deepEqual(mapped.fork, {
+    sourceConversationId: "conversation-source",
+    sourceCheckpointId: "checkpoint-1",
+    sourceAssistantMessageId: "message-source-answer",
+    status: "ready",
+    contextMode: "pi_native_path",
+    projectFiles: "current",
+    createdAt: "2026-08-01T00:01:00.000Z",
+  });
+  assert.equal("piEntryId" in mapped, false);
+  assert.equal("piEntryId" in mapped.messages[0], false);
+  assert.equal("piEntryId" in mapped.sessionPath, false);
+  assert.equal("piEntryId" in mapped.sessionPath.checkpoints[0], false);
+  assert.equal("piEntryId" in mapped.fork, false);
 });
 
 test("project-work image serialization keeps only bounded image data", async () => {
@@ -1771,6 +1941,11 @@ test("project-work image serialization keeps only bounded image data", async () 
     byte_length: 4,
     data: "/9j/2Q==",
   });
+  const finderPng = await serializeProjectWorkImage(new File(
+    [new Uint8Array([0x89, 0x50, 0x4e, 0x47])],
+    "finder-screen.png",
+  ));
+  assert.equal(finderPng.mime_type, "image/png");
   await assert.rejects(
     serializeProjectWorkImage(new File(["<svg/>"], "unsafe.svg", {
       type: "image/svg+xml",
@@ -1779,9 +1954,15 @@ test("project-work image serialization keeps only bounded image data", async () 
   );
 });
 
-test("project-work dropped files route PDF, image, and private text safely", async () => {
+test("project-work dropped files route PDF, image, and content-sniffed text safely", async () => {
   const markdown = new File(["# Notes"], "notes.md", { type: "text/markdown" });
   assert.equal(projectWorkDroppedFileKind(markdown), "text");
+  assert.equal(
+    projectWorkDroppedFileKind(new File([
+      '<?xml version="1.0"?><mxfile compressed="false"></mxfile>',
+    ], "机制图.drawio")),
+    "text",
+  );
   assert.equal(
     projectWorkDroppedFileKind(new File(["pdf"], "paper.pdf", {
       type: "application/pdf",
@@ -1795,10 +1976,26 @@ test("project-work dropped files route PDF, image, and private text safely", asy
     "image",
   );
   assert.equal(
+    projectWorkDroppedFileKind(new File(["png"], "finder-screen.png")),
+    "image",
+  );
+  assert.equal(
     projectWorkDroppedFileKind(new File(["zip"], "archive.zip", {
       type: "application/zip",
     })),
-    "unsupported",
+    "text",
+  );
+  assert.equal(
+    projectWorkDroppedFileKind(new File(["PK"], "report.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    })),
+    "text",
+  );
+  assert.equal(
+    projectWorkDroppedFileKind(new File(["PK"], "data.xlsx", {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })),
+    "text",
   );
   assert.equal(
     projectWorkDroppedFileKind(new File(["TOKEN=secret"], ".env.local", {
@@ -1838,6 +2035,10 @@ test("ordinary attachment upload keeps bytes out of JSON and returns a safe refe
         id: "attachment-upload",
         file_name: "notes.md",
         mime_type: "text/markdown",
+        detected_mime_type: "text/markdown",
+        content_kind: "markdown",
+        reading_hint: "按 Markdown 标题与段落读取。",
+        representation: "source",
         byte_length: 7,
         status: "ready",
         revision,
@@ -1864,6 +2065,61 @@ test("ordinary attachment upload keeps bytes out of JSON and returns a safe refe
     "/api/v1/project-work/conversations/conversation-upload/attachments/attachment-upload/content",
   );
   assert.equal(attachment.id, "attachment-upload");
+  assert.equal(attachment.revision, revision);
+  assert.equal(attachment.detectedMimeType, "text/markdown");
+  assert.equal(attachment.contentKind, "markdown");
+  assert.equal(attachment.readingHint, "按 Markdown 标题与段落读取。");
+  assert.equal(attachment.representation, "source");
+});
+
+test("unknown-suffix Draw.io upload stays byte-only and exposes detected structure", async () => {
+  const calls = [];
+  const revision = `sha256:${"d".repeat(64)}`;
+  const source = '<?xml version="1.0"?><mxfile compressed="false"><diagram name="机制图"/></mxfile>';
+  const file = new File([source], "机制图.drawio");
+  const attachment = await uploadProjectWorkAttachment({
+    conversationId: "conversation-drawio",
+    file,
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (options.method === "POST") {
+        return jsonResponse({
+          attachment: {
+            id: "attachment-drawio",
+            file_name: file.name,
+            mime_type: "text/plain",
+            byte_length: file.size,
+            status: "awaiting_upload",
+          },
+        }, 201);
+      }
+      return jsonResponse({
+        attachment: {
+          id: "attachment-drawio",
+          file_name: file.name,
+          mime_type: "text/plain",
+          detected_mime_type: "application/xml",
+          content_kind: "drawio_xml",
+          reading_hint: "按图名、节点、连线与几何信息读取。",
+          representation: "drawio_projection",
+          projection_line_count: 3,
+          byte_length: file.size,
+          status: "ready",
+          revision,
+        },
+      }, 201);
+    },
+  });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].options.method, "POST");
+  assert.doesNotMatch(calls[0].options.body, /mxfile|compressed/);
+  assert.equal(JSON.parse(calls[0].options.body).file_name, "机制图.drawio");
+  assert.equal(calls[1].options.body, file);
+  assert.equal(attachment.contentKind, "drawio_xml");
+  assert.equal(attachment.detectedMimeType, "application/xml");
+  assert.equal(attachment.representation, "drawio_projection");
+  assert.equal(attachment.projectionLineCount, 3);
   assert.equal(attachment.revision, revision);
 });
 
@@ -1893,6 +2149,7 @@ test("standalone conversations use global list and create routes", async () => {
   const created = await createStandaloneProjectWorkConversation({
     providerId: "deepseek",
     modelId: "deepseek-v4-flash",
+    executionPolicyMode: "auto_review",
     fetchImpl: async (url, options) => {
       calls.push({ url, options });
       return jsonResponse({
@@ -1915,8 +2172,76 @@ test("standalone conversations use global list and create routes", async () => {
     schema_version: 1,
     provider_id: "deepseek",
     model_id: "deepseek-v4-flash",
+    execution_policy_mode: "auto_review",
   });
   assert.equal(created.scope, "standalone");
+});
+
+test("bound conversation creation explicitly requests auto review", async () => {
+  const calls = [];
+  await createProjectWorkConversation({
+    projectId: "project/preferences",
+    providerId: "deepseek",
+    modelId: "deepseek-v4-pro",
+    executionPolicyMode: "auto_review",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        conversation: {
+          id: "conversation-preferences",
+          project_id: "project/preferences",
+          provider_id: "deepseek",
+          model_id: "deepseek-v4-pro",
+          execution_policy: {
+            mode: "auto_review",
+            revision: 2,
+            policy_version: 1,
+          },
+        },
+      });
+    },
+  });
+  assert.equal(
+    calls[0].url,
+    "/api/v1/project-work/projects/project%2Fpreferences/conversations",
+  );
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
+    provider_id: "deepseek",
+    model_id: "deepseek-v4-pro",
+    execution_policy_mode: "auto_review",
+  });
+  await assert.rejects(
+    createProjectWorkConversation({
+      projectId: "project/preferences",
+      executionPolicyMode: "full_access",
+    }),
+    /manual_review 或 auto_review/,
+  );
+});
+
+test("model configuration can persist provider and model without a model call", async () => {
+  const calls = [];
+  await configureProjectWorkConversation({
+    conversationId: "conversation-model-choice",
+    providerId: "deepseek",
+    modelId: "deepseek-v4-pro",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        conversation: {
+          id: "conversation-model-choice",
+          provider_id: "deepseek",
+          model_id: "deepseek-v4-pro",
+        },
+      });
+    },
+  });
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schema_version: 1,
+    provider_id: "deepseek",
+    model_id: "deepseek-v4-pro",
+  });
 });
 
 test("string checks map across failed then passing runs while the command remains retryable", () => {
@@ -2206,6 +2531,45 @@ test("generated Image2 metadata and content URLs stay conversation-scoped", () =
       imageId: "image 1",
     }),
     "/api/v1/project-work/conversations/conversation%2Fimage/generated-images/image%201/content",
+  );
+});
+
+test("generated Office metadata and download URLs stay conversation-scoped", () => {
+  const revision = `sha256:${"b".repeat(64)}`;
+  const mapped = mapProjectWorkConversation({
+    conversation: {
+      id: "conversation/office",
+      project_id: "project-1",
+      generated_office_artifacts: [{
+        id: "office-1",
+        turn_id: "turn-1",
+        kind: "excel",
+        status: "completed",
+        title: "项目数据",
+        summary: "结构化项目数据",
+        file_name: "项目数据.xlsx",
+        mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        byte_length: 2048,
+        sha256: revision,
+        revision,
+        preview_text: "sheet=汇总\nA1=项目",
+        structure_verified: true,
+        render_verified: true,
+        sheet_count: 1,
+      }],
+    },
+  });
+
+  assert.equal(mapped.generatedOfficeArtifacts[0].kind, "excel");
+  assert.equal(mapped.generatedOfficeArtifacts[0].fileName, "项目数据.xlsx");
+  assert.equal(mapped.generatedOfficeArtifacts[0].revision, revision);
+  assert.equal(mapped.generatedOfficeArtifacts[0].renderVerified, true);
+  assert.equal(
+    projectWorkGeneratedOfficeDownloadUrl({
+      conversationId: "conversation/office",
+      artifactId: "office 1",
+    }),
+    "/api/v1/project-work/conversations/conversation%2Foffice/generated-office/office%201/download",
   );
 });
 
@@ -2514,6 +2878,18 @@ test("read, retry, and interrupted-repair resume use distinct idempotent mutatio
     clientRequestId: "project-retry:test",
     fetchImpl,
   });
+  await retryProjectWorkCheckpoint({
+    conversationId: "conversation-control-1",
+    checkpointId: "checkpoint-control-1",
+    clientRequestId: "project-retry-checkpoint:test",
+    fetchImpl,
+  });
+  await forkProjectWorkCheckpoint({
+    conversationId: "conversation-control-1",
+    checkpointId: "checkpoint-control-1",
+    clientRequestId: "project-fork:test",
+    fetchImpl,
+  });
   await resumeProjectWorkVerificationRepair({
     conversationId: "conversation-control-1",
     operationId: "operation-repair-1",
@@ -2524,6 +2900,8 @@ test("read, retry, and interrupted-repair resume use distinct idempotent mutatio
   assert.deepEqual(calls.map((call) => call.url), [
     "/api/v1/project-work/conversations/conversation-control-1/read",
     "/api/v1/project-work/conversations/conversation-control-1/retry-last-turn",
+    "/api/v1/project-work/conversations/conversation-control-1/retry-last-turn",
+    "/api/v1/project-work/conversations/conversation-control-1/forks",
     "/api/v1/project-work/conversations/conversation-control-1/verification-repairs/operation-repair-1/resume",
   ]);
   assert.deepEqual(calls.map((call) => JSON.parse(call.options.body)), [{
@@ -2533,6 +2911,14 @@ test("read, retry, and interrupted-repair resume use distinct idempotent mutatio
   }, {
     schema_version: 1,
     client_request_id: "project-retry:test",
+  }, {
+    schema_version: 1,
+    client_request_id: "project-retry-checkpoint:test",
+    checkpoint_id: "checkpoint-control-1",
+  }, {
+    schema_version: 1,
+    client_request_id: "project-fork:test",
+    checkpoint_id: "checkpoint-control-1",
   }, {
     schema_version: 1,
     client_request_id: "project-repair-resume:test",
