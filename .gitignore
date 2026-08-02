@@ -11,7 +11,6 @@ dist/
 # Local project instructions and review artifacts
 .agents/
 .codex/
-AGENTS.md
 PRODUCT_MEETING.md
 project_state.md
 design-qa.md

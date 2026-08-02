@@ -51,6 +51,10 @@ npm run verify
 
 该命令依次执行运行时合同测试、全量测试、生产构建和 Schema 检查。
 
+## 代码审查
+
+仓库根目录的 `AGENTS.md` 记录公开的产品边界与 Code Review 规则。针对 Pi 原生 Workspace 迁移的背景、目标和重点审查问题见 [`docs/review-context.md`](docs/review-context.md)。
+
 ## 本地数据与凭据
 
 `.env.local`、`.pi-agent/`、依赖缓存和构建产物默认不会进入 Git。请只在 `.env.local` 中填写自己的服务端凭据，不要把 Token、模型登录状态、项目绝对路径或本地运行数据提交到仓库。
