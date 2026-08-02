@@ -1088,8 +1088,61 @@ test("live workbench uses polling only while EventSource is unavailable or recon
   assert.match(implementation, /!streamConnected && shouldPollConversationRef\.current/);
   assert.doesNotMatch(implementation, /if \(shouldPollConversation\) \{\s*schedulePoll/);
   assert.match(implementation, /api\.fetchConversation/);
-  assert.match(implementation, /includeActivity: false/);
+  assert.match(implementation, /includeActivity = false/);
+  assert.match(implementation, /onHeartbeat/);
+  assert.match(implementation, /lastStreamActivityAt/);
+  assert.match(implementation, /refreshSnapshot\(\{ includeActivity: true \}\)/);
   assert.match(implementation, /unsubscribe\?\.\(\)/);
+});
+
+test("normal-work mobile views keep the old Agent conversation and artifact reachable", async () => {
+  const appSource = await readFile(APP_URL, "utf8");
+  const workbenchStart = appSource.indexOf("<LiveProjectWorkbench");
+  const workbenchEnd = appSource.indexOf("/>", workbenchStart);
+  const wiring = appSource.slice(workbenchStart, workbenchEnd);
+  assert.match(wiring, /mobileActive=\{mobileView === "agent" \|\| mobileView === "artifact"\}/);
+  assert.match(wiring, /mobileView=\{mobileView\}/);
+  assert.match(wiring, /onMobileViewChange=\{setMobileView\}/);
+
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const oldConversation = conversation({
+      messages: [{
+        id: "message-user",
+        role: "user",
+        content: "继续使用之前的会话窗",
+      }, {
+        id: "message-assistant",
+        role: "assistant",
+        content: "原生 Pi 和历史工件都还在。",
+        status: "completed",
+      }],
+    });
+    const agentHtml = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      {
+        project,
+        conversation: oldConversation,
+        mobileActive: true,
+        mobileView: "agent",
+      },
+    ));
+    assert.match(agentHtml, /reading-workbench agent-artifact-layout is-mobile-active/);
+    assert.match(agentHtml, /reading-agent-pane is-mobile-active/);
+    assert.match(agentHtml, /继续使用之前的会话窗/);
+    assert.match(agentHtml, /原生 Pi 和历史工件都还在/);
+
+    const artifactHtml = renderToStaticMarkup(React.createElement(
+      LiveProjectWorkbench,
+      {
+        project,
+        conversation: oldConversation,
+        mobileActive: true,
+        mobileView: "artifact",
+      },
+    ));
+    assert.match(artifactHtml, /reading-artifact-pane is-mobile-active/);
+    assert.match(artifactHtml, /aria-label="项目工件"/);
+  });
 });
 
 test("workspace run logs load only while the run artifact is visible and explicitly expanded", async () => {
@@ -3982,10 +4035,11 @@ test("adding file context only updates removable composer context until submit",
     /workflowId: branchTarget \? "planning" : selectedWorkflowId/,
   );
   assert.match(submitImplementation, /const submittedDraft = draft/);
-  assert.match(
-    submitImplementation,
-    /setDraft\(\(current\) => \(\s*current === submittedDraft \? "" : current\s*\)\)/,
-  );
+  assert.match(submitImplementation, /setDraft\(""\)/);
+  assert.match(submitImplementation, /PROJECT_WORK_NOT_RUNNING/);
+  assert.match(submitImplementation, /includeActivity: true/);
+  assert.match(submitImplementation, /startedNewTurn = true/);
+  assert.match(submitImplementation, /setDraft\(\(current\) => current \|\| submittedDraft\)/);
   assert.match(submitImplementation, /replacePendingImage\(null\)/);
   assert.match(source, /useState\(\s*readLastArtifact\(/);
 });

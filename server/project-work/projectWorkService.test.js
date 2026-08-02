@@ -9478,6 +9478,88 @@ test("message admission is atomic and client request ids are idempotent", async 
   assert.equal(sessionFactory.sessions[1].prompts.length, 1);
 });
 
+test("an accepted user message is published before the native runtime finishes opening", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-message-visible-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "project\n", "utf8");
+
+  let runtimeOpening = false;
+  let releaseRuntime;
+  const runtimeGate = new Promise((resolve) => {
+    releaseRuntime = resolve;
+  });
+  const sessionFactory = async () => {
+    runtimeOpening = true;
+    await runtimeGate;
+    return {
+      subscribe() {
+        return () => {};
+      },
+      setActiveToolsByName(names) {
+        return [...names];
+      },
+      async prompt() {},
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+  };
+  sessionFactory.listModels = async () => modelCatalog();
+  sessionFactory.dispose = async () => {};
+  t.after(() => releaseRuntime());
+
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("message-visible"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({ selectionId: selection.selectionId });
+  const conversation = await service.createConversation(project.id);
+  const events = [];
+  const unsubscribe = service.subscribeEvents(
+    conversation.id,
+    (event) => events.push(event),
+  );
+  t.after(unsubscribe);
+
+  const sending = service.sendMessage(conversation.id, {
+    text: "原会话里立即显示这句话",
+    clientRequestId: "message-request:visible-before-runtime",
+  });
+  await eventually(
+    async () => ({ runtimeOpening, events: [...events] }),
+    (state) => (
+      state.runtimeOpening
+      && state.events.some((event) => event.type === "message.created")
+    ),
+    "accepted user message was not published while the runtime was opening",
+  );
+
+  const visible = await service.getConversation(conversation.id);
+  releaseRuntime();
+  await sending;
+  assert.equal(visible.conversation.status, "running");
+  assert.equal(visible.conversation.messages[0].text, "原会话里立即显示这句话");
+  assert.equal(
+    events.find((event) => event.type === "message.created")?.data?.text,
+    "原会话里立即显示这句话",
+  );
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "message did not settle after the runtime opened",
+  );
+});
+
 test("PDF upload stays outside the project overlay and becomes a dynamic Pi read tool", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-conversation-pdf-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));

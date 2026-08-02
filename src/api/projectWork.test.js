@@ -1019,6 +1019,7 @@ test("conversation fetch keeps a bounded recent event window and resumes with de
   let source;
   const resumedEvents = [];
   const connectionStates = [];
+  const heartbeats = [];
   const resyncs = [];
   const errors = [];
   const unsubscribe = subscribeProjectWorkConversation({
@@ -1032,6 +1033,7 @@ test("conversation fetch keeps a bounded recent event window and resumes with de
     },
     onEvent: (event) => resumedEvents.push(event),
     onConnectionState: (state) => connectionStates.push(state),
+    onHeartbeat: (value) => heartbeats.push(value),
     onResync: (value) => resyncs.push(value),
     onError: (error) => errors.push(error),
   });
@@ -1075,6 +1077,12 @@ test("conversation fetch keeps a bounded recent event window and resumes with de
     }),
   });
   source.emit("error", {});
+  source.emit("heartbeat", {
+    data: JSON.stringify({
+      sessionId: fetched.id,
+      lastEventSeq: totalEvents + 2,
+    }),
+  });
   source.emit("resync_required", {
     data: JSON.stringify({
       reason: "event_gap",
@@ -1095,8 +1103,12 @@ test("conversation fetch keeps a bounded recent event window and resumes with de
   assert.equal(resumedEvents[1].replace, false);
   assert.deepEqual(
     connectionStates,
-    ["connected", "connected", "connected", "reconnecting"],
+    ["connected", "connected", "connected", "reconnecting", "connected"],
   );
+  assert.deepEqual(heartbeats, [{
+    sessionId: fetched.id,
+    lastSeq: totalEvents + 2,
+  }]);
   assert.deepEqual(resyncs, [{
     reason: "event_gap",
     lastAvailableSeq: totalEvents + 3,

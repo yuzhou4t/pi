@@ -2941,6 +2941,7 @@ export function subscribeProjectWorkConversation({
   afterSeq = 0,
   onConversation,
   onEvent,
+  onHeartbeat,
   onResync,
   onConnectionState,
   onError,
@@ -3008,6 +3009,20 @@ export function subscribeProjectWorkConversation({
       onError?.(error);
     }
   };
+  const handleHeartbeat = (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      onHeartbeat?.({
+        sessionId: pick(payload, "session_id", "sessionId", conversationId),
+        lastSeq: Number(
+          pick(payload, "last_event_seq", "lastEventSeq", 0),
+        ) || 0,
+      });
+      onConnectionState?.("connected");
+    } catch (error) {
+      onError?.(error);
+    }
+  };
   const handleStreamError = (event) => {
     try {
       const payload = JSON.parse(event.data);
@@ -3024,6 +3039,7 @@ export function subscribeProjectWorkConversation({
   const handleOpen = () => onConnectionState?.("connected");
   source.addEventListener("snapshot", handleSnapshot);
   source.addEventListener("delta", handleDelta);
+  source.addEventListener("heartbeat", handleHeartbeat);
   source.addEventListener("resync_required", handleResync);
   source.addEventListener("stream_error", handleStreamError);
   source.addEventListener("open", handleOpen);
@@ -3031,6 +3047,7 @@ export function subscribeProjectWorkConversation({
   return () => {
     source.removeEventListener?.("snapshot", handleSnapshot);
     source.removeEventListener?.("delta", handleDelta);
+    source.removeEventListener?.("heartbeat", handleHeartbeat);
     source.removeEventListener?.("resync_required", handleResync);
     source.removeEventListener?.("stream_error", handleStreamError);
     source.removeEventListener?.("open", handleOpen);

@@ -3727,6 +3727,9 @@ export function App() {
             installedSkillCount={installedSkillCount}
             sidebarOpen={sidebarOpen}
             onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
+            mobileActive={mobileView === "agent" || mobileView === "artifact"}
+            mobileView={mobileView}
+            onMobileViewChange={setMobileView}
             onConversationChange={updateLiveConversation}
             onConversationForked={activateForkedProjectConversation}
             onCreateConversationInWorkspace={({ projectId, workspaceId }) => (

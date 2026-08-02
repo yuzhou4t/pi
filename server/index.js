@@ -2548,7 +2548,13 @@ export function createApiServer({
           response.end();
         });
         const heartbeat = setInterval(() => {
-          if (!closed) response.write(": keep-alive\n\n");
+          if (!closed) {
+            writeEvent("heartbeat", {
+              schemaVersion: 1,
+              sessionId: conversationId,
+              lastEventSeq: lastSentSeq,
+            });
+          }
         }, 15_000);
         const close = () => {
           if (closed) return;
