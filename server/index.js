@@ -26,6 +26,8 @@ import {
   safeProjectWorkError,
 } from "./project-work/errors.js";
 import { createProjectWorkService } from "./project-work/projectWorkService.js";
+import { createLegacyWorkspaceArchiveService } from "./project-work/legacyWorkspaceArchive.js";
+import { resolveProjectWorkStorageRoot } from "./project-work/projectWorkPaths.js";
 import {
   normalizeProjectWorkRuntimeUrl,
   probeProjectWorkRuntime,
@@ -101,6 +103,11 @@ const projectWork = configuredProjectWorkRuntimeUrl
   ? null
   : createProjectWorkService({
       onLifecycleEvent: notificationDispatcher?.dispatch,
+    });
+const legacyWorkspaceArchives = configuredProjectWorkRuntimeUrl
+  ? null
+  : createLegacyWorkspaceArchiveService({
+      storageRoot: resolveProjectWorkStorageRoot(),
     });
 
 export function shutdownApiServer({
@@ -951,6 +958,26 @@ function sendProjectWorkOfficeArtifact(response, artifact, origin) {
   response.end(body);
 }
 
+function sendProjectWorkPatch(response, artifact, origin) {
+  const body = Buffer.isBuffer(artifact.bytes)
+    ? artifact.bytes
+    : Buffer.from(artifact.bytes);
+  const fileName = path.basename(String(artifact.fileName ?? "changes.patch"))
+    .replaceAll(/[\u0000-\u001f\u007f"\\]/gu, "_");
+  const asciiName = fileName.replaceAll(/[^\x20-\x7e]/gu, "_")
+    || "changes.patch";
+  response.writeHead(200, {
+    "content-type": "text/x-diff; charset=utf-8",
+    "content-length": String(body.length),
+    "content-disposition": `attachment; filename="${asciiName}"`,
+    "cache-control": "private, no-store",
+    "content-security-policy": "default-src 'none'; sandbox",
+    "x-content-type-options": "nosniff",
+    ...corsHeaders(origin),
+  });
+  response.end(body);
+}
+
 function sendWorkflowError(response, error, origin, fallback) {
   sendJson(response, Number.isInteger(error?.status) ? error.status : 500, {
     error: {
@@ -1091,6 +1118,11 @@ function publicProjectWorkConversationSummary(value) {
     sourceProjectLabel: conversation?.sourceProjectLabel ?? null,
     workspaceKind: conversation?.workspaceKind ?? null,
     ...(conversation?.workspace ? { workspace: conversation.workspace } : {}),
+    runtimeProfile: conversation?.runtimeProfile ?? null,
+    legacyMigration: conversation?.legacyMigration
+      && typeof conversation.legacyMigration === "object"
+      ? structuredClone(conversation.legacyMigration)
+      : null,
     scope: conversation?.scope ?? null,
     rootLabel: conversation?.rootLabel ?? null,
     title: conversation?.title ?? "",
@@ -1258,6 +1290,7 @@ export function createApiServer({
   candidateSummaryService = candidateSummaries,
   journalWorkflowService = journalWorkflow,
   projectWorkService = projectWork,
+  legacyWorkspaceArchiveService = legacyWorkspaceArchives,
   workerService = worker,
   notificationSubscriptionService = notificationService,
   projectWorkRuntimeUrl = configuredProjectWorkRuntimeUrl,
@@ -1504,6 +1537,63 @@ export function createApiServer({
       return;
     }
     try {
+      if (
+        request.method === "GET"
+        && url.pathname === "/api/v1/project-work/legacy-workspace-archives"
+      ) {
+        sendJson(
+          response,
+          200,
+          await legacyWorkspaceArchiveService.getSummary(),
+          origin,
+        );
+        return;
+      }
+
+      if (
+        request.method === "POST"
+        && url.pathname === "/api/v1/project-work/legacy-workspace-archives/cleanup"
+      ) {
+        requireProjectWorkMutationOrigin(origin);
+        const payload = await readProjectWorkJson(request);
+        if (
+          payload?.schema_version !== 1
+          || !sha256Pattern.test(String(payload?.mutation_origin ?? ""))
+          || !Array.isArray(payload?.items)
+          || Object.keys(payload).some(
+            (key) => !["schema_version", "mutation_origin", "items"].includes(key),
+          )
+          || payload.items.some((item) => (
+            !item
+            || typeof item !== "object"
+            || Array.isArray(item)
+            || Object.keys(item).some(
+              (key) => !["conversation_id", "archive_hash", "bytes"].includes(key),
+            )
+          ))
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_LEGACY_ARCHIVE_REQUEST_INVALID",
+            "旧工作副本清理请求无效",
+            400,
+          );
+        }
+        sendJson(
+          response,
+          200,
+          await legacyWorkspaceArchiveService.cleanup({
+            mutationOrigin: payload.mutation_origin,
+            items: payload.items.map((item) => ({
+              conversationId: item.conversation_id,
+              archiveHash: item.archive_hash,
+              bytes: item.bytes,
+            })),
+          }),
+          origin,
+        );
+        return;
+      }
+
       if (
         request.method === "GET"
         && url.pathname === "/api/v1/project-work/skills/installed"
@@ -2218,10 +2308,53 @@ export function createApiServer({
       }
       if (conversationMatch && request.method === "GET") {
         const conversationId = decodeProjectWorkSegment(conversationMatch[1]);
-        const result = await projectWorkService.getConversation(conversationId, {
-          afterSeq: Number(url.searchParams.get("after_seq") ?? 0),
-          eventLimit: Number(url.searchParams.get("event_limit") ?? 500),
+        const requestedEventLimit = Number(
+          url.searchParams.get("event_limit") ?? 500,
+        );
+        const eventLimit = Math.min(
+          Math.max(
+            Number.isFinite(requestedEventLimit)
+              ? Math.trunc(requestedEventLimit)
+              : 500,
+            1,
+          ),
+          1_000,
+        );
+        const hasExplicitCursor = url.searchParams.has("after_seq");
+        const includeRecentActivity = url.searchParams.get("activity") !== "none";
+        const requestedAfterSeq = Number(url.searchParams.get("after_seq") ?? 0);
+        let result = await projectWorkService.getConversation(conversationId, {
+          afterSeq: hasExplicitCursor ? requestedAfterSeq : 0,
+          eventLimit: hasExplicitCursor ? eventLimit : 1,
         });
+        if (
+          !hasExplicitCursor
+          && includeRecentActivity
+          && typeof projectWorkService.getConversationTurns === "function"
+        ) {
+          const recentTurns = await projectWorkService.getConversationTurns(
+            conversationId,
+            { limit: 20 },
+          );
+          const recentEvents = [...new Map(
+            (recentTurns?.turns ?? [])
+              .flatMap((turn) => Array.isArray(turn?.events) ? turn.events : [])
+              .filter((event) => Number.isSafeInteger(event?.seq))
+              .map((event) => [event.seq, event]),
+          ).values()].sort((left, right) => left.seq - right.seq);
+          result = {
+            ...result,
+            events: recentEvents,
+            hasEarlierEvents: recentTurns?.hasMore === true,
+            hasMoreEvents: false,
+          };
+        } else if (!hasExplicitCursor && !includeRecentActivity) {
+          result = {
+            ...result,
+            events: [],
+            hasMoreEvents: false,
+          };
+        }
         sendJson(
           response,
           200,
@@ -2247,14 +2380,14 @@ export function createApiServer({
             : 0;
         const wantsStream = String(request.headers.accept ?? "")
           .includes("text/event-stream");
-        const initialSnapshot = await projectWorkService.getConversation(
-          conversationId,
-          {
-            afterSeq,
-            eventLimit: Number(url.searchParams.get("limit") ?? 500),
-          },
-        );
         if (!wantsStream) {
+          const initialSnapshot = await projectWorkService.getConversation(
+            conversationId,
+            {
+              afterSeq,
+              eventLimit: Number(url.searchParams.get("limit") ?? 500),
+            },
+          );
           const publicSnapshot = publicProjectWorkConversationState(
             initialSnapshot,
           );
@@ -2287,58 +2420,133 @@ export function createApiServer({
         });
         response.write("retry: 1500\n\n");
         let closed = false;
+        let initialized = false;
         let lastSentSeq = afterSeq;
         let pump = Promise.resolve();
-        const pushSnapshot = async () => {
+        const bufferedEvents = [];
+        const writeEvent = (name, payload, id = null) => {
           if (closed) return;
-          let hasMore = true;
-          while (hasMore && !closed) {
-            const nextSnapshot = await projectWorkService.getConversation(
-              conversationId,
-              {
-                afterSeq: lastSentSeq,
-                eventLimit: 500,
-              },
-            );
-            const publicSnapshot = publicProjectWorkConversationState(
-              nextSnapshot,
-            );
-            const events = Array.isArray(publicSnapshot.events)
-              ? publicSnapshot.events
-              : [];
-            if (events.length > 0) {
-              lastSentSeq = events.at(-1).seq;
-            } else if (lastSentSeq === 0) {
-              lastSentSeq = publicSnapshot.conversation?.lastEventSeq ?? 0;
-            }
-            response.write(`id: ${lastSentSeq}\n`);
-            response.write("event: snapshot\n");
-            response.write(`data: ${JSON.stringify({
-              schema_version: 1,
-              snapshot_watermark:
-                publicSnapshot.conversation?.lastEventSeq ?? lastSentSeq,
-              conversation: publicSnapshot.conversation,
-              events,
-              has_more: Boolean(publicSnapshot.hasMoreEvents),
-              last_seq: lastSentSeq,
-            })}\n\n`);
-            hasMore = Boolean(publicSnapshot.hasMoreEvents);
+          if (Number.isSafeInteger(id) && id >= 0) {
+            response.write(`id: ${id}\n`);
           }
+          response.write(`event: ${name}\n`);
+          response.write(`data: ${JSON.stringify(payload)}\n\n`);
         };
-        const scheduleSnapshot = () => {
-          pump = pump.then(pushSnapshot).catch((error) => {
+        const sendResync = (latestSeq, reason) => {
+          const normalizedLatest = Number.isSafeInteger(latestSeq)
+            ? Math.max(0, latestSeq)
+            : lastSentSeq;
+          writeEvent("resync_required", {
+            schemaVersion: 1,
+            sessionId: conversationId,
+            expectedAfterSeq: lastSentSeq,
+            lastAvailableSeq: normalizedLatest,
+            reason,
+          }, normalizedLatest);
+          lastSentSeq = normalizedLatest;
+        };
+        const sendDelta = (event) => {
+          const seq = Number(event?.seq);
+          if (!Number.isSafeInteger(seq) || seq < 1 || seq <= lastSentSeq) return;
+          if (seq !== lastSentSeq + 1) {
+            sendResync(seq, "event_gap");
+            return;
+          }
+          writeEvent("delta", {
+            schemaVersion: 1,
+            seq,
+            sessionId: conversationId,
+            turnId: event?.data?.turnId ?? event?.data?.turn_id ?? null,
+            type: event.type,
+            at: event.at ?? null,
+            data: event.data ?? {},
+          }, seq);
+          lastSentSeq = seq;
+        };
+        const enqueueEvent = (event) => {
+          if (!initialized) {
+            bufferedEvents.push(event);
+            return;
+          }
+          pump = pump.then(() => sendDelta(event)).catch((error) => {
             if (closed) return;
-            response.write("event: stream_error\n");
-            response.write(`data: ${JSON.stringify({
+            writeEvent("stream_error", {
               code: error?.code ?? "PROJECT_WORK_EVENT_STREAM_FAILED",
               message: error?.message ?? "项目工作事件流暂时中断",
-            })}\n\n`);
+            });
           });
         };
         const unsubscribe = projectWorkService.subscribeEvents(
           conversationId,
-          scheduleSnapshot,
+          enqueueEvent,
         );
+        const initializeStream = async () => {
+          const initialSnapshot = await projectWorkService.getConversation(
+            conversationId,
+            {
+              afterSeq,
+              eventLimit: Number(url.searchParams.get("limit") ?? 500),
+            },
+          );
+          const publicSnapshot = publicProjectWorkConversationState(
+            initialSnapshot,
+          );
+          const watermark = Number(
+            publicSnapshot.conversation?.lastEventSeq,
+          ) || 0;
+          if (afterSeq > watermark) {
+            sendResync(watermark, "cursor_ahead");
+          } else {
+            const events = Array.isArray(publicSnapshot.events)
+              ? publicSnapshot.events
+              : [];
+            const firstSeq = Number(events[0]?.seq);
+            if (
+              events.length > 0
+              && Number.isSafeInteger(firstSeq)
+              && firstSeq !== afterSeq + 1
+            ) {
+              sendResync(watermark, "event_gap");
+            } else {
+              writeEvent("snapshot", {
+                schemaVersion: 1,
+                snapshotWatermark: watermark,
+                lastEventSeq: watermark,
+                conversation: publicSnapshot.conversation,
+                events: [],
+                hasMore: Boolean(publicSnapshot.hasMoreEvents),
+                lastSeq: afterSeq,
+              }, afterSeq);
+              for (const event of events) sendDelta(event);
+              let hasMore = Boolean(publicSnapshot.hasMoreEvents);
+              while (hasMore && !closed) {
+                const page = publicProjectWorkConversationState(
+                  await projectWorkService.getConversation(conversationId, {
+                    afterSeq: lastSentSeq,
+                    eventLimit: 500,
+                  }),
+                );
+                const pageEvents = Array.isArray(page.events) ? page.events : [];
+                if (pageEvents.length === 0) break;
+                for (const event of pageEvents) sendDelta(event);
+                hasMore = Boolean(page.hasMoreEvents);
+              }
+            }
+          }
+          initialized = true;
+          bufferedEvents
+            .sort((left, right) => Number(left?.seq) - Number(right?.seq))
+            .forEach(sendDelta);
+          bufferedEvents.length = 0;
+        };
+        pump = pump.then(initializeStream).catch((error) => {
+          if (closed) return;
+          writeEvent("stream_error", {
+            code: error?.code ?? "PROJECT_WORK_EVENT_STREAM_FAILED",
+            message: error?.message ?? "项目工作事件流暂时中断",
+          });
+          response.end();
+        });
         const heartbeat = setInterval(() => {
           if (!closed) response.write(": keep-alive\n\n");
         }, 15_000);
@@ -2348,9 +2556,9 @@ export function createApiServer({
           clearInterval(heartbeat);
           unsubscribe();
         };
+        request.once("aborted", close);
         request.once("close", close);
         response.once("close", close);
-        scheduleSnapshot();
         return;
       }
 
@@ -3035,6 +3243,78 @@ export function createApiServer({
           200,
           publicProjectWorkConversationState(
             await projectWorkService.getConversation(conversationId),
+          ),
+          origin,
+        );
+        return;
+      }
+
+      const legacyMigrationExportMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/legacy-migration\/change-sets\/([^/]+)\/export$/,
+      );
+      if (legacyMigrationExportMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(
+          legacyMigrationExportMatch[1],
+        );
+        const changeSetId = decodeProjectWorkSegment(
+          legacyMigrationExportMatch[2],
+        );
+        sendProjectWorkPatch(
+          response,
+          await projectWorkService.exportLegacyMigrationChanges(
+            conversationId,
+            {
+              changeSetId,
+              changeSetHash: url.searchParams.get("change_set_hash"),
+            },
+          ),
+          origin,
+        );
+        return;
+      }
+
+      const legacyMigrationAbandonMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/legacy-migration\/change-sets\/([^/]+)\/abandon$/,
+      );
+      if (legacyMigrationAbandonMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          legacyMigrationAbandonMatch[1],
+        );
+        const changeSetId = decodeProjectWorkSegment(
+          legacyMigrationAbandonMatch[2],
+        );
+        const payload = await readProjectWorkJson(request);
+        if (
+          payload?.schema_version !== 1
+          || typeof payload.client_request_id !== "string"
+          || !projectWorkClientRequestIdPattern.test(
+            payload.client_request_id,
+          )
+          || !sha256Pattern.test(String(payload.change_set_hash ?? ""))
+          || Object.keys(payload).some((key) => ![
+            "schema_version",
+            "client_request_id",
+            "change_set_hash",
+          ].includes(key))
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_LEGACY_MIGRATION_ABANDON_INVALID",
+            "放弃旧会话修改的确认信息无效",
+            400,
+          );
+        }
+        sendJson(
+          response,
+          200,
+          publicProjectWorkConversationState(
+            await projectWorkService.abandonLegacyMigrationChanges(
+              conversationId,
+              {
+                changeSetId,
+                changeSetHash: payload.change_set_hash,
+              },
+            ),
           ),
           origin,
         );

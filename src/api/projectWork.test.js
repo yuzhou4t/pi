@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  abandonProjectWorkLegacyMigrationChanges,
   answerProjectWorkAskUserRequest,
   cancelProjectWorkAskUserRequest,
   clearProjectWorkFollowUps,
@@ -14,6 +15,7 @@ import {
   fetchProjectWorkFile,
   fetchProjectWorkGitEvidence,
   fetchProjectWorkGitCloseouts,
+  fetchLegacyWorkspaceArchives,
   fetchProjectWorkConversation,
   fetchProjectWorkModels,
   fetchProjectWorkProviderConnections,
@@ -35,6 +37,7 @@ import {
   projectWorkGeneratedOfficeDownloadUrl,
   projectWorkBrowserQaScreenshotUrl,
   projectWorkImageUrl,
+  projectWorkLegacyMigrationPatchUrl,
   removeProjectWorkFollowUp,
   removeProjectWorkPdf,
   removeProjectWorkProviderCredential,
@@ -59,6 +62,7 @@ import {
   fetchInstalledProjectWorkSkills,
   inspectProjectWorkSkillPackage,
   installProjectWorkSkillPackage,
+  cleanupLegacyWorkspaceArchives,
 } from "./projectWork.js";
 
 function jsonResponse(body, status = 200) {
@@ -951,16 +955,15 @@ test("project-work subscription resumes after seq and maps incremental snapshots
   assert.equal(source.listeners.size, 0);
 });
 
-test("conversation fetch resumes all 10,501 events from its delivered cursor", async () => {
+test("conversation fetch keeps a bounded recent event window and resumes with deltas", async () => {
   const totalEvents = 10_501;
   const pageSize = 500;
   const calls = [];
   const fetchImpl = async (url) => {
     calls.push(url);
-    const parsed = new URL(url, "http://127.0.0.1");
-    const afterSeq = Number(parsed.searchParams.get("after_seq") ?? 0);
+    const afterSeq = totalEvents - pageSize;
     const events = Array.from(
-      { length: Math.min(pageSize, totalEvents - afterSeq) },
+      { length: pageSize },
       (_, index) => ({
         seq: afterSeq + index + 1,
         type: "agent.progress",
@@ -975,7 +978,8 @@ test("conversation fetch resumes all 10,501 events from its delivered cursor", a
         last_event_seq: totalEvents,
       },
       events,
-      has_more_events: afterSeq + events.length < totalEvents,
+      has_earlier_events: true,
+      has_more_events: false,
     });
   };
 
@@ -984,11 +988,12 @@ test("conversation fetch resumes all 10,501 events from its delivered cursor", a
     fetchImpl,
   });
 
-  assert.equal(calls.length, 20);
+  assert.equal(calls.length, 1);
   assert.equal(fetched.lastEventSeq, totalEvents);
-  assert.equal(fetched.deliveredEventSeq, 10_000);
-  assert.equal(fetched.hasMoreEvents, true);
-  assert.equal(fetched.events.length, 10_000);
+  assert.equal(fetched.deliveredEventSeq, totalEvents);
+  assert.equal(fetched.hasEarlierEvents, true);
+  assert.equal(fetched.hasMoreEvents, false);
+  assert.equal(fetched.events.length, pageSize);
 
   class FakeEventSource {
     constructor(url) {
@@ -1012,7 +1017,10 @@ test("conversation fetch resumes all 10,501 events from its delivered cursor", a
   }
 
   let source;
-  const resumedEvents = [...fetched.events];
+  const resumedEvents = [];
+  const connectionStates = [];
+  const resyncs = [];
+  const errors = [];
   const unsubscribe = subscribeProjectWorkConversation({
     conversationId: fetched.id,
     afterSeq: fetched.deliveredEventSeq,
@@ -1022,30 +1030,13 @@ test("conversation fetch resumes all 10,501 events from its delivered cursor", a
         source = this;
       }
     },
-    onConversation: (conversation) => {
-      resumedEvents.push(...conversation.events);
-    },
+    onEvent: (event) => resumedEvents.push(event),
+    onConnectionState: (state) => connectionStates.push(state),
+    onResync: (value) => resyncs.push(value),
+    onError: (error) => errors.push(error),
   });
 
-  assert.match(source.url, /after_seq=10000$/);
-  source.emit("snapshot", {
-    data: JSON.stringify({
-      snapshot_watermark: totalEvents,
-      last_seq: 10_500,
-      has_more: true,
-      conversation: {
-        id: fetched.id,
-        project_id: "project-1",
-        status: "completed",
-        last_event_seq: totalEvents,
-      },
-      events: Array.from({ length: 500 }, (_, index) => ({
-        seq: 10_001 + index,
-        type: "agent.progress",
-        data: { summary: `公开进展 ${10_001 + index}` },
-      })),
-    }),
-  });
+  assert.match(source.url, /after_seq=10501$/);
   source.emit("snapshot", {
     data: JSON.stringify({
       snapshot_watermark: totalEvents,
@@ -1057,20 +1048,89 @@ test("conversation fetch resumes all 10,501 events from its delivered cursor", a
         status: "completed",
         last_event_seq: totalEvents,
       },
-      events: [{
-        seq: totalEvents,
-        type: "agent.progress",
-        data: { summary: `公开进展 ${totalEvents}` },
-      }],
+      events: [],
+    }),
+  });
+  source.emit("delta", {
+    data: JSON.stringify({
+      seq: totalEvents + 1,
+      sessionId: fetched.id,
+      type: "agent.progress",
+      data: { summary: "继续工作" },
+    }),
+  });
+  source.emit("delta", {
+    data: JSON.stringify({
+      seq: totalEvents + 2,
+      sessionId: fetched.id,
+      turnId: "turn-live",
+      type: "message.delta",
+      data: {
+        id: "assistant-live",
+        delta: "正在形成最终回答",
+        revision: 3,
+        contentIndex: 2,
+        phase: "final_answer",
+      },
+    }),
+  });
+  source.emit("error", {});
+  source.emit("resync_required", {
+    data: JSON.stringify({
+      reason: "event_gap",
+      lastAvailableSeq: totalEvents + 3,
     }),
   });
 
-  assert.equal(resumedEvents.length, totalEvents);
-  assert.equal(
-    resumedEvents.every((event, index) => event.seq === index + 1),
-    true,
+  assert.deepEqual(
+    resumedEvents.map((event) => event.seq),
+    [totalEvents + 1, totalEvents + 2],
   );
+  assert.equal(resumedEvents[1].messageId, "assistant-live");
+  assert.equal(resumedEvents[1].turnId, "turn-live");
+  assert.equal(resumedEvents[1].delta, "正在形成最终回答");
+  assert.equal(resumedEvents[1].revision, 3);
+  assert.equal(resumedEvents[1].contentIndex, 2);
+  assert.equal(resumedEvents[1].phase, "final_answer");
+  assert.equal(resumedEvents[1].replace, false);
+  assert.deepEqual(
+    connectionStates,
+    ["connected", "connected", "connected", "reconnecting"],
+  );
+  assert.deepEqual(resyncs, [{
+    reason: "event_gap",
+    lastAvailableSeq: totalEvents + 3,
+  }]);
+  assert.equal(errors.length, 0);
   unsubscribe();
+});
+
+test("state-only conversation refresh skips historical activity", async () => {
+  let requestedUrl = null;
+  const conversation = await fetchProjectWorkConversation({
+    conversationId: "conversation-refresh",
+    includeActivity: false,
+    fetchImpl: async (url) => {
+      requestedUrl = url;
+      return jsonResponse({
+        conversation: {
+          id: "conversation-refresh",
+          project_id: "project-1",
+          status: "running",
+          last_event_seq: 42,
+        },
+        events: [],
+        has_more_events: false,
+      });
+    },
+  });
+
+  assert.equal(
+    requestedUrl,
+    "/api/v1/project-work/conversations/conversation-refresh?activity=none",
+  );
+  assert.equal(conversation.deliveredEventSeq, 42);
+  assert.deepEqual(conversation.events, []);
 });
 
 test("follow-up API distinguishes queue mutations from steer and keeps exact routes", async () => {
@@ -1298,6 +1358,46 @@ test("conversation mapping preserves blocked auto-review evidence", () => {
 });
 
 test("execution policy mutation is revision-bound and maps the returned policy", async () => {
+  const nativeConversation = mapProjectWorkConversation({
+    conversation: {
+      id: "conversation-native-policy",
+      project_id: "project-1",
+      execution_policy: {
+        mode: "native",
+        revision: 1,
+        policy_version: 1,
+      },
+      workspace_runs: [{
+        id: "pi-shell-1",
+        kind: "pi_shell",
+        status: "succeeded",
+        git_before: {
+          available: true,
+          branch: "main",
+          head: "a".repeat(40),
+          staged: [],
+          unstaged: [],
+          untracked: [],
+          truncated: false,
+        },
+        git_after: {
+          available: true,
+          branch: "main",
+          head: "a".repeat(40),
+          staged: [],
+          unstaged: ["src/app.js"],
+          untracked: [],
+          truncated: false,
+        },
+      }],
+    },
+  });
+  assert.equal(nativeConversation.executionPolicy.mode, "native");
+  assert.deepEqual(nativeConversation.workspaceRuns[0].gitBefore.unstaged, []);
+  assert.deepEqual(
+    nativeConversation.workspaceRuns[0].gitAfter.unstaged,
+    ["src/app.js"],
+  );
   const mappedEvent = mapProjectWorkConversation({
     conversation: {
       id: "conversation-policy-event",
@@ -3220,4 +3320,101 @@ test("browser QA screenshot URL accepts only registered profiles", () => {
     }),
     /desktop 或 mobile/,
   );
+});
+
+test("legacy migration exposes exact patch export and hash-bound abandon", async () => {
+  const changeSetHash = `sha256:${"a".repeat(64)}`;
+  assert.equal(
+    projectWorkLegacyMigrationPatchUrl({
+      conversationId: "conversation legacy",
+      changeSetId: "changes/1",
+      changeSetHash,
+    }),
+    `/api/v1/project-work/conversations/conversation%20legacy/legacy-migration/change-sets/changes%2F1/export?change_set_hash=${encodeURIComponent(changeSetHash)}`,
+  );
+  let request;
+  const result = await abandonProjectWorkLegacyMigrationChanges({
+    conversationId: "conversation-legacy",
+    changeSetId: "changes-1",
+    changeSetHash,
+    clientRequestId: "legacy-migration-abandon:test",
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return jsonResponse({
+        conversation: {
+          id: "conversation-legacy",
+          project_id: "project-1",
+          runtime_profile: "pi-native-v1",
+          legacy_migration: {
+            status: "completed",
+            resolution: "abandoned",
+          },
+        },
+      });
+    },
+  });
+  assert.equal(
+    request.url,
+    "/api/v1/project-work/conversations/conversation-legacy/legacy-migration/change-sets/changes-1/abandon",
+  );
+  assert.deepEqual(JSON.parse(request.options.body), {
+    schema_version: 1,
+    client_request_id: "legacy-migration-abandon:test",
+    change_set_hash: changeSetHash,
+  });
+  assert.equal(result.runtimeProfile, "pi-native-v1");
+  assert.equal(result.legacyMigration.resolution, "abandoned");
+});
+
+test("legacy archive API maps safe summaries and sends an exact cleanup binding", async () => {
+  const archiveHash = `sha256:${"a".repeat(64)}`;
+  const mutationOrigin = `sha256:${"b".repeat(64)}`;
+  const calls = [];
+  const responseBody = {
+    schema_version: 1,
+    total_bytes: 2048,
+    total_file_count: 7,
+    item_count: 1,
+    cleanup_eligible_count: 1,
+    mutation_origin: mutationOrigin,
+    items: [{
+      conversation_id: "conversation-archive",
+      title: "旧 Swift 验证",
+      parts: ["base", "workspace"],
+      archive_hash: archiveHash,
+      bytes: 2048,
+      file_count: 7,
+      cleanup_eligible: true,
+      blocked_reason: null,
+    }],
+  };
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, options });
+    return jsonResponse(responseBody);
+  };
+
+  const listed = await fetchLegacyWorkspaceArchives({ fetchImpl });
+  assert.equal(listed.totalBytes, 2048);
+  assert.equal(listed.items[0].conversationId, "conversation-archive");
+  assert.equal(listed.items[0].archiveHash, archiveHash);
+  await cleanupLegacyWorkspaceArchives({
+    mutationOrigin,
+    items: [{
+      conversationId: "conversation-archive",
+      archiveHash,
+      bytes: 2048,
+    }],
+    fetchImpl,
+  });
+  assert.equal(calls[0].url, "/api/v1/project-work/legacy-workspace-archives");
+  assert.equal(calls[1].url, "/api/v1/project-work/legacy-workspace-archives/cleanup");
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    schema_version: 1,
+    mutation_origin: mutationOrigin,
+    items: [{
+      conversation_id: "conversation-archive",
+      archive_hash: archiveHash,
+      bytes: 2048,
+    }],
+  });
 });

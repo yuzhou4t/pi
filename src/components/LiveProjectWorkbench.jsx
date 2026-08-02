@@ -53,8 +53,12 @@ import {
   validateProjectWorkTextAttachmentFile,
 } from "../api/projectWork.js";
 import {
+  applyProjectWorkEventDelta,
   mergeFreshConversationSnapshot,
   mergeIncrementalConversationSnapshot,
+  projectStreamingAssistantFromEvents,
+  projectStreamingAssistantView,
+  projectWorkEventNeedsHydration,
 } from "../project-work/liveProjectWorkState.js";
 import {
   parseCodeEvidenceHref,
@@ -175,8 +179,8 @@ const AUTO_REVIEW_REASON_LABELS = {
 
 const TOOL_LABELS = {
   read: "读取文件",
-  edit: "准备修改",
-  write: "准备新文件",
+  edit: "修改文件",
+  write: "写入文件",
   grep: "搜索内容",
   find: "查找文件",
   ls: "查看目录",
@@ -377,6 +381,32 @@ export function conversationEventResumeSeq(conversation) {
     : 0;
 }
 
+export function workspaceRunsToLoad(runs, expandedRunIds = new Set()) {
+  return (Array.isArray(runs) ? runs : []).filter((run) => (
+    run?.runId
+    && expandedRunIds.has(run.runId)
+  ));
+}
+
+export function workspaceRunGitSummary(evidence) {
+  if (!evidence) return null;
+  if (evidence.available !== true) return "不可用";
+  const changed = [
+    ...(evidence.staged ?? []),
+    ...(evidence.unstaged ?? []),
+    ...(evidence.untracked ?? []),
+  ];
+  const identity = [
+    evidence.branch || "未命名分支",
+    evidence.head ? evidence.head.slice(0, 8) : null,
+  ].filter(Boolean).join(" @ ");
+  return [
+    identity,
+    `${new Set(changed).size} 项变更`,
+    evidence.truncated ? "列表已截断" : null,
+  ].filter(Boolean).join(" · ");
+}
+
 export function hasProcessingDocuments(conversation) {
   return (conversation?.documents ?? []).some(
     (document) => PROCESSING_DOCUMENT_STATUSES.has(document.status),
@@ -437,7 +467,7 @@ function workspaceStatusCopy(workspace, standalone, fork) {
     title: standalone ? "私有 Workspace 已连接" : "真实 Workspace 已连接",
     detail: standalone
       ? "这里的文件只属于当前会话。"
-      : "读取、写入、构建与测试使用同一工作区；写入仍按当前审批方式执行。",
+      : "读取、写入、构建与测试使用同一工作区；Pi 原生操作的活动与结果会持续保留。",
   };
 }
 
@@ -573,47 +603,26 @@ export function projectSessionMessageView(
   };
 }
 
-export function latestStreamingAssistant(events, messages, running) {
-  if (!running) return null;
-  const safeEvents = Array.isArray(events) ? events : [];
-  const completedAssistantIds = new Set(
-    (Array.isArray(messages) ? messages : [])
-      .filter((message) => message?.role === "assistant" && message.id)
-      .map((message) => message.id),
-  );
-  const latestTurnStartSeq = safeEvents.reduce((latest, event) => (
-    event?.type === "message.created" && Number.isSafeInteger(event.seq)
-      ? Math.max(latest, event.seq)
-      : latest
-  ), 0);
-  let latest = null;
-  for (const event of safeEvents) {
-    if (
-      event?.type !== "message.partial"
-      || !Number.isSafeInteger(event.seq)
-      || event.seq < latestTurnStartSeq
-    ) {
-      continue;
-    }
-    const id = event.messageId ?? event.data?.id ?? event.data?.messageId;
-    const text = event.text ?? event.data?.text;
-    if (
-      typeof id !== "string"
-      || !id
-      || completedAssistantIds.has(id)
-      || typeof text !== "string"
-      || !text
-    ) {
-      continue;
-    }
-    latest = {
-      id,
-      text,
-      seq: event.seq,
-      turnId: event.turnId ?? event.data?.turnId ?? null,
-    };
+export function latestStreamingAssistant(
+  events,
+  messages,
+  running,
+  projection,
+) {
+  return projection === undefined
+    ? projectStreamingAssistantFromEvents(events, messages, running)
+    : projectStreamingAssistantView(projection, messages, running);
+}
+
+function isStreamingAnswerEvent(event) {
+  if (event?.type === "message.partial") {
+    return typeof (event.text ?? event.data?.text) === "string"
+      && Boolean(event.text ?? event.data?.text);
   }
-  return latest;
+  if (event?.type !== "message.delta") return false;
+  const phase = event.phase ?? event.data?.phase;
+  const delta = event.delta ?? event.data?.delta;
+  return phase !== "commentary" && typeof delta === "string" && Boolean(delta);
 }
 
 function ProjectAgentMarkdown({
@@ -1312,6 +1321,7 @@ export function normalizeSubagentRun(event, fallbackIndex = 1, depth = 0) {
     status,
     currentTool: safeSubagentText(source.currentTool, 80),
     currentPath: safeSubagentPath(source.currentPath),
+    modelRef: safeSubagentText(source.modelRef ?? source.model, 120),
     toolCount: boundedSubagentNumber(source.toolCount),
     turnCount: boundedSubagentNumber(source.turnCount),
     tokens: boundedSubagentNumber(source.tokens),
@@ -1628,14 +1638,51 @@ export function activityTurnScopes(events) {
   return scopes;
 }
 
+export function buildActivityTurnIndex(events) {
+  const scopes = activityTurnScopes(events);
+  const byTurnId = new Map();
+  const byMessageId = new Map();
+  const byTurnSeq = new Map();
+  const add = (index, key, scope) => {
+    if (key === null || key === undefined || key === "") return;
+    const matching = index.get(key);
+    if (matching) matching.push(scope);
+    else index.set(key, [scope]);
+  };
+  for (const scope of scopes) {
+    add(byTurnId, scope.boundary?.turnId, scope);
+    add(byMessageId, scope.boundary?.messageId, scope);
+    add(byTurnSeq, scope.boundary?.turnSeq, scope);
+  }
+  return { scopes, byTurnId, byMessageId, byTurnSeq };
+}
+
+function indexedActivityScopesForTurn(index, turn) {
+  if (!index || !turn) return [];
+  const candidates = new Set();
+  const turnId = turn.turnId ?? turn.id ?? null;
+  for (const scope of index.byTurnId.get(turnId) ?? []) candidates.add(scope);
+  for (const scope of index.byMessageId.get(turn.id) ?? []) candidates.add(scope);
+  for (const scope of index.byTurnSeq.get(turn.turnSeq) ?? []) candidates.add(scope);
+  return [...candidates].filter(({ boundary }) => (
+    activityBoundaryMatchesTurn(boundary, turn)
+  ));
+}
+
 export function activityEventsForTurn(events, turn) {
   return activityEventsForTurnAttempt(events, turn);
 }
 
 export function activityEventsForTurnAttempt(events, turn, attempt = null) {
-  const matchingScopes = activityTurnScopes(events).filter(({ boundary }) => (
-    activityBoundaryMatchesTurn(boundary, turn)
-  ));
+  return activityEventsForTurnAttemptFromIndex(
+    buildActivityTurnIndex(events),
+    turn,
+    attempt,
+  );
+}
+
+export function activityEventsForTurnAttemptFromIndex(index, turn, attempt = null) {
+  const matchingScopes = indexedActivityScopesForTurn(index, turn);
   if (matchingScopes.length === 0) return [];
   const eventAttempt = (event) => (
     event?.attempt
@@ -2114,7 +2161,7 @@ export function normalizeActivityEvents(
   }
   if (normalized.length === 0 && running) {
     const hasPartialAnswer = safeEvents.some((event) => (
-      event.type === "message.partial"
+      isStreamingAnswerEvent(event)
       && (
         latestMessageSeq === 0
         || (Number.isSafeInteger(event.seq) && event.seq >= latestMessageSeq)
@@ -2652,12 +2699,17 @@ export function ProjectExecutionPolicyControl({
   saving = false,
   onChange,
 }) {
-  const mode = executionPolicy?.mode === "auto_review"
-    ? "auto_review"
+  const mode = ["manual_review", "auto_review", "native"].includes(
+    executionPolicy?.mode,
+  )
+    ? executionPolicy.mode
     : "manual_review";
-  const disabled = running || saving;
+  const native = mode === "native";
+  const disabled = native || running || saving;
   const label = saving
     ? "正在保存"
+    : native
+      ? "Pi 原生"
     : mode === "auto_review"
       ? "替我审批"
       : "需确认";
@@ -2677,13 +2729,18 @@ export function ProjectExecutionPolicyControl({
           "project-composer-tool",
           "project-execution-policy-trigger",
           mode === "auto_review" ? "is-auto" : "",
+          native ? "is-native" : "",
         ].filter(Boolean).join(" ")}
         type="button"
         disabled={disabled}
         aria-expanded={open && !disabled}
-        aria-haspopup="dialog"
-        aria-controls="project-execution-policy-popover"
-        title={running ? "Agent 工作期间不能更改权限" : "设置当前会话的工作权限"}
+        aria-haspopup={native ? undefined : "dialog"}
+        aria-controls={native ? undefined : "project-execution-policy-popover"}
+        title={native
+          ? "可信 Workspace：选择项目即表示信任；Pi 可原生读取、修改和运行项目"
+          : running
+            ? "Agent 工作期间不能更改权限"
+            : "设置当前会话的工作权限"}
         onClick={() => {
           if (!disabled) onOpenChange(!open);
         }}
@@ -2694,10 +2751,10 @@ export function ProjectExecutionPolicyControl({
           <ShieldCheck size={13} weight="regular" aria-hidden="true" />
         )}
         <span>{label}</span>
-        <CaretUp size={11} weight="bold" aria-hidden="true" />
+        {!native ? <CaretUp size={11} weight="bold" aria-hidden="true" /> : null}
       </button>
 
-      {open && !disabled ? (
+      {open && !disabled && !native ? (
         <section
           id="project-execution-policy-popover"
           className="provider-popover project-execution-policy-popover"
@@ -3105,6 +3162,7 @@ export function ProjectAskUserCard({
   request,
   busy = false,
   autoReview = false,
+  native = false,
   onAnswer,
   onCancel,
 }) {
@@ -3134,7 +3192,9 @@ export function ProjectAskUserCard({
         <div>
           <strong>Agent 等待你的决定</strong>
           <p>
-            {autoReview
+            {native
+              ? "回答只用于明确任务需求。当前项目已进入可信 Pi 原生模式，Agent 会继续在同一 Workspace 工作。"
+              : autoReview
               ? "回答只用于明确任务需求。当前为“替我审批”，符合安全范围的修改会自动写入；超出范围的操作会直接阻止。"
               : "回答只用于明确任务需求，不代表批准任何文件修改。写入仍需在“更改”中核对并确认。"}
           </p>
@@ -3402,6 +3462,7 @@ export function ProjectAgentPane({
     (write) => write.status === "pending",
   );
   const autoReview = conversation.executionPolicy?.mode === "auto_review";
+  const nativeExecution = conversation.executionPolicy?.mode === "native";
   const streamRef = useRef(null);
   const dragDepthRef = useRef(0);
   const followLatestRef = useRef(true);
@@ -3455,6 +3516,10 @@ export function ProjectAgentPane({
     ? persistedPlan
     : planFromActivityEvents(conversation.events);
   const dockPlanSignature = planSignature(dockPlan);
+  const activityTurnIndex = useMemo(
+    () => buildActivityTurnIndex(conversation.events),
+    [conversation.events],
+  );
   const activityByUserMessageId = new Map();
   let latestExecutedTurnStartSeq = 0;
   const userMessages = visibleMessages.filter(
@@ -3463,8 +3528,8 @@ export function ProjectAgentPane({
   for (const message of userMessages) {
     const turnKey = sessionTurnKey(message, `user:${message.id}`);
     const turnAttempt = sessionView.attemptMetaByTurn.get(turnKey)?.attempt;
-    const turnEvents = activityEventsForTurnAttempt(
-      conversation.events,
+    const turnEvents = activityEventsForTurnAttemptFromIndex(
+      activityTurnIndex,
       message,
       turnAttempt,
     );
@@ -3540,6 +3605,7 @@ export function ProjectAgentPane({
     conversation.events,
     conversation.messages,
     running,
+    conversation.streamingAssistantProjection,
   );
   const handleDragEnter = useCallback((event) => {
     if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return;
@@ -3634,15 +3700,25 @@ export function ProjectAgentPane({
                     : "当前对话未连接本地文件夹。Pi 只能访问这个对话的私有草稿区，并公开实际工具活动。"
                   : autoReview
                     ? "Pi 会读取当前项目并公开实际工具活动；安全修改会自动继续，高风险操作会被阻止。"
-                    : "Pi 会读取当前项目、公开实际工具活动，并把修改留到右侧等待确认。"}
+                    : nativeExecution
+                      ? "Pi 会在当前可信 Workspace 原生读取、修改、运行并持续公开实际工具活动。"
+                      : "Pi 会读取当前项目、公开实际工具活动，并把修改留到右侧等待确认。"}
               </p>
             </div>
             <div className="project-agent-scope">
               <span>{standalone ? "未连接本地文件夹" : "真实项目上下文"}</span>
               {standalone ? <span>私有草稿区</span> : null}
-              <span>{autoReview ? "安全修改自动继续" : "修改先审阅"}</span>
+              <span>{nativeExecution
+                ? "原生修改即时生效"
+                : autoReview
+                  ? "安全修改自动继续"
+                  : "修改先审阅"}</span>
               {!standalone ? (
-                <span>{autoReview ? "高风险操作会阻止" : "命令显式运行"}</span>
+                <span>{nativeExecution
+                  ? "命令在同一 Workspace 运行"
+                  : autoReview
+                    ? "高风险操作会阻止"
+                    : "命令显式运行"}</span>
               ) : null}
             </div>
           </section>
@@ -3812,6 +3888,7 @@ export function ProjectAgentPane({
             request={pendingAskUserRequest}
             busy={Boolean(action)}
             autoReview={autoReview}
+            native={nativeExecution}
             onAnswer={(answers) => onAnswerAskUser?.(
               pendingAskUserRequest.id,
               answers,
@@ -5258,8 +5335,10 @@ function WorkspaceWriteArtifact({
     <div className="project-change-artifact is-workspace-writes">
       <aside>
         <header>
-          <span>Workspace 写入</span>
-          <small>{writes.filter((write) => write.status === "pending").length} 待确认</small>
+          <span>Workspace 写入记录</span>
+          <small>{writes.some((write) => write.status === "pending")
+            ? `${writes.filter((write) => write.status === "pending").length} 待确认`
+            : `${writes.length} 条记录`}</small>
         </header>
         {orderedWrites.map((write) => (
           <div
@@ -5285,7 +5364,11 @@ function WorkspaceWriteArtifact({
         <header>
           <div>
             <strong>{activeWrite.path}</strong>
-            <small>精确 unified diff · {activeWrite.approvalMode === "auto_review" ? "替我审批" : "逐次确认"}</small>
+            <small>精确 unified diff · {activeWrite.approvalMode === "native"
+              ? "Pi 原生已执行"
+              : activeWrite.approvalMode === "auto_review"
+                ? "替我审批"
+                : "逐次确认"}</small>
           </div>
           <span className={`is-${activeWrite.status}`}>
             {WORKSPACE_WRITE_STATUS_LABELS[activeWrite.status] ?? activeWrite.status}
@@ -5721,6 +5804,7 @@ export function PreviewArtifact({
 
 function SubagentRunNode({ run }) {
   const metrics = [
+    run.modelRef ? `模型 ${run.modelRef}` : "",
     run.toolCount !== null ? `${run.toolCount} 次工具` : "",
     run.turnCount !== null ? `${run.turnCount} 轮` : "",
     run.tokens !== null ? formatTraceTokens(run.tokens) : "",
@@ -5793,6 +5877,8 @@ function ProjectSubagentRuns({ events }) {
 function RunArtifact({
   conversation,
   workspaceRunLogs,
+  expandedWorkspaceRunIds,
+  onWorkspaceRunExpandedChange,
   onRunVerification,
   onConfirmWorkspaceRun,
   onCancelWorkspaceRun,
@@ -5826,7 +5912,7 @@ function RunArtifact({
       <header>
         <div>
           <strong>运行结果</strong>
-          <small>只运行 Pi 已保存、用户明确点击的验证命令</small>
+          <small>Pi 原生命令、验证与子 Session 的状态和日志会持续保存</small>
         </div>
         {command ? (
           <button
@@ -5864,12 +5950,19 @@ function RunArtifact({
             const liveLogEvents = run.runId
               ? workspaceRunLogs?.[run.runId]?.events ?? []
               : [];
-            const liveOutput = liveLogEvents
-              .filter((event) => event.type === "chunk" && typeof event.text === "string")
-              .sort((left, right) => left.seq - right.seq)
-              .map((event) => event.text)
-              .join("");
+            const logExpanded = Boolean(
+              run.runId && expandedWorkspaceRunIds?.has(run.runId),
+            );
+            const liveOutput = logExpanded
+              ? liveLogEvents
+                .filter((event) => event.type === "chunk" && typeof event.text === "string")
+                .sort((left, right) => left.seq - right.seq)
+                .map((event) => event.text)
+                .join("")
+              : "";
             const displayedOutput = liveOutput || run.output;
+            const gitBefore = workspaceRunGitSummary(run.gitBefore);
+            const gitAfter = workspaceRunGitSummary(run.gitAfter);
             return (
               <article
                 className={`live-project-saved-command is-${run.status}`}
@@ -5883,13 +5976,27 @@ function RunArtifact({
                     ? "等待精确确认；替我审批不会自动运行自定义命令。"
                     : `状态：${run.status}${Number.isInteger(run.exitCode) ? ` · 退出码 ${run.exitCode}` : ""}`}
                 </small>
-                {displayedOutput ? (
-                  <details className="project-run-log">
+                {gitBefore || gitAfter ? (
+                  <small>
+                    Git：运行前 {gitBefore || "未记录"} · 运行后 {gitAfter || "未完成"}
+                  </small>
+                ) : null}
+                {run.runId || displayedOutput ? (
+                  <details
+                    className="project-run-log"
+                    open={logExpanded}
+                    onToggle={(event) => onWorkspaceRunExpandedChange?.(
+                      run.runId,
+                      event.currentTarget.open,
+                    )}
+                  >
                     <summary>
                       {active ? "查看实时日志" : "查看已采集日志"}{" "}
                       <CaretDown size={12} aria-hidden="true" />
                     </summary>
-                    <pre aria-live={active ? "polite" : undefined}>{displayedOutput}</pre>
+                    <pre aria-live={active ? "polite" : undefined}>
+                      {displayedOutput || (active ? "等待输出…" : "没有可显示的日志")}
+                    </pre>
                   </details>
                 ) : null}
                 {run.error ? <p className="project-run-error">{run.error.message ?? run.error}</p> : null}
@@ -6096,6 +6203,8 @@ function ArtifactPane({
   onCancelWorkspaceRun,
   workspaceRunAction,
   workspaceRunLogs,
+  expandedWorkspaceRunIds,
+  onWorkspaceRunExpandedChange,
   onResumeVerificationRepair,
   resumingOperationId,
   verificationError,
@@ -6322,6 +6431,8 @@ function ArtifactPane({
             <RunArtifact
               conversation={conversation}
               workspaceRunLogs={workspaceRunLogs}
+              expandedWorkspaceRunIds={expandedWorkspaceRunIds}
+              onWorkspaceRunExpandedChange={onWorkspaceRunExpandedChange}
               onRunVerification={onRunVerification}
               onConfirmWorkspaceRun={onConfirmWorkspaceRun}
               onCancelWorkspaceRun={onCancelWorkspaceRun}
@@ -6438,6 +6549,9 @@ export function LiveProjectWorkbench({
   const [workspaceAction, setWorkspaceAction] = useState(null);
   const [workspaceError, setWorkspaceError] = useState(null);
   const [workspaceRunLogs, setWorkspaceRunLogs] = useState({});
+  const [expandedWorkspaceRunIds, setExpandedWorkspaceRunIds] = useState(
+    () => new Set(),
+  );
   const [undoError, setUndoError] = useState(null);
   const [gitCloseoutError, setGitCloseoutError] = useState(null);
   const [previewError, setPreviewError] = useState(null);
@@ -6462,6 +6576,7 @@ export function LiveProjectWorkbench({
   const pendingAttachmentsRef = useRef([]);
   const verificationAutoOpenRef = useRef(new Set());
   const workspaceRunLogStateRef = useRef(new Map());
+  const shouldPollConversationRef = useRef(false);
 
   const replacePendingImage = useCallback((nextImage) => {
     const current = pendingImageRef.current;
@@ -6565,6 +6680,7 @@ export function LiveProjectWorkbench({
     setWorkspaceError(null);
     workspaceRunLogStateRef.current = new Map();
     setWorkspaceRunLogs({});
+    setExpandedWorkspaceRunIds(new Set());
     setUndoError(null);
     setPreviewError(null);
     setVerificationError(null);
@@ -6653,6 +6769,7 @@ export function LiveProjectWorkbench({
     snapshot?.id
     && (isConversationRunning(snapshot) || hasProcessingDocuments(snapshot)),
   );
+  shouldPollConversationRef.current = shouldPollConversation;
 
   useEffect(() => {
     const conversationId = snapshot?.id;
@@ -6661,7 +6778,39 @@ export function LiveProjectWorkbench({
     let timeoutId = null;
     let controller = null;
     let requestActive = false;
+    let refreshQueued = false;
     let unsubscribe = null;
+    let streamConnected = false;
+    let reconnectTimeoutId = null;
+    let hydrationTimeoutId = null;
+    let eventFrameId = null;
+    let pendingStreamEvents = [];
+
+    function scheduleHydration() {
+      if (hydrationTimeoutId !== null) {
+        window.clearTimeout(hydrationTimeoutId);
+      }
+      hydrationTimeoutId = window.setTimeout(() => {
+        hydrationTimeoutId = null;
+        void refreshSnapshot();
+      }, 100);
+    }
+
+    function flushPendingStreamEvents() {
+      eventFrameId = null;
+      if (disposed || pendingStreamEvents.length === 0) return;
+      const events = pendingStreamEvents
+        .sort((left, right) => Number(left?.seq) - Number(right?.seq));
+      pendingStreamEvents = [];
+      let nextSnapshot = snapshotRef.current;
+      let hydrationNeeded = false;
+      for (const event of events) {
+        nextSnapshot = applyProjectWorkEventDelta(nextSnapshot, event);
+        hydrationNeeded ||= projectWorkEventNeedsHydration(event);
+      }
+      publishSnapshot(nextSnapshot);
+      if (hydrationNeeded) scheduleHydration();
+    }
 
     function schedulePoll() {
       if (disposed || timeoutId !== null) return;
@@ -6674,6 +6823,7 @@ export function LiveProjectWorkbench({
     async function refreshSnapshot({ continuePolling = false } = {}) {
       if (disposed) return;
       if (requestActive) {
+        refreshQueued = true;
         if (continuePolling) schedulePoll();
         return;
       }
@@ -6687,11 +6837,12 @@ export function LiveProjectWorkbench({
       try {
         const nextSnapshot = await api.fetchConversation({
           conversationId,
+          includeActivity: false,
           signal: controller.signal,
         });
         if (disposed) return;
         const acceptedSnapshot = publishSnapshot(nextSnapshot);
-        keepPolling = continuePolling && (
+        keepPolling = continuePolling && !streamConnected && (
           isConversationRunning(acceptedSnapshot)
           || hasProcessingDocuments(acceptedSnapshot)
         );
@@ -6700,6 +6851,11 @@ export function LiveProjectWorkbench({
         errorRef.current?.(error);
       } finally {
         requestActive = false;
+        if (refreshQueued && !disposed) {
+          refreshQueued = false;
+          void refreshSnapshot({ continuePolling: keepPolling });
+          return;
+        }
         if (keepPolling) schedulePoll();
       }
     }
@@ -6716,22 +6872,64 @@ export function LiveProjectWorkbench({
               nextSnapshot,
             ));
           },
-          onError: () => {
-            void refreshSnapshot({
-              continuePolling: shouldPollConversation,
-            });
+          onEvent: (event) => {
+            if (disposed) return;
+            pendingStreamEvents.push(event);
+            if (eventFrameId === null) {
+              eventFrameId = window.requestAnimationFrame(
+                flushPendingStreamEvents,
+              );
+            }
+          },
+          onResync: () => {
+            if (disposed) return;
+            if (eventFrameId !== null) {
+              window.cancelAnimationFrame(eventFrameId);
+              flushPendingStreamEvents();
+            }
+            void refreshSnapshot();
+          },
+          onConnectionState: (state) => {
+            if (disposed) return;
+            streamConnected = state === "connected";
+            if (streamConnected) {
+              if (reconnectTimeoutId !== null) {
+                window.clearTimeout(reconnectTimeoutId);
+                reconnectTimeoutId = null;
+              }
+              if (timeoutId !== null) {
+                window.clearTimeout(timeoutId);
+                timeoutId = null;
+              }
+              return;
+            }
+            if (reconnectTimeoutId !== null) return;
+            reconnectTimeoutId = window.setTimeout(() => {
+              reconnectTimeoutId = null;
+              if (!streamConnected && shouldPollConversationRef.current) {
+                schedulePoll();
+              }
+            }, Math.max(5_000, pollIntervalMs * 3));
+          },
+          onError: (error) => {
+            if (disposed) return;
+            errorRef.current?.(error);
           },
         });
       } catch (error) {
         errorRef.current?.(error);
       }
     }
-    if (shouldPollConversation) {
+    if (!unsubscribe && shouldPollConversationRef.current) {
       schedulePoll();
     }
     return () => {
       disposed = true;
       window.clearTimeout(timeoutId);
+      window.clearTimeout(reconnectTimeoutId);
+      window.clearTimeout(hydrationTimeoutId);
+      window.cancelAnimationFrame(eventFrameId);
+      pendingStreamEvents = [];
       controller?.abort();
       unsubscribe?.();
     };
@@ -6739,7 +6937,6 @@ export function LiveProjectWorkbench({
     api,
     pollIntervalMs,
     publishSnapshot,
-    shouldPollConversation,
     snapshot?.id,
   ]);
 
@@ -7627,9 +7824,41 @@ export function LiveProjectWorkbench({
   const workspaceRunRevision = (snapshot?.workspaceRuns ?? [])
     .map((run) => `${run.id}:${run.runId ?? ""}:${run.status}`)
     .join("|");
+  const expandedWorkspaceRunRevision = [...expandedWorkspaceRunIds]
+    .sort()
+    .join("|");
+  const handleWorkspaceRunExpandedChange = useCallback((runId, expanded) => {
+    if (!runId) return;
+    setExpandedWorkspaceRunIds((current) => {
+      const next = new Set(current);
+      if (expanded) next.add(runId);
+      else next.delete(runId);
+      return next;
+    });
+    if (!expanded) {
+      workspaceRunLogStateRef.current.delete(runId);
+      setWorkspaceRunLogs((current) => {
+        if (!Object.hasOwn(current, runId)) return current;
+        const next = { ...current };
+        delete next[runId];
+        return next;
+      });
+    }
+  }, []);
+  const runArtifactVisible = artifactOpen && activeArtifactId === "run_result";
   useEffect(() => {
+    if (!runArtifactVisible) {
+      if (workspaceRunLogStateRef.current.size > 0) {
+        workspaceRunLogStateRef.current = new Map();
+        setWorkspaceRunLogs({});
+      }
+      return undefined;
+    }
     const conversationId = snapshot?.id;
-    const runs = (snapshot?.workspaceRuns ?? []).filter((run) => run.runId);
+    const runs = workspaceRunsToLoad(
+      snapshot?.workspaceRuns,
+      expandedWorkspaceRunIds,
+    );
     if (!conversationId || runs.length === 0 || typeof api.fetchWorkspaceRun !== "function") {
       return undefined;
     }
@@ -7694,7 +7923,14 @@ export function LiveProjectWorkbench({
       if (timeoutId !== null) window.clearTimeout(timeoutId);
       for (const controller of controllers) controller.abort();
     };
-  }, [api, pollIntervalMs, snapshot?.id, workspaceRunRevision]);
+  }, [
+    api,
+    expandedWorkspaceRunRevision,
+    pollIntervalMs,
+    runArtifactVisible,
+    snapshot?.id,
+    workspaceRunRevision,
+  ]);
 
   const removeFollowUp = useCallback((itemId) => {
     if (!itemId || typeof api.removeFollowUp !== "function") return;
@@ -8212,6 +8448,8 @@ export function LiveProjectWorkbench({
                 .replace("workspace-run-cancel:", "cancel:")
             : null}
           workspaceRunLogs={workspaceRunLogs}
+          expandedWorkspaceRunIds={expandedWorkspaceRunIds}
+          onWorkspaceRunExpandedChange={handleWorkspaceRunExpandedChange}
           onResumeVerificationRepair={resumeVerificationRepair}
           resumingOperationId={resumingVerificationRepairId}
           verificationError={verificationError}

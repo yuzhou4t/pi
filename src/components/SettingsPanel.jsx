@@ -139,6 +139,40 @@ function formatInteger(value) {
   return integerFormatter.format(Number(value) || 0);
 }
 
+export function formatLocalDataBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${formatInteger(bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = bytes / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && amount >= 1024; index += 1) {
+    amount /= 1024;
+    unit = units[index];
+  }
+  return `${amount >= 10 ? amount.toFixed(1) : amount.toFixed(2)} ${unit}`;
+}
+
+const legacyArchiveBlockedLabels = Object.freeze({
+  conversation_running: "会话仍在运行",
+  needs_review: "需要先处理旧修改",
+  blocked: "迁移需要恢复",
+  migration_incomplete: "尚未完成迁移",
+  archive_symlink: "包含符号链接，无法自动清理",
+  archive_unsupported_entry: "包含特殊文件，无法自动清理",
+  archive_unreadable: "部分文件无法读取，不能自动清理",
+});
+
+export function legacyArchiveBlockedLabel(reason) {
+  return legacyArchiveBlockedLabels[reason] ?? "暂时无法清理";
+}
+
+export function legacyArchiveCleanupConfirmation(items) {
+  const selected = Array.isArray(items) ? items : [];
+  const titles = selected.map((item) => `“${item.title}”`).join("、");
+  const bytes = selected.reduce((sum, item) => sum + (Number(item.bytes) || 0), 0);
+  return `确认清理 ${titles} 的旧工作副本（${formatLocalDataBytes(bytes)}）？\n\n只会删除迁移后不再执行的 base/workspace 副本；会话、事件、Pi Session 和当前真实 Workspace 都会保留。此操作无法撤销。`;
+}
+
 function formatUsd(value) {
   if (!Number.isFinite(value)) return "暂无费用证据";
   const digits = Math.abs(value) < 10 ? 4 : 2;
@@ -941,6 +975,178 @@ export function ConnectionSettingsContent({ connectionClient = workerApi }) {
   );
 }
 
+export function DataSettingsContent({
+  archiveClient = projectWorkApi,
+  confirmCleanup = (message) => globalThis.confirm?.(message) ?? false,
+}) {
+  const [state, setState] = useState({
+    status: "loading",
+    summary: null,
+    error: null,
+    notice: null,
+  });
+
+  const load = useCallback(async ({ quiet = false } = {}) => {
+    if (!quiet) {
+      setState((current) => ({ ...current, status: "loading", error: null }));
+    }
+    try {
+      const summary = await archiveClient.fetchLegacyWorkspaceArchives();
+      setState((current) => ({
+        ...current,
+        status: "ready",
+        summary,
+        error: null,
+      }));
+      return summary;
+    } catch (error) {
+      setState((current) => ({
+        ...current,
+        status: "error",
+        error: error.message,
+      }));
+      return null;
+    }
+  }, [archiveClient]);
+
+  useEffect(() => {
+    let active = true;
+    archiveClient.fetchLegacyWorkspaceArchives().then((summary) => {
+      if (!active) return;
+      setState({ status: "ready", summary, error: null, notice: null });
+    }).catch((error) => {
+      if (!active) return;
+      setState({ status: "error", summary: null, error: error.message, notice: null });
+    });
+    return () => {
+      active = false;
+    };
+  }, [archiveClient]);
+
+  const cleanup = async (items) => {
+    const summary = state.summary;
+    if (!summary || !items.length || !confirmCleanup(legacyArchiveCleanupConfirmation(items))) {
+      return;
+    }
+    setState((current) => ({
+      ...current,
+      status: "cleaning",
+      error: null,
+      notice: null,
+    }));
+    try {
+      await archiveClient.cleanupLegacyWorkspaceArchives({
+        mutationOrigin: summary.mutationOrigin,
+        items: items.map((item) => ({
+          conversationId: item.conversationId,
+          archiveHash: item.archiveHash,
+          bytes: item.bytes,
+        })),
+      });
+      const refreshed = await load({ quiet: true });
+      if (refreshed) {
+        setState((current) => ({
+          ...current,
+          notice: `已清理 ${items.length} 个旧工作副本`,
+        }));
+      }
+    } catch (error) {
+      setState((current) => ({
+        ...current,
+        status: "error",
+        error: error.message,
+      }));
+    }
+  };
+
+  const summary = state.summary;
+  const eligible = summary?.items?.filter((item) => item.cleanupEligible) ?? [];
+  return (
+    <>
+      <div className="settings-section-heading">
+        <span className="eyebrow">本地优先</span>
+        <h2>项目与数据</h2>
+        <p>管理论文工作流、项目工作会话与本机产物。</p>
+      </div>
+      <div className="settings-card">
+        <SettingRow label="项目路径" detail="真实绝对路径只保存在本机服务端" value="受保护" />
+        <SettingRow label="本地数据" detail="会话、Run、事件与工作记录保存在本地" value="已启用" />
+        <SettingRow label="浏览器状态" detail="只保存工作类型、当前会话和界面偏好" value="已启用" />
+      </div>
+
+      <div className="legacy-archive-heading">
+        <div>
+          <h3>旧工作副本</h3>
+          <p>迁移完成后不再执行，仅在你明确确认时清理。</p>
+        </div>
+        {summary ? (
+          <span>{summary.itemCount} 项 · {formatLocalDataBytes(summary.totalBytes)}</span>
+        ) : null}
+      </div>
+      <div className="settings-card legacy-archive-card" aria-live="polite">
+        {state.status === "loading" ? (
+          <div className="legacy-archive-empty">
+            <SpinnerGap className="spin" size={15} aria-hidden="true" />
+            正在统计旧工作副本
+          </div>
+        ) : state.error && !summary ? (
+          <div className="legacy-archive-empty is-error">
+            <span>{state.error}</span>
+            <button className="compact-action" type="button" onClick={() => void load()}>重新读取</button>
+          </div>
+        ) : summary?.items?.length ? (
+          summary.items.map((item) => (
+            <div className="legacy-archive-row" key={item.conversationId}>
+              <div>
+                <strong>{item.title}</strong>
+                <span>{item.conversationId}</span>
+                <small>
+                  {item.bytes === null
+                    ? legacyArchiveBlockedLabel(item.blockedReason)
+                    : `${formatLocalDataBytes(item.bytes)} · ${formatInteger(item.fileCount)} 个文件`}
+                </small>
+              </div>
+              {item.cleanupEligible ? (
+                <button
+                  className="legacy-archive-cleanup"
+                  type="button"
+                  disabled={state.status === "cleaning"}
+                  onClick={() => void cleanup([item])}
+                >
+                  <Trash size={14} aria-hidden="true" />
+                  清理
+                </button>
+              ) : (
+                <span className="legacy-archive-blocked">
+                  {legacyArchiveBlockedLabel(item.blockedReason)}
+                </span>
+              )}
+            </div>
+          ))
+        ) : (
+          <div className="legacy-archive-empty">没有可清理的旧工作副本</div>
+        )}
+      </div>
+      <div className="legacy-archive-footer">
+        <span>当前真实 Workspace、会话与运行记录不会被删除。</span>
+        {eligible.length > 1 ? (
+          <button
+            className="legacy-archive-cleanup"
+            type="button"
+            disabled={state.status === "cleaning"}
+            onClick={() => void cleanup(eligible)}
+          >
+            <Trash size={14} aria-hidden="true" />
+            清理全部可清理项
+          </button>
+        ) : null}
+      </div>
+      {state.notice ? <div className="legacy-archive-notice" role="status">{state.notice}</div> : null}
+      {state.error && summary ? <div className="legacy-archive-notice is-error" role="alert">{state.error}</div> : null}
+    </>
+  );
+}
+
 function SettingsContent({
   section,
   providerName,
@@ -1018,20 +1224,7 @@ function SettingsContent({
   }
 
   if (section === "data") {
-    return (
-      <>
-        <div className="settings-section-heading">
-          <span className="eyebrow">本地优先</span>
-          <h2>项目与数据</h2>
-          <p>管理论文工作流、项目工作会话与本机产物。</p>
-        </div>
-        <div className="settings-card">
-          <SettingRow label="项目路径" detail="真实绝对路径只保存在本机服务端" value="受保护" />
-          <SettingRow label="本地数据" detail="会话、Run、事件与工作快照保存在本地" value="已启用" />
-          <SettingRow label="浏览器状态" detail="只保存工作类型、当前会话和界面偏好" value="已启用" />
-        </div>
-      </>
-    );
+    return <DataSettingsContent />;
   }
 
   if (section === "shortcuts") {

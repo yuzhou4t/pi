@@ -87,11 +87,326 @@ export function mergeFreshConversationSnapshot(current, incoming) {
   return {
     ...incoming,
     events: [...events.values()].sort((left, right) => left.seq - right.seq),
+    streamingAssistantProjection: Object.hasOwn(
+      incoming,
+      "streamingAssistantProjection",
+    )
+      ? incoming.streamingAssistantProjection
+      : current.streamingAssistantProjection ?? null,
   };
 }
 
 export function mergeIncrementalConversationSnapshot(current, incoming) {
   return mergeFreshConversationSnapshot(current, incoming);
+}
+
+const EVENT_HYDRATION_PREFIXES = [
+  "ask_user.",
+  "apply_journal.",
+  "browser_qa.",
+  "change_set.",
+  "compaction.",
+  "document.",
+  "git_closeout.",
+  "image.",
+  "office.",
+  "operation.",
+  "preview.",
+  "verification.",
+  "workspace_write.",
+];
+
+export function projectWorkEventNeedsHydration(event) {
+  const type = String(event?.type ?? "");
+  const data = eventData(event);
+  return type === "workspace_run.completed"
+    || (
+      type === "message.completed"
+      && value(data, "is_final", "isFinal") !== false
+    )
+    || EVENT_HYDRATION_PREFIXES.some((prefix) => type.startsWith(prefix));
+}
+
+function eventData(event) {
+  return event?.data && typeof event.data === "object" && !Array.isArray(event.data)
+    ? event.data
+    : {};
+}
+
+function value(data, snakeName, camelName = snakeName) {
+  return data?.[snakeName] ?? data?.[camelName];
+}
+
+function streamingMessageId(event) {
+  const data = eventData(event);
+  return event?.messageId ?? value(data, "id") ?? value(data, "message_id", "messageId");
+}
+
+export function reduceProjectStreamingAssistant(current, event) {
+  if (event?.type === "message.created") return null;
+  const id = streamingMessageId(event);
+  if (event?.type === "message.completed") {
+    return id && current?.id === id ? null : current;
+  }
+  if (
+    !["message.delta", "message.partial"].includes(event?.type)
+    || typeof id !== "string"
+    || !id
+  ) {
+    return current;
+  }
+  const data = eventData(event);
+  const next = current?.id === id
+    ? {
+        ...current,
+        blocks: (current.blocks ?? []).map((block) => ({ ...block })),
+      }
+    : {
+        id,
+        seq: 0,
+        turnId: null,
+        legacyText: "",
+        hasDeltas: false,
+        lastRevision: 0,
+        blocks: [],
+      };
+  next.seq = Math.max(next.seq, Number(event.seq) || 0);
+  next.turnId = event.turnId ?? value(data, "turn_id", "turnId") ?? next.turnId;
+  if (event.type === "message.partial") {
+    const text = event.text ?? value(data, "text");
+    if (typeof text === "string" && text) next.legacyText = text;
+    return next;
+  }
+
+  const delta = event.delta ?? value(data, "delta");
+  const revision = Number(event.revision ?? value(data, "revision"));
+  if (
+    typeof delta !== "string"
+    || !delta
+    || (
+      Number.isSafeInteger(revision)
+      && revision > 0
+      && revision <= next.lastRevision
+    )
+  ) {
+    return next;
+  }
+  next.hasDeltas = true;
+  if (Number.isSafeInteger(revision) && revision > 0) {
+    next.lastRevision = revision;
+  }
+  const rawContentIndex = Number(
+    event.contentIndex ?? value(data, "content_index", "contentIndex"),
+  );
+  const contentIndex = Number.isSafeInteger(rawContentIndex) && rawContentIndex >= 0
+    ? rawContentIndex
+    : 0;
+  const rawPhase = event.phase ?? value(data, "phase");
+  const phase = ["commentary", "final_answer"].includes(rawPhase)
+    ? rawPhase
+    : null;
+  const blockIndex = next.blocks.findIndex(
+    (block) => block.contentIndex === contentIndex,
+  );
+  const block = blockIndex >= 0
+    ? next.blocks[blockIndex]
+    : { contentIndex, phase, text: "" };
+  block.phase = phase ?? block.phase;
+  block.text += delta;
+  if (blockIndex < 0) next.blocks.push(block);
+  return next;
+}
+
+export function projectStreamingAssistantView(projection, messages, running) {
+  if (!running || !projection?.id) return null;
+  if ((Array.isArray(messages) ? messages : []).some((message) => (
+    message?.role === "assistant" && message.id === projection.id
+  ))) {
+    return null;
+  }
+  const blocks = [...(projection.blocks ?? [])]
+    .sort((left, right) => left.contentIndex - right.contentIndex);
+  const hasExplicitFinal = blocks.some((block) => block.phase === "final_answer");
+  const text = projection.hasDeltas
+    ? blocks
+      .filter((block) => (
+        hasExplicitFinal
+          ? block.phase === "final_answer"
+          : block.phase !== "commentary"
+      ))
+      .map((block) => block.text)
+      .join("")
+    : projection.legacyText;
+  return text
+    ? {
+        id: projection.id,
+        text,
+        seq: projection.seq,
+        turnId: projection.turnId,
+      }
+    : null;
+}
+
+export function projectStreamingAssistantFromEvents(events, messages, running) {
+  const projection = projectStreamingAssistantProjection(events);
+  return projectStreamingAssistantView(projection, messages, running);
+}
+
+export function projectStreamingAssistantProjection(events) {
+  return (Array.isArray(events) ? events : [])
+    .filter((event) => Number.isSafeInteger(event?.seq))
+    .sort((left, right) => left.seq - right.seq)
+    .reduce(reduceProjectStreamingAssistant, null);
+}
+
+function upsertEventMessage(messages, event) {
+  const data = eventData(event);
+  const id = value(data, "id") ?? event.messageId;
+  const role = value(data, "role");
+  if (typeof id !== "string" || !id || !["user", "assistant"].includes(role)) {
+    return messages;
+  }
+  const existing = messages.find((message) => message.id === id);
+  const next = {
+    ...(existing ?? {}),
+    id,
+    role,
+    text: typeof value(data, "text") === "string" ? value(data, "text") : "",
+    status: value(data, "status") ?? existing?.status ?? "completed",
+    isFinal: value(data, "is_final", "isFinal") !== false,
+    messageSeq: Number(value(data, "message_seq", "messageSeq"))
+      || existing?.messageSeq
+      || null,
+    turnId: value(data, "turn_id", "turnId") ?? existing?.turnId ?? null,
+    turnSeq: Number(value(data, "turn_seq", "turnSeq"))
+      || existing?.turnSeq
+      || null,
+    attempt: Number(value(data, "attempt")) || existing?.attempt || 1,
+    providerId: value(data, "provider_id", "providerId")
+      ?? existing?.providerId
+      ?? null,
+    modelId: value(data, "model_id", "modelId") ?? existing?.modelId ?? null,
+    thinkingLevel: value(data, "thinking_level", "thinkingLevel")
+      ?? existing?.thinkingLevel
+      ?? null,
+    checkpointId: value(data, "checkpoint_id", "checkpointId")
+      ?? existing?.checkpointId
+      ?? null,
+    turnEvidence: value(data, "turn_evidence", "turnEvidence")
+      ?? existing?.turnEvidence
+      ?? null,
+    codeEvidence: value(data, "code_evidence", "codeEvidence")
+      ?? existing?.codeEvidence
+      ?? [],
+    createdAt: value(data, "created_at", "createdAt")
+      ?? event.createdAt
+      ?? existing?.createdAt
+      ?? null,
+  };
+  return existing
+    ? messages.map((message) => (message.id === id ? next : message))
+    : [...messages, next];
+}
+
+function updateWorkspaceRuns(runs, event) {
+  const data = eventData(event);
+  const id = value(data, "id", "requestId");
+  if (typeof id !== "string" || !id) return runs;
+  const current = runs.find((run) => run.id === id);
+  if (!current && event.type !== "workspace_run.requested") return runs;
+  const patch = {
+    ...(current ?? {}),
+    id,
+    runId: value(data, "run_id", "runId") ?? current?.runId ?? null,
+    turnId: value(data, "turn_id", "turnId") ?? current?.turnId ?? null,
+    status: value(data, "status") ?? current?.status ?? "requested",
+    executable: value(data, "executable") ?? current?.executable ?? "",
+    argv: Array.isArray(value(data, "argv")) ? value(data, "argv") : current?.argv ?? [],
+    relativeCwd: value(data, "relative_cwd", "relativeCwd")
+      ?? current?.relativeCwd
+      ?? ".",
+    purpose: value(data, "purpose") ?? current?.purpose ?? null,
+    requestHash: value(data, "request_hash", "requestHash")
+      ?? current?.requestHash
+      ?? null,
+    exitCode: value(data, "exit_code", "exitCode") ?? current?.exitCode ?? null,
+    durationMs: value(data, "duration_ms", "durationMs")
+      ?? current?.durationMs
+      ?? null,
+    truncated: value(data, "truncated") === true || current?.truncated === true,
+  };
+  return current
+    ? runs.map((run) => (run.id === id ? patch : run))
+    : [...runs, patch];
+}
+
+export function applyProjectWorkEventDelta(current, event) {
+  if (!current || !Number.isSafeInteger(event?.seq) || event.seq < 1) {
+    return current;
+  }
+  if ((current.events ?? []).some((item) => item.seq === event.seq)) {
+    return current;
+  }
+  const data = eventData(event);
+  const events = [...(current.events ?? []), event]
+    .sort((left, right) => left.seq - right.seq);
+  const currentStreamingProjection = Object.hasOwn(
+    current,
+    "streamingAssistantProjection",
+  )
+    ? current.streamingAssistantProjection
+    : projectStreamingAssistantProjection(current.events);
+  let next = {
+    ...current,
+    events,
+    streamingAssistantProjection: reduceProjectStreamingAssistant(
+      currentStreamingProjection,
+      event,
+    ),
+    lastEventSeq: Math.max(Number(current.lastEventSeq) || 0, event.seq),
+    deliveredEventSeq: Math.max(
+      Number(current.deliveredEventSeq) || 0,
+      event.seq,
+    ),
+    updatedAt: event.createdAt ?? event.at ?? current.updatedAt,
+  };
+
+  if (["message.created", "message.completed"].includes(event.type)) {
+    next.messages = upsertEventMessage(current.messages ?? [], event);
+  }
+  if (event.type === "plan.updated") {
+    next.plan = (Array.isArray(data.steps) ? data.steps : []).map((step, index) => ({
+      id: step.id ?? `step-${index + 1}`,
+      title: step.title ?? step.text ?? `步骤 ${index + 1}`,
+      detail: step.detail ?? "",
+      status: step.status ?? "pending",
+    }));
+  }
+  if (event.type === "agent.status") {
+    const status = value(data, "status");
+    if (typeof status === "string" && status) {
+      next.status = status;
+      next.turnStatus = status;
+    }
+  } else if (event.type === "turn.started") {
+    next.turnStatus = "running";
+    next.activeTurnId = value(data, "turn_id", "turnId") ?? next.activeTurnId;
+  }
+  if (event.type === "ask_user.requested") next.status = "awaiting_user";
+  if (["model.changed", "model.configuration_applied"].includes(event.type)) {
+    next.providerId = value(data, "provider_id", "providerId") ?? next.providerId;
+    next.modelId = value(data, "model_id", "modelId") ?? next.modelId;
+    next.thinkingLevel = value(data, "thinking_level", "thinkingLevel")
+      ?? next.thinkingLevel;
+  }
+  if (String(event.type).startsWith("workspace_run.")) {
+    next.workspaceRuns = updateWorkspaceRuns(current.workspaceRuns ?? [], event);
+    if (event.type === "workspace_run.requested") next.status = "awaiting_confirmation";
+    if (["workspace_run.queued", "workspace_run.started"].includes(event.type)) {
+      next.status = "verifying";
+    }
+  }
+  return next;
 }
 
 export function updateLiveConversationState(state, incoming) {

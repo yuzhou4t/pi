@@ -449,6 +449,7 @@ async function startTestServer(
     allowMissingJournalMutationOrigin = true,
     projectWorkRuntimeUrl,
     projectWorkRuntimeHealthProbe,
+    legacyWorkspaceArchiveService,
   } = {},
 ) {
   const server = createApiServer({
@@ -458,6 +459,7 @@ async function startTestServer(
     allowMissingJournalMutationOrigin,
     projectWorkRuntimeUrl,
     projectWorkRuntimeHealthProbe,
+    legacyWorkspaceArchiveService,
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -603,6 +605,93 @@ test("model usage all merges normal work and paper reading", async (t) => {
     { workflow: "project_work", options: { period: "7d" } },
     { workflow: "paper_reading", options: { period: "7d" } },
   ]);
+});
+
+test("legacy workspace archive routes expose safe totals and require a local exact cleanup", async (t) => {
+  const archiveHash = `sha256:${"a".repeat(64)}`;
+  const mutationOrigin = `sha256:${"b".repeat(64)}`;
+  const calls = [];
+  const summary = {
+    schemaVersion: 1,
+    totalBytes: 1024,
+    totalFileCount: 2,
+    itemCount: 1,
+    cleanupEligibleCount: 1,
+    mutationOrigin,
+    items: [{
+      conversationId: "conversation-archive",
+      title: "旧验证",
+      parts: ["base", "workspace"],
+      archiveHash,
+      bytes: 1024,
+      fileCount: 2,
+      cleanupEligible: true,
+      blockedReason: null,
+    }],
+  };
+  const legacyWorkspaceArchiveService = {
+    async getSummary() {
+      return summary;
+    },
+    async cleanup(value) {
+      calls.push(value);
+      return { ...summary, totalBytes: 0, itemCount: 0, items: [] };
+    },
+  };
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    {},
+    { legacyWorkspaceArchiveService },
+  );
+  t.after(server.close);
+
+  const listed = await fetch(
+    `${server.baseUrl}/api/v1/project-work/legacy-workspace-archives`,
+  );
+  assert.equal(listed.status, 200);
+  assert.equal((await listed.json()).items[0].conversationId, "conversation-archive");
+
+  const rejected = await fetch(
+    `${server.baseUrl}/api/v1/project-work/legacy-workspace-archives/cleanup`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ schema_version: 1, mutation_origin: mutationOrigin, items: [] }),
+    },
+  );
+  assert.equal(rejected.status, 403);
+  assert.equal(calls.length, 0);
+
+  const cleaned = await fetch(
+    `${server.baseUrl}/api/v1/project-work/legacy-workspace-archives/cleanup`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "http://127.0.0.1:4173",
+      },
+      body: JSON.stringify({
+        schema_version: 1,
+        mutation_origin: mutationOrigin,
+        items: [{
+          conversation_id: "conversation-archive",
+          archive_hash: archiveHash,
+          bytes: 1024,
+        }],
+      }),
+    },
+  );
+  assert.equal(cleaned.status, 200);
+  assert.equal((await cleaned.json()).itemCount, 0);
+  assert.deepEqual(calls, [{
+    mutationOrigin,
+    items: [{
+      conversationId: "conversation-archive",
+      archiveHash,
+      bytes: 1024,
+    }],
+  }]);
 });
 
 test("model usage workflow filter calls only the selected workflow", async (t) => {
@@ -1251,6 +1340,8 @@ test("standalone project-work conversation routes use the global scope and retur
     sourceProjectId: null,
     sourceProjectLabel: null,
     workspaceKind: "scratch",
+    runtimeProfile: null,
+    legacyMigration: null,
     scope: "standalone",
     rootLabel: "未连接文件夹",
     title: "独立任务",
@@ -2423,10 +2514,84 @@ test("project-work apply journal routes expose safe history and hash-bound undo"
   }]);
 });
 
-test("project-work event endpoint resumes after seq and streams incremental snapshots", async (t) => {
+test("project-work conversation snapshot carries exactly the latest 20 turns of activity", async (t) => {
+  const calls = [];
+  const projectWorkService = {
+    async getConversation(conversationId, options) {
+      calls.push({ method: "getConversation", conversationId, options });
+      return {
+        schemaVersion: 1,
+        conversation: {
+          id: conversationId,
+          projectId: "project-1",
+          title: "最近工作",
+          status: "completed",
+          messages: [],
+          lastEventSeq: 90,
+        },
+        events: [{ seq: 1, type: "conversation.created", data: {} }],
+        hasMoreEvents: true,
+      };
+    },
+    async getConversationTurns(conversationId, options) {
+      calls.push({ method: "getConversationTurns", conversationId, options });
+      return {
+        turns: Array.from({ length: 20 }, (_, index) => ({
+          id: `turn-${index + 11}`,
+          turnSeq: index + 11,
+          events: [{
+            seq: 71 + index,
+            type: "agent.progress",
+            data: { summary: `进展 ${index + 11}` },
+          }],
+        })),
+        hasMore: true,
+      };
+    },
+  };
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+
+  const response = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-recent`,
+  );
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.deepEqual(payload.events.map((event) => event.seq), Array.from(
+    { length: 20 },
+    (_, index) => 71 + index,
+  ));
+  assert.equal(payload.hasEarlierEvents, true);
+  assert.equal(payload.hasMoreEvents, false);
+  const refreshResponse = await fetch(
+    `${server.baseUrl}/api/v1/project-work/conversations/conversation-recent?activity=none`,
+  );
+  const refreshPayload = await refreshResponse.json();
+  assert.deepEqual(refreshPayload.events, []);
+  assert.deepEqual(calls, [{
+    method: "getConversation",
+    conversationId: "conversation-recent",
+    options: { afterSeq: 0, eventLimit: 1 },
+  }, {
+    method: "getConversationTurns",
+    conversationId: "conversation-recent",
+    options: { limit: 20 },
+  }, {
+    method: "getConversation",
+    conversationId: "conversation-recent",
+    options: { afterSeq: 0, eventLimit: 1 },
+  }]);
+});
+
+test("project-work event endpoint sends one snapshot then incremental deltas", async (t) => {
   const afterSequences = [];
   let subscriptions = 0;
   let unsubscriptions = 0;
+  let streamListener = null;
   const event = {
     seq: 7,
     type: "ask_user.requested",
@@ -2481,6 +2646,7 @@ test("project-work event endpoint resumes after seq and streams incremental snap
       assert.equal(conversationId, "conversation-events");
       assert.equal(typeof listener, "function");
       subscriptions += 1;
+      streamListener = listener;
       return () => {
         unsubscriptions += 1;
       };
@@ -2517,21 +2683,37 @@ test("project-work event endpoint resumes after seq and streams incremental snap
   const reader = stream.body.getReader();
   const decoder = new TextDecoder();
   let text = "";
-  while (!text.includes("event: snapshot")) {
+  while (
+    !text.includes("event: snapshot")
+    || !text.includes("\"seq\":7")
+  ) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    text += decoder.decode(chunk.value, { stream: true });
+  }
+  assert.match(text, /id: 7/);
+  assert.match(text, /event: snapshot/);
+  assert.match(text, /"snapshotWatermark":7/);
+  assert.match(text, /"lastEventSeq":7/);
+  assert.match(text, /"lastSeq":6/);
+  assert.match(text, /event: delta/);
+  assert.equal(typeof streamListener, "function");
+  streamListener(gapEvent);
+  while ((text.match(/event: delta/g) ?? []).length < 2) {
     const chunk = await reader.read();
     if (chunk.done) break;
     text += decoder.decode(chunk.value, { stream: true });
   }
   assert.match(text, /id: 8/);
-  assert.match(text, /event: snapshot/);
-  assert.match(text, /"snapshot_watermark":8/);
-  assert.match(text, /"last_seq":8/);
+  assert.match(text, /event: delta/);
+  assert.match(text, /"sessionId":"conversation-events"/);
   assert.match(text, /"seq":8/);
+  assert.equal((text.match(/event: snapshot/g) ?? []).length, 1);
   controller.abort();
   await reader.cancel().catch(() => undefined);
   await new Promise((resolve) => setTimeout(resolve, 10));
 
-  assert.deepEqual(afterSequences, [6, 7, 6, 6]);
+  assert.deepEqual(afterSequences, [6, 7, 6]);
   assert.equal(subscriptions, 1);
   assert.equal(unsubscriptions, 1);
 });

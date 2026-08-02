@@ -403,6 +403,21 @@ test("execution policy control offers only confirmation and safe auto-review mod
     assert.match(runningHtml, /Agent 工作期间不能更改权限/);
     assert.match(runningHtml, /disabled=""/);
     assert.doesNotMatch(runningHtml, /role="dialog"/);
+
+    const nativeHtml = renderToStaticMarkup(React.createElement(
+      ProjectExecutionPolicyControl,
+      {
+        open: true,
+        onOpenChange: () => {},
+        executionPolicy: { mode: "native", revision: 1 },
+        running: false,
+        onChange: () => {},
+      },
+    ));
+    assert.match(nativeHtml, /Pi 原生/);
+    assert.match(nativeHtml, /可信 Workspace/);
+    assert.match(nativeHtml, /disabled=""/);
+    assert.doesNotMatch(nativeHtml, /role="dialog"/);
   });
 });
 
@@ -1044,10 +1059,10 @@ test("normal-work control mutations publish durable snapshots and refresh queue 
   assert.doesNotMatch(controlImplementation, /applyChangeSet|proposalHash/);
 });
 
-test("live workbench keeps a bounded polling watchdog beside incremental EventSource", async () => {
+test("live workbench uses polling only while EventSource is unavailable or reconnecting", async () => {
   const source = await readFile(COMPONENT_URL, "utf8");
   const effectStart = source.indexOf(
-    "function schedulePoll()",
+    "function scheduleHydration()",
   );
   const effectEnd = source.indexOf(
     "useEffect(() => {\n    const changeSet",
@@ -1063,13 +1078,73 @@ test("live workbench keeps a bounded polling watchdog beside incremental EventSo
     /afterSeq: conversationEventResumeSeq\(snapshotRef\.current\)/,
   );
   assert.match(implementation, /mergeIncrementalConversationSnapshot/);
-  assert.match(
-    implementation,
-    /refreshSnapshot\(\{\s*continuePolling: shouldPollConversation,\s*\}\)/,
-  );
-  assert.match(implementation, /if \(shouldPollConversation\)/);
+  assert.match(implementation, /applyProjectWorkEventDelta/);
+  assert.match(implementation, /pendingStreamEvents\.push\(event\)/);
+  assert.match(implementation, /window\.requestAnimationFrame/);
+  assert.match(implementation, /flushPendingStreamEvents/);
+  assert.match(implementation, /onConnectionState/);
+  assert.match(implementation, /streamConnected = state === "connected"/);
+  assert.match(implementation, /if \(!unsubscribe && shouldPollConversationRef\.current\)/);
+  assert.match(implementation, /!streamConnected && shouldPollConversationRef\.current/);
+  assert.doesNotMatch(implementation, /if \(shouldPollConversation\) \{\s*schedulePoll/);
   assert.match(implementation, /api\.fetchConversation/);
+  assert.match(implementation, /includeActivity: false/);
   assert.match(implementation, /unsubscribe\?\.\(\)/);
+});
+
+test("workspace run logs load only while the run artifact is visible and explicitly expanded", async () => {
+  const source = await readFile(COMPONENT_URL, "utf8");
+  const effectStart = source.indexOf("const workspaceRunRevision");
+  const effectEnd = source.indexOf("const removeFollowUp", effectStart);
+  const implementation = source.slice(effectStart, effectEnd);
+
+  assert.notEqual(effectStart, -1);
+  assert.match(implementation, /workspaceRunsToLoad/);
+  assert.match(implementation, /api\.fetchWorkspaceRun/);
+  assert.match(implementation, /runArtifactVisible/);
+  assert.match(implementation, /workspaceRunLogStateRef\.current\.delete\(runId\)/);
+  assert.doesNotMatch(implementation, /\.filter\(\(run\) => run\.runId\);/);
+
+  await withLiveWorkbench(({ workspaceRunGitSummary, workspaceRunsToLoad }) => {
+    const completed = {
+      id: "request-completed",
+      runId: "run-completed",
+      status: "succeeded",
+      output: "x".repeat(10 * 1024 * 1024),
+    };
+    const running = {
+      id: "request-running",
+      runId: "run-running",
+      status: "running",
+    };
+    assert.deepEqual(
+      workspaceRunsToLoad([completed, running]).map((run) => run.runId),
+      [],
+    );
+    assert.deepEqual(
+      workspaceRunsToLoad(
+        [completed, running],
+        new Set(["run-completed"]),
+      ).map((run) => run.runId),
+      ["run-completed"],
+    );
+    assert.deepEqual(
+      workspaceRunsToLoad(
+        [completed, running],
+        new Set(["run-running"]),
+      ).map((run) => run.runId),
+      ["run-running"],
+    );
+    assert.equal(workspaceRunGitSummary({
+      available: true,
+      branch: "main",
+      head: "abcdef123456",
+      staged: ["src/a.js"],
+      unstaged: ["src/a.js", "src/b.js"],
+      untracked: [],
+      truncated: false,
+    }), "main @ abcdef12 · 2 项变更");
+  });
 });
 
 test("live workbench resumes incomplete event history from the delivered cursor", async () => {
@@ -3463,6 +3538,76 @@ test("the latest safe partial answer renders as one replaceable streaming bubble
   });
 });
 
+test("streaming assistant appends final-answer deltas and keeps commentary out of the answer bubble", async () => {
+  await withLiveWorkbench(({ latestStreamingAssistant }) => {
+    const events = [{
+      seq: 40,
+      type: "message.created",
+      data: { id: "turn-live", role: "user" },
+    }, {
+      seq: 41,
+      type: "message.delta",
+      data: {
+        id: "assistant-live",
+        turnId: "turn-live",
+        delta: "我先查看项目。",
+        revision: 1,
+        contentIndex: 0,
+        phase: "commentary",
+      },
+    }, {
+      seq: 42,
+      type: "message.delta",
+      messageId: "assistant-live",
+      turnId: "turn-live",
+      delta: "已经修复",
+      revision: 2,
+      contentIndex: 1,
+      phase: "final_answer",
+    }, {
+      seq: 43,
+      type: "message.delta",
+      data: {
+        id: "assistant-live",
+        turnId: "turn-live",
+        delta: "，测试通过。",
+        revision: 3,
+        contentIndex: 1,
+        phase: "final_answer",
+      },
+    }, {
+      seq: 44,
+      type: "message.delta",
+      data: {
+        id: "assistant-live",
+        turnId: "turn-live",
+        delta: "不应重复",
+        revision: 3,
+        contentIndex: 1,
+        phase: "final_answer",
+      },
+    }];
+
+    assert.deepEqual(latestStreamingAssistant(events, [], true), {
+      id: "assistant-live",
+      text: "已经修复，测试通过。",
+      seq: 44,
+      turnId: "turn-live",
+    });
+    assert.equal(
+      latestStreamingAssistant([
+        ...events,
+        {
+          seq: 45,
+          type: "message.completed",
+          data: { id: "assistant-live", role: "assistant" },
+        },
+      ], [], true),
+      null,
+    );
+  });
+});
+
 test("activity normalization distinguishes prepared and actually run verification commands", async () => {
   await withLiveWorkbench(({ normalizeActivityEvents }) => {
     const normalized = normalizeActivityEvents([
@@ -3969,6 +4114,56 @@ test("activity keeps five hundred public events in event-sequence order", async 
   });
 });
 
+test("activity builds one event-sequence index for many interleaved turns", async () => {
+  await withLiveWorkbench(({
+    buildActivityTurnIndex,
+    activityEventsForTurnAttemptFromIndex,
+  }) => {
+    const turnCount = 25;
+    const eventsPerTurn = 24;
+    const events = [];
+    let seq = 1;
+    for (let turn = 1; turn <= turnCount; turn += 1) {
+      events.push({
+        seq: seq++,
+        type: "message.created",
+        messageId: `message-${turn}`,
+        turnId: `turn-${turn}`,
+        turnSeq: turn,
+        attempt: 1,
+      });
+      for (let item = 1; item < eventsPerTurn; item += 1) {
+        events.push({
+          seq: seq++,
+          type: item % 2 === 0 ? "agent.progress" : "tool.updated",
+          turnId: `turn-${turn}`,
+          attempt: 1,
+          toolCallId: `tool-${turn}-${item}`,
+          data: { summary: `进展 ${turn}-${item}` },
+        });
+      }
+    }
+
+    const index = buildActivityTurnIndex(events.reverse());
+    assert.equal(index.scopes.length, turnCount);
+    const allTurnEvents = Array.from({ length: turnCount }, (_, offset) => (
+      activityEventsForTurnAttemptFromIndex(index, {
+        id: `message-${offset + 1}`,
+        turnId: `turn-${offset + 1}`,
+        turnSeq: offset + 1,
+      }, 1)
+    ));
+    assert.equal(allTurnEvents.flat().length, turnCount * eventsPerTurn);
+    for (const turnEvents of allTurnEvents) {
+      assert.equal(turnEvents.length, eventsPerTurn);
+      assert.deepEqual(
+        turnEvents.map((event) => event.seq),
+        [...turnEvents].map((event) => event.seq).sort((left, right) => left - right),
+      );
+    }
+  });
+});
+
 test("native reasoning remains interleaved with public progress without repeated completion copy", async () => {
   await withLiveWorkbench(({ ActivityTimeline }) => {
     const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
@@ -4012,6 +4207,7 @@ test("subagent task tree renders safe structured evidence in Run and a compact c
           status: "failed",
           currentTool: "read",
           currentPath: "/Users/private/project/src/App.jsx",
+          modelRef: "deepseek/deepseek-v4-pro",
           toolCount: 4,
           turnCount: 2,
           tokens: 1_200,
@@ -4047,7 +4243,10 @@ test("subagent task tree renders safe structured evidence in Run and a compact c
     assert.match(html, /子智能体任务/);
     assert.match(html, /检查工作台/);
     assert.match(html, /检查标题/);
-    assert.match(html, /4 次工具 · 2 轮 · 1\.2k Token · 2\.5 秒/);
+    assert.match(
+      html,
+      /模型 deepseek\/deepseek-v4-pro · 4 次工具 · 2 轮 · 1\.2k Token · 2\.5 秒/,
+    );
     assert.match(html, /查看运行/);
     assert.doesNotMatch(html, /Users\/private|sk-secret/);
   }, { exposeArtifact: true });

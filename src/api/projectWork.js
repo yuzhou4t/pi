@@ -926,7 +926,7 @@ function mapEvent(raw) {
     ),
     createdAt: pick(raw, "created_at", "createdAt", pick(raw, "at", "at")),
   };
-  if (type !== "message.partial") return event;
+  if (!["message.delta", "message.partial"].includes(type)) return event;
 
   const messageId = data.id
     ?? pick(data, "message_id", "messageId", pick(raw, "message_id", "messageId"));
@@ -936,10 +936,35 @@ function mapEvent(raw) {
     "turnId",
     pick(raw, "turn_id", "turnId"),
   );
-  const text = pick(data, "text", "text", pick(raw, "text", "text", ""));
   const revision = Number(
     pick(data, "revision", "revision", pick(raw, "revision", "revision")),
   );
+  if (type === "message.delta") {
+    const delta = pick(data, "delta", "delta", pick(raw, "delta", "delta", ""));
+    const contentIndex = Number(
+      pick(
+        data,
+        "content_index",
+        "contentIndex",
+        pick(raw, "content_index", "contentIndex"),
+      ),
+    );
+    const phase = pick(data, "phase", "phase", pick(raw, "phase", "phase"));
+    return {
+      ...event,
+      messageId: typeof messageId === "string" ? messageId : null,
+      turnId: typeof turnId === "string" ? turnId : null,
+      delta: typeof delta === "string" ? delta : "",
+      revision: Number.isSafeInteger(revision) && revision > 0 ? revision : null,
+      contentIndex: Number.isSafeInteger(contentIndex) && contentIndex >= 0
+        ? contentIndex
+        : null,
+      phase: ["commentary", "final_answer"].includes(phase) ? phase : null,
+      replace: false,
+    };
+  }
+
+  const text = pick(data, "text", "text", pick(raw, "text", "text", ""));
   return {
     ...event,
     messageId: typeof messageId === "string" ? messageId : null,
@@ -948,6 +973,10 @@ function mapEvent(raw) {
     revision: Number.isSafeInteger(revision) && revision > 0 ? revision : null,
     replace: true,
   };
+}
+
+export function mapProjectWorkEvent(raw) {
+  return mapEvent(raw);
 }
 
 function mapWorkspaceSnapshot(raw) {
@@ -1372,9 +1401,10 @@ function mapExecutionPolicy(raw) {
   const policyVersion = Number(
     pick(source, "policy_version", "policyVersion", 1),
   );
+  const mode = pick(source, "mode", "mode");
   return {
-    mode: pick(source, "mode", "mode") === "auto_review"
-      ? "auto_review"
+    mode: ["manual_review", "auto_review", "native"].includes(mode)
+      ? mode
       : "manual_review",
     revision: Number.isSafeInteger(revision) && revision >= 0 ? revision : 0,
     policyVersion: Number.isSafeInteger(policyVersion) && policyVersion >= 1
@@ -1836,6 +1866,13 @@ export function mapProjectWorkConversation(raw) {
       "workspaceKind",
       standalone ? "scratch" : "bound_project",
     ),
+    runtimeProfile: pick(source, "runtime_profile", "runtimeProfile"),
+    legacyMigration: pick(
+      source,
+      "legacy_migration",
+      "legacyMigration",
+      null,
+    ),
     scope: pick(source, "scope", "scope", standalone ? "standalone" : "project"),
     providerId: pick(source, "provider_id", "providerId"),
     modelId: pick(source, "model_id", "modelId"),
@@ -1857,6 +1894,9 @@ export function mapProjectWorkConversation(raw) {
     messages: asArray(source.messages).map(mapMessage).filter(Boolean),
     hasMoreTurns: Boolean(
       pick(source, "has_more_turns", "hasMoreTurns", false),
+    ),
+    hasEarlierEvents: Boolean(
+      pick(raw, "has_earlier_events", "hasEarlierEvents", false),
     ),
     nextBeforeTurnSeq: (() => {
       const value = Number(
@@ -1958,6 +1998,18 @@ export function mapProjectWorkConversation(raw) {
       durationMs: pick(run, "duration_ms", "durationMs"),
       output: pick(run, "output", "output", ""),
       truncated: pick(run, "truncated", "truncated", false) === true,
+      gitBefore: (() => {
+        const evidence = pick(run, "git_before", "gitBefore");
+        return evidence && typeof evidence === "object"
+          ? mapProjectWorkGitEvidence(evidence)
+          : null;
+      })(),
+      gitAfter: (() => {
+        const evidence = pick(run, "git_after", "gitAfter");
+        return evidence && typeof evidence === "object"
+          ? mapProjectWorkGitEvidence(evidence)
+          : null;
+      })(),
       createdAt: pick(run, "created_at", "createdAt"),
       startedAt: pick(run, "started_at", "startedAt"),
       completedAt: pick(run, "completed_at", "completedAt"),
@@ -2859,38 +2911,25 @@ export async function removeProjectWorkProject({
 
 export async function fetchProjectWorkConversation({
   conversationId,
+  includeActivity = true,
   signal,
   fetchImpl,
 } = {}) {
   requiredId(conversationId, "conversationId");
-  const basePath = `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}`;
-  let payload = await requestJson(basePath, { signal, fetchImpl });
-  const events = [...asArray(payload?.events)];
-  let afterSeq = Number(events.at(-1)?.seq) || 0;
-  let pages = 1;
-  while (
-    (payload?.hasMoreEvents ?? payload?.has_more_events)
-    && afterSeq > 0
-    && pages < 20
-  ) {
-    const nextPayload = await requestJson(
-      `${basePath}?after_seq=${encodeURIComponent(afterSeq)}&event_limit=500`,
-      { signal, fetchImpl },
-    );
-    const nextEvents = asArray(nextPayload?.events);
-    if (nextEvents.length === 0) break;
-    events.push(...nextEvents);
-    afterSeq = Number(nextEvents.at(-1)?.seq) || afterSeq;
-    payload = nextPayload;
-    pages += 1;
-  }
+  const basePath = `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}`
+    + (includeActivity ? "" : "?activity=none");
+  const payload = await requestJson(basePath, { signal, fetchImpl });
+  const events = asArray(payload?.events);
+  const afterSeq = Number(events.at(-1)?.seq) || Number(
+    payload?.conversation?.last_event_seq
+      ?? payload?.conversation?.lastEventSeq
+      ?? 0,
+  );
   return mapProjectWorkConversation({
     ...payload,
     events,
     deliveredEventSeq: afterSeq,
-    hasMoreEvents: Boolean(
-      (payload?.hasMoreEvents ?? payload?.has_more_events) && pages >= 20,
-    ),
+    hasMoreEvents: Boolean(payload?.hasMoreEvents ?? payload?.has_more_events),
   });
 }
 
@@ -2898,6 +2937,9 @@ export function subscribeProjectWorkConversation({
   conversationId,
   afterSeq = 0,
   onConversation,
+  onEvent,
+  onResync,
+  onConnectionState,
   onError,
   eventSourceFactory,
 } = {}) {
@@ -2931,6 +2973,34 @@ export function subscribeProjectWorkConversation({
         ) || 0,
         lastSeq: Number(payload.last_seq ?? payload.lastSeq ?? 0) || 0,
       });
+      onConnectionState?.("connected");
+    } catch (error) {
+      onError?.(error);
+    }
+  };
+  const handleDelta = (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      const mapped = mapEvent(payload);
+      if (!mapped) throw new Error("项目工作事件增量格式无效");
+      onEvent?.(mapped, {
+        lastSeq: mapped.seq,
+        sessionId: pick(payload, "session_id", "sessionId"),
+      });
+      onConnectionState?.("connected");
+    } catch (error) {
+      onError?.(error);
+    }
+  };
+  const handleResync = (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      onResync?.({
+        reason: payload?.reason ?? "event_gap",
+        lastAvailableSeq: Number(
+          payload?.last_available_seq ?? payload?.lastAvailableSeq ?? 0,
+        ) || 0,
+      });
     } catch (error) {
       onError?.(error);
     }
@@ -2946,16 +3016,21 @@ export function subscribeProjectWorkConversation({
     }
   };
   const handleConnectionError = (event) => {
-    onError?.(event instanceof Error
-      ? event
-      : new Error("项目工作事件流正在重新连接"));
+    onConnectionState?.("reconnecting", event);
   };
+  const handleOpen = () => onConnectionState?.("connected");
   source.addEventListener("snapshot", handleSnapshot);
+  source.addEventListener("delta", handleDelta);
+  source.addEventListener("resync_required", handleResync);
   source.addEventListener("stream_error", handleStreamError);
+  source.addEventListener("open", handleOpen);
   source.addEventListener("error", handleConnectionError);
   return () => {
     source.removeEventListener?.("snapshot", handleSnapshot);
+    source.removeEventListener?.("delta", handleDelta);
+    source.removeEventListener?.("resync_required", handleResync);
     source.removeEventListener?.("stream_error", handleStreamError);
+    source.removeEventListener?.("open", handleOpen);
     source.removeEventListener?.("error", handleConnectionError);
     source.close();
   };
@@ -3862,6 +3937,54 @@ export async function applyProjectWorkChangeSet({
   return mapProjectWorkConversation(payload);
 }
 
+export function projectWorkLegacyMigrationPatchUrl({
+  conversationId,
+  changeSetId,
+  changeSetHash,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(changeSetId, "changeSetId");
+  const normalizedHash = requiredId(changeSetHash, "changeSetHash");
+  if (!SHA256_PATTERN.test(normalizedHash)) {
+    throw new TypeError("changeSetHash 必须是完整的 SHA-256 哈希");
+  }
+  const query = new URLSearchParams({ change_set_hash: normalizedHash });
+  return `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/legacy-migration/change-sets/${encodeURIComponent(changeSetId)}/export?${query.toString()}`;
+}
+
+export async function abandonProjectWorkLegacyMigrationChanges({
+  conversationId,
+  changeSetId,
+  changeSetHash,
+  clientRequestId = createRequestId("legacy-migration-abandon"),
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(changeSetId, "changeSetId");
+  const normalizedHash = requiredId(changeSetHash, "changeSetHash");
+  if (!SHA256_PATTERN.test(normalizedHash)) {
+    throw new TypeError("changeSetHash 必须是完整的 SHA-256 哈希");
+  }
+  if (!PROJECT_WORK_CLIENT_REQUEST_ID_PATTERN.test(clientRequestId)) {
+    throw new TypeError("clientRequestId 格式无效");
+  }
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/legacy-migration/change-sets/${encodeURIComponent(changeSetId)}/abandon`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        client_request_id: clientRequestId,
+        change_set_hash: normalizedHash,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
+}
+
 export async function startProjectWorkPreview({
   conversationId,
   previewId,
@@ -4224,6 +4347,87 @@ export async function runProjectWorkVerification({
   return mapProjectWorkConversation(payload);
 }
 
+function mapLegacyWorkspaceArchiveItem(value) {
+  if (!value || typeof value !== "object") return null;
+  const conversationId = pick(value, "conversation_id", "conversationId", "");
+  if (!conversationId) return null;
+  const rawBytes = pick(value, "bytes", "bytes", null);
+  const rawFileCount = pick(value, "file_count", "fileCount", null);
+  return {
+    conversationId,
+    title: String(pick(value, "title", "title", "未命名会话")),
+    parts: asArray(pick(value, "parts", "parts", [])),
+    archiveHash: pick(value, "archive_hash", "archiveHash", null),
+    bytes: rawBytes !== null && Number.isSafeInteger(Number(rawBytes))
+      ? Number(rawBytes)
+      : null,
+    fileCount: rawFileCount !== null && Number.isSafeInteger(Number(rawFileCount))
+      ? Number(rawFileCount)
+      : null,
+    cleanupEligible: Boolean(pick(value, "cleanup_eligible", "cleanupEligible", false)),
+    blockedReason: pick(value, "blocked_reason", "blockedReason", null),
+  };
+}
+
+export function mapLegacyWorkspaceArchiveSummary(value) {
+  const items = asArray(pick(value, "items", "items", []))
+    .map(mapLegacyWorkspaceArchiveItem)
+    .filter(Boolean);
+  return {
+    schemaVersion: Number(pick(value, "schema_version", "schemaVersion", 1)) || 1,
+    totalBytes: Math.max(0, Number(pick(value, "total_bytes", "totalBytes", 0)) || 0),
+    totalFileCount: Math.max(
+      0,
+      Number(pick(value, "total_file_count", "totalFileCount", 0)) || 0,
+    ),
+    itemCount: Math.max(0, Number(pick(value, "item_count", "itemCount", items.length)) || 0),
+    cleanupEligibleCount: Math.max(
+      0,
+      Number(pick(value, "cleanup_eligible_count", "cleanupEligibleCount", 0)) || 0,
+    ),
+    mutationOrigin: String(pick(value, "mutation_origin", "mutationOrigin", "")),
+    items,
+  };
+}
+
+export async function fetchLegacyWorkspaceArchives({ signal, fetchImpl } = {}) {
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/legacy-workspace-archives`,
+    { signal, fetchImpl },
+  );
+  return mapLegacyWorkspaceArchiveSummary(payload);
+}
+
+export async function cleanupLegacyWorkspaceArchives({
+  mutationOrigin,
+  items,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(mutationOrigin, "mutationOrigin");
+  if (!SHA256_PATTERN.test(mutationOrigin) || !Array.isArray(items) || items.length < 1) {
+    throw new TypeError("旧工作副本清理绑定无效");
+  }
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/legacy-workspace-archives/cleanup`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        mutation_origin: mutationOrigin,
+        items: items.map((item) => ({
+          conversation_id: requiredId(item?.conversationId, "conversationId"),
+          archive_hash: requiredId(item?.archiveHash, "archiveHash"),
+          bytes: Number(item?.bytes),
+        })),
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapLegacyWorkspaceArchiveSummary(payload);
+}
+
 export const projectWorkApi = {
   listProjects: listProjectWorkProjects,
   listWorkspaces: listProjectWorkWorkspaces,
@@ -4238,6 +4442,8 @@ export const projectWorkApi = {
   setSkillEnabled: setProjectWorkSkillEnabled,
   getUsage: fetchModelUsage,
   getProjectUsage: fetchProjectWorkUsage,
+  fetchLegacyWorkspaceArchives,
+  cleanupLegacyWorkspaceArchives,
   pickRoot: pickProjectWorkRoot,
   registerProject: registerProjectWorkProject,
   createWorkspace: createProjectWorkWorkspace,
@@ -4281,6 +4487,8 @@ export const projectWorkApi = {
   retryPdf: retryProjectWorkPdf,
   removePdf: removeProjectWorkPdf,
   applyChangeSet: applyProjectWorkChangeSet,
+  legacyMigrationPatchUrl: projectWorkLegacyMigrationPatchUrl,
+  abandonLegacyMigrationChanges: abandonProjectWorkLegacyMigrationChanges,
   confirmWorkspaceRun: confirmProjectWorkWorkspaceRun,
   cancelWorkspaceRun: cancelProjectWorkWorkspaceRun,
   fetchWorkspaceRun: getProjectWorkWorkspaceRun,

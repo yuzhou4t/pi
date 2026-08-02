@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  applyProjectWorkEventDelta,
   adjacentConversationAfterRemoval,
   createProjectConversationLock,
   hydrateCreatedConversation,
@@ -9,12 +10,202 @@ import {
   isProjectWorkConversationDeleteBlocked,
   mergeFreshConversationSnapshot,
   mergeIncrementalConversationSnapshot,
+  projectStreamingAssistantView,
+  projectWorkEventNeedsHydration,
   removeLiveConversation,
   replaceProjectConversationSlice,
   renameLiveConversation,
   updateLiveConversationState,
   upsertLiveProject,
 } from "./liveProjectWorkState.js";
+
+test("incremental project events update visible state without a full snapshot", () => {
+  const initial = {
+    id: "conversation-stream",
+    status: "running",
+    turnStatus: "running",
+    messages: [],
+    events: [],
+    workspaceRuns: [{
+      id: "command-1",
+      runId: null,
+      status: "queued",
+      executable: "npm",
+      argv: ["test"],
+    }],
+    lastEventSeq: 0,
+  };
+  const withPlan = applyProjectWorkEventDelta(initial, {
+    seq: 1,
+    type: "plan.updated",
+    data: {
+      steps: [{ id: "inspect", text: "检查事件流", status: "in_progress" }],
+    },
+  });
+  const withRun = applyProjectWorkEventDelta(withPlan, {
+    seq: 2,
+    type: "workspace_run.started",
+    data: { id: "command-1", runId: "run-1", status: "running" },
+  });
+  const completed = applyProjectWorkEventDelta(withRun, {
+    seq: 3,
+    type: "message.completed",
+    createdAt: "2026-08-02T12:00:00.000Z",
+    data: {
+      id: "assistant-1",
+      role: "assistant",
+      text: "事件流已经恢复。",
+      status: "completed",
+      isFinal: true,
+      turnId: "turn-1",
+    },
+  });
+
+  assert.equal(completed.plan[0].title, "检查事件流");
+  assert.equal(completed.workspaceRuns[0].runId, "run-1");
+  assert.equal(completed.workspaceRuns[0].status, "running");
+  assert.equal(completed.messages[0].text, "事件流已经恢复。");
+  assert.deepEqual(completed.events.map((event) => event.seq), [1, 2, 3]);
+  assert.equal(completed.lastEventSeq, 3);
+  assert.equal(completed.deliveredEventSeq, 3);
+  assert.equal(applyProjectWorkEventDelta(completed, completed.events[2]), completed);
+});
+
+test("message deltas retain append metadata while advancing the live watermark", () => {
+  const initial = {
+    id: "conversation-stream",
+    status: "running",
+    turnStatus: "running",
+    messages: [],
+    events: [],
+    lastEventSeq: 10,
+  };
+  const commentary = applyProjectWorkEventDelta(initial, {
+    seq: 11,
+    type: "message.delta",
+    data: {
+      id: "assistant-live",
+      delta: "正在检查",
+      revision: 1,
+      contentIndex: 0,
+      phase: "commentary",
+    },
+  });
+  const finalAnswer = applyProjectWorkEventDelta(commentary, {
+    seq: 12,
+    type: "message.delta",
+    data: {
+      id: "assistant-live",
+      delta: "检查完成",
+      revision: 2,
+      contentIndex: 1,
+      phase: "final_answer",
+    },
+  });
+
+  assert.deepEqual(
+    finalAnswer.events.map((event) => ({
+      seq: event.seq,
+      delta: event.data.delta,
+      revision: event.data.revision,
+      contentIndex: event.data.contentIndex,
+      phase: event.data.phase,
+    })),
+    [{
+      seq: 11,
+      delta: "正在检查",
+      revision: 1,
+      contentIndex: 0,
+      phase: "commentary",
+    }, {
+      seq: 12,
+      delta: "检查完成",
+      revision: 2,
+      contentIndex: 1,
+      phase: "final_answer",
+    }],
+  );
+  assert.equal(finalAnswer.lastEventSeq, 12);
+  assert.equal(finalAnswer.deliveredEventSeq, 12);
+  assert.equal(projectWorkEventNeedsHydration(finalAnswer.events[1]), false);
+  assert.deepEqual(
+    projectStreamingAssistantView(
+      finalAnswer.streamingAssistantProjection,
+      finalAnswer.messages,
+      true,
+    ),
+    {
+      id: "assistant-live",
+      text: "检查完成",
+      seq: 12,
+      turnId: null,
+    },
+  );
+});
+
+test("the incremental streaming projection resumes from snapshot deltas after refresh", () => {
+  const refreshed = {
+    id: "conversation-stream",
+    status: "running",
+    turnStatus: "running",
+    messages: [],
+    events: [{
+      seq: 20,
+      type: "message.created",
+      data: { id: "turn-live", role: "user" },
+    }, {
+      seq: 21,
+      type: "message.delta",
+      data: {
+        id: "assistant-live",
+        turnId: "turn-live",
+        delta: "刷新前",
+        revision: 1,
+        contentIndex: 0,
+        phase: "final_answer",
+      },
+    }],
+    lastEventSeq: 21,
+  };
+  const resumed = applyProjectWorkEventDelta(refreshed, {
+    seq: 22,
+    type: "message.delta",
+    data: {
+      id: "assistant-live",
+      turnId: "turn-live",
+      delta: "刷新后",
+      revision: 2,
+      contentIndex: 0,
+      phase: "final_answer",
+    },
+  });
+
+  assert.equal(
+    projectStreamingAssistantView(
+      resumed.streamingAssistantProjection,
+      resumed.messages,
+      true,
+    ).text,
+    "刷新前刷新后",
+  );
+});
+
+test("only structural project events request snapshot hydration", () => {
+  assert.equal(projectWorkEventNeedsHydration({ type: "message.partial" }), false);
+  assert.equal(projectWorkEventNeedsHydration({ type: "tool.completed" }), false);
+  assert.equal(projectWorkEventNeedsHydration({
+    type: "message.completed",
+    data: { isFinal: false },
+  }), false);
+  assert.equal(projectWorkEventNeedsHydration({
+    type: "message.completed",
+    data: { isFinal: true },
+  }), true);
+  assert.equal(projectWorkEventNeedsHydration({ type: "workspace_run.started" }), false);
+  assert.equal(projectWorkEventNeedsHydration({ type: "workspace_run.completed" }), true);
+  assert.equal(projectWorkEventNeedsHydration({ type: "ask_user.requested" }), true);
+  assert.equal(projectWorkEventNeedsHydration({ type: "document.ready" }), true);
+});
 
 function state(overrides = {}) {
   return {

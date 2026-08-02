@@ -256,3 +256,34 @@ test("usage loading state never labels stale period data as current", async () =
     );
   });
 });
+
+test("data settings expose explicit, bounded cleanup for migrated legacy copies", async () => {
+  await withSettingsPanel(({
+    SettingsDialog,
+    formatLocalDataBytes,
+    legacyArchiveBlockedLabel,
+    legacyArchiveCleanupConfirmation,
+  }) => {
+    const html = renderToStaticMarkup(React.createElement(SettingsDialog, {
+      section: "data",
+      onSectionChange: () => {},
+      providerName: "DeepSeek",
+      model: "DeepSeek V4 Pro",
+      onClose: () => {},
+    }));
+    assert.match(html, /旧工作副本/);
+    assert.match(html, /迁移完成后不再执行，仅在你明确确认时清理/);
+    assert.match(html, /正在统计旧工作副本/);
+    assert.equal(formatLocalDataBytes(213 * 1024 * 1024), "213.0 MB");
+    assert.equal(legacyArchiveBlockedLabel("needs_review"), "需要先处理旧修改");
+    const confirmation = legacyArchiveCleanupConfirmation([{
+      title: "旧 TTS 验证",
+      bytes: 213 * 1024 * 1024,
+    }]);
+    assert.match(confirmation, /确认清理 “旧 TTS 验证”/);
+    assert.match(confirmation, /base\/workspace/);
+    assert.match(confirmation, /Pi Session 和当前真实 Workspace 都会保留/);
+    assert.match(confirmation, /无法撤销/);
+    assert.doesNotMatch(confirmation, /\/Users\//);
+  });
+});
