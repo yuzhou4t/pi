@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
 import {
+  createSupervisedSubagentEnvironment,
   resolveSupervisedPiCliPath,
   startSupervisedSubagentProcess,
 } from "./subagentProcessSupervisor.js";
@@ -54,6 +55,32 @@ function waitForOutput(stream, pattern, timeoutMs = 2_000) {
 test("supervised Pi CLI resolves to the pinned project dependency", () => {
   const cliPath = resolveSupervisedPiCliPath();
   assert.match(cliPath, /@earendil-works\/pi-coding-agent\/dist\/cli\.js$/);
+});
+
+test("supervised child Pi keeps runtime controls but drops app-only secrets", () => {
+  assert.deepEqual(createSupervisedSubagentEnvironment({
+    HOME: "/Users/native",
+    PATH: "/usr/bin:/bin",
+    SSH_AUTH_SOCK: "/tmp/agent.sock",
+    PROJECT_CACHE_DIR: "/tmp/project-cache",
+    PI_CODING_AGENT_DIR: "/Users/native/.pi/agent",
+    PI_SUBAGENT_CHILD: "1",
+    PI_SUBAGENT_CAPABILITY_CEILING_V1: "signed-control",
+    PI_INTERCOM_ASK_TIMEOUT_MS: "1000",
+    PI_DEEPSEEK_API_KEY: "drop-pi-model-key",
+    OPENAI_API_KEY: "drop-model-key",
+    FEISHU_WEBHOOK: "drop-notification-secret",
+    PROJECT_AUTH_TOKEN: "drop-project-secret",
+  }), {
+    HOME: "/Users/native",
+    PATH: "/usr/bin:/bin",
+    SSH_AUTH_SOCK: "/tmp/agent.sock",
+    PROJECT_CACHE_DIR: "/tmp/project-cache",
+    PI_CODING_AGENT_DIR: "/Users/native/.pi/agent",
+    PI_SUBAGENT_CHILD: "1",
+    PI_SUBAGENT_CAPABILITY_CEILING_V1: "signed-control",
+    PI_INTERCOM_ASK_TIMEOUT_MS: "1000",
+  });
 });
 
 test("supervisor escalates to SIGKILL when a child ignores SIGTERM", {

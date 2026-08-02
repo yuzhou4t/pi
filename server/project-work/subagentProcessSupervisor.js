@@ -15,6 +15,37 @@ const SIGNAL_EXIT_CODES = new Map([
   ["SIGTERM", 143],
   ["SIGKILL", 137],
 ]);
+const PRIVATE_SERVICE_PREFIX = /^(?:CODEX_|ANTHROPIC_|ARK_|AZURE_OPENAI_|DEEPSEEK_|FEISHU_|GEMINI_|GOOGLE_AI_|LARK_|MISTRAL_|NOTIFICATION_|OPENAI_|SLACK_|TAVILY_|TEAMS_|VOLCENGINE_)/iu;
+const PRIVATE_SECRET_NAME = /(?:^|_)(?:API_?KEY|AUTH(?:ORIZATION)?|CREDENTIALS?|PASSWORD|SECRET|TOKEN|WEBHOOK)(?:_|$)/iu;
+const SUBAGENT_CONTROL_NAME = /^(?:PI_SUBAGENT|PI_SUBAGENTS|PI_INTERCOM_)/u;
+const SAFE_PI_NAMES = new Set([
+  "PI_CODING_AGENT_DIR",
+  "PI_OFFLINE",
+]);
+const TRUSTED_AUTH_NAMES = new Set([
+  "SSH_AGENT_PID",
+  "SSH_AUTH_SOCK",
+]);
+
+export function createSupervisedSubagentEnvironment(baseEnvironment) {
+  return Object.fromEntries(
+    Object.entries(baseEnvironment ?? {}).filter(([name, value]) => {
+      if (
+        typeof value !== "string"
+        || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)
+      ) {
+        return false;
+      }
+      if (SUBAGENT_CONTROL_NAME.test(name) || SAFE_PI_NAMES.has(name)) {
+        return true;
+      }
+      if (name.startsWith("PI_") || PRIVATE_SERVICE_PREFIX.test(name)) {
+        return false;
+      }
+      return TRUSTED_AUTH_NAMES.has(name) || !PRIVATE_SECRET_NAME.test(name);
+    }),
+  );
+}
 
 function findPackageRoot(entryPoint) {
   let directory = path.dirname(realpathSync(entryPoint));
@@ -178,7 +209,7 @@ export async function runSupervisedSubagentCommand({
       command,
       args,
       cwd,
-      env,
+      env: createSupervisedSubagentEnvironment(env),
       stdio,
       forceKillAfterMs,
     });
