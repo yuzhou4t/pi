@@ -10,11 +10,11 @@ Pi Agent 是一个本地 Agent 工作空间：长期项目保存持续状态，�
 - 日常启动器把项目工作 Runtime 从公共 API 中拆开监管。网页或 API 重启不会终止 Runtime 中的 turn；退出启动器时才受控停止并保存可恢复状态。
 - 两条工作流共用 `idle / running / awaiting_user / awaiting_review / verifying / recovering / stopped` 生命周期和版本化运行时合同，但各自保留业务状态。事件使用稳定 `seq`、snapshot watermark 和增量 SSE；操作失败不会把已经成功的 Agent 回答改写成整段会话失败。
 - `正常工作` 支持一级独立对话和已绑定本地项目。浏览器只收到安全标签与项目内相对路径；创建、打开、切换会话或工件、切换模型都不会调用模型，只有显式发送才启动 Pi。
-- 项目会话使用 conversation-owned 稀疏审阅层，独立对话使用私有 scratch。两者都通过基础哈希、私有修改层、持久 apply journal 和读回校验提供可恢复隔离；选择 `替我审批` 后，安全范围内的修改会自动写入，超限、删除、危险路径、恢复阻塞或哈希冲突会直接阻止。
+- 正常工作采用 `Project → Workspace → Session`：Git 项目发现主目录与长期 worktree，非 Git 项目直接使用所选原目录；会话创建时绑定固定 Workspace cwd。每次 `edit/write` 都先形成精确、哈希绑定的 `PendingWorkspaceWrite`，实际写入后保存 `WorkspaceChangeSet`、私有 before blob 和读回证据；`替我审批`只能自动执行策略允许的本地文件写入。
 - Pi SDK 会话保留持久 JSONL session、steer、后续消息队列、stop、compact、retry-last-turn、`ask_user`、未读水位和逐轮 provider/model/thinking/token/费用证据。`ask_user` 只表达业务决策，不能替代文件或归档批准。
 - 正常工作在显式发送后立即显示真实的提交/连接阶段，随后实时呈现公开进展旁白、思考生命周期、受控工具活动和计划；旁白用一两句话说明刚确认的事实与下一步，并按回合限量、去重和脱敏，回答正文则以节流后的累计替换片段逐步出现。SSE 之外保留运行期低频同步兜底，断线时不会等到最终结果才一次性补齐；任何原始思维链、工具参数或未过滤结果都不会发送到浏览器。
-- 正常工作的项目写回仍以 hash-bound ChangeSet 为唯一入口：服务端重算逐文件 base/after hash，按项目串行原子写入并读回核验。`需确认`时由右侧 `更改`批准，`替我审批`时由同一安全策略自动批准并保留完整证据；apply journal 支持崩溃恢复和一次性 hash-bound 撤销。ChangeSet 本身不碰 Git；只有另一次显式 Git 收尾预览与确认，才会按精确路径创建一个本地提交，默认不 push、不建 PR、不改历史。
-- `运行`只执行服务端注册的验证 recipe、受审 package script 和已安装依赖。当前按清单识别 Node、Python、Swift、Rust、Go 与 Gradle/Android 的固定 test/check/build 配方，Android 必须使用项目内且已绑定摘要的 Gradle Wrapper；不提供自由终端、安装、watcher、inline code、任意 argv 或隐式网络。每次 attempt、退出码和完整已采集日志都会保留；验证在一次性完整副本和 fail-closed macOS 沙箱中进行，网络关闭，读权限只给副本、私有临时目录、系统库与受控工具链根，写权限只给副本和临时目录。RTK 只压缩失败后回灌给 Pi 的修复上下文，缺失或压缩失败时原样回退，绝不替换右侧日志证据。
+- 正常工作的每次写入都重新校验 Workspace revision 与逐文件 base/after hash，按 Workspace 串行原子写入并读回核验。`需确认`时由右侧 `更改`批准，`替我审批`时由同一安全策略自动批准并保留完整证据；撤销是另一项独立的 hash-bound 确认，文件已变化时不会覆盖。文件写入本身不碰 Git；只有另一次显式 Git 收尾预览与确认，才会按精确路径创建一个本地提交，默认不 push、不建 PR、不改历史。
+- `运行`只执行服务端注册的验证 recipe、受审 package script、已安装依赖，或用户另行确认的精确 `executable + argv + relativeCwd`。当前按清单识别 Node、Python、Swift、Rust、Go 与 Gradle/Android 的固定 test/check/build 配方；所有命令以 `shell:false` 直接在固定 Workspace 中运行并持续复用 `node_modules`、`.build`、Cargo 与 Gradle 缓存，不再复制项目，也不存在项目总体积或文件数拒绝。`WorkspaceRun` 在启动前持久化 queued/running 状态，stdout/stderr 按 seq 保存并可在刷新后补齐；Runtime 异常时，无法确认仍存活的命令恢复为 `interrupted`，不会自动重跑或误报完成。它继承本机用户权限，不是 OS 沙箱；密钥会从运行环境和公开日志中剥离。
 - 正常工作的 `gpt-image-2` 默认关闭；只有用户为当前消息明确选择“生成图片”并发送后才启用。它复用本机 Codex CLI 的 ChatGPT 订阅登录，一轮最多生成一张会话私有 PNG，校验真实格式、尺寸、哈希并读回后才展示在对话和“文件”工件；生成结果不会直接写入项目，订阅消耗记录 Token 与图片次数但不伪造 API 美元价格。
 - `预览`只接受注册式 Vite、静态站点或 Uvicorn recipe，由 supervisor 拥有进程。手动模式会先展示安全 recipe、相对 cwd、参数边界和请求指纹，只有明确确认后才启动回环预览。受控页面验收只能检查该 supervisor 当前拥有的同源 loopback 页面，固定采集桌面/移动截图、DOM/可访问性摘要、console 和失败请求；外部导航、上传、下载、凭据输入与页面写交互均被阻止。
 - `规划方案`是服务端只读工作流：可以检索项目、会话资料与明确启用的只读资料源，也可以提问和输出计划，但不会生成 ChangeSet、验证、预览或写操作。Agent 回答里的项目 `path:line` 仅在本轮确实读取且文件 hash 仍一致时可点击定位，文件变化后会明确显示引用已过期。
@@ -64,7 +64,7 @@ npm run dev -- --host 127.0.0.1 --port 4173
 
 `npm run dev:api` 使用 Pi Agent 专用的开发端口 `8788`，默认 Vite 代理也指向该端口。它读取 `.env.local`，并在服务端代码变化后自动重启，避免前端命中旧版接口。论文语义步骤的 GPT 通道继续使用已登录的 Codex 订阅，DeepSeek 读取 `PI_DEEPSEEK_API_KEY`；项目工作会话直接读取 Pi 本机已配置且可用的模型目录，不读取或复制 Pi/Codex 凭据。MinerU Cloud 读取 `PI_MINERU_API_TOKEN`。GitHub 只读 Connector 优先使用服务端专用 `PI_GITHUB_TOKEN`；缺少该配置时，可通过固定、无 Shell 的 `gh api` 只读适配器复用 GitHub CLI Keychain，且仍需用户为本轮显式启用。Vercel 只读 Connector 复用已登录的本机 Vercel CLI。Pi 不读取或复制这两个 CLI 的 Token，也不会把任何凭据返回浏览器。Zotero Desktop 默认只通过 `http://127.0.0.1:23119` 连接本机，必要时可用 `PI_ZOTERO_BASE_URL` 覆盖。所有独立密钥只放在未跟踪的 `.env.local`，不要写入前端、聊天或 Git。
 
-正常工作会话数据默认保存在 macOS `Application Support/Pi Agent/project-work`，可通过服务端环境变量 `PI_PROJECT_WORK_STORAGE_ROOT` 覆盖。该目录保存安全项目注册、会话状态、事件流、稀疏审阅层、独立对话私有草稿与 Pi JSONL 会话；不会进入浏览器或 Git。创建空会话只写轻量元数据，不扫描或复制项目，也不会启动 Pi。
+正常工作会话数据默认保存在 macOS `Application Support/Pi Agent/project-work`，可通过服务端环境变量 `PI_PROJECT_WORK_STORAGE_ROOT` 覆盖。该目录保存安全项目与 Workspace 注册、会话状态、事件流、`PendingWorkspaceWrite` 私有 before/after 载荷、`WorkspaceChangeSet`、`WorkspaceRun` 日志、独立对话私有草稿与 Pi JSONL session；不会把绝对路径或私有存储目录返回浏览器，也不会进入 Git。创建空会话只写轻量元数据，不扫描或复制项目，也不会启动 Pi。
 
 要启用 MinerU，在 `.env.local` 增加 `PI_MINERU_API_TOKEN=你的_Token` 后重启本地 API。已经完成 PDF 下载但停在 `not_configured` 的 Run 不必重新扫描来源，页面会显示“重新准备全文”，点击后使用已缓存的 5 篇 PDF 继续提交。
 

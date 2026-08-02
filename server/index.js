@@ -1090,6 +1090,7 @@ function publicProjectWorkConversationSummary(value) {
     sourceProjectId: conversation?.sourceProjectId ?? null,
     sourceProjectLabel: conversation?.sourceProjectLabel ?? null,
     workspaceKind: conversation?.workspaceKind ?? null,
+    ...(conversation?.workspace ? { workspace: conversation.workspace } : {}),
     scope: conversation?.scope ?? null,
     rootLabel: conversation?.rootLabel ?? null,
     title: conversation?.title ?? "",
@@ -1733,6 +1734,93 @@ export function createApiServer({
         return;
       }
 
+      const projectWorkspacesMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/projects\/([^/]+)\/workspaces$/,
+      );
+      if (projectWorkspacesMatch && request.method === "GET") {
+        const projectId = decodeProjectWorkSegment(projectWorkspacesMatch[1]);
+        const workspaces = await projectWorkService.listWorkspaces(projectId);
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          workspaces,
+        }, origin);
+        return;
+      }
+      if (projectWorkspacesMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const projectId = decodeProjectWorkSegment(projectWorkspacesMatch[1]);
+        const payload = await readProjectWorkJson(request, { maxBytes: 16 * 1024 });
+        const allowedKeys = new Set([
+          "schema_version",
+          "source_workspace_id",
+          "expected_head",
+          "branch_name",
+          "title",
+          "label",
+        ]);
+        if (
+          payload?.schema_version !== 1
+          || typeof payload.source_workspace_id !== "string"
+          || !payload.source_workspace_id
+          || typeof payload.expected_head !== "string"
+          || !/^[0-9a-f]{7,64}$/i.test(payload.expected_head)
+          || Object.keys(payload).some((key) => !allowedKeys.has(key))
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_WORKSPACE_REQUEST_INVALID",
+            "Workspace 创建请求格式无效",
+            400,
+          );
+        }
+        const workspace = await projectWorkService.createWorkspace(projectId, {
+          sourceWorkspaceId: payload.source_workspace_id,
+          expectedHead: payload.expected_head,
+          branchName: payload.branch_name ?? null,
+          title: payload.title,
+          label: payload.label ?? null,
+        });
+        sendJson(response, 201, {
+          schemaVersion: 1,
+          workspace,
+        }, origin);
+        return;
+      }
+
+      const projectWorkspaceMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/projects\/([^/]+)\/workspaces\/([^/]+)$/,
+      );
+      if (projectWorkspaceMatch && request.method === "DELETE") {
+        requireProjectWorkMutationOrigin(origin);
+        const projectId = decodeProjectWorkSegment(projectWorkspaceMatch[1]);
+        const workspaceId = decodeProjectWorkSegment(projectWorkspaceMatch[2]);
+        const payload = await readProjectWorkJson(request, { maxBytes: 8 * 1024 });
+        if (
+          payload?.schema_version !== 1
+          || typeof payload.expected_head !== "string"
+          || !/^[0-9a-f]{7,64}$/i.test(payload.expected_head)
+          || Object.keys(payload).some(
+            (key) => !["schema_version", "expected_head"].includes(key),
+          )
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_WORKSPACE_REQUEST_INVALID",
+            "Workspace 删除请求格式无效",
+            400,
+          );
+        }
+        const workspace = await projectWorkService.removeWorkspace(
+          projectId,
+          workspaceId,
+          { expectedHead: payload.expected_head },
+        );
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          workspaceId,
+          removed: workspace.removed === true,
+        }, origin);
+        return;
+      }
+
       const projectConversationsMatch = url.pathname.match(
         /^\/api\/v1\/project-work\/projects\/([^/]+)\/conversations$/,
       );
@@ -1758,6 +1846,9 @@ export function createApiServer({
           modelId: payload.model_id,
           thinkingLevel: payload.thinking_level,
           executionPolicyMode: requestedPolicyMode ?? undefined,
+          ...(payload.workspace_id
+            ? { workspaceId: payload.workspace_id }
+            : {}),
         });
         sendJson(
           response,
@@ -2797,6 +2888,107 @@ export function createApiServer({
           schemaVersion: 1,
           applies: await projectWorkService.listApplyJournal(conversationId),
         }, origin);
+        return;
+      }
+
+      const workspaceWriteMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/workspace-writes\/([^/]+)\/(confirm|cancel)$/,
+      );
+      if (workspaceWriteMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(workspaceWriteMatch[1]);
+        const writeId = decodeProjectWorkSegment(workspaceWriteMatch[2]);
+        const payload = await readProjectWorkJson(request);
+        if (
+          payload?.schema_version !== 1
+          || Object.keys(payload).some((key) => ![
+            "schema_version",
+            "client_request_id",
+          ].includes(key))
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORKSPACE_WRITE_CONFIRMATION_INVALID",
+            "Workspace 写入确认请求无效",
+            400,
+          );
+        }
+        const result = workspaceWriteMatch[3] === "confirm"
+          ? await projectWorkService.confirmWorkspaceWrite(
+              conversationId,
+              writeId,
+            )
+          : await projectWorkService.cancelWorkspaceWrite(
+              conversationId,
+              writeId,
+            );
+        sendJson(
+          response,
+          200,
+          publicProjectWorkConversationState(result),
+          origin,
+        );
+        return;
+      }
+
+      const workspaceRunMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/workspace-runs\/([^/]+)$/,
+      );
+      if (workspaceRunMatch && request.method === "GET") {
+        const conversationId = decodeProjectWorkSegment(workspaceRunMatch[1]);
+        const runId = decodeProjectWorkSegment(workspaceRunMatch[2]);
+        const afterSeq = Number(url.searchParams.get("after_seq") ?? 0);
+        const limit = Number(url.searchParams.get("limit") ?? 500);
+        sendJson(response, 200, {
+          schemaVersion: 1,
+          ...(await projectWorkService.getWorkspaceRun(
+            conversationId,
+            runId,
+            { afterSeq, limit },
+          )),
+        }, origin);
+        return;
+      }
+
+      const workspaceRunActionMatch = url.pathname.match(
+        /^\/api\/v1\/project-work\/conversations\/([^/]+)\/workspace-runs\/([^/]+)\/(confirm|cancel)$/,
+      );
+      if (workspaceRunActionMatch && request.method === "POST") {
+        requireProjectWorkMutationOrigin(origin);
+        const conversationId = decodeProjectWorkSegment(
+          workspaceRunActionMatch[1],
+        );
+        const requestId = decodeProjectWorkSegment(workspaceRunActionMatch[2]);
+        const payload = await readProjectWorkJson(request);
+        if (
+          payload?.schema_version !== 1
+          || Object.keys(payload).some((key) => ![
+            "schema_version",
+            "client_request_id",
+            "request_hash",
+          ].includes(key))
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORKSPACE_COMMAND_CONFIRMATION_INVALID",
+            "Workspace 运行确认请求无效",
+            400,
+          );
+        }
+        const result = workspaceRunActionMatch[3] === "confirm"
+          ? await projectWorkService.confirmWorkspaceRun(
+              conversationId,
+              requestId,
+              { requestHash: payload.request_hash },
+            )
+          : await projectWorkService.cancelWorkspaceRun(
+              conversationId,
+              requestId,
+            );
+        sendJson(
+          response,
+          200,
+          publicProjectWorkConversationState(result),
+          origin,
+        );
         return;
       }
 

@@ -872,6 +872,133 @@ test("settings routes preserve provider-secret and Skill review boundaries", asy
   );
 });
 
+test("project-work Workspace routes bind HEAD and conversation selection", async (t) => {
+  const calls = [];
+  const workspace = {
+    id: "workspace-secondary",
+    projectId: "project-route",
+    label: "pi/route-test",
+    kind: "git_worktree",
+    isMain: false,
+    isGit: true,
+    branch: "pi/route-test",
+    head: "b".repeat(40),
+    dirty: false,
+    status: "available",
+    conversationCount: 0,
+    updatedAt: "2026-08-01T00:00:00.000Z",
+  };
+  const projectWorkService = {
+    async listWorkspaces(projectId) {
+      calls.push({ action: "list", projectId });
+      return [workspace];
+    },
+    async createWorkspace(projectId, options) {
+      calls.push({ action: "create", projectId, options });
+      return workspace;
+    },
+    async removeWorkspace(projectId, workspaceId, options) {
+      calls.push({ action: "remove", projectId, workspaceId, options });
+      return { ...workspace, removed: true };
+    },
+    async createConversation(projectId, options) {
+      calls.push({ action: "conversation", projectId, options });
+      return {
+        id: "conversation-route",
+        projectId,
+        workspaceKind: "bound_project",
+        workspace,
+        title: "新工作会话",
+        status: "idle",
+        createdAt: "2026-08-01T00:00:00.000Z",
+        updatedAt: "2026-08-01T00:00:00.000Z",
+      };
+    },
+  };
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    projectWorkService,
+  );
+  t.after(server.close);
+  const endpoint = `${server.baseUrl}/api/v1/project-work/projects/project-route/workspaces`;
+  const headers = {
+    origin: "http://127.0.0.1:4173",
+    "content-type": "application/json",
+  };
+
+  const listed = await fetch(endpoint);
+  assert.equal(listed.status, 200);
+  assert.equal((await listed.json()).workspaces[0].id, workspace.id);
+
+  const created = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      schema_version: 1,
+      source_workspace_id: "workspace-main",
+      expected_head: "a".repeat(40),
+      title: "Route test",
+    }),
+  });
+  assert.equal(created.status, 201);
+
+  const removed = await fetch(`${endpoint}/${workspace.id}`, {
+    method: "DELETE",
+    headers,
+    body: JSON.stringify({
+      schema_version: 1,
+      expected_head: workspace.head,
+    }),
+  });
+  assert.equal(removed.status, 200);
+  assert.equal((await removed.json()).removed, true);
+
+  const conversation = await fetch(
+    `${server.baseUrl}/api/v1/project-work/projects/project-route/conversations`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        schema_version: 1,
+        workspace_id: workspace.id,
+      }),
+    },
+  );
+  assert.equal(conversation.status, 201);
+  assert.equal((await conversation.json()).workspace.id, workspace.id);
+  assert.deepEqual(calls, [{
+    action: "list",
+    projectId: "project-route",
+  }, {
+    action: "create",
+    projectId: "project-route",
+    options: {
+      sourceWorkspaceId: "workspace-main",
+      expectedHead: "a".repeat(40),
+      branchName: null,
+      title: "Route test",
+      label: null,
+    },
+  }, {
+    action: "remove",
+    projectId: "project-route",
+    workspaceId: workspace.id,
+    options: { expectedHead: workspace.head },
+  }, {
+    action: "conversation",
+    projectId: "project-route",
+    options: {
+      title: undefined,
+      providerId: undefined,
+      modelId: undefined,
+      thinkingLevel: undefined,
+      executionPolicyMode: undefined,
+      workspaceId: workspace.id,
+    },
+  }]);
+});
+
 test("project-work PDF routes use raw bytes and conversation-owned retry/remove actions", async (t) => {
   const calls = [];
   const snapshot = (status, documents = [{

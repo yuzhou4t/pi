@@ -211,6 +211,8 @@ function projectWorkConversationLabel(status) {
     awaiting_confirmation: "修改待审阅",
     applied: "修改已应用",
     verifying: "正在验证",
+    verification_failed: "验证未通过",
+    recovery_blocked: "恢复受阻",
     completed: "本轮已完成",
     failed: "本轮失败",
     interrupted: "运行已中断",
@@ -3061,19 +3063,25 @@ export function App() {
     setMobileView("agent");
   };
 
-  const createWorkConversation = (projectId) => {
+  const createWorkConversation = (projectId, {
+    workspaceId = null,
+    activate = false,
+  } = {}) => {
     if (!projectId) return Promise.resolve(null);
     return projectConversationCreationLockRef.current.run(projectId, async () => {
       try {
         const created = await projectWorkApi.createConversation({
           projectId,
+          workspaceId: workspaceId || undefined,
           providerId: preferredProjectWorkSelection.providerId || undefined,
           modelId: preferredProjectWorkSelection.modelId || undefined,
           executionPolicyMode: DEFAULT_PROJECT_WORK_EXECUTION_POLICY_MODE,
         });
         const projectStillSelected = selectedProjectIdRef.current === projectId;
-        const shouldActivate = projectStillSelected
-          && preparingConversationSelectionRef.current?.projectId === projectId;
+        const shouldActivate = projectStillSelected && (
+          activate
+          || preparingConversationSelectionRef.current?.projectId === projectId
+        );
         setLiveProjectWork((current) => insertCreatedConversation(current, created, {
           activate: shouldActivate,
           include: projectStillSelected,
@@ -3083,6 +3091,7 @@ export function App() {
           setPreparingConversationSelection(null);
           activeConversationIdRef.current = created.id;
           setActiveConversationId(created.id);
+          setMobileView("agent");
         }
 
         projectWorkApi.fetchConversation({
@@ -3106,13 +3115,14 @@ export function App() {
           error,
         }));
         showToast(error.message || "无法新建工作会话", "warning");
+        if (activate) throw error;
         return null;
       } finally {
         setCreatingConversationProjectIds((current) => (
           current.filter((id) => id !== projectId)
         ));
       }
-    }, () => focusCreatingWorkConversation(projectId));
+    }, activate ? undefined : () => focusCreatingWorkConversation(projectId));
   };
 
   const createStandaloneConversation = () => (
@@ -3719,6 +3729,12 @@ export function App() {
             onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
             onConversationChange={updateLiveConversation}
             onConversationForked={activateForkedProjectConversation}
+            onCreateConversationInWorkspace={({ projectId, workspaceId }) => (
+              createWorkConversation(projectId, {
+                workspaceId,
+                activate: true,
+              })
+            )}
             onError={handleProjectWorkError}
           />
         ) : readingMode ? (

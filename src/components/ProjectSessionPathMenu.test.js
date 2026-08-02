@@ -185,6 +185,71 @@ test("blocked, busy, and standalone states explain exactly which actions are una
   });
 });
 
+test("Workspace rows create new conversations without switching the current cwd and only clean unused worktrees can be removed", async () => {
+  await withPathMenu(({
+    ProjectSessionPathMenu,
+    projectWorkspaceActionState,
+  }) => {
+    const main = {
+      id: "workspace-main",
+      label: "主工作区",
+      kind: "project_root",
+      isMain: true,
+      isGit: true,
+      branch: "main",
+      head: "1234567890abcdef",
+      dirty: true,
+      status: "available",
+      conversationCount: 1,
+    };
+    const secondary = {
+      id: "workspace-secondary",
+      label: "pi/fix-title-abcd",
+      kind: "git_worktree",
+      isMain: false,
+      isGit: true,
+      branch: "pi/fix-title-abcd",
+      head: "fedcba0987654321",
+      dirty: false,
+      status: "available",
+      conversationCount: 0,
+    };
+    assert.equal(projectWorkspaceActionState(main, {
+      currentWorkspaceId: main.id,
+    }).open.disabled, true);
+    assert.equal(projectWorkspaceActionState(main).remove.disabled, true);
+    assert.equal(projectWorkspaceActionState(secondary).remove.disabled, false);
+    assert.match(projectWorkspaceActionState({
+      ...secondary,
+      dirty: true,
+    }).remove.reason, /未提交修改/);
+    assert.match(projectWorkspaceActionState({
+      ...secondary,
+      conversationCount: 2,
+    }).remove.reason, /仍有会话使用/);
+
+    const html = renderToStaticMarkup(React.createElement(ProjectSessionPathMenu, {
+      open: true,
+      onOpenChange() {},
+      sessionPath,
+      messages,
+      workspaces: [main, secondary],
+      currentWorkspaceId: main.id,
+      onCreateWorktreeConversation() {},
+      onCreateConversationInWorkspace() {},
+      onRemoveWorkspace() {},
+    }));
+    assert.match(html, /主工作区/);
+    assert.match(html, /当前会话/);
+    assert.match(html, /pi\/fix-title-abcd/);
+    assert.match(html, /fedcba09/);
+    assert.match(html, /在此新建会话/);
+    assert.match(html, /从当前 HEAD 新建 Workspace 会话/);
+    assert.match(html, /删除 Workspace pi\/fix-title-abcd/);
+    assert.doesNotMatch(html, /Users\//);
+  });
+});
+
 test("Escape and the shared close helper close the dialog and restore trigger focus", async () => {
   await withPathMenu(({
     closeProjectSessionPathMenu,

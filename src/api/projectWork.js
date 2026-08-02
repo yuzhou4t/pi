@@ -999,8 +999,42 @@ export function mapProjectWorkWorkspace(raw) {
       false,
     ) === true,
     status: pick(raw, "status", "status", "ready"),
+    isMain: pick(raw, "is_main", "isMain", true) !== false,
+    isGit: pick(raw, "is_git", "isGit", false) === true,
+    branch: pick(raw, "branch", "branch"),
+    head: pick(raw, "head", "head"),
+    dirty: pick(raw, "dirty", "dirty", false) === true,
     revision: Number.isSafeInteger(revision) && revision > 0 ? revision : 1,
     createdAt: pick(raw, "created_at", "createdAt"),
+    updatedAt: pick(raw, "updated_at", "updatedAt"),
+  };
+}
+
+export function mapProjectWorkWorkspaceSummary(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const id = pick(raw, "workspace_id", "workspaceId", raw.id ?? null);
+  const projectId = pick(raw, "project_id", "projectId");
+  if (typeof id !== "string" || !id || typeof projectId !== "string" || !projectId) {
+    return null;
+  }
+  const conversationCount = Number(
+    pick(raw, "conversation_count", "conversationCount", 0),
+  );
+  return {
+    id,
+    projectId,
+    label: pick(raw, "label", "label", "Workspace"),
+    kind: pick(raw, "kind", "kind", "project_root"),
+    isMain: pick(raw, "is_main", "isMain", false) === true,
+    isGit: pick(raw, "is_git", "isGit", false) === true,
+    branch: pick(raw, "branch", "branch"),
+    head: pick(raw, "head", "head"),
+    dirty: pick(raw, "dirty", "dirty", false) === true,
+    status: pick(raw, "status", "status", "available"),
+    conversationCount: Number.isSafeInteger(conversationCount)
+      && conversationCount >= 0
+      ? conversationCount
+      : 0,
     updatedAt: pick(raw, "updated_at", "updatedAt"),
   };
 }
@@ -1889,6 +1923,46 @@ export function mapProjectWorkConversation(raw) {
       title: step?.title ?? step?.text,
     }, index)).filter(Boolean),
     pendingChangeSet: changeSet,
+    workspaceWrites: asArray(
+      pick(source, "workspace_writes", "workspaceWrites", []),
+    ).map((write) => ({
+      id: pick(write, "write_id", "writeId", write?.id),
+      turnId: pick(write, "turn_id", "turnId"),
+      toolCallId: pick(write, "tool_call_id", "toolCallId"),
+      path: safeProjectRelativePath(pick(write, "path", "path")),
+      operation: pick(write, "operation", "operation", "update"),
+      status: pick(write, "status", "status", "failed"),
+      approvalMode: pick(write, "approval_mode", "approvalMode", "manual_review"),
+      baseHash: pick(write, "base_hash", "baseHash"),
+      afterHash: pick(write, "after_hash", "afterHash"),
+      patch: pick(write, "patch", "patch", ""),
+      createdAt: pick(write, "created_at", "createdAt"),
+      completedAt: pick(write, "completed_at", "completedAt"),
+      undo: pick(write, "undo", "undo"),
+      error: pick(write, "error", "error"),
+    })).filter((write) => typeof write.id === "string" && write.path),
+    workspaceRuns: asArray(
+      pick(source, "workspace_runs", "workspaceRuns", []),
+    ).map((run) => ({
+      id: pick(run, "request_id", "requestId", run?.id),
+      runId: pick(run, "run_id", "runId"),
+      turnId: pick(run, "turn_id", "turnId"),
+      kind: pick(run, "kind", "kind", "custom"),
+      status: pick(run, "status", "status", "failed"),
+      executable: pick(run, "executable", "executable", ""),
+      argv: asArray(pick(run, "argv", "argv", [])),
+      relativeCwd: pick(run, "relative_cwd", "relativeCwd", "."),
+      purpose: pick(run, "purpose", "purpose"),
+      requestHash: pick(run, "request_hash", "requestHash"),
+      exitCode: pick(run, "exit_code", "exitCode"),
+      durationMs: pick(run, "duration_ms", "durationMs"),
+      output: pick(run, "output", "output", ""),
+      truncated: pick(run, "truncated", "truncated", false) === true,
+      createdAt: pick(run, "created_at", "createdAt"),
+      startedAt: pick(run, "started_at", "startedAt"),
+      completedAt: pick(run, "completed_at", "completedAt"),
+      error: pick(run, "error", "error"),
+    })).filter((run) => typeof run.id === "string"),
     pendingChangeFileCount,
     verificationCommand,
     verificationRuns,
@@ -1943,6 +2017,84 @@ export function mapProjectWorkConversation(raw) {
 export async function listProjectWorkProjects({ signal, fetchImpl } = {}) {
   const payload = await requestJson(`${PROJECT_WORK_API_ROOT}/projects`, { signal, fetchImpl });
   return asArray(payload?.projects).map(mapProject).filter(Boolean);
+}
+
+export async function listProjectWorkWorkspaces({
+  projectId,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(projectId, "projectId");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/workspaces`,
+    { signal, fetchImpl },
+  );
+  return asArray(payload?.workspaces)
+    .map(mapProjectWorkWorkspaceSummary)
+    .filter(Boolean);
+}
+
+export async function createProjectWorkWorkspace({
+  projectId,
+  sourceWorkspaceId,
+  expectedHead,
+  branchName,
+  title,
+  label,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(projectId, "projectId");
+  requiredId(sourceWorkspaceId, "sourceWorkspaceId");
+  requiredId(expectedHead, "expectedHead");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/workspaces`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        source_workspace_id: sourceWorkspaceId,
+        expected_head: expectedHead,
+        ...(typeof branchName === "string" && branchName.trim()
+          ? { branch_name: branchName.trim() }
+          : {}),
+        ...(typeof title === "string" && title.trim()
+          ? { title: title.trim() }
+          : {}),
+        ...(typeof label === "string" && label.trim()
+          ? { label: label.trim() }
+          : {}),
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkWorkspaceSummary(payload?.workspace ?? payload);
+}
+
+export async function removeProjectWorkWorkspace({
+  projectId,
+  workspaceId,
+  expectedHead,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(projectId, "projectId");
+  requiredId(workspaceId, "workspaceId");
+  requiredId(expectedHead, "expectedHead");
+  await requestJson(
+    `${PROJECT_WORK_API_ROOT}/projects/${encodeURIComponent(projectId)}/workspaces/${encodeURIComponent(workspaceId)}`,
+    {
+      method: "DELETE",
+      body: {
+        schema_version: 1,
+        expected_head: expectedHead,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return { projectId, workspaceId, removed: true };
 }
 
 export async function fetchProjectWorkModels({ signal, fetchImpl } = {}) {
@@ -2534,6 +2686,8 @@ export async function registerProjectWorkProject({
 
 export async function createProjectWorkConversation({
   projectId,
+  workspaceId,
+  title,
   providerId,
   modelId,
   thinkingLevel,
@@ -2554,6 +2708,10 @@ export async function createProjectWorkConversation({
       method: "POST",
       body: {
         schema_version: 1,
+        ...(workspaceId ? { workspace_id: workspaceId } : {}),
+        ...(typeof title === "string" && title.trim()
+          ? { title: title.trim() }
+          : {}),
         ...(providerId ? { provider_id: providerId } : {}),
         ...(modelId ? { model_id: modelId } : {}),
         ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
@@ -3922,6 +4080,125 @@ export async function undoProjectWorkApply({
   return mapProjectWorkConversation(payload);
 }
 
+export async function confirmProjectWorkWorkspaceWrite({
+  conversationId,
+  writeId,
+  clientRequestId = createRequestId("project-workspace-write"),
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(writeId, "writeId");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/workspace-writes/${encodeURIComponent(writeId)}/confirm`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        client_request_id: clientRequestId,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
+}
+
+export async function confirmProjectWorkWorkspaceRun({
+  conversationId,
+  requestId,
+  requestHash,
+  clientRequestId = createRequestId("project-workspace-run"),
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(requestId, "requestId");
+  requiredId(requestHash, "requestHash");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/workspace-runs/${encodeURIComponent(requestId)}/confirm`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        client_request_id: clientRequestId,
+        request_hash: requestHash,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
+}
+
+export async function cancelProjectWorkWorkspaceRun({
+  conversationId,
+  requestId,
+  clientRequestId = createRequestId("project-workspace-run"),
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(requestId, "requestId");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/workspace-runs/${encodeURIComponent(requestId)}/cancel`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        client_request_id: clientRequestId,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
+}
+
+export async function getProjectWorkWorkspaceRun({
+  conversationId,
+  runId,
+  afterSeq = 0,
+  limit = 500,
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(runId, "runId");
+  const query = new URLSearchParams({
+    after_seq: String(Math.max(0, Number(afterSeq) || 0)),
+    limit: String(Math.max(1, Math.min(1_000, Number(limit) || 500))),
+  });
+  return requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/workspace-runs/${encodeURIComponent(runId)}?${query}`,
+    { signal, fetchImpl },
+  );
+}
+
+export async function cancelProjectWorkWorkspaceWrite({
+  conversationId,
+  writeId,
+  clientRequestId = createRequestId("project-workspace-write"),
+  signal,
+  fetchImpl,
+} = {}) {
+  requiredId(conversationId, "conversationId");
+  requiredId(writeId, "writeId");
+  const payload = await requestJson(
+    `${PROJECT_WORK_API_ROOT}/conversations/${encodeURIComponent(conversationId)}/workspace-writes/${encodeURIComponent(writeId)}/cancel`,
+    {
+      method: "POST",
+      body: {
+        schema_version: 1,
+        client_request_id: clientRequestId,
+      },
+      signal,
+      fetchImpl,
+    },
+  );
+  return mapProjectWorkConversation(payload);
+}
+
 export async function runProjectWorkVerification({
   conversationId,
   commandId,
@@ -3949,6 +4226,7 @@ export async function runProjectWorkVerification({
 
 export const projectWorkApi = {
   listProjects: listProjectWorkProjects,
+  listWorkspaces: listProjectWorkWorkspaces,
   listModels: fetchProjectWorkModels,
   listProviderConnections: fetchProjectWorkProviderConnections,
   saveProviderApiKey: saveProjectWorkProviderApiKey,
@@ -3962,6 +4240,8 @@ export const projectWorkApi = {
   getProjectUsage: fetchProjectWorkUsage,
   pickRoot: pickProjectWorkRoot,
   registerProject: registerProjectWorkProject,
+  createWorkspace: createProjectWorkWorkspace,
+  removeWorkspace: removeProjectWorkWorkspace,
   removeProject: removeProjectWorkProject,
   createConversation: createProjectWorkConversation,
   createStandaloneConversation: createStandaloneProjectWorkConversation,
@@ -4001,6 +4281,11 @@ export const projectWorkApi = {
   retryPdf: retryProjectWorkPdf,
   removePdf: removeProjectWorkPdf,
   applyChangeSet: applyProjectWorkChangeSet,
+  confirmWorkspaceRun: confirmProjectWorkWorkspaceRun,
+  cancelWorkspaceRun: cancelProjectWorkWorkspaceRun,
+  fetchWorkspaceRun: getProjectWorkWorkspaceRun,
+  confirmWorkspaceWrite: confirmProjectWorkWorkspaceWrite,
+  cancelWorkspaceWrite: cancelProjectWorkWorkspaceWrite,
   startPreview: startProjectWorkPreview,
   fetchWorkspace: fetchProjectWorkWorkspace,
   fetchGitEvidence: fetchProjectWorkGitEvidence,

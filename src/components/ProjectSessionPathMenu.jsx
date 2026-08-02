@@ -8,6 +8,8 @@ import {
   CaretDown,
   ChatsCircle,
   GitBranch,
+  Plus,
+  Trash,
   TreeStructure,
 } from "@phosphor-icons/react";
 
@@ -209,6 +211,36 @@ export function projectSessionPathActionState(checkpoint, {
   };
 }
 
+export function projectWorkspaceActionState(workspace, {
+  currentWorkspaceId = null,
+  busy = false,
+  loading = false,
+} = {}) {
+  const unavailable = workspace?.status && workspace.status !== "available"
+    ? "Workspace 当前正在使用"
+    : null;
+  const commonReason = loading
+    ? "正在刷新 Workspace"
+    : busy
+      ? "当前 Agent 正在工作"
+      : unavailable;
+  const current = workspace?.id === currentWorkspaceId;
+  const openReason = commonReason ?? (current ? "当前会话已固定在这里" : null);
+  const removeReason = commonReason
+    ?? (workspace?.isMain ? "主 Workspace 不能删除" : null)
+    ?? (!workspace?.isGit || workspace?.kind !== "git_worktree"
+      ? "只有次级 Git worktree 可以删除"
+      : null)
+    ?? (workspace?.dirty ? "含有未提交修改，不能删除" : null)
+    ?? (workspace?.conversationCount > 0 ? "仍有会话使用，不能删除" : null)
+    ?? (!workspace?.head ? "缺少可确认的 Git HEAD" : null);
+  return {
+    current,
+    open: { disabled: Boolean(openReason), reason: openReason },
+    remove: { disabled: Boolean(removeReason), reason: removeReason },
+  };
+}
+
 export function selectProjectSessionCheckpoint(
   checkpointId,
   callbacks,
@@ -270,6 +302,14 @@ export function ProjectSessionPathMenu({
   onRetryCheckpoint,
   onStartBranch,
   onForkCheckpoint,
+  workspaces = [],
+  currentWorkspaceId = null,
+  workspacesLoading = false,
+  workspaceAction = null,
+  workspaceError = null,
+  onCreateWorktreeConversation,
+  onCreateConversationInWorkspace,
+  onRemoveWorkspace,
   busy = false,
   standalone = false,
 }) {
@@ -352,10 +392,83 @@ export function ProjectSessionPathMenu({
         >
           <header className="project-session-path-header">
             <div>
-              <strong id={titleId}>会话路径</strong>
-              <small>每个已完成回答都会保留为检查点</small>
+              <strong id={titleId}>路径与 Workspace</strong>
+              <small>会话固定使用一个 Workspace；每个已完成回答都会保留为检查点</small>
             </div>
           </header>
+
+          {!standalone ? (
+            <section className="project-session-workspaces" aria-label="项目 Workspace">
+              <header>
+                <strong>Workspace</strong>
+                <small>{workspacesLoading ? "正在刷新…" : `${workspaces.length} 个可用位置`}</small>
+              </header>
+              {workspaces.length > 0 ? (
+                <ul>
+                  {workspaces.map((workspace) => {
+                    const state = projectWorkspaceActionState(workspace, {
+                      currentWorkspaceId,
+                      busy: busy || Boolean(workspaceAction),
+                      loading: workspacesLoading,
+                    });
+                    return (
+                      <li key={workspace.id}>
+                        <div>
+                          <strong>{workspace.label || "Workspace"}</strong>
+                          <small>
+                            {workspace.branch || (workspace.isGit ? "分离 HEAD" : "本地文件夹")}
+                            {workspace.head ? ` · ${workspace.head.slice(0, 8)}` : ""}
+                          </small>
+                          <span>
+                            {state.current ? "当前会话" : `${workspace.conversationCount ?? 0} 个会话`}
+                            {workspace.dirty ? " · 有未提交修改" : ""}
+                          </span>
+                        </div>
+                        {!state.current ? (
+                          <button
+                            type="button"
+                            disabled={state.open.disabled}
+                            title={state.open.reason ?? undefined}
+                            onClick={() => onCreateConversationInWorkspace?.(workspace)}
+                          >
+                            {workspaceAction === `conversation:${workspace.id}` ? "正在创建" : "在此新建会话"}
+                          </button>
+                        ) : null}
+                        {!workspace.isMain && workspace.kind === "git_worktree" ? (
+                          <button
+                            className="is-danger"
+                            type="button"
+                            disabled={state.remove.disabled}
+                            title={state.remove.reason ?? undefined}
+                            aria-label={`删除 Workspace ${workspace.label || workspace.branch || ""}`}
+                            onClick={() => onRemoveWorkspace?.(workspace)}
+                          >
+                            <Trash size={13} aria-hidden="true" />
+                          </button>
+                        ) : null}
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <p>{workspacesLoading ? "正在读取 Workspace…" : "当前没有可显示的 Workspace。"}</p>
+              )}
+              {workspaceError ? <p className="is-error">{workspaceError}</p> : null}
+              {workspaces.find((workspace) => workspace.id === currentWorkspaceId)?.isGit ? (
+                <button
+                  className="project-session-workspace-create"
+                  type="button"
+                  disabled={busy || workspacesLoading || Boolean(workspaceAction)}
+                  onClick={() => onCreateWorktreeConversation?.(
+                    workspaces.find((workspace) => workspace.id === currentWorkspaceId),
+                  )}
+                >
+                  <Plus size={14} aria-hidden="true" />
+                  {workspaceAction === "create" ? "正在创建" : "从当前 HEAD 新建 Workspace 会话"}
+                </button>
+              ) : null}
+            </section>
+          ) : null}
 
           {groups.length > 0 ? (
             <ol className="project-session-path-turns">
