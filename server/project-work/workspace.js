@@ -14,7 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
-import { constants } from "node:fs";
+import { constants, createReadStream } from "node:fs";
 import { createTwoFilesPatch, diffLines } from "diff";
 import { projectWorkError } from "./errors.js";
 
@@ -34,6 +34,8 @@ const FILTERED_DIRECTORIES = new Set([
   ".git-worktrees",
   ".pi",
   ".agents",
+  ".build",
+  ".gradle",
   ".codex",
   ".pi-agent",
   ".pi-worktrees",
@@ -41,6 +43,8 @@ const FILTERED_DIRECTORIES = new Set([
   ".worktree",
   ".worktrees",
   "node_modules",
+  "build",
+  "target",
   "venv",
 ]);
 const FILTERED_FILE_NAMES = new Set([
@@ -507,6 +511,40 @@ async function createProjectTreeReader(root) {
       )).values()];
     },
   };
+}
+
+async function hashWorkspaceFile(entry) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(entry.target)) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex");
+}
+
+export async function getProjectWorkspaceRevision(root) {
+  const reader = await createProjectTreeReader(root);
+  const pending = [""];
+  const hash = createHash("sha256");
+  hash.update("pi-agent-workspace-revision-v1\0");
+  while (pending.length > 0) {
+    const directory = pending.shift();
+    const entries = (await reader.list(directory)).sort(compareTreeEntries);
+    for (const entry of entries) {
+      hash.update(entry.type);
+      hash.update("\0");
+      hash.update(entry.path);
+      hash.update("\0");
+      hash.update(String(entry.stat.mode & 0o777));
+      hash.update("\0");
+      if (entry.type === "directory") {
+        pending.push(entry.path);
+      } else {
+        hash.update(await hashWorkspaceFile(entry));
+        hash.update("\0");
+      }
+    }
+  }
+  return `sha256:${hash.digest("hex")}`;
 }
 
 async function createOverlayTreeReader({ projectRoot, workspaceRoot }) {

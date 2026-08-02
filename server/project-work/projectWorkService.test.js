@@ -20,6 +20,7 @@ import {
   aggregateProjectWorkUsage,
   createProjectWorkService,
 } from "./projectWorkService.js";
+import { legacyConversationTitleFromMessage } from "./conversationTitle.js";
 import { applySelectedChangeSet } from "./workspace.js";
 
 function incrementalId(prefix = "test") {
@@ -1052,6 +1053,158 @@ function createAbortToolSessionFactory() {
       dispose() {
         releasePrompt?.();
       },
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createSubagentProgressSessionFactory() {
+  const sessions = [];
+  const factory = async (options) => {
+    let subscriber = null;
+    const record = { prompts: [] };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      setActiveToolsByName(names) {
+        return [...names];
+      },
+      async prompt(prompt) {
+        record.prompts.push(prompt);
+        const currentPath = path.join(options.workspaceRoot, "src", "app.js");
+        const progress = [{
+          index: 0,
+          status: "completed",
+          currentTool: "read_file",
+          currentPath,
+          currentToolArgs: {
+            prompt: "raw child prompt must stay private",
+            apiKey: "sk-subagent-private-secret",
+          },
+          toolCount: 3,
+          turnCount: 2,
+          tokens: 42,
+          durationMs: 1_500,
+        }, {
+          index: 1,
+          status: "failed",
+          currentTool: "search_files",
+          currentPath: path.join(options.workspaceRoot, "src"),
+          currentToolArgs: {
+            query: "private query must stay private",
+          },
+          toolCount: 5,
+          turnCount: 4,
+          tokens: 64,
+          durationMs: 2_500,
+        }];
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({ type: "turn_start" });
+        subscriber?.({
+          type: "tool_execution_start",
+          toolCallId: "raw-subagent-tool-call-id",
+          toolName: "subagent",
+          args: {
+            agent: "internal-security-auditor",
+            tasks: [{
+              task: "raw child prompt must stay private",
+              cwd: "/Users/private/source-tree",
+            }, {
+              task: "second raw child prompt must stay private",
+              cwd: "/Users/private/other-tree",
+            }],
+          },
+        });
+        subscriber?.({
+          type: "tool_execution_update",
+          toolCallId: "raw-subagent-tool-call-id",
+          toolName: "subagent",
+          args: {
+            agent: "internal-security-auditor",
+            task: "raw child prompt must stay private",
+          },
+          partialResult: {
+            content: [{
+              type: "text",
+              text: "raw progress content sk-subagent-private-secret",
+            }],
+            details: {
+              totalSteps: 2,
+              progress,
+            },
+          },
+        });
+        subscriber?.({
+          type: "tool_execution_end",
+          toolCallId: "raw-subagent-tool-call-id",
+          toolName: "subagent",
+          isError: false,
+          args: {
+            agent: "internal-security-auditor",
+            task: "raw child prompt must stay private",
+          },
+          result: {
+            content: [{
+              type: "text",
+              text: "raw result content sk-subagent-private-secret",
+            }],
+            details: {
+              totalSteps: 2,
+              progress,
+              results: [{
+                exitCode: 0,
+                finalOutput: "1/2 succeeded === Task 1: internal-security-auditor === 已核对 src/app.js 的导出结构",
+                usage: { turns: 2, input: 30, output: 12 },
+                progressSummary: {
+                  toolCount: 3,
+                  tokens: 42,
+                  durationMs: 1_500,
+                },
+              }, {
+                exitCode: 1,
+                timedOut: true,
+                error: "检查超时于 /Users/private/source-tree，sk-subagent-private-secret",
+                usage: { turns: 4, input: 50, output: 14 },
+                progressSummary: {
+                  toolCount: 5,
+                  tokens: 64,
+                  durationMs: 2_500,
+                },
+              }],
+            },
+          },
+        });
+        subscriber?.({
+          type: "message_start",
+          message: { role: "assistant" },
+        });
+        subscriber?.({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "并行检查已结束。" }],
+            stopReason: "stop",
+          },
+        });
+        subscriber?.({ type: "turn_end" });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        subscriber?.({ type: "agent_settled" });
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
     };
     record.host = host;
     sessions.push(record);
@@ -4502,6 +4655,120 @@ test("stopping a parent turn records its interrupted subagent as stopped instead
   assert.doesNotMatch(JSON.stringify(completed), /Users\/private\/project/);
 });
 
+test("subagent events persist public progress while excluding private prompts and runtime details", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-events-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await writeFile(
+    path.join(projectRoot, "src", "app.js"),
+    "export const ready = true;\n",
+  );
+  const service = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createSubagentProgressSessionFactory(),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("subagent-events"),
+  });
+  t.after(() => service.dispose());
+
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, { text: "并行核对两个实现点" });
+  const snapshot = await eventually(
+    () => service.getConversation(conversation.id),
+    (value) => value.events.some((event) => (
+      event.type === "tool.completed" && event.data.name === "subagent"
+    )),
+    "subagent completion event was not persisted",
+  );
+  const toolEvents = snapshot.events.filter((event) => (
+    event.data?.name === "subagent"
+  ));
+
+  assert.deepEqual(
+    toolEvents.map((event) => event.type),
+    ["tool.started", "tool.progress", "tool.completed"],
+  );
+  assert.equal(new Set(toolEvents.map((event) => event.data.callId)).size, 1);
+  assert.match(toolEvents[0].data.callId, /^subagent-[a-f0-9]{16}$/u);
+  assert.equal(toolEvents[0].data.subagentRun.status, "running");
+  assert.equal(toolEvents[0].data.subagentRun.task, "并行项目检查（2 项）");
+
+  const progressChildren = toolEvents[1].data.subagentRun.children;
+  assert.deepEqual(progressChildren.map((child) => ({
+    task: child.task,
+    status: child.status,
+    currentTool: child.currentTool,
+    currentPath: child.currentPath,
+    toolCount: child.toolCount,
+    turnCount: child.turnCount,
+    tokens: child.tokens,
+    durationMs: child.durationMs,
+  })), [{
+    task: "并行检查项 1",
+    status: "completed",
+    currentTool: "read_file",
+    currentPath: "src/app.js",
+    toolCount: 3,
+    turnCount: 2,
+    tokens: 42,
+    durationMs: 1_500,
+  }, {
+    task: "并行检查项 2",
+    status: "failed",
+    currentTool: "search_files",
+    currentPath: "src",
+    toolCount: 5,
+    turnCount: 4,
+    tokens: 64,
+    durationMs: 2_500,
+  }]);
+
+  const completedRun = toolEvents[2].data.subagentRun;
+  assert.equal(completedRun.status, "timed_out");
+  assert.equal(completedRun.summary, "1/2 项已完成");
+  assert.equal(completedRun.children[0].status, "completed");
+  assert.equal(
+    completedRun.children[0].summary,
+    "1/2 个子任务已完成 子任务 1：已核对 src/app.js 的导出结构",
+  );
+  assert.equal(completedRun.children[1].status, "timed_out");
+  assert.match(completedRun.children[1].error, /^检查超时于 /u);
+  assert.deepEqual({
+    toolCount: completedRun.children[1].toolCount,
+    turnCount: completedRun.children[1].turnCount,
+    tokens: completedRun.children[1].tokens,
+    durationMs: completedRun.children[1].durationMs,
+  }, {
+    toolCount: 5,
+    turnCount: 4,
+    tokens: 64,
+    durationMs: 2_500,
+  });
+
+  const persisted = JSON.stringify(toolEvents);
+  for (const privateValue of [
+    "raw child prompt must stay private",
+    "second raw child prompt must stay private",
+    "private query must stay private",
+    "raw progress content",
+    "raw result content",
+    "sk-subagent-private-secret",
+    "internal-security-auditor",
+    "raw-subagent-tool-call-id",
+    "/Users/private/source-tree",
+    "/Users/private/other-tree",
+    "currentToolArgs",
+  ]) {
+    assert.doesNotMatch(persisted, new RegExp(privateValue));
+  }
+});
+
 test("queued follow-ups survive a service restart even when the active turn cannot resume", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-follow-up-restore-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
@@ -6200,7 +6467,10 @@ test("real project-work chain binds context and changes, applies by hash, and pr
   assert.equal(failed.status, "failed");
   assert.equal(failed.exitCode, 1);
   const afterFailedVerification = await service.getConversation(conversation.id);
-  assert.equal(afterFailedVerification.conversation.status, "applied");
+  assert.equal(
+    afterFailedVerification.conversation.status,
+    "verification_failed",
+  );
   assert.equal(afterFailedVerification.conversation.lastError, null);
   assert.equal(runnerCalls.length, 2);
   const canonicalStorageRoot = await realpath(storageRoot);
@@ -8452,13 +8722,14 @@ test("the first explicit message derives a short title without overriding a user
     (snapshot) => snapshot.conversation.status === "awaiting_confirmation",
     "automatic-title conversation did not settle",
   );
-  const expectedTitle = task
-    .normalize("NFKC")
-    .trim()
-    .replaceAll(/\s+/g, " ")
-    .slice(0, 48);
-  assert.equal(automaticSettled.conversation.title, expectedTitle);
-  assert.ok(automaticSettled.conversation.title.length <= 48);
+  assert.equal(
+    automaticSettled.conversation.title,
+    "修复登录设置保存问题",
+  );
+  assert.notEqual(
+    automaticSettled.conversation.title,
+    legacyConversationTitleFromMessage(task),
+  );
 
   const userNamed = await service.createConversation(project.id);
   await service.renameConversation(project.id, userNamed.id, {
@@ -8476,6 +8747,63 @@ test("the first explicit message derives a short title without overriding a user
     sessionFactory.sessions.map((session) => session.prompts.length),
     [1, 1],
   );
+});
+
+test("legacy automatic prompt prefixes migrate without spending a model call or reordering the conversation", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-conversation-title-migration-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "国别智枢");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), "project\n", "utf8");
+  const firstSessionFactory = createFakeSessionFactory();
+  const firstService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: firstSessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("legacy-title"),
+  });
+
+  const selection = await firstService.pickProjectRoot({ mode: "existing" });
+  const project = await firstService.registerProject({ selectionId: selection.selectionId });
+  const conversation = await firstService.createConversation(project.id);
+  const task = "理解一下这个项目和我们这个MVP架构对齐一下，不要修改我们的项目，然后给我讲解一下这个DRAWIO";
+  await firstService.sendMessage(conversation.id, { text: task });
+  await eventually(
+    () => firstService.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status === "awaiting_confirmation",
+    "legacy-title seed conversation did not settle",
+  );
+  await firstService.dispose();
+
+  const statePath = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+    "conversation.json",
+  );
+  const legacyRecord = JSON.parse(await readFile(statePath, "utf8"));
+  legacyRecord.title = legacyConversationTitleFromMessage(task);
+  delete legacyRecord.titleOrigin;
+  const originalUpdatedAt = legacyRecord.updatedAt;
+  await writeFile(statePath, `${JSON.stringify(legacyRecord, null, 2)}\n`, "utf8");
+
+  const secondSessionFactory = createFakeSessionFactory();
+  const secondService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: secondSessionFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("migrated-title"),
+  });
+  t.after(() => secondService.dispose());
+
+  const listed = await secondService.listConversations(project.id);
+  assert.equal(listed.find((item) => item.id === conversation.id)?.title, "对齐国别智枢与 MVP 架构");
+  assert.equal(secondSessionFactory.sessions.length, 0);
+  const migratedRecord = JSON.parse(await readFile(statePath, "utf8"));
+  assert.equal(migratedRecord.title, "对齐国别智枢与 MVP 架构");
+  assert.equal(migratedRecord.titleOrigin, "prompt");
+  assert.equal(migratedRecord.updatedAt, originalUpdatedAt);
 });
 
 test("deleting a running conversation is rejected without aborting it", async (t) => {

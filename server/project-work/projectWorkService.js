@@ -46,6 +46,7 @@ import {
   PROJECT_WORK_DEFAULT_TOOL_NAMES,
   PROJECT_WORK_PREVIEW_TOOL_NAME,
   PROJECT_WORK_REPAIR_TOOL_NAMES,
+  PROJECT_WORK_SUBAGENT_TOOL_NAME,
   readProjectWorkOverlayTextFile,
 } from "./piSessionHost.js";
 import { createProjectPreviewSupervisor } from "./previewSupervisor.js";
@@ -62,6 +63,10 @@ import {
   projectWorkAttachmentManifestPrompt,
 } from "./projectWorkAttachments.js";
 import {
+  deriveConversationTitle,
+  legacyTitleNeedsMigration,
+} from "./conversationTitle.js";
+import {
   CODEX_IMAGE_MODEL_ID,
   CODEX_IMAGE_PROVIDER_ID,
   generateCodexSubscriptionImage,
@@ -75,9 +80,17 @@ import {
 } from "./officeArtifacts.js";
 
 import { createProjectRegistry, publicProject } from "./projectRegistry.js";
+import {
+  createWorkspaceRegistry,
+  publicWorkspace,
+} from "./workspaceRegistry.js";
 import { createSkillPackageService } from "./skillPackageService.js";
 import { normalizeTurnUsage } from "./turnEvidence.js";
 import { createVerificationRunner } from "./verificationRunner.js";
+import {
+  createWorkspaceRunSupervisor,
+  validateWorkspaceRunCommand,
+} from "./workspaceRunSupervisor.js";
 import {
   createVerificationProjectSnapshot,
 } from "./verificationWorkspace.js";
@@ -91,6 +104,7 @@ import {
   createFilteredProjectSnapshot,
   getProjectFileTree,
   getProjectOverlayFileTree,
+  getProjectWorkspaceRevision,
   normalizeProjectPath,
   readBoundFileState,
   readProjectImageFile,
@@ -1287,6 +1301,27 @@ function compactText(value, maxLength, fallback = "") {
   return normalized.slice(0, maxLength) || fallback;
 }
 
+function publicPersistedProjectWorkError(error) {
+  const code = compactText(error?.code, 120);
+  if (!/^PROJECT_(?:WORK|WORKSPACE)_[A-Z0-9_]+$/u.test(code)) {
+    return safeProjectWorkError(error);
+  }
+  const message = compactText(
+    error?.message,
+    300,
+    "项目工作操作失败",
+  )
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/giu, "Bearer <redacted>")
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_-]{8,}|github_pat_[A-Za-z0-9_-]{8,}|npm_[A-Za-z0-9]{20,}|xox[a-z]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{16})\b/giu, "<redacted>")
+    .replace(/\/(?:Users|home|private|var|tmp|Volumes)\/[^\s，。；：、"']+/gu, "<workspace>")
+    .replace(/[A-Za-z]:\\[^\s，。；：、"']+/gu, "<workspace>");
+  return {
+    code,
+    message,
+    retryable: error?.retryable === true,
+  };
+}
+
 function structuredId(value, label) {
   const id = String(value ?? "").trim();
   if (!STRUCTURED_ID_PATTERN.test(id)) {
@@ -1551,14 +1586,6 @@ function conversationTitle(value) {
   return normalized;
 }
 
-function conversationTitleFromMessage(value) {
-  return String(value ?? "")
-    .normalize("NFKC")
-    .trim()
-    .replaceAll(/\s+/g, " ")
-    .slice(0, 48) || DEFAULT_CONVERSATION_TITLE;
-}
-
 function conversationWorkType(conversation) {
   return conversation?.workType === WORKER_WORK_TYPE
     ? WORKER_WORK_TYPE
@@ -1623,20 +1650,35 @@ function conversationWorkspaceKind(conversation) {
 
 function normalizedWorkspaceRecord(conversation, at = null) {
   const conversationKind = conversationWorkspaceKind(conversation);
-  const kind = conversationKind === "scratch" ? "scratch" : "sparse_overlay";
-  const recoverableIsolation = ["scratch", "sparse_overlay"].includes(kind);
+  const directWorkspace = conversation.runtimeMode === "workspace-v2";
+  const kind = directWorkspace
+    ? conversationKind === "scratch" ? "private_scratch" : "project_root"
+    : conversationKind === "scratch" ? "scratch" : "sparse_overlay";
+  const recoverableIsolation = directWorkspace
+    ? true
+    : ["scratch", "sparse_overlay"].includes(kind);
   const defaults = {
     schemaVersion: 1,
-    id: `workspace-${conversation.id}`,
+    id: compactText(conversation.workspaceId, 180)
+      || `workspace-${conversation.id}`,
     kind,
-    isolation: kind === "scratch" ? "private_scratch" : "review_overlay",
-    recovery: "apply_journal_v1",
+    isolation: directWorkspace ? "persistent_workspace" : kind === "scratch"
+      ? "private_scratch"
+      : "review_overlay",
+    recovery: directWorkspace
+      ? "workspace_write_journal_v1"
+      : "apply_journal_v1",
     recoverableIsolation,
     automaticApplyAllowed: recoverableIsolation,
     status: "ready",
-    rootLabel: kind === "scratch"
+    rootLabel: conversationKind === "scratch"
       ? STANDALONE_ROOT_LABEL
       : compactText(conversation.rootLabel, 160) || null,
+    isMain: conversation.workspace?.isMain !== false,
+    isGit: conversation.workspace?.isGit === true,
+    branch: compactText(conversation.workspace?.branch, 240) || null,
+    head: compactText(conversation.workspace?.head, 80) || null,
+    dirty: conversation.workspace?.dirty === true,
     revision: 1,
     createdAt: conversation.createdAt ?? at,
     updatedAt: conversation.createdAt ?? at,
@@ -1645,13 +1687,22 @@ function normalizedWorkspaceRecord(conversation, at = null) {
   if (!source || typeof source !== "object" || Array.isArray(source)) {
     return defaults;
   }
-  const sourceMatchesKind = source.kind === kind;
+  const sourceMatchesKind = source.kind === kind
+    || (directWorkspace && ["project_root", "git_worktree", "private_scratch"]
+      .includes(source.kind));
   const status = sourceMatchesKind
     && ["ready", "recovering", "recovery_blocked"].includes(source.status)
     ? source.status
     : "ready";
   return {
     ...defaults,
+    kind: sourceMatchesKind ? source.kind : defaults.kind,
+    id: compactText(source.id, 180) || defaults.id,
+    isMain: source.isMain !== false,
+    isGit: source.isGit === true,
+    branch: compactText(source.branch, 240) || null,
+    head: compactText(source.head, 80) || null,
+    dirty: source.dirty === true,
     recoverableIsolation,
     automaticApplyAllowed: recoverableIsolation && status === "ready",
     status,
@@ -1752,6 +1803,7 @@ function publicConversationSummary(conversation) {
       ? compactText(conversation.sourceProjectLabel, 160) || null
       : null,
     workspaceKind,
+    workspace: publicWorkspaceRecord(conversation),
     scope: workspaceKind === "scratch" ? "standalone" : "project",
     rootLabel: workspaceKind === "scratch"
       ? STANDALONE_ROOT_LABEL
@@ -1879,6 +1931,73 @@ function publicConversationState(conversation, lastEventSeq, {
     activeChangeSet: conversation.activeChangeSet
       ? structuredClone(conversation.activeChangeSet)
       : null,
+    workspaceWrites: (conversation.workspaceWrites ?? [])
+      .slice(-100)
+      .map((write) => ({
+        id: compactText(write.id, 180),
+        turnId: compactText(write.turnId, 180) || null,
+        toolCallId: compactText(write.toolCallId, 180) || null,
+        path: compactText(write.path, 500),
+        operation: ["create", "update"].includes(write.operation)
+          ? write.operation
+          : "update",
+        status: ["pending", "written", "cancelled", "stale", "failed", "undone"]
+          .includes(write.status)
+          ? write.status
+          : "failed",
+        approvalMode: write.approvalMode === "auto_review"
+          ? "auto_review"
+          : "manual_review",
+        baseHash: compactText(write.baseHash, 80) || null,
+        afterHash: compactText(write.afterHash, 80) || null,
+        patch: compactText(write.patch, 64_000),
+        createdAt: compactText(write.createdAt, 80) || null,
+        completedAt: compactText(write.completedAt, 80) || null,
+        undo: write.undo && typeof write.undo === "object"
+          ? {
+              status: ["available", "used", "blocked"].includes(write.undo.status)
+                ? write.undo.status
+                : "blocked",
+              hash: compactText(write.undo.hash, 80) || null,
+              usedAt: compactText(write.undo.usedAt, 80) || null,
+            }
+          : null,
+        error: write.error ? publicPersistedProjectWorkError(write.error) : null,
+      })),
+    workspaceRuns: (conversation.workspaceRuns ?? [])
+      .slice(-100)
+      .map((run) => ({
+        id: compactText(run.id, 180),
+        runId: compactText(run.runId, 180) || null,
+        turnId: compactText(run.turnId, 180) || null,
+        kind: run.kind === "custom" ? "custom" : "verification",
+        status: [
+          "requested",
+          "queued",
+          "running",
+          "succeeded",
+          "failed",
+          "cancelled",
+          "interrupted",
+        ].includes(run.status) ? run.status : "failed",
+        executable: compactText(run.executable, 2_048),
+        argv: Array.isArray(run.argv)
+          ? run.argv.slice(0, 256).map((value) => compactText(value, 16_384))
+          : [],
+        relativeCwd: compactText(run.relativeCwd, 2_048) || ".",
+        purpose: compactText(run.purpose, 240) || null,
+        requestHash: SHA256_PATTERN.test(String(run.requestHash ?? ""))
+          ? run.requestHash
+          : null,
+        exitCode: Number.isInteger(run.exitCode) ? run.exitCode : null,
+        durationMs: Number.isFinite(run.durationMs) ? run.durationMs : null,
+        output: compactText(run.output, 64_000),
+        truncated: run.truncated === true,
+        createdAt: compactText(run.createdAt, 80) || null,
+        startedAt: compactText(run.startedAt, 80) || null,
+        completedAt: compactText(run.completedAt, 80) || null,
+        error: run.error ? publicPersistedProjectWorkError(run.error) : null,
+      })),
     verifications: (conversation.verifications ?? [])
       .map(publicVerification)
       .filter(Boolean),
@@ -2548,6 +2667,7 @@ export function aggregateProjectWorkUsage({
 export function createProjectWorkService({
   storageRoot = resolveProjectWorkStorageRoot(),
   sessionFactory,
+  workspaceRuntimeMode = sessionFactory ? "overlay-v1" : "workspace-v2",
   documentParser = defaultDocumentParser(),
   documentPollIntervalMs = defaultDocumentPollInterval(),
   documentMaxPollAttempts = defaultDocumentMaxPollAttempts(
@@ -2560,12 +2680,14 @@ export function createProjectWorkService({
   gitCloseoutService,
   picker = createMacOSProjectPicker(),
   runner = createVerificationRunner(),
+  runSupervisor,
   verificationOutputCompactor = createVerificationOutputCompactor(),
   imageGenerator = generateCodexSubscriptionImage,
   wordArtifactGenerator = generateWordArtifact,
   excelArtifactGenerator = generateExcelArtifact,
   officeArtifactProbe = probeOfficeArtifactRuntime,
   previewSupervisor = createProjectPreviewSupervisor(),
+  workspaceRegistry,
   browserQaService,
   skillPackageService,
   onLifecycleEvent,
@@ -2575,6 +2697,8 @@ export function createProjectWorkService({
   const configuredStorageRoot = path.resolve(storageRoot);
   const effectiveGitCloseoutService = gitCloseoutService
     ?? createGitCloseoutService({ storageRoot: configuredStorageRoot });
+  const effectiveRunSupervisor = runSupervisor
+    ?? createWorkspaceRunSupervisor({ storageRoot: configuredStorageRoot });
   const effectiveBrowserQaService = browserQaService
     ?? createPreviewBrowserQaService({ previewSupervisor });
   const effectiveSkillPackageService = skillPackageService
@@ -2617,6 +2741,12 @@ export function createProjectWorkService({
     now,
     idFactory,
   });
+  const effectiveWorkspaceRegistry = workspaceRegistry
+    ?? createWorkspaceRegistry({
+      storageRoot: configuredStorageRoot,
+      now,
+      idFactory,
+    });
   const conversationStore = createConversationStore({
     storageRoot: configuredStorageRoot,
   });
@@ -2626,11 +2756,13 @@ export function createProjectWorkService({
   const conversationOperationClaims = new Map();
   const blockedOverlayRecoveryRuns = new Map();
   const verificationControllers = new Map();
+  const activeWorkspaceRunRequests = new Set();
   const browserQaRuns = new Map();
   const browserQaProjectRuns = new Map();
   const applyQueues = new Map();
   const followUpMutationQueues = new Map();
   const askUserWaiters = new Map();
+  const workspaceWriteWaiters = new Map();
   const autoReviewSettlements = new Set();
   const deletingConversations = new Set();
   const deletingProjects = new Set();
@@ -2802,6 +2934,10 @@ export function createProjectWorkService({
     return now().toISOString();
   }
 
+  async function workspaceRevision(workspaceRoot) {
+    return getProjectWorkspaceRevision(workspaceRoot);
+  }
+
   function assertActive() {
     if (disposed) throw new Error("project work service is disposed");
   }
@@ -2951,9 +3087,25 @@ export function createProjectWorkService({
     const workspaceKind = conversationWorkspaceKind(conversation);
     if (workspaceKind === "bound_project") {
       const project = await registry.get(conversation.projectId);
+      if (conversation.runtimeMode === "workspace-v2") {
+        const workspace = await effectiveWorkspaceRegistry.resolveWorkspace({
+          project,
+          workspaceId: conversation.workspaceId,
+        });
+        return {
+          workspaceKind,
+          projectRoot: workspace.rootPath,
+          sourceProjectRoot: project.rootPath,
+          workspaceRoot: workspace.rootPath,
+          rootLabel: conversation.rootLabel ?? project.rootLabel,
+          workspace,
+          lockKey: `workspace:${workspace.id}`,
+        };
+      }
       return {
         workspaceKind,
         projectRoot: project.rootPath,
+        workspaceRoot: project.rootPath,
         rootLabel: conversation.rootLabel ?? project.rootLabel,
         lockKey: `project:${project.id}`,
       };
@@ -2989,8 +3141,12 @@ export function createProjectWorkService({
     return {
       workspaceKind,
       projectRoot: canonicalRoot,
+      workspaceRoot: canonicalRoot,
       rootLabel: STANDALONE_ROOT_LABEL,
-      lockKey: `conversation:${conversation.id}`,
+      lockKey: conversation.runtimeMode === "workspace-v2"
+        ? `workspace:${compactText(conversation.workspaceId, 180)
+          || `workspace-${conversation.id}`}`
+        : `conversation:${conversation.id}`,
     };
   }
 
@@ -3037,7 +3193,7 @@ export function createProjectWorkService({
       [paths.scratchRoot, "<workspace>"],
       [paths.directory, "<workspace>"],
       [
-        workspace.projectRoot,
+        workspace.workspaceRoot,
         workspace.workspaceKind === "scratch" ? "<workspace>" : "<project>",
       ],
       [configuredStorageRoot, "<workspace>"],
@@ -3239,6 +3395,7 @@ export function createProjectWorkService({
     if (
       BUSY_CONVERSATION_STATUSES.has(status)
       || status === "awaiting_user"
+      || status === "awaiting_confirmation"
     ) {
       return false;
     }
@@ -3261,6 +3418,9 @@ export function createProjectWorkService({
   }
 
   function pendingReviewArtifactId(current) {
+    if ((current.workspaceWrites ?? []).some((write) => write.status === "pending")) {
+      return "changes";
+    }
     if (
       current.activeChangeSet?.status === "ready"
       && Array.isArray(current.activeChangeSet.files)
@@ -3274,6 +3434,9 @@ export function createProjectWorkService({
     if (hasPendingVerificationReview(current)) {
       return "run_result";
     }
+    if ((current.workspaceRuns ?? []).some((run) => run.status === "requested")) {
+      return "run_result";
+    }
     if (
       current.preview?.status === "requested"
       && current.preview.executionPolicyMode === "manual_review"
@@ -3284,9 +3447,59 @@ export function createProjectWorkService({
   }
 
   function stableStatusAfterOperation(current, resumeStatus = "idle") {
+    if (
+      current.status === "recovery_blocked"
+      || durableCheckpointRecovery(current)?.status === "recovery_blocked"
+      || (current.applyJournal ?? []).some(
+        (record) => record.status === "recovery_blocked",
+      )
+      || (current.gitCloseouts ?? []).some(
+        (record) => record.status === "recovery_blocked",
+      )
+    ) {
+      return "recovery_blocked";
+    }
+    if (
+      current.status === "awaiting_user"
+      || (current.askUserRequests ?? []).some(
+        (request) => request.status === "pending",
+      )
+    ) {
+      return "awaiting_user";
+    }
     if (pendingReviewArtifactId(current)) {
       return "awaiting_confirmation";
     }
+    const latestVerificationByRequest = new Map();
+    for (const verification of current.verifications ?? []) {
+      if (
+        typeof verification.commandId === "string"
+        && ["passed", "failed", "aborted", "interrupted"].includes(
+          verification.status,
+        )
+      ) {
+        latestVerificationByRequest.set(
+          verification.commandId,
+          verification.status,
+        );
+      }
+    }
+    if ([...latestVerificationByRequest.values()].includes("interrupted")) {
+      return "interrupted";
+    }
+    if ([...latestVerificationByRequest.values()].includes("failed")) {
+      return "verification_failed";
+    }
+    const latestWorkspaceRun = [...(current.workspaceRuns ?? [])]
+      .reverse()
+      .find((run) => [
+        "succeeded",
+        "failed",
+        "cancelled",
+        "interrupted",
+      ].includes(run.status));
+    if (latestWorkspaceRun?.status === "interrupted") return "interrupted";
+    if (latestWorkspaceRun?.status === "failed") return "verification_failed";
     if (
       typeof resumeStatus === "string"
       && !BUSY_CONVERSATION_STATUSES.has(resumeStatus)
@@ -3719,6 +3932,463 @@ export function createProjectWorkService({
     return normalized;
   }
 
+  function workspaceWritePayloadDirectory(conversationId, writeId) {
+    return path.join(
+      conversationPaths(conversationId).directory,
+      "workspace-writes",
+      writeId,
+    );
+  }
+
+  async function writeWorkspacePayloadOnce(targetPath, content) {
+    try {
+      await writeFile(targetPath, content, { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      const existing = await readFile(targetPath);
+      if (sha256(existing) !== sha256(content)) {
+        throw projectWorkError(
+          "PROJECT_WORKSPACE_WRITE_PAYLOAD_CONFLICT",
+          "Workspace 写入恢复数据与当前请求不一致",
+          409,
+          true,
+        );
+      }
+    }
+  }
+
+  function waitForWorkspaceWrite(key) {
+    return new Promise((resolve) => {
+      const waiting = workspaceWriteWaiters.get(key) ?? [];
+      waiting.push(resolve);
+      workspaceWriteWaiters.set(key, waiting);
+    });
+  }
+
+  function settleWorkspaceWriteWaiters(key, result) {
+    const waiting = workspaceWriteWaiters.get(key) ?? [];
+    workspaceWriteWaiters.delete(key);
+    for (const resolve of waiting) resolve(result);
+  }
+
+  async function buildWorkspaceChangeSet(conversationId, turnId) {
+    const conversation = await conversationStore.get(conversationId);
+    const writes = (conversation.workspaceWrites ?? []).filter((write) => (
+      write.turnId === turnId && write.status === "written"
+    ));
+    const latestByPath = new Map();
+    for (const write of writes) {
+      const current = latestByPath.get(write.path);
+      latestByPath.set(write.path, current
+        ? {
+            ...write,
+            baseExists: current.baseExists,
+            baseHash: current.baseHash,
+            baseMode: current.baseMode,
+            patch: [current.patch, write.patch].filter(Boolean).join("\n"),
+          }
+        : write);
+    }
+    const files = [...latestByPath.values()]
+      .sort((left, right) => left.path.localeCompare(right.path))
+      .map((write) => ({
+        id: `workspace-file-${createHash("sha256")
+          .update(`${write.path}:${write.baseHash ?? "missing"}:${write.afterHash}`)
+          .digest("hex")
+          .slice(0, 24)}`,
+        path: write.path,
+        operation: write.baseExists ? "update" : "create",
+        patch: write.patch,
+        baseHash: write.baseHash,
+        afterHash: write.afterHash,
+        baseMode: write.baseMode,
+        afterMode: write.afterMode,
+        selected: true,
+        actionable: false,
+      }));
+    const hash = sha256(Buffer.from(JSON.stringify(files.map((file) => ({
+      path: file.path,
+      baseHash: file.baseHash,
+      afterHash: file.afterHash,
+    })))));
+    return {
+      id: `workspace-change-${turnId}`,
+      hash,
+      status: files.length > 0 ? "applied" : "clean",
+      workspaceDirect: true,
+      files,
+      stats: {
+        files: files.length,
+        additions: files.filter((file) => file.operation === "create").length,
+        deletions: 0,
+      },
+      turnId,
+      workflowId: null,
+      createdAt: writes[0]?.createdAt ?? timestamp(),
+      appliedAt: writes.at(-1)?.completedAt ?? timestamp(),
+    };
+  }
+
+  async function commitWorkspaceWriteUnlocked(conversationId, writeId) {
+    const conversation = await conversationStore.get(conversationId);
+    const write = (conversation.workspaceWrites ?? []).find(
+      (item) => item.id === writeId,
+    );
+    if (!write) {
+      throw projectWorkError(
+        "PROJECT_WORKSPACE_WRITE_NOT_FOUND",
+        "待确认的 Workspace 写入不存在",
+        404,
+      );
+    }
+    if (write.status === "written") return write;
+    if (write.status !== "pending") {
+      throw projectWorkError(
+        "PROJECT_WORKSPACE_WRITE_NOT_PENDING",
+        "Workspace 写入已经处理",
+        409,
+      );
+    }
+    const workspace = await resolveConversationWorkspace(conversation);
+    const payloadDirectory = workspaceWritePayloadDirectory(
+      conversationId,
+      writeId,
+    );
+    const content = await readFile(path.join(payloadDirectory, "after.txt"));
+    if (sha256(content) !== write.afterHash) {
+      throw projectWorkError(
+        "PROJECT_WORKSPACE_WRITE_PAYLOAD_CORRUPT",
+        "Workspace 写入内容未通过哈希校验",
+        409,
+      );
+    }
+    const current = await readBoundFileState(workspace.workspaceRoot, write.path);
+    const alreadyApplied = current.exists && current.hash === write.afterHash;
+    const baseMatches = write.baseExists
+      ? current.exists && current.hash === write.baseHash
+      : !current.exists;
+    if (!baseMatches && !alreadyApplied) {
+      const completedAt = timestamp();
+      const staleError = {
+        code: "PROJECT_WORKSPACE_WRITE_STALE",
+        message: "文件在确认前已经变化，请让 Agent 重新读取后再修改",
+        retryable: true,
+      };
+      await updateConversation(conversationId, (latest) => {
+        const workspaceWrites = (latest.workspaceWrites ?? []).map((item) => (
+          item.id === writeId
+            ? { ...item, status: "stale", completedAt, error: staleError }
+            : item
+        ));
+        return {
+          workspaceWrites,
+          status: stableStatusAfterOperation(
+            { ...latest, workspaceWrites },
+            "running",
+          ),
+        };
+      });
+      await appendEvent(conversationId, "workspace_write.stale", {
+        id: writeId,
+        path: write.path,
+        status: "stale",
+        artifactId: "changes",
+      });
+      throw projectWorkError(
+        staleError.code,
+        staleError.message,
+        409,
+        true,
+      );
+    }
+    if (!alreadyApplied) {
+      await applyBoundFileTransitions({
+        root: workspace.workspaceRoot,
+        transitions: [{
+          path: write.path,
+          expectedHash: write.baseHash,
+          targetBuffer: content,
+          targetHash: write.afterHash,
+          targetMode: write.afterMode,
+        }],
+      });
+    }
+    const readBack = await readBoundFileState(workspace.workspaceRoot, write.path);
+    if (!readBack.exists || readBack.hash !== write.afterHash) {
+      throw projectWorkError(
+        "PROJECT_WORKSPACE_WRITE_READBACK_FAILED",
+        "Workspace 写入未通过读回校验",
+        409,
+        true,
+      );
+    }
+    const completedAt = timestamp();
+    let completedWrite;
+    await updateConversation(conversationId, (latest) => {
+      completedWrite = {
+        ...write,
+        status: "written",
+        completedAt,
+        error: null,
+        undo: {
+          status: "available",
+          hash: sha256({
+            schemaVersion: 1,
+            conversationId,
+            writeId,
+            path: write.path,
+            baseHash: write.baseHash,
+            afterHash: write.afterHash,
+          }),
+          usedAt: null,
+        },
+      };
+      return {
+        status: latest.status === "awaiting_confirmation"
+          ? "running"
+          : latest.status,
+        workspace: {
+          ...normalizedWorkspaceRecord(latest, completedAt),
+          dirty: true,
+          revision: normalizedWorkspaceRecord(latest, completedAt).revision + 1,
+          updatedAt: completedAt,
+        },
+        workspaceWrites: (latest.workspaceWrites ?? []).map((item) => (
+          item.id === writeId ? completedWrite : item
+        )),
+      };
+    });
+    const changeSet = await buildWorkspaceChangeSet(
+      conversationId,
+      write.turnId,
+    );
+    await updateConversation(conversationId, { activeChangeSet: changeSet });
+    await appendEvent(conversationId, "workspace_write.completed", {
+      id: writeId,
+      turnId: write.turnId,
+      path: write.path,
+      status: "written",
+      baseHash: write.baseHash,
+      afterHash: write.afterHash,
+      artifactId: "changes",
+    });
+    return completedWrite;
+  }
+
+  async function commitWorkspaceWrite(conversationId, writeId) {
+    const conversation = await conversationStore.get(conversationId);
+    const workspace = await resolveConversationWorkspace(conversation);
+    return withApplyLock(workspace.lockKey, () => (
+      commitWorkspaceWriteUnlocked(conversationId, writeId)
+    ));
+  }
+
+  async function recordWorkspaceWrite(
+    conversationId,
+    request,
+    turnSettings,
+  ) {
+    if (
+      turnSettings?.workType !== PROJECT_WORK_TYPE
+      || turnSettings?.workflowId
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORKSPACE_WRITE_FORBIDDEN",
+        "当前只读工作流不能写入 Workspace",
+        403,
+      );
+    }
+    const normalizedPath = normalizeProjectPath(request?.path);
+    const content = Buffer.from(String(request?.content ?? ""), "utf8");
+    const afterHash = sha256(content);
+    if (afterHash !== request?.afterHash) {
+      throw projectWorkError(
+        "PROJECT_WORKSPACE_WRITE_INVALID",
+        "Workspace 写入内容与预览哈希不一致",
+        400,
+      );
+    }
+    const writeId = `workspace-write-${createHash("sha256")
+      .update(`${conversationId}:${turnSettings.turnId}:${request.toolCallId}`)
+      .digest("hex")
+      .slice(0, 32)}`;
+    const existingConversation = await conversationStore.get(conversationId);
+    const existing = (existingConversation.workspaceWrites ?? []).find(
+      (item) => item.id === writeId,
+    );
+    if (existing && existing.status !== "pending") return existing;
+    const payloadDirectory = workspaceWritePayloadDirectory(
+      conversationId,
+      writeId,
+    );
+    if (!existing) {
+      await mkdir(payloadDirectory, { recursive: true, mode: 0o700 });
+      const workspace = await resolveConversationWorkspace(existingConversation);
+      const current = await readBoundFileState(workspace.workspaceRoot, normalizedPath);
+      const baseMatches = request.baseExists
+        ? current.exists && current.hash === request.baseHash
+        : !current.exists;
+      if (!baseMatches) {
+        throw projectWorkError(
+          "PROJECT_WORKSPACE_WRITE_STALE",
+          "文件在修改准备期间已经变化，请重新读取后再修改",
+          409,
+          true,
+        );
+      }
+      if (current.exists) {
+        await writeWorkspacePayloadOnce(
+          path.join(payloadDirectory, "before.txt"),
+          current.buffer,
+        );
+      }
+      await writeWorkspacePayloadOnce(
+        path.join(payloadDirectory, "after.txt"),
+        content,
+      );
+      const createdAt = timestamp();
+      let autoDecision = null;
+      if (turnSettings.executionPolicyMode === "auto_review") {
+        const lineCount = (value) => (
+          value.length === 0 ? 0 : value.toString("utf8").split("\n").length
+        );
+        autoDecision = reviewAutoChangeSet({
+          id: writeId,
+          status: "ready",
+          files: [{
+            path: normalizedPath,
+            operation: request.operation === "create" ? "create" : "modify",
+            baseHash: request.baseExists ? request.baseHash : null,
+            afterHash,
+          }],
+          stats: {
+            additions: lineCount(content),
+            deletions: current.exists ? lineCount(current.buffer) : 0,
+          },
+        }, {
+          workflowId: turnSettings.workflowId,
+        });
+      }
+      const approvalMode = autoDecision?.decision === "allow"
+        ? "auto_review"
+        : "manual_review";
+      const pending = {
+        id: writeId,
+        turnId: turnSettings.turnId,
+        toolCallId: compactText(request.toolCallId, 180),
+        path: normalizedPath,
+        operation: request.operation === "create" ? "create" : "update",
+        status: "pending",
+        approvalMode,
+        baseExists: request.baseExists === true,
+        baseHash: compactText(request.baseHash, 80) || null,
+        baseMode: Number.isInteger(request.baseMode) ? request.baseMode : null,
+        afterHash,
+        afterMode: Number.isInteger(request.afterMode) ? request.afterMode : 0o600,
+        patch: compactText(request.patch, 64_000),
+        createdAt,
+        completedAt: null,
+        error: null,
+      };
+      await updateConversation(conversationId, (currentConversation) => ({
+        status: approvalMode === "manual_review"
+          ? "awaiting_confirmation"
+          : currentConversation.status,
+        workspaceWrites: [
+          ...(currentConversation.workspaceWrites ?? []).slice(-199),
+          pending,
+        ],
+      }));
+      await appendEvent(conversationId, "workspace_write.requested", {
+        id: writeId,
+        turnId: turnSettings.turnId,
+        path: normalizedPath,
+        operation: pending.operation,
+        status: "pending",
+        approvalMode,
+        baseHash: pending.baseHash,
+        afterHash,
+        patch: pending.patch,
+        artifactId: "changes",
+      });
+      if (autoDecision) {
+        await recordAutoReviewDecision(
+          conversationId,
+          "workspace_write",
+          writeId,
+          autoDecision,
+          turnSettings,
+        );
+      }
+      if (approvalMode === "auto_review") {
+        return commitWorkspaceWrite(conversationId, writeId);
+      }
+    }
+    return waitForWorkspaceWrite(`${conversationId}:${writeId}`);
+  }
+
+  async function confirmWorkspaceWrite(conversationId, writeId) {
+    const key = `${conversationId}:${writeId}`;
+    let write;
+    try {
+      write = await commitWorkspaceWrite(conversationId, writeId);
+    } catch (error) {
+      settleWorkspaceWriteWaiters(key, {
+        id: writeId,
+        status: error?.code === "PROJECT_WORKSPACE_WRITE_STALE"
+          ? "stale"
+          : "failed",
+      });
+      throw error;
+    }
+    settleWorkspaceWriteWaiters(key, write);
+    return snapshot(conversationId);
+  }
+
+  async function cancelWorkspaceWrite(conversationId, writeId) {
+    const completedAt = timestamp();
+    let cancelled;
+    await updateConversation(conversationId, (current) => {
+      const write = (current.workspaceWrites ?? []).find(
+        (item) => item.id === writeId,
+      );
+      if (!write) {
+        throw projectWorkError(
+          "PROJECT_WORKSPACE_WRITE_NOT_FOUND",
+          "待确认的 Workspace 写入不存在",
+          404,
+        );
+      }
+      if (write.status !== "pending") {
+        throw projectWorkError(
+          "PROJECT_WORKSPACE_WRITE_NOT_PENDING",
+          "Workspace 写入已经处理",
+          409,
+        );
+      }
+      cancelled = {
+        ...write,
+        status: "cancelled",
+        completedAt,
+      };
+      return {
+        status: "running",
+        workspaceWrites: (current.workspaceWrites ?? []).map((item) => (
+          item.id === writeId ? cancelled : item
+        )),
+      };
+    });
+    await appendEvent(conversationId, "workspace_write.cancelled", {
+      id: writeId,
+      path: cancelled.path,
+      status: "cancelled",
+      artifactId: "changes",
+    });
+    const key = `${conversationId}:${writeId}`;
+    settleWorkspaceWriteWaiters(key, cancelled);
+    return snapshot(conversationId);
+  }
+
   async function recordVerificationRequest(
     conversationId,
     request,
@@ -3779,7 +4449,7 @@ export function createProjectWorkService({
     const workspace = await resolveConversationWorkspace(conversation);
     const paths = conversationPaths(conversationId);
     const workspaceRoots = {
-      projectRoot: workspace.projectRoot,
+      projectRoot: workspace.workspaceRoot,
       baseRoot: paths.baseRoot,
       workspaceRoot: paths.workspaceRoot,
     };
@@ -3809,11 +4479,16 @@ export function createProjectWorkService({
       recipeId: request.recipeId,
       cwd: request.cwd ?? "",
       readTextFile: async (filePath) => (
-        readProjectWorkOverlayTextFile({
-          ...workspaceRoots,
-          filePath,
-          endLine: Number.MAX_SAFE_INTEGER,
-        })
+        conversation.runtimeMode === "workspace-v2"
+          ? readProjectTextFile(workspace.workspaceRoot, {
+              filePath,
+              endLine: Number.MAX_SAFE_INTEGER,
+            })
+          : readProjectWorkOverlayTextFile({
+              ...workspaceRoots,
+              filePath,
+              endLine: Number.MAX_SAFE_INTEGER,
+            })
       ).then((result) => result.content),
     });
     const normalized = {
@@ -3876,6 +4551,418 @@ export function createProjectWorkService({
       checks: verification.checks,
     });
     return verification;
+  }
+
+  async function recordWorkspaceCommandRequest(
+    conversationId,
+    request,
+    turnSettings,
+  ) {
+    if (turnSettings?.workflowId || turnSettings?.workType !== PROJECT_WORK_TYPE) {
+      throw projectWorkError(
+        "PROJECT_WORKSPACE_COMMAND_FORBIDDEN",
+        "当前只读工作流不能创建 Workspace 运行请求",
+        403,
+      );
+    }
+    if (
+      !request
+      || typeof request !== "object"
+      || Array.isArray(request)
+      || Object.keys(request).some(
+        (field) => !["executable", "argv", "cwd", "purpose"].includes(field),
+      )
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORKSPACE_COMMAND_INVALID",
+        "Workspace 运行请求包含未受控字段",
+        400,
+      );
+    }
+    const conversation = await conversationStore.get(conversationId);
+    if (conversation.runtimeMode !== "workspace-v2") {
+      throw projectWorkError(
+        "PROJECT_WORKSPACE_COMMAND_UNAVAILABLE",
+        "旧工作会话需要迁移到真实 Workspace 后才能运行命令",
+        409,
+        true,
+      );
+    }
+    const command = validateWorkspaceRunCommand({
+      file: request.executable,
+      args: request.argv,
+    });
+    const safeExecutable = await sanitizeForConversation(
+      conversationId,
+      command.file,
+    );
+    if (safeExecutable !== command.file) {
+      throw projectWorkError(
+        "PROJECT_WORKSPACE_COMMAND_INVALID",
+        "自定义命令不能包含本机绝对路径",
+        400,
+      );
+    }
+    const relativeCwd = normalizeProjectPath(request.cwd ?? "", {
+      allowEmpty: true,
+    }) || ".";
+    const workspace = await resolveConversationWorkspace(conversation);
+    await resolveVerificationCwd(
+      workspace.workspaceRoot,
+      relativeCwd === "." ? "" : relativeCwd,
+    );
+    const revision = await workspaceRevision(workspace.workspaceRoot);
+    const id = `workspace-command-${idFactory()}`;
+    const requestHash = sha256({
+      schemaVersion: 1,
+      conversationId,
+      workspaceId: conversation.workspaceId,
+      executable: command.file,
+      argv: command.args,
+      relativeCwd,
+      workspaceRevision: revision,
+    });
+    const record = {
+      schemaVersion: 1,
+      id,
+      runId: null,
+      turnId: compactText(turnSettings.turnId, 180) || null,
+      kind: "custom",
+      status: "requested",
+      executable: command.file,
+      argv: command.args,
+      relativeCwd,
+      purpose: compactText(request.purpose, 240) || "运行项目命令",
+      workspaceRevision: revision,
+      requestHash,
+      exitCode: null,
+      durationMs: null,
+      output: "",
+      truncated: false,
+      createdAt: timestamp(),
+      startedAt: null,
+      completedAt: null,
+      error: null,
+    };
+    await updateConversation(conversationId, (current) => ({
+      status: "awaiting_confirmation",
+      workspaceRuns: [...(current.workspaceRuns ?? []).slice(-199), record],
+    }));
+    await appendEvent(conversationId, "workspace_run.requested", {
+      id,
+      turnId: record.turnId,
+      status: record.status,
+      executable: record.executable,
+      argv: record.argv,
+      relativeCwd,
+      purpose: record.purpose,
+      requestHash,
+      artifactId: "run_result",
+    });
+    return record;
+  }
+
+  async function collectWorkspaceRunOutput(runId) {
+    let afterSeq = 0;
+    const stdout = [];
+    const stderr = [];
+    while (true) {
+      const page = await effectiveRunSupervisor.snapshot(runId, {
+        afterSeq,
+        limit: 1_000,
+      });
+      for (const event of page.events) {
+        if (event.type !== "chunk") continue;
+        (event.stream === "stderr" ? stderr : stdout).push(event.text);
+      }
+      afterSeq = page.nextSeq;
+      if (!page.hasMore) break;
+    }
+    return { stdout: stdout.join(""), stderr: stderr.join("") };
+  }
+
+  async function executeQueuedWorkspaceRun(conversationId, requestId) {
+    activeWorkspaceRunRequests.add(conversationId);
+    try {
+      const initial = await conversationStore.get(conversationId);
+      const workspace = await resolveConversationWorkspace(initial);
+      return await withApplyLock(workspace.lockKey, async () => {
+      let conversation = await conversationStore.get(conversationId);
+      const request = (conversation.workspaceRuns ?? []).find(
+        (run) => run.id === requestId,
+      );
+      if (!request || request.status !== "queued") return null;
+      const currentRevision = await workspaceRevision(workspace.workspaceRoot);
+      if (currentRevision !== request.workspaceRevision) {
+        const completedAt = timestamp();
+        await updateConversation(conversationId, (current) => ({
+          status: stableStatusAfterOperation({
+            ...current,
+            workspaceRuns: (current.workspaceRuns ?? []).map((run) => (
+              run.id === requestId
+                ? {
+                    ...run,
+                    status: "failed",
+                    completedAt,
+                    error: {
+                      code: "PROJECT_WORKSPACE_COMMAND_STALE",
+                      message: "Workspace 已变化，请重新读取并创建运行请求",
+                      retryable: true,
+                    },
+                  }
+                : run
+            )),
+          }),
+          workspaceRuns: (current.workspaceRuns ?? []).map((run) => (
+            run.id === requestId
+              ? {
+                  ...run,
+                  status: "failed",
+                  completedAt,
+                  error: {
+                    code: "PROJECT_WORKSPACE_COMMAND_STALE",
+                    message: "Workspace 已变化，请重新读取并创建运行请求",
+                    retryable: true,
+                  },
+                }
+              : run
+          )),
+        }));
+        await appendEvent(conversationId, "workspace_run.completed", {
+          id: requestId,
+          status: "failed",
+          errorCode: "PROJECT_WORKSPACE_COMMAND_STALE",
+          artifactId: "run_result",
+        });
+        return null;
+      }
+      let started;
+      try {
+        started = await effectiveRunSupervisor.start({
+          workspaceId: conversation.workspaceId,
+          workspaceRoot: workspace.workspaceRoot,
+          file: request.executable,
+          args: request.argv,
+          cwd: request.relativeCwd,
+          metadata: { kind: "custom" },
+        });
+      } catch (error) {
+        const completedAt = timestamp();
+        const safeError = safeProjectWorkError(error);
+        await updateConversation(conversationId, (current) => {
+          const workspaceRuns = (current.workspaceRuns ?? []).map((run) => (
+            run.id === requestId
+              ? { ...run, status: "failed", completedAt, error: safeError }
+              : run
+          ));
+          return {
+            workspaceRuns,
+            status: stableStatusAfterOperation({ ...current, workspaceRuns }),
+          };
+        });
+        await appendEvent(conversationId, "workspace_run.completed", {
+          id: requestId,
+          status: "failed",
+          errorCode: safeError.code,
+          artifactId: "run_result",
+        });
+        return null;
+      }
+      await updateConversation(conversationId, (current) => ({
+        status: "verifying",
+        workspaceRuns: (current.workspaceRuns ?? []).map((run) => (
+          run.id === requestId
+            ? {
+                ...run,
+                runId: started.run.id,
+                status: "running",
+                startedAt: started.run.startedAt ?? timestamp(),
+              }
+            : run
+        )),
+      }));
+      await appendEvent(conversationId, "workspace_run.started", {
+        id: requestId,
+        runId: started.run.id,
+        status: "running",
+        artifactId: "run_result",
+      });
+      const completed = await started.completion;
+      const streams = await collectWorkspaceRunOutput(started.run.id);
+      const status = completed.status;
+      const output = await sanitizeForConversation(
+        conversationId,
+        [streams.stdout, streams.stderr].filter(Boolean).join("\n\n"),
+      );
+      const completedAt = completed.completedAt ?? timestamp();
+      let settled;
+      await updateConversation(conversationId, (current) => {
+        const workspaceRuns = (current.workspaceRuns ?? []).map((run) => (
+          run.id === requestId
+            ? {
+                ...run,
+                status,
+                exitCode: completed.exitCode,
+                durationMs: completed.durationMs,
+                output,
+                truncated: completed.output?.truncated === true,
+                completedAt,
+                error: completed.error
+                  ? {
+                      code: "PROJECT_WORKSPACE_COMMAND_FAILED",
+                      message: compactText(completed.error, 500),
+                      retryable: false,
+                    }
+                  : null,
+              }
+            : run
+        ));
+        settled = {
+          workspaceRuns,
+          status: stableStatusAfterOperation({ ...current, workspaceRuns }),
+        };
+        return settled;
+      });
+      await appendEvent(conversationId, "workspace_run.completed", {
+        id: requestId,
+        runId: started.run.id,
+        status,
+        exitCode: completed.exitCode,
+        durationMs: completed.durationMs,
+        truncated: completed.output?.truncated === true,
+        artifactId: "run_result",
+      });
+      await appendEvent(conversationId, "agent.status", {
+        status: settled.status,
+        artifactId: "run_result",
+      });
+        return completed;
+      });
+    } finally {
+      activeWorkspaceRunRequests.delete(conversationId);
+    }
+  }
+
+  async function confirmWorkspaceRun(conversationId, requestId, {
+    requestHash,
+  } = {}) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    let queued;
+    await updateConversation(conversationId, (current) => {
+      assertProjectWorkConversation(current);
+      const request = (current.workspaceRuns ?? []).find(
+        (run) => run.id === requestId,
+      );
+      if (!request || request.status !== "requested") {
+        throw projectWorkError(
+          "PROJECT_WORKSPACE_COMMAND_NOT_FOUND",
+          "可确认的 Workspace 运行请求不存在",
+          404,
+        );
+      }
+      if (!SHA256_PATTERN.test(String(requestHash ?? ""))
+        || requestHash !== request.requestHash) {
+        throw projectWorkError(
+          "PROJECT_WORKSPACE_COMMAND_BINDING_MISMATCH",
+          "Workspace 运行确认与当前精确请求不一致",
+          409,
+          true,
+        );
+      }
+      queued = { ...request, status: "queued" };
+      return {
+        status: "verifying",
+        workspaceRuns: (current.workspaceRuns ?? []).map((run) => (
+          run.id === requestId ? queued : run
+        )),
+      };
+    });
+    await appendEvent(conversationId, "workspace_run.queued", {
+      id: requestId,
+      status: "queued",
+      artifactId: "run_result",
+    });
+    void executeQueuedWorkspaceRun(conversationId, requestId).catch(async (error) => {
+      const safeError = safeProjectWorkError(error);
+      const completedAt = timestamp();
+      await updateConversation(conversationId, (current) => {
+        const workspaceRuns = (current.workspaceRuns ?? []).map((run) => (
+          run.id === requestId && ["queued", "running"].includes(run.status)
+            ? { ...run, status: "failed", completedAt, error: safeError }
+            : run
+        ));
+        return {
+          workspaceRuns,
+          status: stableStatusAfterOperation({ ...current, workspaceRuns }),
+        };
+      }).catch(() => undefined);
+      await appendEvent(conversationId, "workspace_run.completed", {
+        id: requestId,
+        status: "failed",
+        errorCode: safeError.code,
+        artifactId: "run_result",
+      }).catch(() => undefined);
+      await appendEvent(conversationId, "error", safeError).catch(() => undefined);
+    });
+    return snapshot(conversationId);
+  }
+
+  async function cancelWorkspaceRun(conversationId, requestId) {
+    assertActive();
+    const conversation = await conversationStore.get(conversationId);
+    assertProjectWorkConversation(conversation);
+    const request = (conversation.workspaceRuns ?? []).find(
+      (run) => run.id === requestId,
+    );
+    if (!request || !["requested", "queued", "running"].includes(request.status)) {
+      throw projectWorkError(
+        "PROJECT_WORKSPACE_COMMAND_NOT_FOUND",
+        "可停止的 Workspace 运行不存在",
+        404,
+      );
+    }
+    if (request.runId) {
+      await effectiveRunSupervisor.cancel(request.runId);
+    } else {
+      const completedAt = timestamp();
+      await updateConversation(conversationId, (current) => {
+        const workspaceRuns = (current.workspaceRuns ?? []).map((run) => (
+          run.id === requestId
+            ? { ...run, status: "cancelled", completedAt }
+            : run
+        ));
+        return {
+          workspaceRuns,
+          status: stableStatusAfterOperation({ ...current, workspaceRuns }),
+        };
+      });
+      await appendEvent(conversationId, "workspace_run.completed", {
+        id: requestId,
+        status: "cancelled",
+        artifactId: "run_result",
+      });
+    }
+    return snapshot(conversationId);
+  }
+
+  async function getWorkspaceRun(conversationId, runId, options = {}) {
+    assertActive();
+    const conversation = await conversationStore.get(conversationId);
+    assertProjectWorkConversation(conversation);
+    const ownsRun = (conversation.workspaceRuns ?? []).some(
+      (run) => run.runId === runId,
+    ) || (conversation.verifications ?? []).some(
+      (verification) => verification.workspaceRunId === runId,
+    );
+    if (!ownsRun) {
+      throw projectWorkError(
+        "PROJECT_WORK_RUN_NOT_FOUND",
+        "运行记录不存在",
+        404,
+      );
+    }
+    return effectiveRunSupervisor.snapshot(runId, options);
   }
 
   async function recordGitCloseoutRequest(
@@ -4005,7 +5092,7 @@ export function createProjectWorkService({
       );
     }
     const proposal = await effectiveGitCloseoutService.requestGitCloseout({
-      projectRoot: workspace.projectRoot,
+      projectRoot: workspace.workspaceRoot,
       conversationId,
       turnId,
       changeSetId: appliedChangeSet.id,
@@ -5179,6 +6266,15 @@ export function createProjectWorkService({
     turnFailure,
     options = {},
   ) {
+    const current = await conversationStore.get(conversationId);
+    if (current.runtimeMode === "workspace-v2") {
+      return blockFailedTurnState(conversationId, {
+        changeSet: null,
+        turnSettings,
+        turnFailure,
+        ...options,
+      });
+    }
     let failedChangeSet = null;
     if (!turnSettings.workflowId) {
       const candidate = await refreshChangeSet(
@@ -5325,13 +6421,15 @@ export function createProjectWorkService({
       detail: "正在启动受控本机预览",
     });
     try {
-      const conversation = await conversationStore.get(conversationId);
+      let conversation = await conversationStore.get(conversationId);
       const workspace = await resolveConversationWorkspace(conversation);
-      const started = await previewSupervisor.start({
-        key: conversationId,
-        projectRoot: workspace.projectRoot,
-        request: previewRequest,
-      });
+      const started = await withApplyLock(workspace.lockKey, () => (
+        previewSupervisor.start({
+          key: conversationId,
+          projectRoot: workspace.workspaceRoot,
+          request: previewRequest,
+        })
+      ));
       await updatePreviewRequest(conversationId, previewRequest.id, {
         status: "ready",
         url: started.url,
@@ -5959,6 +7057,64 @@ export function createProjectWorkService({
     }
   }
 
+  async function settleDirectWorkspace(runtime, changeSet, turnSettings) {
+    const conversationId = runtime.conversationId;
+    autoReviewSettlements.add(conversationId);
+    try {
+      const current = await conversationStore.get(conversationId);
+      const currentTurnVerifications = (current.verifications ?? []).filter(
+        (verification) => (
+          verification.status === "requested"
+          && typeof verification.recipeId === "string"
+          && verification.turnId === turnSettings.turnId
+          && verification.executionPolicyRevision
+            === turnSettings.executionPolicyRevision
+        ),
+      );
+      for (const verification of currentTurnVerifications) {
+        const decision = reviewAutoVerification(verification, {
+          workflowId: turnSettings.workflowId,
+          turnId: turnSettings.turnId,
+          isolated: true,
+        });
+        await recordAutoReviewDecision(
+          conversationId,
+          "verification",
+          verification.id,
+          decision,
+          turnSettings,
+        );
+        if (decision.decision === "allow") {
+          await runVerification(conversationId, {
+            requestId: verification.id,
+          }, {
+            autoReviewSettlement: true,
+            preserveConversationStatus: true,
+          });
+        } else {
+          await blockAutoVerification(
+            conversationId,
+            verification,
+            decision,
+          );
+        }
+      }
+      await settleAutoPreview(runtime, true, turnSettings);
+      return updateConversation(conversationId, (latest) => ({
+        activeChangeSet: changeSet.files.length > 0
+          ? changeSet
+          : latest.activeChangeSet,
+        status: stableStatusAfterOperation(
+          latest,
+          changeSet.files.length > 0 ? "applied" : "idle",
+        ),
+        lastError: null,
+      }));
+    } finally {
+      autoReviewSettlements.delete(conversationId);
+    }
+  }
+
   function queueRuntimeEvent(runtime, event) {
     runtime.eventQueue = runtime.eventQueue
       .catch(() => undefined)
@@ -6053,9 +7209,164 @@ export function createProjectWorkService({
     return true;
   }
 
+  function boundedSubagentMetric(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+  }
+
+  function publicSubagentStatus(progress, result, event) {
+    if (result?.timedOut === true) return "timed_out";
+    if (result?.stopped === true) return "stopped";
+    if (result?.interrupted === true || result?.detached === true) {
+      return "interrupted";
+    }
+    if (event.type === "tool_execution_end" && result) {
+      return result.exitCode === 0 ? "completed" : "failed";
+    }
+    if (progress?.status === "completed") return "completed";
+    if (progress?.status === "failed") return "failed";
+    if (progress?.status === "detached") return "interrupted";
+    if (progress?.status === "running") return "running";
+    return event.type === "tool_execution_start" ? "running" : "queued";
+  }
+
+  function publicSubagentPath(runtime, value) {
+    if (typeof value !== "string" || !value.trim()) return null;
+    let candidate = value.trim();
+    if (path.isAbsolute(candidate)) {
+      const relative = path.relative(runtime.workspaceRoot, candidate);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+        return null;
+      }
+      candidate = relative;
+    }
+    try {
+      return normalizeProjectPath(candidate);
+    } catch {
+      return null;
+    }
+  }
+
+  async function publicSubagentText(conversationId, value, maxLength) {
+    if (typeof value !== "string" || !value.trim()) return null;
+    const sanitized = await sanitizeForConversation(conversationId, value);
+    return redactPublicProgressSecrets(sanitized)
+      .replace(/\/(?:Users|home|private|var|tmp|Volumes)\/[^\s，。；：、"']+/gu, "<workspace>")
+      .replace(/[A-Za-z]:\\[^\s，。；：、"']+/gu, "<workspace>")
+      .replace(/\b(\d+)\/(\d+)\s+succeeded\b/giu, "$1/$2 个子任务已完成")
+      .replace(/===\s*Task\s+(\d+)\s*:\s*[^=\n]{1,160}\s*===\s*/giu, "子任务 $1：")
+      .replace(/===\s*Task\s+(\d+)\s*===\s*/giu, "子任务 $1：")
+      .replace(/\s+/gu, " ")
+      .trim()
+      .slice(0, maxLength) || null;
+  }
+
+  async function safeSubagentRun(runtime, event) {
+    const payload = event.type === "tool_execution_update"
+      ? event.partialResult
+      : event.type === "tool_execution_end"
+        ? event.result
+        : null;
+    const details = payload?.details && typeof payload.details === "object"
+      ? payload.details
+      : {};
+    const progressItems = Array.isArray(details.progress) ? details.progress : [];
+    const results = Array.isArray(details.results) ? details.results : [];
+    const requestedCount = Array.isArray(event.args?.tasks)
+      ? event.args.tasks.length
+      : event.args?.agent || event.args?.task
+        ? 1
+        : 0;
+    const indexedProgress = new Map(progressItems.map((item, arrayIndex) => [
+      Number.isSafeInteger(item?.index) && item.index >= 0 ? item.index : arrayIndex,
+      item,
+    ]));
+    const count = Math.max(
+      1,
+      requestedCount,
+      Number.isSafeInteger(details.totalSteps) ? details.totalSteps : 0,
+      progressItems.length,
+      results.length,
+    );
+    const forcedStatus = runtime.abortRequested === true
+      ? "aborted"
+      : event.type === "tool_execution_end" && event.isError === true
+        ? "failed"
+        : null;
+    const children = await Promise.all(Array.from({ length: count }, async (_, index) => {
+      const progress = indexedProgress.get(index) ?? progressItems[index] ?? null;
+      const result = results[index] ?? null;
+      const currentTool = typeof progress?.currentTool === "string"
+        && /^[A-Za-z0-9_.-]{1,80}$/u.test(progress.currentTool)
+        ? progress.currentTool
+        : null;
+      return {
+        index: index + 1,
+        task: count === 1 ? "只读项目检查" : `并行检查项 ${index + 1}`,
+        status: forcedStatus ?? publicSubagentStatus(progress, result, event),
+        currentTool,
+        currentPath: publicSubagentPath(runtime, progress?.currentPath),
+        toolCount: boundedSubagentMetric(
+          progress?.toolCount ?? result?.progressSummary?.toolCount,
+        ),
+        turnCount: boundedSubagentMetric(
+          progress?.turnCount ?? result?.usage?.turns,
+        ),
+        tokens: boundedSubagentMetric(
+          progress?.tokens
+            ?? result?.progressSummary?.tokens
+            ?? ((result?.usage?.input ?? 0) + (result?.usage?.output ?? 0)),
+        ),
+        durationMs: boundedSubagentMetric(
+          progress?.durationMs ?? result?.progressSummary?.durationMs,
+        ),
+        summary: event.type === "tool_execution_end"
+          ? await publicSubagentText(runtime.conversationId, result?.finalOutput, 300)
+          : null,
+        error: await publicSubagentText(
+          runtime.conversationId,
+          result?.error,
+          240,
+        ),
+        children: [],
+      };
+    }));
+    const statuses = new Set(children.map((child) => child.status));
+    const rootStatus = [
+      "running",
+      "timed_out",
+      "aborted",
+      "interrupted",
+      "stopped",
+      "failed",
+      "completed",
+      "queued",
+    ].find((status) => statuses.has(status)) ?? "queued";
+    const completedCount = children.filter(
+      (child) => child.status === "completed",
+    ).length;
+    return {
+      index: 1,
+      task: count === 1 ? "只读项目检查" : `并行项目检查（${count} 项）`,
+      status: rootStatus,
+      currentTool: count === 1 ? children[0].currentTool : null,
+      currentPath: count === 1 ? children[0].currentPath : null,
+      toolCount: count === 1 ? children[0].toolCount : null,
+      turnCount: count === 1 ? children[0].turnCount : null,
+      tokens: count === 1 ? children[0].tokens : null,
+      durationMs: count === 1 ? children[0].durationMs : null,
+      summary: `${completedCount}/${count} 项已完成`,
+      error: null,
+      children: count === 1 ? [] : children,
+    };
+  }
+
   async function safeToolData(runtime, event) {
+    const subagentTool = event.toolName === PROJECT_WORK_SUBAGENT_TOOL_NAME;
     const data = {
-      callId: compactText(event.toolCallId, 160),
+      callId: subagentTool && event.toolCallId
+        ? `subagent-${sha256(String(event.toolCallId)).slice(7, 23)}`
+        : compactText(event.toolCallId, 160),
       name: compactText(event.toolName, 80),
       turnId: compactText(runtime.activeTurnSettings?.turnId, 180) || null,
       attempt: Number.isSafeInteger(runtime.activeTurnSettings?.attempt)
@@ -6069,6 +7380,10 @@ export function createProjectWorkService({
       } catch {
         data.path = null;
       }
+    }
+    if (subagentTool) {
+      data.subagentRun = await safeSubagentRun(runtime, event);
+      data.status = data.subagentRun.status;
     }
     if (event.type === "tool_execution_end") {
       const attachmentTool = [
@@ -6093,7 +7408,9 @@ export function createProjectWorkService({
               : `已按需读取附件${attachmentDetails?.hasMore === true
                 ? "，仍有后续内容"
                 : "，已到文件末尾"}`
-          : extractMessageText({
+          : subagentTool
+            ? data.subagentRun?.summary
+            : extractMessageText({
               content: event.result?.content,
             });
       if (summary) {
@@ -6102,11 +7419,13 @@ export function createProjectWorkService({
           summary.slice(0, 500),
         );
       }
-      data.status = event.isError
-        ? runtime.abortRequested === true
-          ? "aborted"
-          : "failed"
-        : "completed";
+      if (!subagentTool) {
+        data.status = event.isError
+          ? runtime.abortRequested === true
+            ? "aborted"
+            : "failed"
+          : "completed";
+      }
     }
     return data;
   }
@@ -6329,15 +7648,37 @@ export function createProjectWorkService({
                 lastError: null,
               }));
             } else {
-              const changeSet = await refreshChangeSet(
-                conversationId,
-                turnSettings,
-              );
+              const directWorkspace = contextConversation.runtimeMode
+                === "workspace-v2";
+              const changeSet = directWorkspace
+                ? await buildWorkspaceChangeSet(
+                    conversationId,
+                    turnSettings.turnId,
+                  )
+                : await refreshChangeSet(
+                    conversationId,
+                    turnSettings,
+                  );
+              if (directWorkspace && changeSet.files.length > 0) {
+                await updateConversation(conversationId, {
+                  activeChangeSet: changeSet,
+                });
+              }
               settledConversation = turnSettings.executionPolicyMode
                 === "auto_review"
-                ? await settleAutoReview(runtime, changeSet, turnSettings)
+                ? directWorkspace
+                  ? await settleDirectWorkspace(runtime, changeSet, turnSettings)
+                  : await settleAutoReview(runtime, changeSet, turnSettings)
                 : await updateConversation(conversationId, (current) => ({
-                    status: stableStatusAfterOperation(current, "idle"),
+                    activeChangeSet: directWorkspace && changeSet.files.length > 0
+                      ? changeSet
+                      : current.activeChangeSet,
+                    status: stableStatusAfterOperation(
+                      current,
+                      directWorkspace && changeSet.files.length > 0
+                        ? "applied"
+                        : "idle",
+                    ),
                     lastError: null,
                   }));
             }
@@ -6679,6 +8020,13 @@ export function createProjectWorkService({
     const conversation = await conversationStore.get(conversationId);
     const paths = conversationPaths(conversationId);
     const workspace = await resolveConversationWorkspace(conversation);
+    const directWorkspace = conversation.runtimeMode === "workspace-v2";
+    const runtimeWorkspaceRoot = directWorkspace
+      ? workspace.workspaceRoot
+      : paths.workspaceRoot;
+    const runtimeBaseRoot = directWorkspace
+      ? workspace.workspaceRoot
+      : paths.baseRoot;
     let workspaceSnapshot = conversation.workspaceSnapshot ?? null;
     if (!workspaceSnapshot) {
       const existingEvents = await conversationStore.readEvents(conversationId, {
@@ -6697,8 +8045,8 @@ export function createProjectWorkService({
       conversationId,
       workType: conversationWorkType(conversation),
       defaultToolNames: defaultToolNamesForConversation(conversation),
-      projectRoot: workspace.projectRoot,
-      workspaceRoot: paths.workspaceRoot,
+      projectRoot: workspace.workspaceRoot,
+      workspaceRoot: runtimeWorkspaceRoot,
       eventQueue: Promise.resolve(),
       turnIndex: 0,
       activeAssistantId: null,
@@ -6727,14 +8075,16 @@ export function createProjectWorkService({
     };
     runtime.host = await effectiveSessionFactory({
       conversationId,
-      projectRoot: workspace.projectRoot,
-      baseRoot: paths.baseRoot,
-      workspaceRoot: paths.workspaceRoot,
+      projectRoot: workspace.workspaceRoot,
+      baseRoot: runtimeBaseRoot,
+      workspaceRoot: runtimeWorkspaceRoot,
+      legacyWorkspaceRoot: directWorkspace ? paths.workspaceRoot : null,
       sessionDir: paths.sessionDir,
       modelRef: conversation.modelRef,
       thinkingLevel: conversation.thinkingLevel,
       workspaceSnapshot,
       workspaceKind: workspace.workspaceKind,
+      directWorkspace,
       documentAccess: {
         list: () => documentService.listForAgent(conversationId),
         search: (request) => documentService.searchForAgent(
@@ -6774,7 +8124,17 @@ export function createProjectWorkService({
         progress,
         runtime.activeTurnSettings,
       ),
+      onWorkspaceWrite: (write) => recordWorkspaceWrite(
+        conversationId,
+        write,
+        runtime.activeTurnSettings,
+      ),
       onVerificationRequest: (request) => recordVerificationRequest(
+        conversationId,
+        request,
+        runtime.activeTurnSettings,
+      ),
+      onWorkspaceCommandRequest: (request) => recordWorkspaceCommandRequest(
         conversationId,
         request,
         runtime.activeTurnSettings,
@@ -6878,9 +8238,57 @@ export function createProjectWorkService({
       conversationId,
       conversation,
     );
+    const recoverableWorkspaceRuns = (conversation.workspaceRuns ?? []).filter(
+      (run) => ["queued", "running"].includes(run.status),
+    );
+    if (
+      recoverableWorkspaceRuns.length > 0
+      && !activeWorkspaceRunRequests.has(conversationId)
+    ) {
+      const interruptedAt = timestamp();
+      const interruptedIds = new Set(
+        recoverableWorkspaceRuns.map((run) => run.id),
+      );
+      conversation = await updateConversation(conversationId, (current) => {
+        const workspaceRuns = (current.workspaceRuns ?? []).map((run) => (
+          interruptedIds.has(run.id)
+            ? {
+                ...run,
+                status: "interrupted",
+                completedAt: interruptedAt,
+                error: {
+                  code: "PROJECT_WORKSPACE_RUN_INTERRUPTED",
+                  message: "运行服务恢复后无法确认原进程状态，本次命令未自动重跑",
+                  retryable: true,
+                },
+              }
+            : run
+        ));
+        return {
+          workspaceRuns,
+          status: stableStatusAfterOperation({ ...current, workspaceRuns }),
+        };
+      });
+      for (const run of recoverableWorkspaceRuns) {
+        await appendEvent(conversationId, "workspace_run.completed", {
+          id: run.id,
+          runId: run.runId ?? null,
+          status: "interrupted",
+          errorCode: "PROJECT_WORKSPACE_RUN_INTERRUPTED",
+          artifactId: "run_result",
+        });
+      }
+    }
+    const hasRecoverableVerification = (conversation.verifications ?? []).some(
+      (verification) => verification.status === "running",
+    ) || (conversation.operations ?? []).some((operation) => (
+      operation.type === "verification_repair"
+      && operation.status === "running"
+    ));
     if (
       conversation.status === "verifying"
       && !verificationControllers.has(conversationId)
+      && hasRecoverableVerification
     ) {
       const interruptedAt = timestamp();
       const runningVerification = (conversation.verifications ?? []).find(
@@ -6895,13 +8303,8 @@ export function createProjectWorkService({
       const runningRepairIds = new Set(
         runningRepairOperations.map((operation) => operation.id),
       );
-      conversation = await updateConversation(conversationId, (current) => ({
-        status: stableStatusAfterOperation(
-          current,
-          runningRepairOperations.at(-1)?.resumeStatus
-            ?? runningVerification?.resumeStatus,
-        ),
-        verifications: (current.verifications ?? []).map((verification) => (
+      conversation = await updateConversation(conversationId, (current) => {
+        const verifications = (current.verifications ?? []).map((verification) => (
           verification.status === "running"
             ? {
                 ...verification,
@@ -6909,8 +8312,15 @@ export function createProjectWorkService({
                 completedAt: interruptedAt,
               }
             : verification
-        )),
-        operations: (current.operations ?? []).map((operation) => (
+        ));
+        return {
+          status: stableStatusAfterOperation(
+            { ...current, verifications },
+            runningRepairOperations.at(-1)?.resumeStatus
+              ?? runningVerification?.resumeStatus,
+          ),
+          verifications,
+          operations: (current.operations ?? []).map((operation) => (
           runningRepairIds.has(operation.id)
             ? {
                 ...operation,
@@ -6923,9 +8333,10 @@ export function createProjectWorkService({
                 },
               }
             : operation
-        )),
-        lastError: null,
-      }));
+          )),
+          lastError: null,
+        };
+      });
       await appendEvent(conversationId, "verification.interrupted", {
         id: runningVerification?.id ?? null,
         commandId: runningVerification?.commandId ?? null,
@@ -7410,6 +8821,132 @@ export function createProjectWorkService({
     ));
   }
 
+  function workspaceConversationIsBusy(conversation) {
+    return BUSY_CONVERSATION_STATUSES.has(conversation.status)
+      || activeMessageClaims.has(conversation.id)
+      || conversationOperationClaims.has(conversation.id)
+      || Boolean(runtimes.get(conversation.id)?.completion)
+      || verificationControllers.has(conversation.id)
+      || browserQaRuns.has(conversation.id)
+      || autoReviewSettlements.has(conversation.id)
+      || (documentOperationCounts.get(conversation.id) ?? 0) > 0
+      || hasActiveConversationDocuments(conversation)
+      || (conversation.verifications ?? []).some(
+        (verification) => verification.status === "running",
+      );
+  }
+
+  async function projectWorkspaceUsage(projectId) {
+    const conversations = await conversationStore.list(projectId);
+    const conversationCounts = new Map();
+    const busyWorkspaceIds = new Set();
+    for (const conversation of conversations) {
+      const workspaceId = compactText(conversation.workspaceId, 180);
+      if (!workspaceId) continue;
+      conversationCounts.set(
+        workspaceId,
+        (conversationCounts.get(workspaceId) ?? 0) + 1,
+      );
+      if (workspaceConversationIsBusy(conversation)) {
+        busyWorkspaceIds.add(workspaceId);
+      }
+    }
+    for (const workspaceId of conversationCounts.keys()) {
+      if (applyQueues.has(`workspace:${workspaceId}`)) {
+        busyWorkspaceIds.add(workspaceId);
+      }
+    }
+    return { conversations, conversationCounts, busyWorkspaceIds };
+  }
+
+  async function listWorkspaces(projectId) {
+    assertActive();
+    const project = await registry.get(projectId);
+    const { conversationCounts, busyWorkspaceIds } = await projectWorkspaceUsage(
+      project.id,
+    );
+    return effectiveWorkspaceRegistry.list({
+      project,
+      conversationCounts,
+      busyWorkspaceIds,
+    });
+  }
+
+  async function createWorkspace(projectId, {
+    sourceWorkspaceId,
+    expectedHead,
+    branchName = null,
+    title = "task",
+    label = null,
+  } = {}) {
+    assertActive();
+    const project = await registry.get(projectId);
+    const source = await effectiveWorkspaceRegistry.resolveWorkspace({
+      project,
+      workspaceId: sourceWorkspaceId,
+    });
+    if (!source.isGit || !source.head) {
+      throw projectWorkError(
+        "PROJECT_WORK_WORKTREE_REQUIRES_GIT",
+        "只有 Git 项目可以创建 worktree",
+        409,
+      );
+    }
+    if (typeof expectedHead !== "string" || !expectedHead) {
+      throw projectWorkError(
+        "PROJECT_WORK_WORKTREE_CONFIRMATION_REQUIRED",
+        "创建 Workspace 前需要确认源 Workspace 的 HEAD",
+        400,
+      );
+    }
+    if (source.head !== expectedHead) {
+      throw projectWorkError(
+        "PROJECT_WORK_WORKTREE_STALE",
+        "源 Workspace 的 HEAD 已变化，请重新确认",
+        409,
+        true,
+      );
+    }
+    const { busyWorkspaceIds } = await projectWorkspaceUsage(project.id);
+    return effectiveWorkspaceRegistry.createWorktree({
+      project,
+      sourceWorkspaceId: source.id,
+      expectedHead,
+      branchName,
+      title,
+      label,
+      busy: busyWorkspaceIds.has(source.id),
+    });
+  }
+
+  async function removeWorkspace(projectId, workspaceId, {
+    expectedHead,
+  } = {}) {
+    assertActive();
+    const project = await registry.get(projectId);
+    const { conversationCounts, busyWorkspaceIds } = await projectWorkspaceUsage(
+      project.id,
+    );
+    if ((conversationCounts.get(workspaceId) ?? 0) > 0) {
+      throw projectWorkError(
+        "PROJECT_WORK_WORKSPACE_HAS_CONVERSATIONS",
+        "Workspace 仍绑定工作会话，不能删除",
+        409,
+      );
+    }
+    const workspace = await effectiveWorkspaceRegistry.removeWorktree({
+      project,
+      workspaceId,
+      expectedHead,
+      busy: busyWorkspaceIds.has(workspaceId)
+        || applyQueues.has(`workspace:${workspaceId}`),
+    });
+    return {
+      ...workspace,
+      removed: true,
+    };
+  }
+
   async function createConversationRecord({
     projectId,
     workspaceKind,
@@ -7426,6 +8963,8 @@ export function createProjectWorkService({
     sourceProjectId = null,
     sourceProjectLabel = null,
     forkPreparation = null,
+    workspaceId = null,
+    workspaceSummary = null,
   } = {}) {
     assertActive();
     if (![PROJECT_WORK_TYPE, WORKER_WORK_TYPE].includes(workType)) {
@@ -7478,12 +9017,18 @@ export function createProjectWorkService({
     );
     const conversationId = `conversation-${idFactory()}`;
     const paths = conversationPaths(conversationId);
+    const directWorkspace = workType === PROJECT_WORK_TYPE
+      && workspaceRuntimeMode === "workspace-v2";
     try {
       await mkdir(path.dirname(paths.directory), { recursive: true, mode: 0o700 });
       await mkdir(paths.directory, { recursive: false, mode: 0o700 });
       await Promise.all([
-        mkdir(paths.baseRoot, { recursive: false, mode: 0o700 }),
-        mkdir(paths.workspaceRoot, { recursive: false, mode: 0o700 }),
+        ...(!directWorkspace
+          ? [
+              mkdir(paths.baseRoot, { recursive: false, mode: 0o700 }),
+              mkdir(paths.workspaceRoot, { recursive: false, mode: 0o700 }),
+            ]
+          : []),
         mkdir(paths.sessionDir, { recursive: false, mode: 0o700 }),
         mkdir(paths.generatedArtifactsRoot, {
           recursive: false,
@@ -7509,8 +9054,12 @@ export function createProjectWorkService({
           ? compactText(sourceProjectLabel, 160) || null
           : null,
         workspaceKind,
+        runtimeMode: directWorkspace ? "workspace-v2" : "overlay-v1",
+        workspaceId: compactText(workspaceId, 180)
+          || `workspace-${conversationId}`,
         rootLabel,
         title: compactText(title, 160, DEFAULT_CONVERSATION_TITLE),
+        titleOrigin: compactText(title, 160) ? "assigned" : "default",
         status: "idle",
         providerId: selectedModel.providerId,
         modelId: selectedModel.modelId,
@@ -7568,14 +9117,18 @@ export function createProjectWorkService({
         applyJournal: [],
         workspaceSnapshot: {
           schemaVersion: 1,
-          rulesVersion: 2,
-          mode: workspaceKind === "scratch" ? "scratch" : "sparse_overlay",
+          rulesVersion: directWorkspace ? 3 : 2,
+          mode: directWorkspace
+            ? "real_workspace"
+            : workspaceKind === "scratch" ? "scratch" : "sparse_overlay",
           includedFiles: 0,
           includedBytes: 0,
           skippedBinaryFiles: 0,
           skippedOversizedFiles: 0,
           truncated: false,
         },
+        workspaceWrites: [],
+        workspaceRuns: [],
         contextUsage: defaultContextUsage(),
         compaction: defaultCompactionState(),
         readState: {
@@ -7589,7 +9142,19 @@ export function createProjectWorkService({
         updatedAt: createdAt,
       };
       initialConversation.workspace = normalizedWorkspaceRecord(
-        initialConversation,
+        {
+          ...initialConversation,
+          workspace: directWorkspace && workspaceSummary
+            ? {
+                ...workspaceSummary,
+                id: initialConversation.workspaceId,
+                status: "ready",
+                revision: 1,
+                createdAt,
+                updatedAt: createdAt,
+              }
+            : undefined,
+        },
         createdAt,
       );
       const conversation = await conversationStore.create(initialConversation);
@@ -7598,6 +9163,7 @@ export function createProjectWorkService({
         projectId,
         workType,
         workspaceKind,
+        workspaceId: initialConversation.workspaceId,
       });
       return publicConversationSummary(conversation);
     } catch (error) {
@@ -7638,6 +9204,22 @@ export function createProjectWorkService({
           true,
         );
       }
+      if (workspaceRuntimeMode === "workspace-v2") {
+        const selectedWorkspace = await effectiveWorkspaceRegistry.selectWorkspace({
+          project,
+          workspaceId: compactText(options.workspaceId, 180) || null,
+        });
+        return await createConversationRecord({
+          projectId: project.id,
+          workspaceKind: "bound_project",
+          rootLabel: project.rootLabel,
+        }, {
+          ...options,
+          workType: PROJECT_WORK_TYPE,
+          workspaceId: selectedWorkspace.id,
+          workspaceSummary: publicWorkspace(selectedWorkspace),
+        });
+      }
       return await createConversationRecord({
         projectId: project.id,
         workspaceKind: "bound_project",
@@ -7645,6 +9227,16 @@ export function createProjectWorkService({
       }, {
         ...options,
         workType: PROJECT_WORK_TYPE,
+        workspaceId: compactText(options.workspaceId, 180)
+          || `workspace-${project.id}-main`,
+        workspaceSummary: {
+          kind: "project_root",
+          isMain: true,
+          isGit: false,
+          branch: null,
+          head: null,
+          dirty: false,
+        },
       });
     } finally {
       const remaining = (conversationCreationCounts.get(project.id) ?? 1) - 1;
@@ -7663,6 +9255,14 @@ export function createProjectWorkService({
     }, {
       ...options,
       workType: PROJECT_WORK_TYPE,
+      workspaceSummary: {
+        kind: "private_scratch",
+        isMain: true,
+        isGit: false,
+        branch: null,
+        head: null,
+        dirty: false,
+      },
     });
   }
 
@@ -7756,25 +9356,51 @@ export function createProjectWorkService({
     );
   }
 
+  async function migrateLegacyConversationTitle(conversation) {
+    if (!legacyTitleNeedsMigration(conversation)) return conversation;
+    return conversationStore.update(conversation.id, (current) => {
+      if (!legacyTitleNeedsMigration(current)) return {};
+      const firstUserMessage = normalizedConversationMessages(current)
+        .find((message) => message.role === "user" && message.text);
+      return {
+        title: deriveConversationTitle({
+          text: firstUserMessage?.text,
+          contextLabel: conversationWorkType(current) === WORKER_WORK_TYPE
+            ? current.sourceProjectLabel
+            : current.rootLabel,
+          attachments: firstUserMessage?.attachments ?? [],
+          images: firstUserMessage?.images ?? [],
+          fallback: DEFAULT_CONVERSATION_TITLE,
+        }),
+        titleOrigin: "prompt",
+      };
+    });
+  }
+
+  async function migrateLegacyConversationTitles(conversations) {
+    return Promise.all(conversations.map(migrateLegacyConversationTitle));
+  }
+
   async function listConversations(projectId) {
     assertActive();
     await registry.get(projectId);
-    const conversations = await recoverInterruptedForkTargets(
+    const retained = await recoverInterruptedForkTargets(
       await conversationStore.list(projectId),
     );
+    const conversations = await migrateLegacyConversationTitles(retained);
     return conversations.map(publicConversationSummary);
   }
 
   async function listStandaloneConversations() {
     assertActive();
-    return (await conversationStore.list(null))
+    return (await migrateLegacyConversationTitles(await conversationStore.list(null)))
       .filter((conversation) => conversationWorkType(conversation) === PROJECT_WORK_TYPE)
       .map(publicConversationSummary);
   }
 
   async function listWorkerConversations() {
     assertActive();
-    return (await conversationStore.list(null))
+    return (await migrateLegacyConversationTitles(await conversationStore.list(null)))
       .filter((conversation) => conversationWorkType(conversation) === WORKER_WORK_TYPE)
       .map(publicConversationSummary);
   }
@@ -7783,6 +9409,7 @@ export function createProjectWorkService({
     assertActive();
     await recoverInterruptedForkTarget(conversationId);
     await recoverDurableCheckpointNavigation(conversationId);
+    await migrateLegacyConversationTitle(await conversationStore.get(conversationId));
     await awaitPublishedRuntimeSettlement(conversationId);
     const current = await snapshot(conversationId, options);
     if (
@@ -8026,14 +9653,19 @@ export function createProjectWorkService({
           400,
         );
       }
-      const file = await readProjectWorkOverlayTextFile({
-        projectRoot: workspace.projectRoot,
-        baseRoot: paths.baseRoot,
-        workspaceRoot: paths.workspaceRoot,
+      const readOptions = {
         filePath: item?.path,
         startLine: item?.startLine,
         endLine: item?.endLine,
-      }).catch((error) => {
+      };
+      const file = await (conversation.runtimeMode === "workspace-v2"
+        ? readProjectTextFile(workspace.workspaceRoot, readOptions)
+        : readProjectWorkOverlayTextFile({
+            projectRoot: workspace.workspaceRoot,
+            baseRoot: paths.baseRoot,
+            workspaceRoot: paths.workspaceRoot,
+            ...readOptions,
+          })).catch((error) => {
         if (error?.code !== "PROJECT_WORK_FILE_NOT_FOUND") throw error;
         throw projectWorkError(
           "PROJECT_WORK_CONTEXT_OUTSIDE_SNAPSHOT",
@@ -8592,14 +10224,25 @@ export function createProjectWorkService({
           messageId: userMessage.id,
         });
         claimInstalled = true;
+        const shouldDeriveTitle = (
+          current.title === DEFAULT_CONVERSATION_TITLE
+          && (current.messages ?? []).length === 0
+          && !["assigned", "manual"].includes(current.titleOrigin)
+        );
         return {
           ...selection,
-          title: (
-            current.title === DEFAULT_CONVERSATION_TITLE
-            && (current.messages ?? []).length === 0
-          )
-            ? conversationTitleFromMessage(messageText)
+          title: shouldDeriveTitle
+            ? deriveConversationTitle({
+                text: messageText,
+                contextLabel: conversationWorkType(current) === WORKER_WORK_TYPE
+                  ? current.sourceProjectLabel
+                  : current.rootLabel,
+                attachments: messageAttachments,
+                images: normalizedImages.map(({ metadata }) => metadata),
+                fallback: DEFAULT_CONVERSATION_TITLE,
+              })
             : current.title,
+          titleOrigin: shouldDeriveTitle ? "prompt" : current.titleOrigin,
           status: "running",
           plan: null,
           messages: [...(current.messages ?? []), userMessage],
@@ -9414,6 +11057,7 @@ export function createProjectWorkService({
           executionPolicyMode: normalizeExecutionPolicy(
             source.executionPolicy,
           ).mode,
+          workspaceId: source.workspaceId,
           forkPreparation: {
             sourceConversationId: conversationId,
             sourceCheckpointId: stableCheckpoint.checkpointId,
@@ -9423,10 +11067,18 @@ export function createProjectWorkService({
         });
         createdConversationId = targetSummary.id;
         const targetPaths = conversationPaths(createdConversationId);
+        const targetConversation = await conversationStore.get(
+          createdConversationId,
+        );
+        const targetWorkspace = await resolveConversationWorkspace(
+          targetConversation,
+        );
         const forkResult = await runtime.host.forkSessionFromCheckpoint(
           stableCheckpoint.piCheckpoint.assistantEntryId,
           {
-            targetWorkspaceRoot: targetPaths.workspaceRoot,
+            targetWorkspaceRoot: targetConversation.runtimeMode === "workspace-v2"
+              ? targetWorkspace.workspaceRoot
+              : targetPaths.workspaceRoot,
             targetSessionDir: targetPaths.sessionDir,
           },
         );
@@ -10189,13 +11841,14 @@ export function createProjectWorkService({
     const conversation = await conversationStore.get(conversationId);
     assertProjectWorkConversation(conversation);
     const workspace = await resolveConversationWorkspace(conversation);
-    const paths = conversationPaths(conversationId);
-    const file = await readProjectWorkOverlayTextFile({
-      ...options,
-      projectRoot: workspace.projectRoot,
-      baseRoot: paths.baseRoot,
-      workspaceRoot: paths.workspaceRoot,
-    });
+    const file = conversation.runtimeMode === "workspace-v2"
+      ? await readProjectTextFile(workspace.workspaceRoot, options)
+      : await readProjectWorkOverlayTextFile({
+          ...options,
+          projectRoot: workspace.workspaceRoot,
+          baseRoot: conversationPaths(conversationId).baseRoot,
+          workspaceRoot: conversationPaths(conversationId).workspaceRoot,
+        });
     if (
       options.expectedContentHash !== undefined
       && (
@@ -10218,12 +11871,13 @@ export function createProjectWorkService({
     const conversation = await conversationStore.get(conversationId);
     assertProjectWorkConversation(conversation);
     const workspace = await resolveConversationWorkspace(conversation);
-    const paths = conversationPaths(conversationId);
-    return readProjectOverlayImageFile({
-      ...options,
-      projectRoot: workspace.projectRoot,
-      workspaceRoot: paths.workspaceRoot,
-    });
+    return conversation.runtimeMode === "workspace-v2"
+      ? readProjectImageFile(workspace.workspaceRoot, options)
+      : readProjectOverlayImageFile({
+          ...options,
+          projectRoot: workspace.workspaceRoot,
+          workspaceRoot: conversationPaths(conversationId).workspaceRoot,
+        });
   }
 
   async function readGeneratedImage(conversationId, imageId) {
@@ -10301,17 +11955,29 @@ export function createProjectWorkService({
     const conversation = await conversationStore.get(conversationId);
     assertProjectWorkConversation(conversation);
     const workspace = await resolveConversationWorkspace(conversation);
-    const paths = conversationPaths(conversationId);
-    return getProjectOverlayFileTree({
-      ...options,
-      projectRoot: workspace.projectRoot,
-      workspaceRoot: paths.workspaceRoot,
-    });
+    return conversation.runtimeMode === "workspace-v2"
+      ? getProjectFileTree(workspace.workspaceRoot, options)
+      : getProjectOverlayFileTree({
+          ...options,
+          projectRoot: workspace.workspaceRoot,
+          workspaceRoot: conversationPaths(conversationId).workspaceRoot,
+        });
   }
 
   async function getChangeSet(conversationId) {
     assertActive();
-    assertProjectWorkConversation(await conversationStore.get(conversationId));
+    const conversation = await conversationStore.get(conversationId);
+    assertProjectWorkConversation(conversation);
+    if (conversation.runtimeMode === "workspace-v2") {
+      return conversation.activeChangeSet ?? {
+        id: null,
+        hash: null,
+        status: "clean",
+        workspaceDirect: true,
+        files: [],
+        stats: { files: 0, additions: 0, deletions: 0 },
+      };
+    }
     const claim = await claimConversationOperation(conversationId, {
       kind: "change_set_refresh",
       message: "Agent 正在准备修改，请稍后再审阅更改",
@@ -10340,7 +12006,7 @@ export function createProjectWorkService({
       };
     }
     const workspace = await resolveConversationWorkspace(conversation);
-    return gitInspector(workspace.projectRoot);
+    return gitInspector(workspace.workspaceRoot);
   }
 
   async function listGitCloseouts(conversationId) {
@@ -10350,7 +12016,7 @@ export function createProjectWorkService({
     if (conversationWorkspaceKind(conversation) === "scratch") return [];
     const workspace = await resolveConversationWorkspace(conversation);
     const recovered = await effectiveGitCloseoutService.recoverGitCloseouts({
-      projectRoot: workspace.projectRoot,
+      projectRoot: workspace.workspaceRoot,
       conversationId,
     });
     for (const record of recovered) {
@@ -10365,7 +12031,7 @@ export function createProjectWorkService({
       });
     }
     const records = (await effectiveGitCloseoutService.listGitCloseouts({
-      projectRoot: workspace.projectRoot,
+      projectRoot: workspace.workspaceRoot,
       conversationId,
     })).map(publicGitCloseout).filter(Boolean);
     await updateConversation(conversationId, {
@@ -10399,7 +12065,7 @@ export function createProjectWorkService({
     const workspace = await resolveConversationWorkspace(conversation);
     const proposalId = compactText(confirmation?.proposalId, 180);
     const existing = await effectiveGitCloseoutService.getGitCloseout({
-      projectRoot: workspace.projectRoot,
+      projectRoot: workspace.workspaceRoot,
       proposalId,
       conversationId,
     });
@@ -10513,7 +12179,7 @@ export function createProjectWorkService({
       committed = existing;
     } else {
       committed = await effectiveGitCloseoutService.confirmGitCloseout({
-        projectRoot: workspace.projectRoot,
+        projectRoot: workspace.workspaceRoot,
         ...receivedBinding,
       });
     }
@@ -10743,7 +12409,7 @@ export function createProjectWorkService({
     const journalFiles = [];
     for (const change of selectedChanges) {
       const [projectBefore, baseBefore, workspaceAfter] = await Promise.all([
-        readBoundFileState(workspace.projectRoot, change.path),
+        readBoundFileState(workspace.workspaceRoot, change.path),
         readBoundFileState(paths.baseRoot, change.path),
         readBoundFileState(paths.workspaceRoot, change.path),
       ]);
@@ -10898,7 +12564,7 @@ export function createProjectWorkService({
         recoveryTransitions(
           paths,
           journal,
-          workspace.projectRoot,
+          workspace.workspaceRoot,
           "projectBeforeMode",
         ),
         recoveryTransitions(
@@ -10909,7 +12575,7 @@ export function createProjectWorkService({
         ),
       ]);
       await applyBoundFileTransitions({
-        root: workspace.projectRoot,
+        root: workspace.workspaceRoot,
         transitions: projectTransitions,
       });
       await applyBoundFileTransitions({
@@ -10958,7 +12624,7 @@ export function createProjectWorkService({
   ) {
     try {
       for (const file of journal.files) {
-        const current = await readBoundFileState(workspace.projectRoot, file.path);
+        const current = await readBoundFileState(workspace.workspaceRoot, file.path);
         assertFileHash(
           current,
           file.afterHash,
@@ -11172,7 +12838,7 @@ export function createProjectWorkService({
       });
       try {
         await changeApplier({
-          projectRoot: workspace.projectRoot,
+          projectRoot: workspace.workspaceRoot,
           baseRoot: paths.baseRoot,
           workspaceRoot: paths.workspaceRoot,
           changeSet: current,
@@ -11246,6 +12912,116 @@ export function createProjectWorkService({
           409,
         );
       }
+      const workspaceWrite = (conversation.workspaceWrites ?? []).find(
+        (write) => write.id === applyId,
+      );
+      if (workspaceWrite) {
+        if (
+          workspaceWrite.status !== "written"
+          || workspaceWrite.undo?.status !== "available"
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_UNDO_UNAVAILABLE",
+            "这次 Workspace 写入当前不能撤销或已经撤销",
+            409,
+          );
+        }
+        if (undoHash !== workspaceWrite.undo.hash) {
+          throw projectWorkError(
+            "PROJECT_WORK_UNDO_BINDING_MISMATCH",
+            "撤销内容已变化，请刷新后重试",
+            409,
+            true,
+          );
+        }
+        const current = await readBoundFileState(
+          workspace.workspaceRoot,
+          workspaceWrite.path,
+        );
+        if (!current.exists || current.hash !== workspaceWrite.afterHash) {
+          await updateConversation(conversationId, (latest) => ({
+            workspaceWrites: (latest.workspaceWrites ?? []).map((write) => (
+              write.id === applyId
+                ? {
+                    ...write,
+                    undo: { ...write.undo, status: "blocked" },
+                    error: {
+                      code: "PROJECT_WORK_UNDO_FILE_STALE",
+                      message: "文件已发生变化，未执行撤销",
+                      retryable: true,
+                    },
+                  }
+                : write
+            )),
+          }));
+          throw projectWorkError(
+            "PROJECT_WORK_UNDO_FILE_STALE",
+            "文件已发生变化，未执行撤销",
+            409,
+            true,
+          );
+        }
+        let beforeBuffer = null;
+        if (workspaceWrite.baseExists) {
+          beforeBuffer = await readFile(path.join(
+            workspaceWritePayloadDirectory(conversationId, applyId),
+            "before.txt",
+          ));
+          if (sha256(beforeBuffer) !== workspaceWrite.baseHash) {
+            throw projectWorkError(
+              "PROJECT_WORKSPACE_WRITE_PAYLOAD_CORRUPT",
+              "Workspace 撤销内容未通过哈希校验",
+              409,
+            );
+          }
+        }
+        await applyBoundFileTransitions({
+          root: workspace.workspaceRoot,
+          transitions: [{
+            path: workspaceWrite.path,
+            expectedHash: workspaceWrite.afterHash,
+            targetBuffer: beforeBuffer,
+            targetHash: workspaceWrite.baseHash,
+            targetMode: workspaceWrite.baseMode,
+          }],
+        });
+        const undoneAt = timestamp();
+        await updateConversation(conversationId, (latest) => ({
+          workspace: {
+            ...normalizedWorkspaceRecord(latest, undoneAt),
+            dirty: true,
+            revision: normalizedWorkspaceRecord(latest, undoneAt).revision + 1,
+            updatedAt: undoneAt,
+          },
+          workspaceWrites: (latest.workspaceWrites ?? []).map((write) => (
+            write.id === applyId
+              ? {
+                  ...write,
+                  status: "undone",
+                  error: null,
+                  undo: { ...write.undo, status: "used", usedAt: undoneAt },
+                }
+              : write
+          )),
+        }));
+        const remainingChangeSet = await buildWorkspaceChangeSet(
+          conversationId,
+          workspaceWrite.turnId,
+        );
+        const updated = await updateConversation(conversationId, (latest) => ({
+          status: remainingChangeSet.status === "clean" ? "idle" : "applied",
+          activeChangeSet: latest.activeChangeSet?.turnId === workspaceWrite.turnId
+            ? remainingChangeSet
+            : latest.activeChangeSet,
+        }));
+        await appendEvent(conversationId, "workspace_write.undone", {
+          id: applyId,
+          path: workspaceWrite.path,
+          status: "undone",
+          artifactId: "changes",
+        });
+        return snapshot(conversationId, { conversation: updated });
+      }
       const journal = (conversation.applyJournal ?? []).find(
         (record) => record.id === applyId,
       );
@@ -11283,7 +13059,7 @@ export function createProjectWorkService({
         const transitions = [];
         for (const file of journal.files) {
           const current = await readBoundFileState(
-            workspace.projectRoot,
+            workspace.workspaceRoot,
             file.path,
           );
           assertFileHash(
@@ -11300,7 +13076,7 @@ export function createProjectWorkService({
           });
         }
         await applyBoundFileTransitions({
-          root: workspace.projectRoot,
+          root: workspace.workspaceRoot,
           transitions,
         });
       } catch (error) {
@@ -11933,13 +13709,13 @@ export function createProjectWorkService({
     assertProjectWorkConversation(await conversationStore.get(conversationId));
     const operationClaim = autoReviewSettlement || repairOperationId
       ? null
-      : await claimConversationOperation(conversationId, {
+        : await claimConversationOperation(conversationId, {
           kind: "verification_run",
           code: "PROJECT_WORK_VERIFICATION_BUSY",
           message: "当前会话已有操作正在运行",
         });
     try {
-      const conversation = await conversationStore.get(conversationId);
+      let conversation = await conversationStore.get(conversationId);
       assertBrowserQaNotRunning(conversationId, conversation);
       const candidate = (conversation.verifications ?? []).find(
       (item) => item.id === requestId,
@@ -11955,7 +13731,7 @@ export function createProjectWorkService({
         true,
       );
     }
-    const verification = (
+    let verification = (
       candidate?.status === "requested"
       && typeof candidate.recipeId === "string"
     )
@@ -11968,7 +13744,7 @@ export function createProjectWorkService({
         404,
       );
     }
-    const commandBindingHash = verification.bindingHash
+    let commandBindingHash = verification.bindingHash
       ?? verificationBindingHash(verification);
     if (
       expectedCommandBindingHash
@@ -12002,9 +13778,54 @@ export function createProjectWorkService({
     }
     const workspace = await resolveConversationWorkspace(conversation);
     assertConversationNotDeleting(conversationId);
+    const lockedResult = await withApplyLock(workspace.lockKey, async () => {
+      conversation = await conversationStore.get(conversationId);
+      verification = (conversation.verifications ?? []).find((item) => (
+      item.id === requestId
+      && item.status === "requested"
+      && typeof item.recipeId === "string"
+      ));
+      if (!verification) {
+        throw projectWorkError(
+        "PROJECT_WORK_VERIFICATION_NOT_FOUND",
+        "验证请求已变化，请重新确认",
+        409,
+        true,
+        );
+      }
+      const lockedCommandBindingHash = verification.bindingHash
+        ?? verificationBindingHash(verification);
+      if (lockedCommandBindingHash !== commandBindingHash) {
+        throw projectWorkError(
+        "PROJECT_WORK_VERIFICATION_BINDING_CHANGED",
+        "验证命令绑定已变化，需要用户重新确认",
+        409,
+        true,
+        );
+      }
+      commandBindingHash = lockedCommandBindingHash;
     const paths = conversationPaths(conversationId);
+    const directWorkspace = conversation.runtimeMode === "workspace-v2";
     let verificationChangeSet = null;
-    if (
+    if (directWorkspace) {
+      if (
+        conversation.activeChangeSet?.workspaceDirect === true
+        && conversation.activeChangeSet.status === "applied"
+      ) {
+        verificationChangeSet = conversation.activeChangeSet;
+        for (const file of verificationChangeSet.files ?? []) {
+          const workspaceState = await readBoundFileState(
+            workspace.workspaceRoot,
+            file.path,
+          );
+          assertFileHash(
+            workspaceState,
+            file.afterHash,
+            "Workspace 文件已变化，请重新读取后再运行验证",
+          );
+        }
+      }
+    } else if (
       conversation.activeChangeSet
       && !["clean", "applied", "undone"].includes(
         conversation.activeChangeSet.status,
@@ -12047,15 +13868,20 @@ export function createProjectWorkService({
       repairAttempt: Number.isSafeInteger(repairAttempt) && repairAttempt > 0
         ? repairAttempt
         : 0,
+      workspaceRunId: null,
     };
-    const verificationDirectory = path.join(
-      paths.directory,
-      "verification-runs",
-      attempt.id,
-    );
-    const verificationBaseRoot = path.join(verificationDirectory, "base");
-    const verificationWorkspaceRoot = path.join(verificationDirectory, "workspace");
-    const verificationTemporaryRoot = path.join(verificationDirectory, "tmp");
+    const verificationDirectory = directWorkspace
+      ? null
+      : path.join(paths.directory, "verification-runs", attempt.id);
+    const verificationBaseRoot = verificationDirectory
+      ? path.join(verificationDirectory, "base")
+      : null;
+    const verificationWorkspaceRoot = verificationDirectory
+      ? path.join(verificationDirectory, "workspace")
+      : workspace.workspaceRoot;
+    const verificationTemporaryRoot = verificationDirectory
+      ? path.join(verificationDirectory, "tmp")
+      : null;
     await updateConversation(conversationId, (current) => ({
       status: preserveConversationStatus ? current.status : "verifying",
       verifications: [...current.verifications, attempt],
@@ -12069,64 +13895,69 @@ export function createProjectWorkService({
     let result;
     let failureCode = null;
     try {
-      const materialized = await createVerificationSnapshot({
-        projectRoot: workspace.projectRoot,
-        baseRoot: verificationBaseRoot,
-        workspaceRoot: verificationWorkspaceRoot,
-        storageRoot: configuredStorageRoot,
-        recipeStack: verification.recipe?.stack ?? "node",
-      });
-      if (
-        materialized?.truncated === true
-        || (materialized?.skippedBinaryFiles ?? 0) > 0
-        || (materialized?.skippedOversizedFiles ?? 0) > 0
-      ) {
-        throw projectWorkError(
-          "PROJECT_WORK_VERIFICATION_SNAPSHOT_INCOMPLETE",
-          "无法完整物化项目，未运行验证",
-          409,
-          true,
-        );
-      }
-      if (verificationChangeSet) {
-        const transitions = [];
-        for (const file of verificationChangeSet.files) {
-          const workspaceState = await readBoundFileState(
-            paths.workspaceRoot,
-            file.path,
+      if (!directWorkspace) {
+        const materialized = await createVerificationSnapshot({
+          projectRoot: workspace.workspaceRoot,
+          baseRoot: verificationBaseRoot,
+          workspaceRoot: verificationWorkspaceRoot,
+          storageRoot: configuredStorageRoot,
+          recipeStack: verification.recipe?.stack ?? "node",
+        });
+        if (
+          materialized?.truncated === true
+          || (materialized?.skippedBinaryFiles ?? 0) > 0
+          || (materialized?.skippedOversizedFiles ?? 0) > 0
+        ) {
+          throw projectWorkError(
+            "PROJECT_WORK_VERIFICATION_SNAPSHOT_INCOMPLETE",
+            "无法完整物化项目，未运行验证",
+            409,
+            true,
           );
-          assertFileHash(
-            workspaceState,
-            file.afterHash,
-            "待审阅修改已变化，请重新检查后再运行验证",
-          );
-          transitions.push({
-            path: file.path,
-            expectedHash: file.baseHash,
-            targetBuffer: workspaceState.exists
-              ? workspaceState.buffer
-              : null,
-            targetHash: file.afterHash,
-            targetMode: workspaceState.mode,
+        }
+        if (verificationChangeSet) {
+          const transitions = [];
+          for (const file of verificationChangeSet.files) {
+            const workspaceState = await readBoundFileState(
+              paths.workspaceRoot,
+              file.path,
+            );
+            assertFileHash(
+              workspaceState,
+              file.afterHash,
+              "待审阅修改已变化，请重新检查后再运行验证",
+            );
+            transitions.push({
+              path: file.path,
+              expectedHash: file.baseHash,
+              targetBuffer: workspaceState.exists
+                ? workspaceState.buffer
+                : null,
+              targetHash: file.afterHash,
+              targetMode: workspaceState.mode,
+            });
+          }
+          await applyBoundFileTransitions({
+            root: verificationWorkspaceRoot,
+            transitions,
           });
         }
-        await applyBoundFileTransitions({
-          root: verificationWorkspaceRoot,
-          transitions,
-        });
       }
       const currentRecipe = await resolveVerificationRecipe({
         recipeId: verification.recipeId,
         cwd: verification.command.cwd,
         readTextFile: async (filePath) => {
+          if (directWorkspace) {
+            return readProjectTextFile(workspace.workspaceRoot, {
+              filePath,
+              endLine: Number.MAX_SAFE_INTEGER,
+            }).then((file) => file.content);
+          }
           const normalizedPath = normalizeProjectPath(filePath);
-          return readFile(
-            path.join(
-              verificationWorkspaceRoot,
-              ...normalizedPath.split("/"),
-            ),
-            "utf8",
-          );
+          return readFile(path.join(
+            verificationWorkspaceRoot,
+            ...normalizedPath.split("/"),
+          ), "utf8");
         },
       });
       if (
@@ -12150,21 +13981,85 @@ export function createProjectWorkService({
           true,
         );
       }
-      const cwd = await resolveVerificationCwd(
-        verificationWorkspaceRoot,
-        verification.command.cwd,
-      );
-      await mkdir(verificationTemporaryRoot, {
-        recursive: true,
-        mode: 0o700,
-      });
-      result = await runner({
-        ...verification.command,
-        workspaceRoot: verificationWorkspaceRoot,
-        cwd,
-        temporaryDirectory: verificationTemporaryRoot,
-        signal: controller.signal,
-      });
+      if (directWorkspace) {
+        const started = await effectiveRunSupervisor.start({
+          workspaceId: conversation.workspaceId,
+          workspaceRoot: workspace.workspaceRoot,
+          file: currentRecipe.command.file,
+          args: currentRecipe.command.args,
+          cwd: currentRecipe.command.cwd || ".",
+          environment: currentRecipe.command.environment,
+          metadata: {
+            kind: "verification",
+            recipeId: verification.recipeId,
+          },
+          registeredRecipe: true,
+        });
+        attempt.workspaceRunId = started.run.id;
+        await updateConversation(conversationId, (current) => ({
+          verifications: current.verifications.map((item) => (
+            item.id === attempt.id
+              ? { ...item, workspaceRunId: started.run.id }
+              : item
+          )),
+        }));
+        await appendEvent(conversationId, "verification.run_bound", {
+          id: attempt.id,
+          runId: started.run.id,
+          artifactId: "run_result",
+        });
+        const abortRun = () => {
+          void effectiveRunSupervisor.cancel(started.run.id);
+        };
+        controller.signal.addEventListener("abort", abortRun, { once: true });
+        if (controller.signal.aborted) abortRun();
+        const completedRun = await started.completion;
+        controller.signal.removeEventListener("abort", abortRun);
+        let afterSeq = 0;
+        const stdout = [];
+        const stderr = [];
+        while (true) {
+          const page = await effectiveRunSupervisor.snapshot(started.run.id, {
+            afterSeq,
+            limit: 1_000,
+          });
+          for (const event of page.events) {
+            if (event.type !== "chunk") continue;
+            (event.stream === "stderr" ? stderr : stdout).push(event.text);
+          }
+          afterSeq = page.nextSeq;
+          if (!page.hasMore) break;
+        }
+        result = {
+          exitCode: completedRun.exitCode,
+          durationMs: completedRun.durationMs,
+          stdout: stdout.join(""),
+          stderr: [stderr.join(""), completedRun.error]
+            .filter(Boolean)
+            .join("\n"),
+          truncated: completedRun.output?.truncated === true,
+          timedOut: false,
+          aborted: ["cancelled"].includes(completedRun.status),
+          interrupted: completedRun.status === "interrupted",
+          isolation: "persistent_workspace",
+        };
+      } else {
+        const cwd = await resolveVerificationCwd(
+          verificationWorkspaceRoot,
+          verification.command.cwd,
+        );
+        await mkdir(verificationTemporaryRoot, {
+          recursive: true,
+          mode: 0o700,
+        });
+        result = await runner({
+          ...verification.command,
+          workspaceRoot: verificationWorkspaceRoot,
+          cwd,
+          temporaryDirectory: verificationTemporaryRoot,
+          signal: controller.signal,
+        });
+      }
     } catch (error) {
       failureCode = error instanceof ProjectWorkError
         ? error.code
@@ -12181,8 +14076,10 @@ export function createProjectWorkService({
         aborted: controller.signal.aborted,
       };
     } finally {
-      await rm(verificationDirectory, { recursive: true, force: true })
-        .catch(() => undefined);
+      if (verificationDirectory) {
+        await rm(verificationDirectory, { recursive: true, force: true })
+          .catch(() => undefined);
+      }
     }
     try {
       const rawOutput = [
@@ -12192,6 +14089,7 @@ export function createProjectWorkService({
       const output = await sanitizeConversationPaths(conversationId, rawOutput);
       const runnerFailed = (
         result.aborted !== true
+        && result.interrupted !== true
         && (result.exitCode !== 0 || result.timedOut === true)
       );
       const compactedOutput = typeof verificationOutputCompactor === "function"
@@ -12214,7 +14112,9 @@ export function createProjectWorkService({
         result.aborted === true
         || controller.signal.aborted
       );
-      const status = operationAborted
+      const status = result.interrupted === true
+        ? "interrupted"
+        : operationAborted
         ? "aborted"
         : result.exitCode === 0 && !result.timedOut
           ? "passed"
@@ -12296,12 +14196,13 @@ export function createProjectWorkService({
         if (verificationControllers.get(conversationId) === controller) {
           verificationControllers.delete(conversationId);
         }
-        return await startVerificationRepairLoop(conversationId, {
+        return {
+          startRepair: true,
           commandId: verification.id,
           commandBindingHash,
           failedAttempt: completed,
           resumeStatus,
-        });
+        };
       }
       return completed;
       } finally {
@@ -12309,6 +14210,16 @@ export function createProjectWorkService({
           verificationControllers.delete(conversationId);
         }
       }
+      });
+      if (lockedResult?.startRepair === true) {
+        return await startVerificationRepairLoop(conversationId, {
+          commandId: lockedResult.commandId,
+          commandBindingHash: lockedResult.commandBindingHash,
+          failedAttempt: lockedResult.failedAttempt,
+          resumeStatus: lockedResult.resumeStatus,
+        });
+      }
+      return lockedResult;
     } finally {
       releaseConversationOperation(conversationId, operationClaim);
     }
@@ -12419,6 +14330,7 @@ export function createProjectWorkService({
     assertConversationNotDeleting(conversationId);
     const updated = await updateConversation(conversationId, {
       title: normalizedTitle,
+      titleOrigin: "manual",
     });
     return publicConversationSummary(updated);
   }
@@ -12431,6 +14343,7 @@ export function createProjectWorkService({
     assertStandaloneConversation(conversation);
     const updated = await updateConversation(conversationId, {
       title: normalizedTitle,
+      titleOrigin: "manual",
     });
     return publicConversationSummary(updated);
   }
@@ -12443,6 +14356,7 @@ export function createProjectWorkService({
     assertStandaloneConversation(conversation, { workType: WORKER_WORK_TYPE });
     const updated = await updateConversation(conversationId, {
       title: normalizedTitle,
+      titleOrigin: "manual",
     });
     return publicConversationSummary(updated);
   }
@@ -12579,6 +14493,7 @@ export function createProjectWorkService({
     closing.push(...browserQaRuns.values());
     browserQaRuns.clear();
     browserQaProjectRuns.clear();
+    activeWorkspaceRunRequests.clear();
     runtimes.clear();
     activeMessageClaims.clear();
     conversationOperationClaims.clear();
@@ -12594,8 +14509,15 @@ export function createProjectWorkService({
       });
     }
     askUserWaiters.clear();
+    for (const waiting of workspaceWriteWaiters.values()) {
+      for (const resolve of waiting) {
+        resolve({ id: null, status: "cancelled" });
+      }
+    }
+    workspaceWriteWaiters.clear();
     await Promise.allSettled(closing);
     await previewSupervisor.dispose?.();
+    await effectiveRunSupervisor.dispose?.();
     await effectiveSessionFactory.dispose?.();
   }
 
@@ -12604,15 +14526,20 @@ export function createProjectWorkService({
     abortConversation,
     applyChangeSet,
     cancelAskUserRequest,
+    cancelWorkspaceRun,
+    cancelWorkspaceWrite,
     clearFollowUps,
     compactConversation,
     configureConversation,
     configureExecutionPolicy,
     confirmGitCloseout,
+    confirmWorkspaceRun,
+    confirmWorkspaceWrite,
     createAskUserRequest,
     createConversationAttachment,
     createConversation,
     createConversationDocument,
+    createWorkspace,
     createStandaloneConversation,
     createWorkerConversation,
     dispose,
@@ -12624,6 +14551,7 @@ export function createProjectWorkService({
     getProjectTree,
     getUsage,
     getWorkspace,
+    getWorkspaceRun,
     enqueueFollowUp,
     listApplyJournal,
     listAskUserRequests,
@@ -12634,6 +14562,7 @@ export function createProjectWorkService({
     listModels,
     listProviderConnections,
     listProjects,
+    listWorkspaces,
     listSkillCatalog,
     listStandaloneConversations,
     listWorkerConversations,
@@ -12656,6 +14585,7 @@ export function createProjectWorkService({
     removeFollowUp,
     removeProject,
     removeProviderCredential,
+    removeWorkspace,
     removeStandaloneConversation,
     removeWorkerConversation,
     renameConversation,

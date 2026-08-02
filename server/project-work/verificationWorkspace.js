@@ -13,9 +13,8 @@ import { constants } from "node:fs";
 import path from "node:path";
 import { projectWorkError } from "./errors.js";
 
-const DEFAULT_MAX_FILES = 120_000;
-const DEFAULT_MAX_BYTES = 1536 * 1024 * 1024;
-const DEFAULT_MAX_FILE_BYTES = 256 * 1024 * 1024;
+// Legacy overlay-v1 recovery helper only. Production project-work sessions run
+// directly in persistent Workspaces and never call this copier.
 
 const ALWAYS_EXCLUDED_DIRECTORIES = new Set([
   ".agents",
@@ -31,8 +30,6 @@ const ALWAYS_EXCLUDED_DIRECTORIES = new Set([
 
 const STACK_DEPENDENCY_DIRECTORIES = Object.freeze({
   node: new Set(["node_modules"]),
-  swift: new Set([".build"]),
-  android: new Set([".gradle"]),
 });
 
 const OPTIONAL_DEPENDENCY_DIRECTORIES = new Set([
@@ -139,34 +136,11 @@ async function canonicalDirectory(directoryPath, label) {
   return canonical;
 }
 
-function assertWithinLimits(counters, sourceStat, limits) {
-  if (sourceStat.size > limits.maxFileBytes) {
-    throw projectWorkError(
-      "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE",
-      "项目包含超出受控验证上限的单个文件",
-      409,
-      true,
-    );
-  }
-  if (
-    counters.files + 1 > limits.maxFiles
-    || counters.bytes + sourceStat.size > limits.maxBytes
-  ) {
-    throw projectWorkError(
-      "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE",
-      "项目超出受控验证副本的文件数或总大小上限",
-      409,
-      true,
-    );
-  }
-}
-
 async function cloneTree({
   sourceRoot,
   destinationRoot,
   excludedRoot,
   recipeStack,
-  limits,
 }) {
   const counters = {
     files: 0,
@@ -271,7 +245,6 @@ async function cloneTree({
           true,
         );
       }
-      assertWithinLimits(counters, sourceStat, limits);
       await mkdir(path.dirname(destinationPath), {
         recursive: true,
         mode: 0o700,
@@ -335,9 +308,6 @@ export async function createVerificationProjectSnapshot({
   workspaceRoot,
   storageRoot,
   recipeStack,
-  maxFiles = DEFAULT_MAX_FILES,
-  maxBytes = DEFAULT_MAX_BYTES,
-  maxFileBytes = DEFAULT_MAX_FILE_BYTES,
 } = {}) {
   const canonicalProjectRoot = await canonicalDirectory(
     projectRoot,
@@ -357,30 +327,23 @@ export async function createVerificationProjectSnapshot({
       true,
     );
   }
-  const limits = {
-    maxFiles,
-    maxBytes,
-    maxFileBytes,
-  };
   const materialized = await cloneTree({
     sourceRoot: canonicalProjectRoot,
     destinationRoot: baseRoot,
     excludedRoot: null,
     recipeStack,
-    limits,
   });
   await cloneTree({
     sourceRoot: await canonicalDirectory(baseRoot, "验证基础副本"),
     destinationRoot: workspaceRoot,
     excludedRoot: null,
     recipeStack,
-    limits,
   });
   return {
     ...materialized,
     truncated: false,
     skippedBinaryFiles: 0,
     skippedOversizedFiles: 0,
-    isolation: "private_copy",
+    isolation: "legacy_private_copy",
   };
 }

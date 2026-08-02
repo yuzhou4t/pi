@@ -19,10 +19,10 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 
-const SUPPORTED_PI_SDK_VERSION = "0.82.0";
+const SUPPORTED_PI_SDK_VERSION = "0.82.1";
 const UPGRADE_GUARD_MESSAGE = [
-  "Pi Agent is validated against @earendil-works/pi-coding-agent 0.82.0.",
-  "Do not upgrade to 0.82.1 (or any other version) until this compatibility",
+  "Pi Agent is validated against @earendil-works/pi-coding-agent 0.82.1.",
+  "Do not upgrade to another version until this compatibility",
   "gate is deliberately updated and passes against the candidate install.",
 ].join(" ");
 const projectRoot = path.resolve(
@@ -34,7 +34,7 @@ async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
 }
 
-test("Pi SDK stays pinned to 0.82.0 in manifest, lockfile, and installed runtime", async () => {
+test("Pi SDK stays pinned to 0.82.1 in manifest, lockfile, and installed runtime", async () => {
   const [manifest, lockfile, installedManifest] = await Promise.all([
     readJson(path.join(projectRoot, "package.json")),
     readJson(path.join(projectRoot, "package-lock.json")),
@@ -69,7 +69,7 @@ test("Pi SDK stays pinned to 0.82.0 in manifest, lockfile, and installed runtime
   );
   assert.match(
     lockedPackage?.resolved ?? "",
-    /pi-coding-agent-0\.82\.0\.tgz$/,
+    /pi-coding-agent-0\.82\.1\.tgz$/,
     UPGRADE_GUARD_MESSAGE,
   );
   assert.equal(
@@ -81,7 +81,7 @@ test("Pi SDK stays pinned to 0.82.0 in manifest, lockfile, and installed runtime
   assert.equal(installedManifest.exports?.["."]?.import, "./dist/index.js");
 });
 
-test("Pi SDK 0.82.0 exposes the runtime contracts used by piSessionHost", async (t) => {
+test("Pi SDK 0.82.1 exposes the runtime contracts used by piSessionHost", async (t) => {
   for (const [name, value] of Object.entries({
     createAgentSession,
     DefaultResourceLoader,
@@ -99,6 +99,7 @@ test("Pi SDK 0.82.0 exposes the runtime contracts used by piSessionHost", async 
   }
   assert.equal(typeof ModelRuntime.create, "function");
   assert.equal(typeof SessionManager.continueRecent, "function");
+  assert.equal(typeof SessionManager.forkFrom, "function");
   assert.equal(typeof SettingsManager.create, "function");
   assert.equal(typeof SettingsManager.inMemory, "function");
   assert.equal(typeof DefaultResourceLoader.prototype.reload, "function");

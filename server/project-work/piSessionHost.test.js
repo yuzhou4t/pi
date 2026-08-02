@@ -336,7 +336,7 @@ test("project-work model catalog exposes only safe rate-card metadata", async ()
     currency: "USD",
     unit: "per_million_tokens",
     source: "pi_model_catalog",
-    version: "0.82.0",
+    version: "0.82.1",
     input: 5,
     output: 30,
     cacheRead: 0.5,

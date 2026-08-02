@@ -79,6 +79,7 @@ export const PROJECT_WORK_DEFAULT_TOOL_NAMES = [
   "update_plan",
   "ask_user",
   "request_verification",
+  "request_workspace_command",
   "request_git_closeout",
 ];
 export const PROJECT_WORK_IMAGE_TOOL_NAME = "generate_image";
@@ -178,16 +179,17 @@ const ULTRA_GUIDANCE = [
 const subagentJiti = createJiti(import.meta.url);
 let subagentCapabilityApiPromise = null;
 const APP_GUIDANCE = [
-  "You are working through a contained review overlay for the user's project.",
-  "Reads use the latest safe project files unless a proposed overlay file exists.",
-  "Use only the provided contained file tools. Project reads cannot access paths outside the project and review overlay; read may additionally load text resources only under the exact enabled Skill directories advertised in the Skills list.",
+  "You are working directly in the user's selected persistent project Workspace.",
+  "Reads always use the current Workspace files. Writes are executed only through the app's exact per-write approval policy and are recorded with before/after hashes.",
+  "Use only the provided contained file tools. Project reads cannot access paths outside the Workspace; read may additionally load text resources only under the exact enabled Skill directories advertised in the Skills list.",
   "Every contained project-tool path must be relative to the project root. Use \".\" for the root directory; never pass an absolute working-directory, runtime, or home path.",
   "For non-trivial tasks, use report_progress in the user's language with 1-2 concise sentences stating the fact just confirmed and what comes next. Report only before the first substantive inspection, at a key finding or phase change, when blocked, or before verification. When work continues, include it in the same assistant turn as the next substantive tool call instead of pausing only to report. Never narrate every tool call, and never expose private reasoning, hidden chain-of-thought, secrets, raw tool arguments, or unfiltered tool output.",
   "Keep the public plan current with update_plan.",
   "Use request_verification only with one registered recipe ID. Never provide a command, argv, shell, installer, watch process, or network option. The app's deterministic server policy resolves the recipe and decides whether it waits, is blocked, or continues after the turn settles.",
+  "Use request_workspace_command only when a registered recipe cannot express an exact project check. It creates a visible confirmation request and never runs immediately; provide one executable, argv array, and relative cwd without Shell, PTY, installers, inline code, backgrounding, or environment overrides.",
   "Use generate_image only when the user's current explicit message asks to create an image. It creates one conversation-owned image and never writes that binary asset into the project.",
   "Use write_word_document or write_excel_workbook only when the user's current explicit message asks for a Word document or Excel workbook. These tools create versioned conversation-owned downloads in Files; they never overwrite or add a binary file to the project review overlay.",
-  "Edits are written only to the review overlay. Never claim that the live project changed before the app reports a successfully applied change set.",
+  "Never claim that a write succeeded until the write tool reports that the hash-bound Workspace update was committed and read back.",
   "Use request_git_closeout only after the exact project changes were applied and their bound verification passed. It creates a reviewed local-commit proposal; it never commits, pushes, opens a PR, or approves itself.",
 ].join("\n");
 const STANDALONE_GUIDANCE = [
@@ -679,6 +681,7 @@ export async function createProjectWorkSubagentView({
   projectRoot,
   baseRoot,
   workspaceRoot,
+  directWorkspace = false,
 } = {}) {
   await cleanupStaleProjectWorkSubagentViews().catch(() => undefined);
   const temporaryRoot = await mkdtemp(
@@ -692,28 +695,30 @@ export async function createProjectWorkSubagentView({
       baseRoot: snapshotBaseRoot,
       workspaceRoot: snapshotWorkspaceRoot,
     });
-    const changeSet = await recomputeChangeSet({
-      conversationId: "ultra-read-view",
-      baseRoot,
-      workspaceRoot,
-      allowDeletes: false,
-    });
-    const transitions = [];
-    for (const file of changeSet.files) {
-      const overlayState = await readBoundFileState(workspaceRoot, file.path);
-      const snapshotState = await readBoundFileState(snapshotWorkspaceRoot, file.path);
-      transitions.push({
-        path: file.path,
-        expectedHash: snapshotState.hash,
-        targetBuffer: overlayState.exists ? overlayState.buffer : null,
-        targetHash: file.afterHash,
-        targetMode: overlayState.mode,
+    if (!directWorkspace) {
+      const changeSet = await recomputeChangeSet({
+        conversationId: "ultra-read-view",
+        baseRoot,
+        workspaceRoot,
+        allowDeletes: false,
+      });
+      const transitions = [];
+      for (const file of changeSet.files) {
+        const overlayState = await readBoundFileState(workspaceRoot, file.path);
+        const snapshotState = await readBoundFileState(snapshotWorkspaceRoot, file.path);
+        transitions.push({
+          path: file.path,
+          expectedHash: snapshotState.hash,
+          targetBuffer: overlayState.exists ? overlayState.buffer : null,
+          targetHash: file.afterHash,
+          targetMode: overlayState.mode,
+        });
+      }
+      await applyBoundFileTransitions({
+        root: snapshotWorkspaceRoot,
+        transitions,
       });
     }
-    await applyBoundFileTransitions({
-      root: snapshotWorkspaceRoot,
-      transitions,
-    });
     const settingsDirectory = path.join(temporaryRoot, ".pi");
     const agentDirectory = path.join(settingsDirectory, "agents");
     await mkdir(settingsDirectory, { recursive: true, mode: 0o700 });
@@ -1328,18 +1333,71 @@ function createReadTool(roots, skillResources) {
   });
 }
 
-function createWriteTool(roots) {
+function createWriteTool(roots, { directWorkspace = false, onWorkspaceWrite } = {}) {
   return defineTool({
     name: "write",
     label: "write",
-    description: "Write a proposed text file only inside the private review overlay.",
+    description: directWorkspace
+      ? "Write a text file through the app's hash-bound Workspace approval policy."
+      : "Write a proposed text file only inside the private review overlay.",
     promptSnippet: "Write a contained project text file",
     executionMode: "sequential",
     parameters: Type.Object({
       path: Type.String(),
       content: Type.String(),
     }),
-    async execute(_toolCallId, { path: filePath, content }) {
+    async execute(toolCallId, { path: filePath, content }) {
+      if (directWorkspace) {
+        const inspected = await inspectOverlayPath(roots, filePath, {
+          allowMissing: true,
+        });
+        if (inspected.selected?.stat && !inspected.selected.stat.isFile()) {
+          throw new Error(`Not a file: ${inspected.normalized}`);
+        }
+        const before = inspected.selected?.stat
+          ? await readBoundedText(roots, inspected.normalized)
+          : null;
+        const afterBuffer = Buffer.from(content, "utf8");
+        if (afterBuffer.length > MAX_TOOL_FILE_BYTES) {
+          throw new Error("File exceeds the contained tool size limit");
+        }
+        const patch = createTwoFilesPatch(
+          before ? `a/${inspected.normalized}` : "/dev/null",
+          `b/${inspected.normalized}`,
+          before?.content ?? "",
+          content,
+          "",
+          "",
+          { context: 3 },
+        );
+        const result = await onWorkspaceWrite?.({
+          toolCallId,
+          path: inspected.normalized,
+          operation: before ? "update" : "create",
+          baseExists: Boolean(before),
+          baseHash: before?.hash ?? null,
+          baseMode: before?.mode ?? null,
+          afterHash: sha256(afterBuffer),
+          afterMode: before?.mode ?? 0o600,
+          content,
+          patch: patch.slice(0, MAX_TOOL_OUTPUT_CHARS),
+        });
+        if (result?.status !== "written") {
+          return textResult(`Write to ${inspected.normalized} was not approved`, {
+            path: inspected.normalized,
+            status: result?.status ?? "cancelled",
+            writeId: result?.id ?? null,
+          });
+        }
+        return textResult(`Wrote ${afterBuffer.length} bytes to ${inspected.normalized}`, {
+          path: inspected.normalized,
+          status: "written",
+          writeId: result.id ?? null,
+          baseHash: before?.hash ?? null,
+          afterHash: sha256(afterBuffer),
+          patch: patch.slice(0, MAX_TOOL_OUTPUT_CHARS),
+        });
+      }
       const normalized = await writeOverlayText(roots, filePath, content);
       return textResult(`Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${normalized}`, {
         path: normalized,
@@ -1348,11 +1406,13 @@ function createWriteTool(roots) {
   });
 }
 
-function createEditTool(roots) {
+function createEditTool(roots, { directWorkspace = false, onWorkspaceWrite } = {}) {
   return defineTool({
     name: "edit",
     label: "edit",
-    description: "Apply exact text replacements only inside the private review overlay.",
+    description: directWorkspace
+      ? "Apply exact replacements through the app's hash-bound Workspace approval policy."
+      : "Apply exact text replacements only inside the private review overlay.",
     promptSnippet: "Edit a contained project text file",
     executionMode: "sequential",
     parameters: Type.Object({
@@ -1362,7 +1422,7 @@ function createEditTool(roots) {
         newText: Type.String(),
       }), { minItems: 1, maxItems: 32 }),
     }),
-    async execute(_toolCallId, { path: filePath, edits }) {
+    async execute(toolCallId, { path: filePath, edits }) {
       const file = await readBoundedText(roots, filePath);
       const replacements = edits.map((edit) => {
         if (!edit.oldText) throw new Error("oldText cannot be empty");
@@ -1382,20 +1442,22 @@ function createEditTool(roots) {
       for (const replacement of [...replacements].reverse()) {
         next = `${next.slice(0, replacement.start)}${replacement.newText}${next.slice(replacement.end)}`;
       }
-      await writeOverlayText(
-        roots,
-        file.normalized,
-        next,
-        file.mode,
-        file.source === "project"
-          ? {
-              expectedProjectSource: {
-                buffer: file.buffer,
-                hash: file.hash,
-              },
-            }
-          : undefined,
-      );
+      if (!directWorkspace) {
+        await writeOverlayText(
+          roots,
+          file.normalized,
+          next,
+          file.mode,
+          file.source === "project"
+            ? {
+                expectedProjectSource: {
+                  buffer: file.buffer,
+                  hash: file.hash,
+                },
+              }
+            : undefined,
+        );
+      }
       const patch = createTwoFilesPatch(
         `a/${file.normalized}`,
         `b/${file.normalized}`,
@@ -1405,6 +1467,36 @@ function createEditTool(roots) {
         "",
         { context: 3 },
       );
+      if (directWorkspace) {
+        const result = await onWorkspaceWrite?.({
+          toolCallId,
+          path: file.normalized,
+          operation: "update",
+          baseExists: true,
+          baseHash: file.hash,
+          baseMode: file.mode,
+          afterHash: sha256(Buffer.from(next, "utf8")),
+          afterMode: file.mode,
+          content: next,
+          patch: patch.slice(0, MAX_TOOL_OUTPUT_CHARS),
+        });
+        if (result?.status !== "written") {
+          return textResult(`Edit to ${file.normalized} was not approved`, {
+            path: file.normalized,
+            status: result?.status ?? "cancelled",
+            writeId: result?.id ?? null,
+            patch: patch.slice(0, MAX_TOOL_OUTPUT_CHARS),
+          });
+        }
+        return textResult(`Updated ${file.normalized}`, {
+          path: file.normalized,
+          status: "written",
+          writeId: result.id ?? null,
+          baseHash: file.hash,
+          afterHash: sha256(Buffer.from(next, "utf8")),
+          patch: patch.slice(0, MAX_TOOL_OUTPUT_CHARS),
+        });
+      }
       return textResult(`Updated ${file.normalized}`, {
         path: file.normalized,
         patch: patch.slice(0, MAX_TOOL_OUTPUT_CHARS),
@@ -1674,12 +1766,15 @@ export async function createProjectWorkTools({
   onPlan,
   onAskUserRequest,
   onVerificationRequest,
+  onWorkspaceCommandRequest,
   onGitCloseoutRequest,
   onImageGenerationRequest,
   onWordArtifactRequest,
   onExcelArtifactRequest,
   onPreviewRequest,
   onProgress,
+  onWorkspaceWrite,
+  directWorkspace = false,
   enabledSkillPaths = [],
 } = {}) {
   const [roots, skillResources] = await Promise.all([
@@ -1794,6 +1889,33 @@ export async function createProjectWorkTools({
       const created = await onVerificationRequest(request);
       return textResult(
         `Verification request ${created.id} is ready for user review. It has not run.`,
+        { id: created.id },
+      );
+    },
+  });
+  const requestWorkspaceCommand = defineTool({
+    name: "request_workspace_command",
+    label: "request_workspace_command",
+    description: "Request one exact Workspace command for explicit user confirmation. The server rejects shells, PTYs, installers, inline code, background processes, environment overrides, and implicit network actions.",
+    promptSnippet: "Request one exact confirmed Workspace command",
+    executionMode: "sequential",
+    parameters: Type.Object({
+      executable: Type.String({ minLength: 1, maxLength: 2_048 }),
+      argv: Type.Array(Type.String({ maxLength: 16_384 }), { maxItems: 256 }),
+      cwd: Type.Optional(Type.String({ maxLength: 2_048 })),
+      purpose: Type.Optional(Type.String({ maxLength: 240 })),
+    }, { additionalProperties: false }),
+    async execute(_toolCallId, request) {
+      if (typeof onWorkspaceCommandRequest !== "function") {
+        throw projectWorkError(
+          "PROJECT_WORKSPACE_COMMAND_UNAVAILABLE",
+          "当前会话不能创建 Workspace 运行请求",
+          409,
+        );
+      }
+      const created = await onWorkspaceCommandRequest(request);
+      return textResult(
+        `Workspace command ${created.id} is ready for exact user confirmation. It has not run.`,
         { id: created.id },
       );
     },
@@ -2235,8 +2357,8 @@ export async function createProjectWorkTools({
 
   return [
     createReadTool(roots, skillResources),
-    createEditTool(roots),
-    createWriteTool(roots),
+    createEditTool(roots, { directWorkspace, onWorkspaceWrite }),
+    createWriteTool(roots, { directWorkspace, onWorkspaceWrite }),
     createGrepTool(roots),
     createFindTool(roots),
     createLsTool(roots),
@@ -2257,6 +2379,7 @@ export async function createProjectWorkTools({
     updatePlan,
     askUser,
     requestVerification,
+    requestWorkspaceCommand,
     requestGitCloseout,
     generateImage,
     requestPreview,
@@ -2367,7 +2490,7 @@ function publicModelPricing(cost) {
     currency: "USD",
     unit: "per_million_tokens",
     source: "pi_model_catalog",
-    version: "0.82.0",
+    version: "0.82.1",
     input: rate(cost.input),
     output: rate(cost.output),
     cacheRead: rate(cost.cacheRead),
@@ -2691,6 +2814,7 @@ export function createPiSessionFactory({
     projectRoot,
     baseRoot,
     workspaceRoot,
+    legacyWorkspaceRoot = null,
     sessionDir,
     modelRef,
     thinkingLevel = "medium",
@@ -2702,12 +2826,15 @@ export function createPiSessionFactory({
     onPlan,
     onAskUserRequest,
     onVerificationRequest,
+    onWorkspaceCommandRequest,
     onGitCloseoutRequest,
     onImageGenerationRequest,
     onWordArtifactRequest,
     onExcelArtifactRequest,
     onPreviewRequest,
     onProgress,
+    onWorkspaceWrite,
+    directWorkspace = false,
   } = {}) => {
     const cwd = await realpath(workspaceRoot);
     const runtime = await runtimePromise;
@@ -2729,7 +2856,46 @@ export function createPiSessionFactory({
         400,
       );
     }
-    const sessionManager = SessionManager.continueRecent(cwd, sessionDir);
+    let sessionManager = SessionManager.continueRecent(cwd, sessionDir);
+    if (
+      sessionManager.getEntries().length === 0
+      && typeof legacyWorkspaceRoot === "string"
+      && path.resolve(legacyWorkspaceRoot) !== path.resolve(cwd)
+    ) {
+      try {
+        const legacyCwd = await realpath(legacyWorkspaceRoot);
+        const legacyManager = SessionManager.continueRecent(
+          legacyCwd,
+          sessionDir,
+        );
+        if (legacyManager.getEntries().length > 0) {
+          const legacySessionFile = legacyManager.getSessionFile();
+          if (!legacySessionFile) throw new Error("legacy session file is missing");
+          const legacyIds = legacyManager.getEntries().map((entry) => entry.id);
+          const legacyLeaf = legacyManager.getLeafId() ?? null;
+          const migrated = SessionManager.forkFrom(
+            legacySessionFile,
+            cwd,
+            sessionDir,
+          );
+          const migratedIds = migrated.getEntries().map((entry) => entry.id);
+          if (
+            JSON.stringify(migratedIds) !== JSON.stringify(legacyIds)
+            || (migrated.getLeafId() ?? null) !== legacyLeaf
+          ) {
+            throw new Error("migrated Pi session tree does not match the source");
+          }
+          sessionManager = migrated;
+        }
+      } catch (error) {
+        throw projectWorkError(
+          "PROJECT_WORK_SESSION_WORKSPACE_MIGRATION_BLOCKED",
+          "Pi 会话未能迁移到真实 Workspace，旧会话记录已保留",
+          409,
+          true,
+        );
+      }
+    }
     if (path.resolve(sessionManager.getCwd()) !== path.resolve(cwd)) {
       throw projectWorkError(
         "PROJECT_WORK_SESSION_INVALID",
@@ -2767,6 +2933,7 @@ export function createPiSessionFactory({
         projectRoot,
         baseRoot,
         workspaceRoot: cwd,
+        directWorkspace,
       });
       activeSubagentView = view;
       return view;
@@ -2854,12 +3021,15 @@ export function createPiSessionFactory({
       onPlan,
       onAskUserRequest,
       onVerificationRequest,
+      onWorkspaceCommandRequest,
       onGitCloseoutRequest,
       onImageGenerationRequest,
       onWordArtifactRequest,
       onExcelArtifactRequest,
       onPreviewRequest,
       onProgress,
+      onWorkspaceWrite,
+      directWorkspace,
       enabledSkillPaths,
     });
     const { session } = await createAgentSession({
