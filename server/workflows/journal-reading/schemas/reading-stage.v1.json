@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "paper_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stage": {
+      "type": "string",
+      "enum": [
+        "research-question",
+        "method",
+        "evidence",
+        "project-relation"
+      ]
+    },
+    "answer": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 1800
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "properties": {
+          "locator": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
+          "support": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 300
+          }
+        },
+        "required": [
+          "locator",
+          "support"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "string",
+        "minLength": 2,
+        "maxLength": 240
+      }
+    }
+  },
+  "required": [
+    "paper_id",
+    "stage",
+    "answer",
+    "evidence",
+    "open_questions"
+  ],
+  "additionalProperties": false
+}

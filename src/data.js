@@ -1,0 +1,286 @@
+import { PROJECT_WORK_WORKFLOWS } from "../shared/projectWorkCapabilities.js";
+
+export const providers = [
+  {
+    id: "codex-subscription",
+    name: "GPT · Codex 订阅",
+    hint: "使用本机 Codex 登录状态",
+    available: false,
+    status: "checking",
+    reasonCode: "CATALOG_LOADING",
+    models: ["account-default"],
+  },
+  {
+    id: "deepseek",
+    name: "DeepSeek API",
+    hint: "使用本机服务端 API 配置",
+    available: false,
+    status: "checking",
+    reasonCode: "CATALOG_LOADING",
+    models: ["deepseek-v4-pro", "deepseek-v4-flash"],
+  },
+];
+
+export function getModelDisplayName(modelId) {
+  return modelId === "account-default" ? "账户默认模型" : modelId;
+}
+
+export const skillCatalog = PROJECT_WORK_WORKFLOWS.map((workflow) => ({
+  id: workflow.id,
+  name: workflow.label,
+  description: workflow.description,
+  category: "代码工作",
+  source: "Pi Agent 内置",
+  kind: "workflow",
+  defaultInstalled: true,
+  defaultEnabled: true,
+}));
+
+export const projects = [
+  {
+    id: "research-flow",
+    name: "研究工作流 A",
+    state: "角色重构 · 待继续",
+    updated: "14:32",
+    sourceCount: 9,
+    lastChecked: "今天 14:32",
+    defaultPrompt: "把当前架构整理成一份可直接交给协作者的版本，并明确第一版边界。",
+    restore: [
+      {
+        label: "上次完成",
+        body: "论文阅读脉络与第一版角色草案已经收口。",
+      },
+      {
+        label: "当前卡点",
+        body: "角色职责过载；真实并行与汇合点仍不清晰。",
+      },
+      {
+        label: "建议下一步",
+        body: "重构为协调器与动态专业池，形成可交接版本。",
+        accent: true,
+      },
+    ],
+    artifact: {
+      type: "交接稿",
+      title: "版本一架构交接稿",
+      status: "草稿 · 依据 7/9 · 有 2 项待讨论",
+      sections: [
+        {
+          title: "本轮目标",
+          paragraphs: [
+            "将职责过载的固定角色，收敛为一个负责流程与状态的核心协调器，以及按任务临时调用的动态专业池。第一版只描述可实现边界，不提前加入长期记忆、自动评审或后台循环。",
+          ],
+        },
+        {
+          title: "当前判断",
+          bullets: [
+            "固定角色同时承担检索、分析、审查和写作，边界不可验证；",
+            "真正需要并行的是独立资料抽取，其他路径应在明确节点汇合；",
+            "生成成功不能代表研究判断成立，结论必须回到来源和人工确认。",
+          ],
+        },
+        {
+          title: "建议结构",
+          ordered: [
+            ["核心协调器", "恢复项目状态、拆解本轮目标、记录阶段结果。"],
+            ["动态专业池", "按任务调用资料整理、方法分析、内容成稿等临时岗位。"],
+            ["汇合点", "每次只接收结构化阶段结果，不直接接收未经审阅的长对话。"],
+            ["人工门槛", "状态、证据、写入与导出分别确认。"],
+          ],
+        },
+        {
+          title: "待讨论",
+          bullets: [
+            "第一版是否只支持一个主成果；",
+            "“写入项目”是否继续保持关闭，仅支持导出 Markdown。",
+          ],
+        },
+      ],
+    },
+    sources: [
+      {
+        id: "handoff-note",
+        name: "新会话交接说明.md",
+        excerpt: "上一次工作已完成阅读脉络整理，下一步是收敛角色职责。",
+        detail: "文档明确记录了已完成的阅读范围、尚未验证的角色边界，以及本轮应优先处理的架构交接稿。",
+        status: "已核验 · 今天 14:32",
+      },
+      {
+        id: "architecture",
+        name: "当前架构设计.md",
+        excerpt: "现有角色同时承担规划、执行与审查，存在职责过载。",
+        detail: "五个固定角色之间出现职责重复；独立抽取可以并行，但规划和审查需要在明确节点汇合。",
+        status: "已核验 · 今天 14:30",
+      },
+      {
+        id: "evolution",
+        name: "架构演化工作稿.md",
+        excerpt: "动态专业池只在任务需要时创建，不作为第一版固定对象。",
+        detail: "工作稿建议先保留一个协调器，再把研究、数据与写作角色改为按任务创建的临时能力。",
+        status: "已核验 · 昨天",
+      },
+      {
+        id: "paper-03",
+        name: "研究论文 03.pdf",
+        excerpt: "生成成本低，但可靠筛选与证据判断仍是核心瓶颈。",
+        detail: "论文第 7–9 页讨论了自动生成与人工评估之间的成本差异，支持保留来源核对门槛。",
+        status: "已读 · 第 7–9 页",
+      },
+      {
+        id: "role-matrix",
+        name: "角色职责矩阵.md",
+        excerpt: "检索、分析与写作在三个角色间重复出现，缺少可验收边界。",
+        detail: "矩阵显示固定角色的输入输出没有稳定契约，支持改为按任务调用的专业能力。",
+        status: "已核验 · 昨天",
+      },
+      {
+        id: "flow-boundary",
+        name: "流程边界清单.md",
+        excerpt: "第一版只保留状态恢复、单一成果、来源核对和确认导出。",
+        detail: "终端、Git、多智能体和自动循环均被明确移出第一版。",
+        status: "已核验 · 昨天",
+      },
+      {
+        id: "review-note",
+        name: "方案复盘记录.md",
+        excerpt: "界面应把主成果放在中央，不以聊天记录或进度面板作为主对象。",
+        detail: "复盘结论同时约束产品信息架构与本轮交付形式。",
+        status: "已核验 · 周一",
+      },
+    ],
+    decisions: [
+      "第一版只有一个主成果，避免同时维护多条对话流。",
+      "真实项目资料保留在本机，仅发送用户明确选中的上下文。",
+      "生成、写入和导出是三个不同状态，不用一个“完成”概括。",
+    ],
+    pending: ["是否允许导出 Markdown？", "是否保留“一个主成果”的限制？"],
+  },
+  {
+    id: "literature-desk",
+    name: "文献发现台",
+    state: "生产核验 · 今日",
+    updated: "13:18",
+    sourceCount: 6,
+    lastChecked: "今天 13:18",
+    defaultPrompt: "把今天的候选论文压缩成一页研究简报，并标出仍需阅读全文的部分。",
+    restore: [
+      { label: "上次完成", body: "候选论文已去重，并按研究问题完成第一轮分类。" },
+      { label: "当前卡点", body: "两篇论文只有摘要证据，不能直接并入结论。" },
+      { label: "建议下一步", body: "形成一页候选简报，保留阅读全文清单。", accent: true },
+    ],
+    artifact: {
+      type: "研究简报",
+      title: "本月候选论文核验简报",
+      status: "草稿 · 依据 4/6 · 有 2 项待讨论",
+      sections: [
+        { title: "筛选结果", paragraphs: ["本轮六个候选来源中，三篇与研究问题直接相关，一篇可作为方法补充，两篇目前只有摘要层面的弱证据。"] },
+        { title: "可确认发现", bullets: ["可靠性评估正在从单一准确率转向过程与证据联合检查；", "长链研究任务的主要瓶颈仍是来源选择和中间状态丢失；", "人工评审更适合放在阶段汇合点，而不是每一步都介入。"] },
+        { title: "阅读全文队列", ordered: [["论文 A", "核验实验设置与基线选择。"], ["论文 B", "补读附录中的失败案例。"]] },
+        { title: "输出边界", bullets: ["摘要证据只标记为候选，不写成已确认结论；", "未获取全文的来源保留缺口提示。"] },
+      ],
+    },
+    sources: [
+      { id: "paper-a", name: "候选论文 A.pdf", excerpt: "提出阶段化评估，但实验只覆盖有限任务。", detail: "需要进一步核验实验设置、数据规模和对照基线。", status: "已读 · 第 2–6 页" },
+      { id: "paper-b", name: "候选论文 B.pdf", excerpt: "报告长链任务中的上下文丢失现象。", detail: "正文支持当前判断，附录失败案例尚未读完。", status: "部分核验 · 附录待读" },
+      { id: "search-log", name: "检索记录.json", excerpt: "共发现 18 条，去重后保留 6 条。", detail: "标题、DOI 与作者组合去重完成，未发现重复版本。", status: "已核验 · 今天 12:50" },
+    ],
+    decisions: ["先做候选简报，再决定是否阅读全文。", "摘要不能单独支撑研究结论。", "每篇论文保留一个明确的待验证问题。"],
+    pending: ["是否将论文 A 加入精读队列？", "是否保留摘要来源？"],
+  },
+  {
+    id: "daily-brief",
+    name: "AI 每日简报",
+    state: "报告已生成 · 08:00",
+    updated: "08:05",
+    sourceCount: 12,
+    lastChecked: "今天 08:05",
+    defaultPrompt: "把已有条目整理成固定栏目日报，英文残留先翻译，不重新抓取。",
+    restore: [
+      { label: "上次完成", body: "过去 24 小时条目已汇总，来源状态也已记录。" },
+      { label: "当前卡点", body: "三条英文摘要尚未翻译，两个来源处于延迟状态。" },
+      { label: "建议下一步", body: "只整理本地报告，补齐中文并导出。", accent: true },
+    ],
+    artifact: {
+      type: "每日简报",
+      title: "AI 充电站 · 今日必看",
+      status: "可校对 · 依据 10/12 · 有 1 项待讨论",
+      sections: [
+        { title: "统计窗口", paragraphs: ["过去 24 小时共收录 12 条有效更新，其中创作者更新 5 条、官方与行业信息 4 条、AI HOT 精选 3 条。"] },
+        { title: "今日必看", bullets: ["一项新的开源推理评测强调过程可复核性；", "主流模型服务更新了批处理与缓存说明；", "两位创作者集中讨论轻量个人 Agent 的边界。"] },
+        { title: "来源状态", bullets: ["十个来源正常；", "两个来源延迟，未把延迟误判为抓取代码故障。"] },
+        { title: "编辑说明", paragraphs: ["正文只使用已经生成的本地报告和工作流状态，不在整理阶段重新运行抓取。"] },
+      ],
+    },
+    sources: [
+      { id: "latest-report", name: "latest-report.txt", excerpt: "本地日报正文已生成，仍有三段英文残留。", detail: "当前成果以该文件为正文基准，不重新抓取。", status: "已读取 · 今天 08:00" },
+      { id: "workflow-state", name: "latest-workflow.json", excerpt: "12 条有效更新；2 个来源延迟。", detail: "状态文件记录了窗口、条目数和各来源结果。", status: "已核验 · 今天 08:05" },
+      { id: "hot-list", name: "AI HOT 精选.md", excerpt: "三条候选均有中文标题与来源链接。", detail: "可直接并入日报固定栏目。", status: "已核验 · 今天 07:58" },
+    ],
+    decisions: ["日报整理不触发重新抓取。", "英文残留先翻译再输出。", "来源延迟只做状态提醒。"],
+    pending: ["是否保留两个延迟来源的提醒？"],
+  },
+  {
+    id: "content-studio",
+    name: "内容写作",
+    state: "教程稿 · 待校对",
+    updated: "昨天",
+    sourceCount: 7,
+    lastChecked: "昨天 21:40",
+    defaultPrompt: "按现有正文基准整理成可发布教程，保留原有措辞和操作顺序。",
+    restore: [
+      { label: "上次完成", body: "教程结构和主要截图说明已经完成。" },
+      { label: "当前卡点", body: "两个操作步骤的界面文案与当前版本不一致。" },
+      { label: "建议下一步", body: "对照现有界面做一次措辞级校对。", accent: true },
+    ],
+    artifact: {
+      type: "内容初稿",
+      title: "AI 工具实践教程 · 校对稿",
+      status: "待校对 · 依据 5/7 · 有 2 项待讨论",
+      sections: [
+        { title: "文章目标", paragraphs: ["让第一次使用该工具的读者，在不理解内部术语的前提下，完成一次从任务输入到成果导出的完整实践。"] },
+        { title: "操作主线", ordered: [["准备资料", "确认本轮输入范围和不可上传内容。"], ["生成初稿", "选择明确的成果类型并保留来源。"], ["人工校对", "检查事实、界面文案和最终导出格式。"]] },
+        { title: "当前修改", bullets: ["删除抽象功能介绍，直接从实际任务进入；", "截图说明统一使用当前中文界面名称；", "把风险和确认点放回对应步骤。"] },
+        { title: "待补内容", bullets: ["补一张服务商切换截图；", "核验 Skill 安装后的状态提示。"] },
+      ],
+    },
+    sources: [
+      { id: "baseline", name: "当前正文基准.md", excerpt: "正文措辞和结构以该版本为准。", detail: "仅做必要的界面词更新，不重写已确认段落。", status: "已核验 · 昨天" },
+      { id: "ui-notes", name: "界面核验记录.md", excerpt: "两个按钮名称已随版本更新。", detail: "需要在步骤二和步骤五同步替换。", status: "已核验 · 昨天" },
+      { id: "screens", name: "截图清单.md", excerpt: "当前还缺服务商切换与 Skill 状态两张图。", detail: "其他截图已完成编号和正文引用。", status: "待补 · 2 张" },
+    ],
+    decisions: ["正文基准控制措辞。", "界面文案必须以当前版本为准。", "不把功能说明写成营销文案。"],
+    pending: ["是否补拍服务商切换截图？", "是否保留风险说明小节？"],
+  },
+  {
+    id: "source-tracker",
+    name: "数据源跟踪",
+    state: "来源更新 · 3 条",
+    updated: "周一",
+    sourceCount: 8,
+    lastChecked: "周一 16:20",
+    defaultPrompt: "核对三个更新来源，区分真实变化、口径调整和暂时无法确认的条目。",
+    restore: [
+      { label: "上次完成", body: "八个核心来源已登记，字段和更新时间已统一。" },
+      { label: "当前卡点", body: "三个来源发生变化，其中一个没有变更说明。" },
+      { label: "建议下一步", body: "形成差异表，并标记不能归因的变化。", accent: true },
+    ],
+    artifact: {
+      type: "核验记录",
+      title: "数据源更新核验 · 第 27 周",
+      status: "草稿 · 依据 6/8 · 有 1 项待讨论",
+      sections: [
+        { title: "本轮范围", paragraphs: ["只核对本月出现差异的三个来源，不重新下载没有变化的数据集。"] },
+        { title: "核验结果", bullets: ["来源 01 为正常版本更新，字段结构未变；", "来源 03 调整了统计口径，需要同步说明；", "来源 07 没有发布变更说明，暂时不能归因。"] },
+        { title: "建议动作", ordered: [["更新记录", "写入版本与口径变化。"], ["保留旧值", "来源 07 在确认前不覆盖。"], ["下次检查", "一周后复核变更说明。"]] },
+        { title: "风险", paragraphs: ["不能因为文件时间变化就推断数据内容已经更新。"] },
+      ],
+    },
+    sources: [
+      { id: "source-01", name: "资料源 01 / 版本说明", excerpt: "发布新版本，字段结构保持不变。", detail: "版本号和文件校验值已变化，属于可确认更新。", status: "已核验 · 周一" },
+      { id: "source-03", name: "资料源 03 / 口径说明", excerpt: "统计范围从自然年改为滚动十二个月。", detail: "需要同步更新指标解释，不能直接与旧值比较。", status: "已核验 · 周一" },
+      { id: "source-07", name: "资料源 07 / 数据文件", excerpt: "文件时间已变化，但没有发布说明。", detail: "当前只能确认文件元数据变化，不能确认内容变化原因。", status: "待核验 · 周一" },
+    ],
+    decisions: ["没有变更说明时不覆盖旧值。", "口径变化与数值变化分开记录。", "未变化来源不重复下载。"],
+    pending: ["是否将来源 07 加入下周复核？"],
+  },
+];

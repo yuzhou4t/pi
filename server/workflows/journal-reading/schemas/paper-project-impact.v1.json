@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "impacts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 20
+          },
+          "project_impact": {
+            "type": "string",
+            "minLength": 4,
+            "maxLength": 260
+          }
+        },
+        "required": ["request_id", "project_impact"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["impacts"],
+  "additionalProperties": false
+}

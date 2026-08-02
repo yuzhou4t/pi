@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.npm-cache
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+.pi-agent/
+
+# Local project instructions and review artifacts
+.agents/
+.codex/
+AGENTS.md
+PRODUCT_MEETING.md
+project_state.md
+design-qa.md
+qa/
+scripts/Pi Agent.command

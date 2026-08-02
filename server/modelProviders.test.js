@@ -1,0 +1,163 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createModelProviderRegistry, ModelProviderRegistryError } from "./modelProviders.js";
+
+const schema = {
+  type: "object",
+  properties: { answer: { type: "string" } },
+  required: ["answer"],
+  additionalProperties: false,
+};
+
+test("Pi-style provider registry routes a bounded structured task to DeepSeek", async () => {
+  let received;
+  const registry = createModelProviderRegistry({
+    env: {
+      PI_DEEPSEEK_API_KEY: "server-secret",
+      PI_DEEPSEEK_TIMEOUT_MS: "1200",
+    },
+    deepseekRunner: async (request) => {
+      received = request;
+      return {
+        text: JSON.stringify({ answer: "ok" }),
+        operationId: "deepseek-operation",
+        upstreamRequestId: "upstream-1",
+        usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+      };
+    },
+  });
+  const result = await registry.completeStructured({
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+    system: "Short system.",
+    prompt: "One bounded task.",
+    input: { paper_id: "paper-1" },
+    schema,
+  });
+  assert.equal(result.value.answer, "ok");
+  assert.equal(received.messages.length, 2);
+  assert.match(received.messages[0].content, /严格匹配以下 JSON Schema/);
+  assert.match(received.messages[0].content, /"required":\["answer"\]/);
+  assert.match(received.messages[0].content, /"additionalProperties":false/);
+  assert.match(received.messages[1].content, /输入 JSON/);
+  assert.match(received.messages[1].content, /"paper_id":"paper-1"/);
+  assert.equal(received.apiKey, "server-secret");
+  assert.equal(received.timeoutMs, 1200);
+});
+
+test("Pi-style provider registry keeps the existing Codex subscription adapter", async () => {
+  let received;
+  const registry = createModelProviderRegistry({
+    env: { PI_CODEX_TIMEOUT_MS: "2400" },
+    codexRunner: async (request) => {
+      received = request;
+      return {
+        text: JSON.stringify({ answer: "ok" }),
+        operationId: "codex-operation",
+        usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+      };
+    },
+  });
+  const result = await registry.completeStructured({
+    providerId: "codex-subscription",
+    modelId: "account-default",
+    system: "Short system.",
+    prompt: "One bounded task.",
+    input: { paper_id: "paper-1" },
+    schema,
+  });
+  assert.equal(result.value.answer, "ok");
+  assert.equal(received.timeoutMs, 2400);
+  assert.equal(received.modelId, "account-default");
+  assert.equal(received.reasoningEffort, null);
+  assert.match(received.prompt, /One bounded task/);
+  assert.deepEqual(received.schema, schema);
+});
+
+test("Pi-style provider registry forwards the fixed Spark reasoning profile", async () => {
+  let received;
+  const registry = createModelProviderRegistry({
+    codexRunner: async (request) => {
+      received = request;
+      return {
+        text: JSON.stringify({ answer: "ok" }),
+        operationId: "codex-spark-operation",
+        usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+      };
+    },
+  });
+  const result = await registry.completeStructured({
+    providerId: "codex-subscription",
+    modelId: "gpt-5.3-codex-spark",
+    reasoningEffort: "low",
+    system: "Short system.",
+    prompt: "Translate one batch.",
+    input: { paper_id: "paper-1" },
+    schema,
+  });
+  assert.equal(received.modelId, "gpt-5.3-codex-spark");
+  assert.equal(received.reasoningEffort, "low");
+  assert.equal(result.reasoning_effort, "low");
+});
+
+test("provider usage is recorded before malformed structured output is rejected", async () => {
+  const captured = [];
+  const registry = createModelProviderRegistry({
+    deepseekRunner: async () => ({
+      text: "not json",
+      operationId: "deepseek-invalid-output",
+      upstreamRequestId: "upstream-invalid-output",
+      usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+    }),
+    usageRecorder: async (receipt) => {
+      captured.push(receipt);
+      return receipt.usage;
+    },
+  });
+
+  await assert.rejects(registry.completeStructured({
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+    system: "system",
+    prompt: "prompt",
+    input: {},
+    schema,
+  }), (error) => (
+    error instanceof ModelProviderRegistryError
+    && error.code === "MODEL_OUTPUT_INVALID"
+  ));
+  assert.equal(captured.length, 1);
+  assert.deepEqual(captured[0], {
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+    operationId: "deepseek-invalid-output",
+    upstreamRequestId: "upstream-invalid-output",
+    usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+  });
+});
+
+test("unknown providers and malformed JSON outputs are rejected", async () => {
+  const registry = createModelProviderRegistry({
+    deepseekRunner: async () => ({
+      text: "not json",
+      operationId: "operation",
+      usage: {},
+    }),
+  });
+  await assert.rejects(registry.completeStructured({
+    providerId: "unknown",
+    modelId: "unknown",
+    system: "system",
+    prompt: "prompt",
+    input: {},
+    schema,
+  }), (error) => error instanceof ModelProviderRegistryError && error.code === "MODEL_NOT_ALLOWED");
+  await assert.rejects(registry.completeStructured({
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+    system: "system",
+    prompt: "prompt",
+    input: {},
+    schema,
+  }), (error) => error instanceof ModelProviderRegistryError && error.code === "MODEL_OUTPUT_INVALID");
+});

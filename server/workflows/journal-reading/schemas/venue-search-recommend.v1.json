@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "answer": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 1200
+    },
+    "recommendations": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "properties": {
+          "paper_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 300
+          },
+          "project_impact": {
+            "type": "string",
+            "minLength": 4,
+            "maxLength": 260
+          }
+        },
+        "required": ["paper_id", "reason", "project_impact"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["answer", "recommendations"],
+  "additionalProperties": false
+}

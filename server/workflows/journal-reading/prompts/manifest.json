@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "workflow_id": "journal-reading-v1",
+  "system": {
+    "version": "system.v1",
+    "file": "system.v1.md"
+  },
+  "active": {
+    "candidate-ranking": "candidate-ranking.v2",
+    "candidate-summary": "candidate-summary.v2",
+    "five-minute-guide": "five-minute-guide.v3",
+    "research-question": "research-question.v2",
+    "method": "method.v3",
+    "evidence": "evidence.v3",
+    "project-relation": "project-relation.v3",
+    "reading-follow-up": "reading-follow-up.v1",
+    "reading-chat": "reading-chat.v4",
+    "translation": "translation.v1",
+    "paper-project-impact": "paper-project-impact.v1",
+    "venue-search-plan": "venue-search-plan.v2",
+    "venue-search-recommend": "venue-search-recommend.v2",
+    "venue-search-translate": "venue-search-translate.v1"
+  },
+  "versions": {
+    "candidate-ranking.v1": {
+      "file": "candidate-ranking.v1.md",
+      "schema": "ranking.v1.json"
+    },
+    "candidate-ranking.v2": {
+      "file": "candidate-ranking.v2.md",
+      "schema": "ranking.v2.json"
+    },
+    "candidate-summary.v2": {
+      "file": "candidate-summary.v2.md",
+      "schema": "candidate-summary.v2.json"
+    },
+    "five-minute-guide.v1": {
+      "file": "five-minute-guide.v1.md",
+      "schema": "guide.v1.json"
+    },
+    "five-minute-guide.v2": {
+      "file": "five-minute-guide.v2.md",
+      "schema": "guide.v2.json"
+    },
+    "five-minute-guide.v3": {
+      "file": "five-minute-guide.v3.md",
+      "schema": "guide.v2.json"
+    },
+    "research-question.v1": {
+      "file": "research-question.v1.md",
+      "schema": "reading-stage.v1.json"
+    },
+    "method.v1": {
+      "file": "method.v1.md",
+      "schema": "reading-stage.v1.json"
+    },
+    "evidence.v1": {
+      "file": "evidence.v1.md",
+      "schema": "reading-stage.v1.json"
+    },
+    "project-relation.v1": {
+      "file": "project-relation.v1.md",
+      "schema": "reading-stage.v1.json"
+    },
+    "research-question.v2": {
+      "file": "research-question.v2.md",
+      "schema": "reading-stage.v2.json"
+    },
+    "method.v2": {
+      "file": "method.v2.md",
+      "schema": "reading-stage.v2.json"
+    },
+    "evidence.v2": {
+      "file": "evidence.v2.md",
+      "schema": "reading-stage.v2.json"
+    },
+    "project-relation.v2": {
+      "file": "project-relation.v2.md",
+      "schema": "reading-stage.v2.json"
+    },
+    "method.v3": {
+      "file": "method.v3.md",
+      "schema": "reading-stage.v2.json"
+    },
+    "evidence.v3": {
+      "file": "evidence.v3.md",
+      "schema": "reading-stage.v2.json"
+    },
+    "project-relation.v3": {
+      "file": "project-relation.v3.md",
+      "schema": "reading-stage.v2.json"
+    },
+    "reading-follow-up.v1": {
+      "file": "reading-follow-up.v1.md",
+      "schema": "reading-stage.v2.json"
+    },
+    "reading-chat.v1": {
+      "file": "reading-chat.v1.md",
+      "schema": "reading-chat.v1.json"
+    },
+    "reading-chat.v2": {
+      "file": "reading-chat.v2.md",
+      "schema": "reading-chat.v2.json"
+    },
+    "translation.v1": {
+      "file": "translation.v1.md",
+      "schema": "translation.v1.json"
+    },
+    "paper-project-impact.v1": {
+      "file": "paper-project-impact.v1.md",
+      "schema": "paper-project-impact.v1.json"
+    },
+    "reading-chat.v3": {
+      "file": "reading-chat.v3.md",
+      "schema": "reading-chat.v3.json"
+    },
+    "reading-chat.v4": {
+      "file": "reading-chat.v4.md",
+      "schema": "reading-chat.v4.json"
+    },
+    "venue-search-plan.v1": {
+      "file": "venue-search-plan.v1.md",
+      "schema": "venue-search-plan.v1.json"
+    },
+    "venue-search-plan.v2": {
+      "file": "venue-search-plan.v2.md",
+      "schema": "venue-search-plan.v2.json"
+    },
+    "venue-search-recommend.v1": {
+      "file": "venue-search-recommend.v1.md",
+      "schema": "venue-search-recommend.v1.json"
+    },
+    "venue-search-recommend.v2": {
+      "file": "venue-search-recommend.v2.md",
+      "schema": "venue-search-recommend.v2.json"
+    },
+    "venue-search-translate.v1": {
+      "file": "venue-search-translate.v1.md",
+      "schema": "venue-search-translate.v1.json"
+    }
+  }
+}

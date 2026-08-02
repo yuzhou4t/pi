@@ -1,0 +1,37 @@
+{
+  "name": "pi-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:api": "PI_API_PORT=8788 node --watch --env-file-if-exists=.env.local server/index.js",
+    "local": "node scripts/pi-agent-local.mjs",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test:contracts": "node --test server/runtimeSchema.test.js server/modelMode.test.js server/project-work/piSdkCompatibility.test.js server/promptRegistry.test.js",
+    "test": "node --test --test-concurrency=1",
+    "schema:check": "node scripts/check-runtime-schemas.mjs",
+    "verify": "npm run test:contracts && npm test && npm run build && npm run schema:check"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "@phosphor-icons/react": "^2.1.10",
+    "@vitejs/plugin-react": "5.0.4",
+    "diff": "8.0.4",
+    "fflate": "^0.8.2",
+    "jiti": "2.7.0",
+    "katex": "^0.18.1",
+    "pi-subagents": "0.37.2",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
+    "rehype-raw": "^7.0.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
+    "typebox": "1.1.38",
+    "vite": "6.4.2"
+  }
+}
