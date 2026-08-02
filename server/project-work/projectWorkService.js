@@ -3636,7 +3636,9 @@ function createProjectWorkServiceRuntime({
       return "awaiting_confirmation";
     }
     const latestVerificationByRequest = new Map();
-    for (const verification of current.verifications ?? []) {
+    for (const verification of activeVerificationRecords(
+      current.verifications,
+    )) {
       if (
         typeof verification.commandId === "string"
         && ["passed", "failed", "aborted", "interrupted"].includes(
@@ -10189,24 +10191,151 @@ function createProjectWorkServiceRuntime({
     );
   }
 
+  function legacyVerificationChain(
+    verifications,
+    { legacyOverlay = false } = {},
+  ) {
+    const records = Array.isArray(verifications) ? verifications : [];
+    const requestIds = new Set();
+    const explicitlyLegacy = (verification) => (
+      verification?.status === "legacy_superseded"
+      || verification?.blockedReason === "legacy_workspace_migration"
+      || verification?.errorCode
+        === "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE"
+    );
+    for (const verification of records) {
+      const overlayPending = legacyOverlay && [
+        "requested",
+        "pending_approval",
+        "running",
+      ].includes(verification?.status);
+      if (!explicitlyLegacy(verification) && !overlayPending) continue;
+      const requestId = compactText(
+        verification?.commandId ?? verification?.id,
+        180,
+      );
+      if (requestId) requestIds.add(requestId);
+    }
+    const isLegacy = (verification) => {
+      if (explicitlyLegacy(verification)) return true;
+      const id = compactText(verification?.id, 180);
+      const commandId = compactText(verification?.commandId, 180);
+      return Boolean(
+        (id && requestIds.has(id))
+        || (commandId && requestIds.has(commandId)),
+      );
+    };
+    return { records, isLegacy };
+  }
+
+  function activeVerificationRecords(verifications) {
+    const chain = legacyVerificationChain(verifications);
+    return chain.records.filter((verification) => !chain.isLegacy(verification));
+  }
+
   function supersedeLegacyVerifications(
     verifications,
     completedAt,
     { legacyOverlay = true } = {},
   ) {
-    if (!legacyOverlay) return [...(verifications ?? [])];
-    return (verifications ?? []).map((verification) => (
-      ["requested", "pending_approval", "running"].includes(
-        verification?.status,
-      )
-        ? {
-            ...verification,
-            status: "legacy_superseded",
-            blockedReason: "legacy_workspace_migration",
-            completedAt,
-          }
-        : verification
-    ));
+    const chain = legacyVerificationChain(verifications, { legacyOverlay });
+    return chain.records.map((verification) => {
+      if (!chain.isLegacy(verification)) return verification;
+      if (
+        verification.status === "legacy_superseded"
+        && verification.blockedReason === "legacy_workspace_migration"
+      ) {
+        return verification;
+      }
+      return {
+        ...verification,
+        legacyStatus: compactText(verification.legacyStatus, 80)
+          || verification.status
+          || null,
+        status: "legacy_superseded",
+        blockedReason: "legacy_workspace_migration",
+        supersededAt: verification.supersededAt ?? completedAt,
+        completedAt: verification.completedAt ?? completedAt,
+      };
+    });
+  }
+
+  function legacyVerificationNormalizationRequired(conversation) {
+    if (
+      workspaceRuntimeMode !== "workspace-v2"
+      || conversationWorkType(conversation) !== PROJECT_WORK_TYPE
+      || conversationWorkspaceKind(conversation) !== "bound_project"
+      || conversation.runtimeProfile !== "pi-native-v1"
+    ) {
+      return false;
+    }
+    const chain = legacyVerificationChain(conversation.verifications);
+    const hasLegacyChain = chain.records.some(chain.isLegacy);
+    if (!hasLegacyChain) return false;
+    if (chain.records.some((verification) => (
+      chain.isLegacy(verification)
+      && verification.status !== "legacy_superseded"
+    ))) {
+      return true;
+    }
+    if (
+      conversation.lastError?.code
+      === "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE"
+    ) {
+      return true;
+    }
+    if (!["verification_failed", "interrupted"].includes(conversation.status)) {
+      return false;
+    }
+    return stableStatusAfterOperation(conversation, "idle")
+      !== conversation.status;
+  }
+
+  async function normalizeMigratedLegacyVerifications(conversationId) {
+    let normalization = null;
+    const normalized = await updateConversation(conversationId, (current) => {
+      if (!legacyVerificationNormalizationRequired(current)) return {};
+      const normalizedAt = timestamp();
+      const verifications = supersedeLegacyVerifications(
+        current.verifications,
+        normalizedAt,
+        { legacyOverlay: false },
+      );
+      const supersededCount = verifications.reduce((count, verification, index) => (
+        verification.status === "legacy_superseded"
+        && current.verifications?.[index]?.status !== "legacy_superseded"
+          ? count + 1
+          : count
+      ), 0);
+      const clearLastError = current.lastError?.code
+        === "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE";
+      const recomputeStatus = ["verification_failed", "interrupted"].includes(
+        current.status,
+      );
+      const next = { ...current, verifications };
+      const status = recomputeStatus
+        ? stableStatusAfterOperation(next, "idle")
+        : current.status;
+      normalization = {
+        normalizedAt,
+        supersededCount,
+        previousStatus: current.status,
+        status,
+        clearedLastError: clearLastError,
+      };
+      return {
+        verifications,
+        status,
+        ...(clearLastError ? { lastError: null } : {}),
+      };
+    });
+    if (!normalization) return normalized;
+    await appendEvent(
+      conversationId,
+      "workspace.legacy_verifications_superseded",
+      normalization,
+    );
+    return conversationStore.get(conversationId);
   }
 
   function legacySessionCheckpoints(conversation) {
@@ -10286,7 +10415,11 @@ function createProjectWorkServiceRuntime({
     if (existing) return existing;
     const migration = (async () => {
       let conversation = await conversationStore.get(conversationId);
-      if (!requiresLegacyWorkspaceMigration(conversation)) return conversation;
+      if (!requiresLegacyWorkspaceMigration(conversation)) {
+        return legacyVerificationNormalizationRequired(conversation)
+          ? normalizeMigratedLegacyVerifications(conversationId)
+          : conversation;
+      }
       if (
         conversation.legacyMigration?.status === "needs_review"
         && conversation.activeChangeSet?.status === "ready"
@@ -10577,7 +10710,10 @@ function createProjectWorkServiceRuntime({
     if (workspaceRuntimeMode !== "workspace-v2") return;
     const conversations = await conversationStore.list(undefined);
     await Promise.all(conversations.map(async (conversation) => {
-      if (!requiresLegacyWorkspaceMigration(conversation)) return;
+      if (
+        !requiresLegacyWorkspaceMigration(conversation)
+        && !legacyVerificationNormalizationRequired(conversation)
+      ) return;
       await migrateLegacyProjectConversation(conversation.id);
     }));
   }
