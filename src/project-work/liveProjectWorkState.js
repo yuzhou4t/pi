@@ -267,11 +267,15 @@ function upsertEventMessage(messages, event) {
     return messages;
   }
   const existing = messages.find((message) => message.id === id);
+  const text = typeof value(data, "text") === "string"
+    ? value(data, "text")
+    : existing?.content ?? existing?.text ?? "";
   const next = {
     ...(existing ?? {}),
     id,
     role,
-    text: typeof value(data, "text") === "string" ? value(data, "text") : "",
+    content: text,
+    text,
     status: value(data, "status") ?? existing?.status ?? "completed",
     isFinal: value(data, "is_final", "isFinal") !== false,
     messageSeq: Number(value(data, "message_seq", "messageSeq"))
@@ -368,7 +372,6 @@ export function applyProjectWorkEventDelta(current, event) {
       Number(current.deliveredEventSeq) || 0,
       event.seq,
     ),
-    updatedAt: event.createdAt ?? event.at ?? current.updatedAt,
   };
 
   if (["message.created", "message.completed"].includes(event.type)) {

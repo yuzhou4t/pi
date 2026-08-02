@@ -64,11 +64,90 @@ test("incremental project events update visible state without a full snapshot", 
   assert.equal(completed.plan[0].title, "检查事件流");
   assert.equal(completed.workspaceRuns[0].runId, "run-1");
   assert.equal(completed.workspaceRuns[0].status, "running");
+  assert.equal(completed.messages[0].content, "事件流已经恢复。");
   assert.equal(completed.messages[0].text, "事件流已经恢复。");
   assert.deepEqual(completed.events.map((event) => event.seq), [1, 2, 3]);
   assert.equal(completed.lastEventSeq, 3);
   assert.equal(completed.deliveredEventSeq, 3);
   assert.equal(applyProjectWorkEventDelta(completed, completed.events[2]), completed);
+});
+
+test("incremental user and final message events use the renderer's canonical content field", () => {
+  const initial = {
+    id: "conversation-visible-events",
+    status: "running",
+    turnStatus: "running",
+    messages: [],
+    events: [],
+    lastEventSeq: 0,
+  };
+  const withUser = applyProjectWorkEventDelta(initial, {
+    seq: 1,
+    type: "message.created",
+    at: "2026-08-03T09:00:00.000Z",
+    data: {
+      id: "message-user",
+      role: "user",
+      text: "继续在原会话里工作",
+      turnId: "turn-visible",
+    },
+  });
+  const withFinal = applyProjectWorkEventDelta(withUser, {
+    seq: 2,
+    type: "message.completed",
+    at: "2026-08-03T09:00:01.000Z",
+    data: {
+      id: "message-assistant",
+      role: "assistant",
+      text: "原生 Pi 已经完成本轮。",
+      status: "completed",
+      isFinal: true,
+      turnId: "turn-visible",
+    },
+  });
+
+  assert.deepEqual(
+    withFinal.messages.map(({ role, content, text }) => ({ role, content, text })),
+    [{
+      role: "user",
+      content: "继续在原会话里工作",
+      text: "继续在原会话里工作",
+    }, {
+      role: "assistant",
+      content: "原生 Pi 已经完成本轮。",
+      text: "原生 Pi 已经完成本轮。",
+    }],
+  );
+});
+
+test("incremental event time does not reject the authoritative same-watermark hydration", () => {
+  const initial = {
+    id: "conversation-hydration",
+    status: "running",
+    turnStatus: "running",
+    messages: [],
+    events: [],
+    lastEventSeq: 4,
+    updatedAt: "2026-08-03T09:00:00.000Z",
+  };
+  const withRequestEvent = applyProjectWorkEventDelta(initial, {
+    seq: 5,
+    type: "ask_user.requested",
+    at: "2026-08-03T09:00:02.000Z",
+    data: { id: "ask-user-1" },
+  });
+  const hydrated = mergeFreshConversationSnapshot(withRequestEvent, {
+    ...withRequestEvent,
+    updatedAt: "2026-08-03T09:00:01.000Z",
+    askUserRequests: [{
+      id: "ask-user-1",
+      status: "pending",
+      questions: [{ id: "scope", prompt: "确认范围" }],
+    }],
+  });
+
+  assert.equal(withRequestEvent.updatedAt, initial.updatedAt);
+  assert.equal(hydrated.askUserRequests[0].questions[0].prompt, "确认范围");
 });
 
 test("message deltas retain append metadata while advancing the live watermark", () => {

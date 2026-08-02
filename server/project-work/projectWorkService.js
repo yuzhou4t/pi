@@ -11768,6 +11768,12 @@ function createProjectWorkServiceRuntime({
 
     let runtime = null;
     try {
+      const {
+        clientRequestId: _clientRequestId,
+        requestFingerprint: _requestFingerprint,
+        ...publicUserMessage
+      } = userMessage;
+      await appendEvent(conversationId, "message.created", publicUserMessage);
       runtime = await getRuntime(conversationId);
       if (selectedModel.modelRef !== runtime.modelRef) {
         if (typeof runtime.host.setModel !== "function") {
@@ -11859,12 +11865,6 @@ function createProjectWorkServiceRuntime({
       runtime.activeTurnSettings = turnSettings;
       runtime.activePiUserEntryId = null;
       runtime.abortRequested = false;
-      const {
-        clientRequestId: _clientRequestId,
-        requestFingerprint: _requestFingerprint,
-        ...publicUserMessage
-      } = userMessage;
-      await appendEvent(conversationId, "message.created", publicUserMessage);
       const hostHarnessSnapshot = typeof runtime.host.getHarnessSnapshot === "function"
         ? runtime.host.getHarnessSnapshot()
         : null;

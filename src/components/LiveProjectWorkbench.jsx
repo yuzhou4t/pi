@@ -6542,6 +6542,9 @@ export function LiveProjectWorkbench({
   installedSkillCount = 0,
   sidebarOpen = true,
   onToggleSidebar,
+  mobileActive = false,
+  mobileView = "agent",
+  onMobileViewChange,
   api = projectWorkApi,
   pollIntervalMs = 1_000,
   onConversationChange,
@@ -6752,7 +6755,13 @@ export function LiveProjectWorkbench({
     verificationAutoOpenRef.current.add(key);
     setActiveArtifactId("run_result");
     setArtifactOpen(true);
-  }, [snapshot?.id, unresolvedVerification?.requestKey]);
+    if (mobileActive) onMobileViewChange?.("artifact");
+  }, [
+    mobileActive,
+    onMobileViewChange,
+    snapshot?.id,
+    unresolvedVerification?.requestKey,
+  ]);
 
   useEffect(() => {
     if (!selectedCheckpointId) return;
@@ -6822,9 +6831,12 @@ export function LiveProjectWorkbench({
     let controller = null;
     let requestActive = false;
     let refreshQueued = false;
+    let refreshQueuedWithActivity = false;
     let unsubscribe = null;
     let streamConnected = false;
+    let lastStreamActivityAt = Date.now();
     let reconnectTimeoutId = null;
+    let streamWatchdogTimeoutId = null;
     let hydrationTimeoutId = null;
     let eventFrameId = null;
     let pendingStreamEvents = [];
@@ -6863,10 +6875,14 @@ export function LiveProjectWorkbench({
       }, pollIntervalMs);
     }
 
-    async function refreshSnapshot({ continuePolling = false } = {}) {
+    async function refreshSnapshot({
+      continuePolling = false,
+      includeActivity = false,
+    } = {}) {
       if (disposed) return;
       if (requestActive) {
         refreshQueued = true;
+        refreshQueuedWithActivity ||= includeActivity;
         if (continuePolling) schedulePoll();
         return;
       }
@@ -6880,7 +6896,7 @@ export function LiveProjectWorkbench({
       try {
         const nextSnapshot = await api.fetchConversation({
           conversationId,
-          includeActivity: false,
+          includeActivity,
           signal: controller.signal,
         });
         if (disposed) return;
@@ -6895,12 +6911,33 @@ export function LiveProjectWorkbench({
       } finally {
         requestActive = false;
         if (refreshQueued && !disposed) {
+          const queuedActivity = refreshQueuedWithActivity;
           refreshQueued = false;
-          void refreshSnapshot({ continuePolling: keepPolling });
+          refreshQueuedWithActivity = false;
+          void refreshSnapshot({
+            continuePolling: keepPolling,
+            includeActivity: queuedActivity,
+          });
           return;
         }
         if (keepPolling) schedulePoll();
       }
+    }
+
+    function scheduleStreamWatchdog() {
+      if (disposed || streamWatchdogTimeoutId !== null) return;
+      const watchdogDelay = Math.max(45_000, pollIntervalMs * 15);
+      streamWatchdogTimeoutId = window.setTimeout(() => {
+        streamWatchdogTimeoutId = null;
+        if (
+          streamConnected
+          && shouldPollConversationRef.current
+          && Date.now() - lastStreamActivityAt >= watchdogDelay
+        ) {
+          void refreshSnapshot({ includeActivity: true });
+        }
+        scheduleStreamWatchdog();
+      }, watchdogDelay);
     }
 
     if (typeof api.subscribeConversation === "function") {
@@ -6910,6 +6947,7 @@ export function LiveProjectWorkbench({
           afterSeq: conversationEventResumeSeq(snapshotRef.current),
           onConversation: (nextSnapshot) => {
             if (disposed) return;
+            lastStreamActivityAt = Date.now();
             publishSnapshot(mergeIncrementalConversationSnapshot(
               snapshotRef.current,
               nextSnapshot,
@@ -6917,6 +6955,7 @@ export function LiveProjectWorkbench({
           },
           onEvent: (event) => {
             if (disposed) return;
+            lastStreamActivityAt = Date.now();
             pendingStreamEvents.push(event);
             if (eventFrameId === null) {
               eventFrameId = window.requestAnimationFrame(
@@ -6924,18 +6963,23 @@ export function LiveProjectWorkbench({
               );
             }
           },
+          onHeartbeat: () => {
+            if (disposed) return;
+            lastStreamActivityAt = Date.now();
+          },
           onResync: () => {
             if (disposed) return;
             if (eventFrameId !== null) {
               window.cancelAnimationFrame(eventFrameId);
               flushPendingStreamEvents();
             }
-            void refreshSnapshot();
+            void refreshSnapshot({ includeActivity: true });
           },
           onConnectionState: (state) => {
             if (disposed) return;
             streamConnected = state === "connected";
             if (streamConnected) {
+              lastStreamActivityAt = Date.now();
               if (reconnectTimeoutId !== null) {
                 window.clearTimeout(reconnectTimeoutId);
                 reconnectTimeoutId = null;
@@ -6963,6 +7007,7 @@ export function LiveProjectWorkbench({
         errorRef.current?.(error);
       }
     }
+    if (unsubscribe) scheduleStreamWatchdog();
     if (!unsubscribe && shouldPollConversationRef.current) {
       schedulePoll();
     }
@@ -6970,6 +7015,7 @@ export function LiveProjectWorkbench({
       disposed = true;
       window.clearTimeout(timeoutId);
       window.clearTimeout(reconnectTimeoutId);
+      window.clearTimeout(streamWatchdogTimeoutId);
       window.clearTimeout(hydrationTimeoutId);
       window.cancelAnimationFrame(eventFrameId);
       pendingStreamEvents = [];
@@ -7145,36 +7191,51 @@ export function LiveProjectWorkbench({
       return;
     }
     const queueFollowUp = running && runningMessageMode === "follow_up";
-    executeAction(queueFollowUp ? "follow-up" : "message", () => (
-      queueFollowUp
-        ? api.enqueueFollowUp({
-            conversationId: snapshot.id,
-            text,
-          }).then((result) => result.snapshot)
-        : running
-          ? api.steerConversation({
+    let startedNewTurn = !running;
+    const sendNewTurn = () => api.sendMessage({
+      conversationId: snapshot.id,
+      text,
+      checkpointId: branchTarget?.id,
+      contexts: contextChips,
+      images: pendingImage ? [pendingImage.file] : [],
+      attachments: pendingAttachments,
+      capabilities: selectedCapabilityIds,
+      workflowId: branchTarget ? "planning" : selectedWorkflowId,
+      providerId: providerId || snapshot.providerId,
+      modelId: modelId || snapshot.modelId,
+      thinkingLevel: activeThinkingLevel,
+    });
+    setDraft("");
+    executeAction(queueFollowUp ? "follow-up" : "message", async () => {
+      if (!running) return sendNewTurn();
+      try {
+        return queueFollowUp
+          ? await api.enqueueFollowUp({
               conversationId: snapshot.id,
               text,
-            })
-        : api.sendMessage({
+            }).then((result) => result.snapshot)
+          : await api.steerConversation({
+              conversationId: snapshot.id,
+              text,
+            });
+      } catch (error) {
+        if (error?.code !== "PROJECT_WORK_NOT_RUNNING") throw error;
+        if (typeof api.fetchConversation === "function") {
+          const currentSnapshot = await api.fetchConversation({
             conversationId: snapshot.id,
-            text,
-            checkpointId: branchTarget?.id,
-            contexts: contextChips,
-            images: pendingImage ? [pendingImage.file] : [],
-            attachments: pendingAttachments,
-            capabilities: selectedCapabilityIds,
-            workflowId: branchTarget ? "planning" : selectedWorkflowId,
-            providerId: providerId || snapshot.providerId,
-            modelId: modelId || snapshot.modelId,
-            thinkingLevel: activeThinkingLevel,
-          })
-    )).then((nextSnapshot) => {
-      if (!nextSnapshot) return;
-      setDraft((current) => (
-        current === submittedDraft ? "" : current
-      ));
-      if (!running) {
+            includeActivity: true,
+          });
+          publishSnapshot(currentSnapshot);
+        }
+        startedNewTurn = true;
+        return sendNewTurn();
+      }
+    }).then((nextSnapshot) => {
+      if (!nextSnapshot) {
+        setDraft((current) => current || submittedDraft);
+        return;
+      }
+      if (startedNewTurn) {
         setBranchTarget(null);
         if (branchTarget) setSelectedCheckpointId(null);
         setContextChips([]);
@@ -7196,6 +7257,7 @@ export function LiveProjectWorkbench({
     pendingAttachments,
     pendingImage,
     providerId,
+    publishSnapshot,
     replacePendingAttachments,
     replacePendingImage,
     runningMessageMode,
@@ -7323,12 +7385,13 @@ export function LiveProjectWorkbench({
     if (!ARTIFACTS.some((artifact) => artifact.id === artifactId)) return;
     setActiveArtifactId(artifactId);
     setArtifactOpen(true);
+    if (mobileActive) onMobileViewChange?.("artifact");
     if (artifactId === "files" && path) {
       setRequestedFilePath(path);
       setRequestedFileLine(Number.isSafeInteger(line) ? line : null);
       setRequestedFileHash(typeof contentHash === "string" ? contentHash : "");
     }
-  }, []);
+  }, [mobileActive, onMobileViewChange]);
 
   const openCodeEvidence = useCallback(async (reference) => {
     const conversationId = snapshotRef.current?.id;
@@ -8310,6 +8373,9 @@ export function LiveProjectWorkbench({
     return (
       <AgentArtifactLayout
         ariaLabel="项目工作"
+        mobileActive={mobileActive}
+        mobileView={mobileView === "artifact" ? "agent" : mobileView}
+        agentMobileView="agent"
         artifactOpen={false}
         onArtifactOpenChange={() => {}}
         closedLabel="打开工件"
@@ -8330,8 +8396,14 @@ export function LiveProjectWorkbench({
   return (
     <AgentArtifactLayout
       ariaLabel="项目工作会话"
-      artifactOpen={artifactOpen}
-      onArtifactOpenChange={setArtifactOpen}
+      mobileActive={mobileActive}
+      mobileView={mobileView}
+      agentMobileView="agent"
+      artifactOpen={artifactOpen || (mobileActive && mobileView === "artifact")}
+      onArtifactOpenChange={(open) => {
+        setArtifactOpen(open);
+        if (mobileActive) onMobileViewChange?.(open ? "artifact" : "agent");
+      }}
       closedLabel="打开工件"
       openLabel="收起工件"
       closedTitle="打开右侧项目工件"
