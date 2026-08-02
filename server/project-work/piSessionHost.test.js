@@ -1112,6 +1112,9 @@ test("trusted Workspace sessions use Pi native tools and discover project resour
   });
 
   const snapshot = host.getHarnessSnapshot();
+  assert.equal(snapshot.harnessVersion, "pi-native-v1");
+  assert.ok(snapshot.prompt.layers.includes("真实 Workspace 原生规则"));
+  assert.equal(snapshot.prompt.layers.includes("项目审阅工作区规则"), false);
   assert.equal(snapshot.resources.settings, "project_and_global");
   assert.equal(snapshot.resources.prompts, 1);
   assert.equal(snapshot.context.projectRules, 1);
@@ -1122,6 +1125,14 @@ test("trusted Workspace sessions use Pi native tools and discover project resour
   assert.notEqual(host.getToolSources().native_probe, "sdk");
   assert.equal(host.modelRef, "openai-codex/gpt-5.6-sol");
   assert.equal(host.thinkingLevel, host.getHarnessSnapshot().thinkingLevel);
+
+  const source = await readFile(new URL("./piSessionHost.js", import.meta.url), "utf8");
+  const nativeGuidance = source.slice(
+    source.indexOf("const APP_GUIDANCE"),
+    source.indexOf("const STANDALONE_GUIDANCE"),
+  );
+  assert.match(nativeGuidance, /Historical request_verification calls/);
+  assert.match(nativeGuidance, /use native Bash to collect fresh test or build evidence/);
 
   host.setActiveToolsByName(["read", "grep", "update_plan"]);
   assert.deepEqual(host.getHarnessSnapshot().activeTools, [

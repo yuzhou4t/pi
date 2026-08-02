@@ -931,16 +931,36 @@ export function verificationAttention(conversation) {
   const runs = Array.isArray(conversation.verificationRuns)
     ? conversation.verificationRuns
     : [];
+  const retiredRequestIds = new Set();
+  for (const run of runs) {
+    if (
+      run.status !== "legacy_superseded"
+      && run.errorCode !== "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE"
+    ) continue;
+    const requestId = run.commandId || run.id;
+    if (requestId) retiredRequestIds.add(requestId);
+  }
+  if (command?.status === "legacy_superseded" && command.id) {
+    retiredRequestIds.add(command.id);
+  }
+  const commandRetired = Boolean(
+    command
+    && (
+      command.status === "legacy_superseded"
+      || retiredRequestIds.has(command.id)
+    ),
+  );
   const executableRuns = runs.filter((run) => ![
     "saved",
     "ready",
     "requested",
     "pending_approval",
     "proposed",
-  ].includes(run.status));
-  const matchingRuns = command && executableRuns.some(
-    (run) => run.commandId === command.id,
-  )
+    "legacy_superseded",
+  ].includes(run.status)
+    && run.errorCode !== "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE"
+    && !retiredRequestIds.has(run.commandId));
+  const matchingRuns = command
     ? executableRuns.filter((run) => run.commandId === command.id)
     : executableRuns;
   const latestRun = matchingRuns.at(-1) ?? null;
@@ -959,6 +979,7 @@ export function verificationAttention(conversation) {
       command: command?.displayCommand ?? latestRun?.command ?? "",
     };
   }
+  if (commandRetired && !latestRun) return null;
   if (latestRun && isSuccessfulRun(latestRun)) return null;
   const status = latestRun?.status ?? command?.status ?? null;
   if (!UNRESOLVED_VERIFICATION_STATUSES.has(status) && !command) return null;
@@ -5891,20 +5912,33 @@ function RunArtifact({
   browserQaError,
   browserQaScreenshotUrl,
 }) {
-  const command = conversation.verificationCommand;
+  const command = conversation.verificationCommand?.status === "legacy_superseded"
+    ? null
+    : conversation.verificationCommand;
   const interruptedRepairs = (conversation.operations ?? []).filter(
     (operation) => (
       operation.type === "verification_repair"
       && operation.status === "interrupted"
     ),
   );
-  const runs = conversation.verificationRuns.filter((run) => ![
-    "saved",
-    "ready",
-    "requested",
-    "pending_approval",
-    "proposed",
-  ].includes(run.status));
+  const verificationRuns = conversation.verificationRuns ?? [];
+  const linkedVerificationRequestIds = new Set(
+    verificationRuns.map((run) => run.commandId).filter(Boolean),
+  );
+  const runs = verificationRuns.filter((run) => (
+    ![
+      "saved",
+      "ready",
+      "requested",
+      "pending_approval",
+      "proposed",
+    ].includes(run.status)
+    && !(
+      run.status === "legacy_superseded"
+      && !run.commandId
+      && linkedVerificationRequestIds.has(run.id)
+    )
+  ));
   const workspaceRuns = conversation.workspaceRuns ?? [];
 
   return (
@@ -6086,6 +6120,7 @@ function RunArtifact({
             const successful = isSuccessfulRun(run);
             const failed = isFailedRun(run);
             const blocked = run.status === "blocked";
+            const legacy = run.status === "legacy_superseded";
             const blockedReason = AUTO_REVIEW_REASON_LABELS[run.blockedReason]
               ?? (blocked ? "这条验证命令没有通过替我审批" : null);
             const logs = run.logs.length > 0
@@ -6097,13 +6132,14 @@ function RunArtifact({
                   successful ? "is-passed" : "",
                   failed ? "is-failed" : "",
                   blocked ? "is-blocked" : "",
+                  legacy ? "is-legacy" : "",
                 ].filter(Boolean).join(" ")}
                 key={run.id}
               >
                 <header>
                   {successful ? (
                     <CheckCircle size={18} weight="fill" aria-hidden="true" />
-                  ) : blocked ? (
+                  ) : blocked || legacy ? (
                     <ShieldCheck size={18} weight="fill" aria-hidden="true" />
                   ) : failed ? (
                     <WarningCircle size={18} weight="fill" aria-hidden="true" />
@@ -6111,13 +6147,20 @@ function RunArtifact({
                     <CircleNotch size={18} weight="bold" aria-hidden="true" />
                   )}
                   <div>
-                    <strong>{blocked ? "验证已阻止" : `验证 ${index + 1}`}</strong>
+                    <strong>{legacy
+                      ? "旧验证记录"
+                      : blocked ? "验证已阻止" : `验证 ${index + 1}`}</strong>
                     <code>{run.command || command?.displayCommand || "已保存命令"}</code>
                   </div>
-                  <span>{blocked ? "未运行" : run.status}</span>
+                  <span>{legacy ? "已退役" : blocked ? "未运行" : run.status}</span>
                 </header>
-                {blockedReason ? <p>{blockedReason}</p> : run.summary ? <p>{run.summary}</p> : null}
-                {!blocked && run.checks.length > 0 ? (
+                {legacy ? (
+                  <p>
+                    旧复制验证已退役，不影响当前 Workspace 状态。
+                    {run.summary ? ` 原记录：${run.summary}` : ""}
+                  </p>
+                ) : blockedReason ? <p>{blockedReason}</p> : run.summary ? <p>{run.summary}</p> : null}
+                {!blocked && !legacy && run.checks.length > 0 ? (
                   <ul>
                     {run.checks.map((check) => (
                       <li key={check.id}>
@@ -6134,7 +6177,7 @@ function RunArtifact({
                 {!blocked ? (
                   <details className="project-run-log">
                     <summary>
-                      查看完整已采集日志
+                      {legacy ? "查看旧验证日志" : "查看完整已采集日志"}
                       <CaretDown size={12} aria-hidden="true" />
                     </summary>
                     <pre>{logs.length > 0 ? logs.join("\n") : "命令没有产生输出"}</pre>

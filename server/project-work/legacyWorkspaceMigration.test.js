@@ -121,6 +121,90 @@ async function createLegacyFixture({ changed = false } = {}) {
   };
 }
 
+async function createNativeLegacyVerificationFixture() {
+  const temporaryRoot = await mkdtemp(
+    path.join(os.tmpdir(), "pi-native-legacy-verification-"),
+  );
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "state");
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "Package.swift"), "// current\n", "utf8");
+  const initialService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: sessionFactory(),
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("native-legacy"),
+  });
+  const selection = await initialService.pickProjectRoot({ mode: "existing" });
+  const project = await initialService.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await initialService.createConversation(project.id, {
+    title: "旧验证状态回填",
+  });
+  await initialService.dispose();
+
+  const conversationDirectory = path.join(
+    storageRoot,
+    "conversations",
+    conversation.id,
+  );
+  const statePath = path.join(conversationDirectory, "conversation.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.status = "verification_failed";
+  state.lastError = {
+    code: "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE",
+    message: "旧验证副本超过大小限制",
+    retryable: true,
+  };
+  state.legacyMigration = {
+    schemaVersion: 1,
+    status: "completed",
+    sourceRuntimeMode: "workspace-v2",
+    targetRuntimeMode: "workspace-v2",
+    targetWorkspaceId: state.workspaceId,
+    startedAt: "2026-08-02T00:00:00.000Z",
+    completedAt: "2026-08-02T00:00:01.000Z",
+    resolution: "clean",
+    error: null,
+  };
+  const requests = [1, 2, 3].map((index) => ({
+    id: `legacy-swift-request-${index}`,
+    status: "legacy_superseded",
+    blockedReason: "legacy_workspace_migration",
+    recipeId: "swift.test",
+    command: {
+      file: "swift",
+      args: ["test", "--disable-automatic-resolution"],
+      cwd: ".",
+      environment: {},
+    },
+    createdAt: `2026-08-01T00:00:0${index}.000Z`,
+    completedAt: `2026-08-02T00:00:0${index}.000Z`,
+  }));
+  const attempts = requests.map((request, index) => ({
+    id: `legacy-swift-attempt-${index + 1}`,
+    commandId: request.id,
+    status: "failed",
+    errorCode: "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE",
+    summary: "项目超出旧验证副本限制",
+    output: "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE",
+    createdAt: `2026-08-01T00:01:0${index + 1}.000Z`,
+    completedAt: `2026-08-01T00:01:1${index + 1}.000Z`,
+  }));
+  state.verifications = [...requests, ...attempts];
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  return {
+    temporaryRoot,
+    projectRoot,
+    storageRoot,
+    project,
+    conversation,
+    conversationDirectory,
+    statePath,
+  };
+}
+
 test("legacy project conversations migrate once to the real main Workspace", async (t) => {
   const fixture = await createLegacyFixture();
   t.after(() => rm(fixture.temporaryRoot, { recursive: true, force: true }));
@@ -163,6 +247,80 @@ test("legacy project conversations migrate once to the real main Workspace", asy
   );
   assert.equal(
     events.filter((event) => event.type === "workspace.migration_completed").length,
+    1,
+  );
+  await assert.rejects(
+    access(path.join(fixture.conversationDirectory, "verification-runs")),
+    (error) => error?.code === "ENOENT",
+  );
+});
+
+test("already-native conversations retire linked legacy verification failures once", async (t) => {
+  const fixture = await createNativeLegacyVerificationFixture();
+  t.after(() => rm(fixture.temporaryRoot, { recursive: true, force: true }));
+  let sessionMigrationCalls = 0;
+  const createService = () => createProjectWorkService({
+    storageRoot: fixture.storageRoot,
+    sessionFactory: sessionFactory(),
+    sessionMigrator: async () => {
+      sessionMigrationCalls += 1;
+      throw new Error("native conversation must not fork its Session again");
+    },
+    picker: async () => ({ rootPath: fixture.projectRoot }),
+    idFactory: incrementalId("native-normalize"),
+  });
+
+  const firstService = createService();
+  const first = await firstService.getConversation(fixture.conversation.id);
+  assert.equal(first.conversation.status, "idle");
+  assert.equal(first.conversation.runtimeProfile, "pi-native-v1");
+  assert.equal(
+    first.conversation.verifications.every(
+      (verification) => verification.status === "legacy_superseded",
+    ),
+    true,
+  );
+  const normalizedAttempts = first.conversation.verifications.filter(
+    (verification) => verification.commandId,
+  );
+  assert.equal(normalizedAttempts.length, 3);
+  assert.equal(
+    normalizedAttempts.every(
+      (verification) => verification.legacyStatus === "failed",
+    ),
+    true,
+  );
+  assert.equal(
+    normalizedAttempts.every((verification) => (
+      verification.errorCode
+      === "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE"
+      && verification.output === "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE"
+    )),
+    true,
+  );
+  assert.equal(sessionMigrationCalls, 0);
+  await firstService.dispose();
+
+  const secondService = createService();
+  t.after(() => secondService.dispose());
+  const second = await secondService.getConversation(fixture.conversation.id);
+  assert.equal(second.conversation.status, "idle");
+  assert.equal(sessionMigrationCalls, 0);
+  const persisted = JSON.parse(await readFile(fixture.statePath, "utf8"));
+  assert.equal(persisted.lastError, null);
+  assert.equal(
+    persisted.verifications.filter((verification) => verification.commandId)
+      .every((verification) => verification.legacyStatus === "failed"),
+    true,
+  );
+  const events = (await readFile(
+    path.join(fixture.conversationDirectory, "events.jsonl"),
+    "utf8",
+  )).trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(
+    events.filter((event) => (
+      event.type === "workspace.legacy_verifications_superseded"
+    )).length,
     1,
   );
   await assert.rejects(
