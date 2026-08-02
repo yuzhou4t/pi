@@ -142,6 +142,8 @@ const STATUS_LABELS = {
   changes_ready: "修改待审阅",
   applied: "修改已应用",
   verifying: "正在验证",
+  awaiting_verification: "验证待运行",
+  verification_failed: "验证未通过",
   compacting: "正在压缩上下文",
   aborting: "正在停止",
   aborted: "已停止",
@@ -341,6 +343,16 @@ export function mergeConversationTitle(snapshot, conversation) {
 }
 
 function activeStatus(conversation) {
+  const attention = verificationAttention(conversation);
+  if (attention) {
+    if (["running", "queued"].includes(attention.status)) return "verifying";
+    if (["failed", "timed_out", "interrupted", "aborted", "blocked"].includes(
+      attention.status,
+    )) {
+      return "verification_failed";
+    }
+    return "awaiting_verification";
+  }
   return conversation?.turnStatus || conversation?.status || "idle";
 }
 
@@ -389,7 +401,10 @@ function statusClass(conversation) {
   if (["awaiting_confirmation", "awaiting_approval", "changes_ready"].includes(status)) {
     return "awaiting_confirmation";
   }
-  if (["failed", "interrupted"].includes(status)) return "test_failed";
+  if (["failed", "interrupted", "verification_failed"].includes(status)) {
+    return "test_failed";
+  }
+  if (status === "awaiting_verification") return "awaiting_confirmation";
   if (["applied"].includes(status)) return "changes_applied";
   if (["completed"].includes(status)) return "completed";
   return "ready";
@@ -413,16 +428,16 @@ function workspaceStatusCopy(workspace, standalone, fork) {
   if (fork?.status === "ready") {
     return {
       tone: "ready",
-      title: "分支对话已隔离",
-      detail: "继承检查点上下文；项目文件按当前状态重新读取。",
+      title: "已从检查点继续",
+      detail: "会话继承检查点上下文，并继续使用当前 Workspace。",
     };
   }
   return {
     tone: "ready",
-    title: standalone ? "私有草稿已隔离" : "修改在隔离副本中准备",
+    title: standalone ? "私有 Workspace 已连接" : "真实 Workspace 已连接",
     detail: standalone
       ? "这里的文件只属于当前会话。"
-      : "真实项目只会在你确认更改后更新。",
+      : "读取、写入、构建与测试使用同一工作区；写入仍按当前审批方式执行。",
   };
 }
 
@@ -675,7 +690,7 @@ function eventTitle(event) {
     if (event.status === "waiting") return "思考已暂停";
     if (event.status === "stopped") return "思考已停止";
     if (event.status === "incomplete") return "思考未完成";
-    return "思考完成";
+    return safePhasePresentation(event.phaseContext, "finished").title;
   }
   if (type === "conversation.created") return "工作会话已创建";
   if (type === "message.created") return "任务已提交";
@@ -865,6 +880,125 @@ function isFailedRun(run) {
   return ["failed", "timed_out", "interrupted", "aborted"].includes(run.status);
 }
 
+const UNRESOLVED_VERIFICATION_STATUSES = new Set([
+  "saved",
+  "ready",
+  "requested",
+  "pending_approval",
+  "proposed",
+  "queued",
+  "running",
+  "failed",
+  "timed_out",
+  "interrupted",
+  "aborted",
+  "blocked",
+]);
+
+export function verificationAttention(conversation) {
+  if (!conversation) return null;
+  const latestWorkspaceRun = (conversation.workspaceRuns ?? []).at(-1) ?? null;
+  const workspaceRun = latestWorkspaceRun
+    && !["succeeded", "cancelled"].includes(latestWorkspaceRun.status)
+    ? latestWorkspaceRun
+    : null;
+  if (workspaceRun) {
+    const copy = {
+      requested: ["项目命令等待确认", "请在“运行”工件核对精确命令后确认。"],
+      queued: ["项目命令正在排队", "它会在当前 Workspace 获得运行租约后启动。"],
+      running: ["项目命令正在运行", "实时日志会持续保存在“运行”工件。"],
+      failed: ["项目命令未通过", workspaceRun.error?.message || "失败结果和日志已经保留。"],
+      interrupted: ["项目命令已中断", "运行记录已经保留，且不会自动重跑。"],
+    }[workspaceRun.status] ?? ["项目命令需要处理", "请打开“运行”工件查看。"];
+    return {
+      requestKey: workspaceRun.id,
+      status: workspaceRun.status,
+      title: copy[0],
+      detail: copy[1],
+      command: [workspaceRun.executable, ...(workspaceRun.argv ?? [])].join(" "),
+    };
+  }
+  const command = conversation.verificationCommand ?? null;
+  const runs = Array.isArray(conversation.verificationRuns)
+    ? conversation.verificationRuns
+    : [];
+  const executableRuns = runs.filter((run) => ![
+    "saved",
+    "ready",
+    "requested",
+    "pending_approval",
+    "proposed",
+  ].includes(run.status));
+  const matchingRuns = command && executableRuns.some(
+    (run) => run.commandId === command.id,
+  )
+    ? executableRuns.filter((run) => run.commandId === command.id)
+    : executableRuns;
+  const latestRun = matchingRuns.at(-1) ?? null;
+  const interruptedRepair = [...(conversation.operations ?? [])]
+    .reverse()
+    .find((operation) => (
+      operation.type === "verification_repair"
+      && operation.status === "interrupted"
+    ));
+  if (interruptedRepair) {
+    return {
+      requestKey: command?.id ?? interruptedRepair.id ?? "verification-repair",
+      status: "interrupted",
+      title: "修复与复测尚未完成",
+      detail: "运行记录已经保留，请在“运行”工件中继续。",
+      command: command?.displayCommand ?? latestRun?.command ?? "",
+    };
+  }
+  if (latestRun && isSuccessfulRun(latestRun)) return null;
+  const status = latestRun?.status ?? command?.status ?? null;
+  if (!UNRESOLVED_VERIFICATION_STATUSES.has(status) && !command) return null;
+  if (!status && !command) return null;
+  const copy = {
+    failed: ["验证未通过", latestRun?.summary || "失败结果和日志已经保留。"],
+    timed_out: ["验证已超时", "运行日志已经保留，可核对后重试。"],
+    interrupted: ["验证已中断", "运行日志已经保留，不会自动重跑。"],
+    aborted: ["验证已停止", "验证没有完成，可在运行工件中重新启动。"],
+    blocked: ["验证尚未运行", "安全策略阻止了这次运行，请查看具体原因。"],
+    running: ["验证正在运行", "实时结果和日志会持续进入运行工件。"],
+    queued: ["验证正在等待运行", "请求已登记，尚未启动项目命令。"],
+  }[status] ?? ["验证等待运行", "命令已经保存，需要在运行工件中明确启动。"];
+  return {
+    requestKey: command?.id ?? latestRun?.commandId ?? latestRun?.id ?? "verification",
+    status: status ?? "requested",
+    title: copy[0],
+    detail: copy[1],
+    command: command?.displayCommand ?? latestRun?.command ?? "",
+  };
+}
+
+function VerificationAttentionCard({ attention, onOpenArtifact }) {
+  if (!attention) return null;
+  return (
+    <section
+      className={`project-verification-attention is-${attention.status}`}
+      role={["failed", "timed_out", "interrupted", "blocked"].includes(attention.status)
+        ? "alert"
+        : "status"}
+    >
+      {["running", "queued"].includes(attention.status) ? (
+        <CircleNotch size={18} weight="bold" aria-hidden="true" />
+      ) : (
+        <WarningCircle size={18} weight="fill" aria-hidden="true" />
+      )}
+      <div>
+        <strong>{attention.title}</strong>
+        <p>{attention.detail}</p>
+        {attention.command ? <code>{attention.command}</code> : null}
+      </div>
+      <button type="button" onClick={() => onOpenArtifact?.("run_result")}>
+        打开运行
+        <CaretRight size={13} weight="bold" aria-hidden="true" />
+      </button>
+    </section>
+  );
+}
+
 function safeLoopbackPreviewUrl(value) {
   if (typeof value !== "string" || !value) return null;
   try {
@@ -1019,32 +1153,208 @@ function PlanSteps({ plan }) {
   );
 }
 
-function PlanCard({ plan, pinned = false, historical = false }) {
+function PlanCard({ plan }) {
   if (!Array.isArray(plan) || plan.length === 0) return null;
   const completed = plan.filter((step) => step.status === "completed").length;
-  if (historical) {
-    return (
-      <details className="project-plan-card is-history" aria-label="Agent 计划">
-        <summary>
-          <span>Agent 计划</span>
-          <small>{completed}/{plan.length}</small>
-          <CaretDown size={12} aria-hidden="true" />
-        </summary>
-        <PlanSteps plan={plan} />
-      </details>
-    );
-  }
   return (
-    <section
-      className={`project-plan-card${pinned ? " is-pinned" : ""}`}
-      aria-label="Agent 计划"
-    >
-      <header>
+    <details className="project-plan-card is-history" aria-label="Agent 计划">
+      <summary>
         <span>Agent 计划</span>
         <small>{completed}/{plan.length}</small>
-      </header>
+        <CaretDown size={12} aria-hidden="true" />
+      </summary>
       <PlanSteps plan={plan} />
-    </section>
+    </details>
+  );
+}
+
+function planSignature(plan) {
+  return (Array.isArray(plan) ? plan : [])
+    .map((step) => `${step.id}:${step.status}:${step.title}`)
+    .join("|");
+}
+
+export function ProjectPlanDock({ plan, running }) {
+  const [expanded, setExpanded] = useState(Boolean(running));
+  const normalizedPlan = normalizeActivityPlan(plan);
+  const completed = normalizedPlan.filter(
+    (step) => step.status === "completed",
+  ).length;
+  const revision = planSignature(normalizedPlan);
+
+  useEffect(() => {
+    setExpanded(Boolean(running));
+  }, [revision, running]);
+
+  if (normalizedPlan.length === 0) return null;
+  return (
+    <aside
+      className={`project-plan-dock${running ? " is-running" : " is-settled"}${expanded ? " is-expanded" : ""}`}
+      aria-label="当前 Agent 计划"
+    >
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        {running ? (
+          <CircleNotch size={14} weight="bold" aria-hidden="true" />
+        ) : (
+          <CheckCircle size={14} weight="fill" aria-hidden="true" />
+        )}
+        <span>
+          <strong>Agent 计划</strong>
+          <small>{running ? "固定显示" : "本轮已收起"} · {completed}/{normalizedPlan.length}</small>
+        </span>
+        <CaretDown size={13} aria-hidden="true" />
+      </button>
+      <div className="project-plan-dock-body" hidden={!expanded}>
+        <PlanSteps plan={normalizedPlan} />
+      </div>
+    </aside>
+  );
+}
+
+const SUBAGENT_STATUSES = new Set([
+  "queued",
+  "running",
+  "completed",
+  "failed",
+  "timed_out",
+  "interrupted",
+  "aborted",
+  "stopped",
+]);
+
+const SUBAGENT_STATUS_LABELS = {
+  queued: "等待启动",
+  running: "正在工作",
+  completed: "已完成",
+  failed: "未完成",
+  timed_out: "已超时",
+  interrupted: "已中断",
+  aborted: "已停止",
+  stopped: "已停止",
+};
+
+function safeSubagentText(value, maxLength = 160) {
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/(?:\/Users|\/home|\/private|\/var\/folders)\/[^\s，。；：、]+/giu, "<workspace>")
+    .replace(/[A-Za-z]:\\[^\s，。；：、]+/gu, "<workspace>")
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b/gu, "[已隐藏]")
+    .replace(/\b(\d+)\/(\d+)\s+succeeded\b/giu, "$1/$2 个子任务已完成")
+    .replace(/===\s*Task\s+(\d+)\s*:\s*[^=\n]{1,160}\s*===\s*/giu, "子任务 $1：")
+    .replace(/===\s*Task\s+(\d+)\s*===\s*/giu, "子任务 $1：")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function safeSubagentPath(value) {
+  const path = safeSubagentText(value, 180);
+  if (!path || path === "<workspace>") return path;
+  if (
+    path.startsWith("/")
+    || path.startsWith("~")
+    || /^[A-Za-z]:[\\/]/u.test(path)
+    || path.split(/[\\/]/u).includes("..")
+  ) {
+    return "<workspace>";
+  }
+  return path;
+}
+
+function boundedSubagentNumber(value) {
+  return Number.isFinite(Number(value)) && Number(value) >= 0
+    ? Number(value)
+    : null;
+}
+
+export function normalizeSubagentRun(event, fallbackIndex = 1, depth = 0) {
+  if (!event || depth > 2) return null;
+  const source = event?.data?.subagentRun
+    ?? event?.subagentRun
+    ?? event?.data?.subagent
+    ?? event;
+  const eventStatus = event.status ?? event.data?.status;
+  const rawStatus = source.status ?? eventStatus;
+  const status = SUBAGENT_STATUSES.has(rawStatus)
+    ? rawStatus
+    : rawStatus === "active"
+      ? "running"
+      : rawStatus === "succeeded"
+        ? "completed"
+        : "queued";
+  const index = Number.isSafeInteger(Number(source.index))
+    && Number(source.index) > 0
+    ? Number(source.index)
+    : fallbackIndex;
+  const rawChildren = Array.isArray(source.children)
+    ? source.children
+    : Array.isArray(source.tasks)
+      ? source.tasks
+      : [];
+  const children = rawChildren.slice(0, 8).flatMap((child, childIndex) => {
+    const normalized = normalizeSubagentRun(child, childIndex + 1, depth + 1);
+    return normalized ? [normalized] : [];
+  });
+  const error = source.error && typeof source.error === "object"
+    ? source.error.message
+    : source.error;
+  return {
+    key: `${event.seq ?? "run"}-${index}-${depth}`,
+    index,
+    task: safeSubagentText(
+      source.task ?? source.title ?? source.label,
+      120,
+    ) || `并行子任务 ${index}`,
+    status,
+    currentTool: safeSubagentText(source.currentTool, 80),
+    currentPath: safeSubagentPath(source.currentPath),
+    toolCount: boundedSubagentNumber(source.toolCount),
+    turnCount: boundedSubagentNumber(source.turnCount),
+    tokens: boundedSubagentNumber(source.tokens),
+    durationMs: boundedSubagentNumber(source.durationMs),
+    summary: safeSubagentText(
+      source.summary ?? event.summary ?? event.detail ?? event.data?.summary,
+      300,
+    ),
+    error: safeSubagentText(error, 240),
+    children,
+  };
+}
+
+export function subagentRunsFromEvents(events) {
+  return collapseToolActivity(
+    (Array.isArray(events) ? events : [])
+      .filter((event) => TOOL_ACTIVITY_TYPES.has(event?.type))
+      .sort((left, right) => left.seq - right.seq),
+  ).filter((event) => event.toolName === "subagent")
+    .map((event, index) => normalizeSubagentRun(event, index + 1))
+    .filter(Boolean);
+}
+
+function SubagentActivityCard({ run, onOpenArtifact }) {
+  const details = [
+    run.currentTool ? `当前：${TOOL_LABELS[run.currentTool] ?? run.currentTool}` : "",
+    run.currentPath,
+  ].filter(Boolean).join(" · ");
+  return (
+    <article
+      className={`project-subagent-activity is-${run.status}`}
+      aria-label={`子智能体：${run.task}`}
+    >
+      <GitBranch size={15} weight="bold" aria-hidden="true" />
+      <div>
+        <strong>{run.task}</strong>
+        <small>并行子智能体{SUBAGENT_STATUS_LABELS[run.status]}{details ? ` · ${details}` : ""}</small>
+      </div>
+      <button type="button" onClick={() => onOpenArtifact?.("run_result")}>
+        查看运行
+        <CaretRight size={12} weight="bold" aria-hidden="true" />
+      </button>
+    </article>
   );
 }
 
@@ -1060,6 +1370,13 @@ function ActivityEvent({ event, isLatest, isLatestProgress = false, onOpenArtifa
   useEffect(() => {
     setOpen(isLatest);
   }, [isLatest]);
+
+  if (event.toolName === "subagent") {
+    const run = normalizeSubagentRun(event);
+    return run ? (
+      <SubagentActivityCard run={run} onOpenArtifact={onOpenArtifact} />
+    ) : null;
+  }
 
   if (event.type === "agent.progress") {
     const narration = progressNarration(event);
@@ -1170,6 +1487,20 @@ function collapseToolActivity(events) {
     collapsed[existingIndex] = {
       ...existing,
       ...event,
+      data: {
+        ...(existing.data ?? {}),
+        ...(event.data ?? {}),
+        ...(
+          existing.data?.subagentRun || event.data?.subagentRun
+            ? {
+                subagentRun: {
+                  ...(existing.data?.subagentRun ?? {}),
+                  ...(event.data?.subagentRun ?? {}),
+                },
+              }
+            : {}
+        ),
+      },
       seq: lifecycleFirstSeq,
       firstSeq: lifecycleFirstSeq,
       lastSeq: Math.max(existing.lastSeq ?? existing.seq, lastSeq),
@@ -1223,7 +1554,9 @@ function updateCommandSummary(event, commandEvent, running) {
 }
 
 function currentTurnActivityEvents(events) {
-  const safeEvents = Array.isArray(events) ? events : [];
+  const safeEvents = (Array.isArray(events) ? events : [])
+    .filter((event) => Number.isSafeInteger(event?.seq) && event.seq > 0)
+    .sort((left, right) => left.seq - right.seq);
   const latestMessageSeq = safeEvents.reduce((latest, event) => (
     event.type === "message.created" && Number.isSafeInteger(event.seq)
       ? Math.max(latest, event.seq)
@@ -1378,7 +1711,7 @@ function terminalStateForStatus(status) {
   if (["aborted", "stopped", "interrupted"].includes(status)) {
     return ACTIVITY_TERMINAL_STATES.stopped;
   }
-  if (["failed", "error"].includes(status)) {
+  if (["failed", "error", "verification_failed"].includes(status)) {
     return ACTIVITY_TERMINAL_STATES.incomplete;
   }
   if ([
@@ -1632,7 +1965,6 @@ export function normalizeActivityEvents(
       continue;
     }
     if (event.type === "agent.thinking") {
-      if (hasRuntimeFallback) continue;
       const status = event.status === "finished" ? "finished" : "active";
       if (!activeThinkingEvent) {
         closeVisibleBatches();
@@ -1956,7 +2288,7 @@ function HarnessSnapshot({ event }) {
     ?? "未记录";
   const workspace = snapshot.context?.workspace === "scratch"
     ? "独立对话工作区"
-    : "项目审阅工作区";
+    : "项目 Workspace";
   const snapshotScope = snapshot.context?.snapshot === "bounded"
     ? "有边界快照"
     : "当前安全快照";
@@ -2031,15 +2363,7 @@ export function ActivityTimeline({
     phase,
     terminalStatus,
   );
-  const hasPublicNarration = normalizedEvents.some(
-    (event) => event.type === "agent.progress",
-  );
-  const visibleEvents = transparentMode || !hasPublicNarration
-    ? normalizedEvents
-    : normalizedEvents.filter((event) => (
-      event.type !== "agent.thinking"
-      && event.type !== "activity.phase"
-    ));
+  const visibleEvents = normalizedEvents;
   const currentTurn = currentTurnActivityEvents(events).events;
   const terminalState = activityTerminalState(currentTurn, terminalStatus);
   const harnessEvent = [...currentTurn]
@@ -3073,6 +3397,10 @@ export function ProjectAgentPane({
   const queuedFollowUps = (conversation.followUpQueue ?? []).filter(
     (item) => item.status === "queued",
   );
+  const unresolvedVerification = verificationAttention(conversation);
+  const pendingWorkspaceWrites = (conversation.workspaceWrites ?? []).filter(
+    (write) => write.status === "pending",
+  );
   const autoReview = conversation.executionPolicy?.mode === "auto_review";
   const streamRef = useRef(null);
   const dragDepthRef = useRef(0);
@@ -3122,6 +3450,11 @@ export function ProjectAgentPane({
     || Boolean(limitedSnapshotEvent);
   const includedFiles = conversation.workspaceSnapshot?.includedFiles
     ?? limitedSnapshotEvent?.data?.snapshot?.includedFiles;
+  const persistedPlan = normalizeActivityPlan(conversation.plan);
+  const dockPlan = persistedPlan.length > 0
+    ? persistedPlan
+    : planFromActivityEvents(conversation.events);
+  const dockPlanSignature = planSignature(dockPlan);
   const activityByUserMessageId = new Map();
   let latestExecutedTurnStartSeq = 0;
   const userMessages = visibleMessages.filter(
@@ -3249,6 +3582,7 @@ export function ProjectAgentPane({
           <span>PDF、Word、Excel、图片和文本资料都会留在当前会话</span>
         </div>
       ) : null}
+      <ProjectPlanDock plan={dockPlan} running={workActive} />
       <div
         className="project-agent-stream"
         onScroll={handleStreamScroll}
@@ -3416,11 +3750,10 @@ export function ProjectAgentPane({
                 </article>
                 {turnActivity ? (
                   <>
-                    <PlanCard
-                      plan={turnPlan}
-                      pinned={turnRunning}
-                      historical={!isLatestExecutedTurn}
-                    />
+                    {turnPlan.length > 0
+                      && planSignature(turnPlan) !== dockPlanSignature ? (
+                        <PlanCard plan={turnPlan} />
+                      ) : null}
                     <ActivityTimeline
                       events={turnActivity.events}
                       running={turnRunning}
@@ -3487,11 +3820,38 @@ export function ProjectAgentPane({
           />
         ) : null}
         <ActionError error={error ?? conversation.error} />
-        <ProjectLoopCloseoutCard
-          events={conversation.events}
-          conversationStatus={conversation.status}
+        <VerificationAttentionCard
+          attention={unresolvedVerification}
           onOpenArtifact={onOpenArtifact}
         />
+        {!unresolvedVerification ? (
+          <ProjectLoopCloseoutCard
+            events={conversation.events}
+            conversationStatus={conversation.status}
+            onOpenArtifact={onOpenArtifact}
+          />
+        ) : null}
+
+        {pendingWorkspaceWrites.length > 0 ? (
+          <section className="project-agent-decision is-workspace-write" role="status">
+            <GitDiff size={18} aria-hidden="true" />
+            <div>
+              <strong>{pendingWorkspaceWrites.length} 次文件写入等待确认</strong>
+              <p>
+                {pendingWorkspaceWrites.slice(0, 2).map((write) => write.path).join("、")}
+                {pendingWorkspaceWrites.length > 2 ? ` 等 ${pendingWorkspaceWrites.length} 个文件` : ""}
+              </p>
+            </div>
+            <button
+              className="project-agent-link"
+              type="button"
+              onClick={() => onOpenArtifact("changes")}
+            >
+              核对精确 Diff
+              <CaretRight size={13} weight="bold" aria-hidden="true" />
+            </button>
+          </section>
+        ) : null}
 
         {conversation.pendingChangeSet?.status && [
           "pending",
@@ -4541,7 +4901,7 @@ function FileArtifact({
                     ? Number(selectedDocument.imageCount) > 0
                       ? `Pi 已可按需读取解析正文。这份资料保留了 ${selectedDocument.imageCount} 张图像，但本版资料工具暂不解读这些图像。`
                       : "解析正文保存在当前会话中。下一次明确发送任务时，Pi 可以通过只读资料工具按需检索和阅读。"
-                    : "会话资料已与项目文件和待应用修改隔离；解析过程不会自动调用模型。")}
+                    : "会话资料不会写入 Workspace；解析过程也不会自动调用模型。")}
               </p>
             </div>
             <dl>
@@ -4725,7 +5085,7 @@ export function ChangeEvidencePanel({
     ? "正在恢复文件操作"
     : workspace?.status === "recovery_blocked"
       ? "恢复需要检查"
-      : "隔离副本正常";
+      : "Workspace 正常";
   const gitUnavailable = gitStatus === "ready" && gitEvidence?.available === false;
   return (
     <section className="project-change-evidence" aria-label="项目改动证据">
@@ -4851,6 +5211,160 @@ export function ChangeEvidencePanel({
   );
 }
 
+const WORKSPACE_WRITE_STATUS_LABELS = {
+  pending: "等待确认",
+  applying: "正在写入",
+  applied: "已写入 Workspace",
+  written: "已写入 Workspace",
+  cancelled: "已取消",
+  failed: "写入失败",
+  stale: "文件已变化",
+  undone: "已安全撤销",
+};
+
+function WorkspaceWriteArtifact({
+  writes,
+  onConfirm,
+  onCancel,
+  onUndo,
+  action,
+  error,
+}) {
+  const orderedWrites = [
+    ...writes.filter((write) => write.status === "pending"),
+    ...writes.filter((write) => write.status !== "pending").reverse(),
+  ];
+  const [activeWriteId, setActiveWriteId] = useState(orderedWrites[0]?.id ?? null);
+  const revision = orderedWrites.map((write) => `${write.id}:${write.status}`).join("|");
+
+  useEffect(() => {
+    setActiveWriteId((current) => (
+      orderedWrites.some((write) => write.id === current)
+        ? current
+        : orderedWrites[0]?.id ?? null
+    ));
+  }, [revision]);
+
+  const activeWrite = orderedWrites.find((write) => write.id === activeWriteId)
+    ?? orderedWrites[0]
+    ?? null;
+  if (!activeWrite) return null;
+  const patchLines = String(activeWrite.patch ?? "").split("\n");
+  const pending = activeWrite.status === "pending";
+  const confirming = action === `workspace-write-confirm:${activeWrite.id}`;
+  const cancelling = action === `workspace-write-cancel:${activeWrite.id}`;
+  const busy = Boolean(action);
+  return (
+    <div className="project-change-artifact is-workspace-writes">
+      <aside>
+        <header>
+          <span>Workspace 写入</span>
+          <small>{writes.filter((write) => write.status === "pending").length} 待确认</small>
+        </header>
+        {orderedWrites.map((write) => (
+          <div
+            className={`project-change-file${write.id === activeWrite.id ? " is-active" : ""}`}
+            key={write.id}
+          >
+            <button type="button" onClick={() => setActiveWriteId(write.id)}>
+              <GitDiff size={14} aria-hidden="true" />
+              <span>
+                <strong>{write.path}</strong>
+                <small>
+                  {OPERATION_LABELS[write.operation]
+                    ?? OPERATION_LABELS[write.operation === "update" ? "modify" : write.operation]
+                    ?? write.operation}
+                  {" · "}{WORKSPACE_WRITE_STATUS_LABELS[write.status] ?? write.status}
+                </small>
+              </span>
+            </button>
+          </div>
+        ))}
+      </aside>
+      <section className="project-diff-viewer">
+        <header>
+          <div>
+            <strong>{activeWrite.path}</strong>
+            <small>精确 unified diff · {activeWrite.approvalMode === "auto_review" ? "替我审批" : "逐次确认"}</small>
+          </div>
+          <span className={`is-${activeWrite.status}`}>
+            {WORKSPACE_WRITE_STATUS_LABELS[activeWrite.status] ?? activeWrite.status}
+          </span>
+        </header>
+        <pre>
+          {patchLines.map((line, index) => {
+            const tone = line.startsWith("+") && !line.startsWith("+++")
+              ? "is-added"
+              : line.startsWith("-") && !line.startsWith("---")
+                ? "is-removed"
+                : line.startsWith("@@")
+                  ? "is-hunk"
+                  : "";
+            return <code className={tone} key={`${activeWrite.id}:${index}`}>{line}{"\n"}</code>;
+          })}
+        </pre>
+        <div className="project-change-hashes">
+          <span>基础版本 <code>{activeWrite.baseHash ?? "无（新文件）"}</code></span>
+          <span>目标版本 <code>{activeWrite.afterHash ?? "无（删除文件）"}</code></span>
+        </div>
+        <footer className="project-change-confirmation">
+          <div>
+            <strong>{pending ? "这次写入等待确认" : WORKSPACE_WRITE_STATUS_LABELS[activeWrite.status]}</strong>
+            <small>
+              {pending
+                ? "确认时服务端会重新核对基础哈希；文件变化后会拒绝写入。"
+                : activeWrite.error?.message ?? activeWrite.error ?? "写入事实与读回结果已保留。"}
+            </small>
+            {error ? <span className="project-change-cancelled">{error.message}</span> : null}
+          </div>
+          {pending ? (
+            <div>
+              <button
+                className="project-change-cancel"
+                type="button"
+                disabled={busy}
+                onClick={() => onCancel?.(activeWrite)}
+              >
+                {cancelling ? "正在取消" : "取消写入"}
+              </button>
+              <button
+                className="project-change-confirm"
+                type="button"
+                disabled={busy}
+                onClick={() => onConfirm?.(activeWrite)}
+              >
+                {confirming ? "正在写入" : "确认写入"}
+              </button>
+            </div>
+          ) : (
+            <div className="project-change-completed-actions">
+              {activeWrite.status === "written"
+                && activeWrite.undo?.status === "available" ? (
+                <button
+                  className="project-change-cancel"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => onUndo?.(activeWrite)}
+                >
+                  撤销这次写入
+                </button>
+              ) : null}
+              <span className="project-change-applied">
+              {["applied", "written"].includes(activeWrite.status) ? (
+                <CheckCircle size={15} weight="fill" aria-hidden="true" />
+              ) : (
+                <WarningCircle size={15} weight="fill" aria-hidden="true" />
+              )}
+              {WORKSPACE_WRITE_STATUS_LABELS[activeWrite.status] ?? activeWrite.status}
+              </span>
+            </div>
+          )}
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 export function ChangeArtifact({
   conversation,
   selectedFileIds,
@@ -4870,6 +5384,10 @@ export function ChangeArtifact({
   onUndoApply,
   undoingApplyId,
   undoError,
+  onConfirmWorkspaceWrite,
+  onCancelWorkspaceWrite,
+  workspaceWriteAction = null,
+  workspaceWriteError = null,
   running = false,
 }) {
   const changeSet = conversation.pendingChangeSet;
@@ -4912,7 +5430,16 @@ export function ChangeArtifact({
         undoError={undoError}
         running={running}
       />
-      {!changeSet || !activeFile ? (
+      {(conversation.workspaceWrites ?? []).length > 0 ? (
+        <WorkspaceWriteArtifact
+          writes={conversation.workspaceWrites}
+          onConfirm={onConfirmWorkspaceWrite}
+          onCancel={onCancelWorkspaceWrite}
+          onUndo={onUndoApply}
+          action={workspaceWriteAction}
+          error={workspaceWriteError}
+        />
+      ) : !changeSet || !activeFile ? (
         <div className="project-run-empty">
           <GitDiff size={24} aria-hidden="true" />
           <h3>还没有待审阅修改</h3>
@@ -5192,9 +5719,84 @@ export function PreviewArtifact({
   );
 }
 
+function SubagentRunNode({ run }) {
+  const metrics = [
+    run.toolCount !== null ? `${run.toolCount} 次工具` : "",
+    run.turnCount !== null ? `${run.turnCount} 轮` : "",
+    run.tokens !== null ? formatTraceTokens(run.tokens) : "",
+    run.durationMs !== null ? formatTraceDuration(run.durationMs) : "",
+  ].filter(Boolean);
+  return (
+    <li className={`is-${run.status}`}>
+      <div className="project-subagent-run-row">
+        <span className="project-subagent-run-state" aria-hidden="true">
+          {run.status === "running" ? (
+            <CircleNotch size={13} weight="bold" />
+          ) : run.status === "completed" ? (
+            <Check size={13} weight="bold" />
+          ) : ["failed", "timed_out", "interrupted"].includes(run.status) ? (
+            <WarningCircle size={13} weight="fill" />
+          ) : (
+            <StopCircle size={13} />
+          )}
+        </span>
+        <div>
+          <strong>{run.task}</strong>
+          <small>{SUBAGENT_STATUS_LABELS[run.status]}</small>
+          {run.currentTool || run.currentPath ? (
+            <p>
+              {run.currentTool
+                ? `当前动作：${TOOL_LABELS[run.currentTool] ?? run.currentTool}`
+                : ""}
+              {run.currentTool && run.currentPath ? " · " : ""}
+              {run.currentPath || ""}
+            </p>
+          ) : null}
+          {run.error ? <p className="is-error">{run.error}</p> : null}
+          {!run.error && run.summary ? <p>{run.summary}</p> : null}
+          {metrics.length > 0 ? <footer>{metrics.join(" · ")}</footer> : null}
+        </div>
+      </div>
+      {run.children.length > 0 ? (
+        <ol>
+          {run.children.map((child) => (
+            <SubagentRunNode key={child.key} run={child} />
+          ))}
+        </ol>
+      ) : null}
+    </li>
+  );
+}
+
+function ProjectSubagentRuns({ events }) {
+  const runs = subagentRunsFromEvents(events);
+  if (runs.length === 0) return null;
+  const active = runs.filter((run) => ["queued", "running"].includes(run.status)).length;
+  return (
+    <section className="project-subagent-runs" aria-label="子智能体任务">
+      <header>
+        <GitBranch size={16} weight="bold" aria-hidden="true" />
+        <div>
+          <strong>子智能体任务</strong>
+          <small>{active > 0 ? `${active} 项正在工作` : `${runs.length} 项已记录`}</small>
+        </div>
+      </header>
+      <ol className="project-subagent-run-tree">
+        {runs.map((run) => (
+          <SubagentRunNode key={run.key} run={run} />
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 function RunArtifact({
   conversation,
+  workspaceRunLogs,
   onRunVerification,
+  onConfirmWorkspaceRun,
+  onCancelWorkspaceRun,
+  workspaceRunAction,
   onResumeVerificationRepair,
   resumingOperationId,
   running,
@@ -5217,6 +5819,7 @@ function RunArtifact({
     "pending_approval",
     "proposed",
   ].includes(run.status));
+  const workspaceRuns = conversation.workspaceRuns ?? [];
 
   return (
     <div className="project-run-artifact">
@@ -5230,7 +5833,7 @@ function RunArtifact({
             type="button"
             onClick={onRunVerification}
             disabled={running}
-            title="在隔离工作区运行已保存的验证命令"
+            title="在当前 Workspace 运行已保存的验证命令"
           >
             {running ? (
               <CircleNotch size={14} weight="bold" aria-hidden="true" />
@@ -5249,9 +5852,73 @@ function RunArtifact({
             <small>实际项目脚本：<code>{command.resolvedScript}</code></small>
           ) : null}
           <small>工作目录：{command.cwdLabel}</small>
-          <small>点击后会在隔离工作区运行；待审阅修改不会提前写入真实项目。</small>
+          <small>点击后会在当前 Workspace 运行，并复用项目工具链与构建缓存。</small>
         </section>
       ) : null}
+      {workspaceRuns.length > 0 ? (
+        <section className="project-workspace-run-requests" aria-label="Workspace 运行">
+          {workspaceRuns.map((run) => {
+            const pending = run.status === "requested";
+            const active = ["queued", "running"].includes(run.status);
+            const commandText = [run.executable, ...(run.argv ?? [])].join(" ");
+            const liveLogEvents = run.runId
+              ? workspaceRunLogs?.[run.runId]?.events ?? []
+              : [];
+            const liveOutput = liveLogEvents
+              .filter((event) => event.type === "chunk" && typeof event.text === "string")
+              .sort((left, right) => left.seq - right.seq)
+              .map((event) => event.text)
+              .join("");
+            const displayedOutput = liveOutput || run.output;
+            return (
+              <article
+                className={`live-project-saved-command is-${run.status}`}
+                key={run.id}
+              >
+                <strong>{run.purpose || "项目命令"}</strong>
+                <code>{commandText}</code>
+                <small>工作目录：{run.relativeCwd || "."}</small>
+                <small>
+                  {pending
+                    ? "等待精确确认；替我审批不会自动运行自定义命令。"
+                    : `状态：${run.status}${Number.isInteger(run.exitCode) ? ` · 退出码 ${run.exitCode}` : ""}`}
+                </small>
+                {displayedOutput ? (
+                  <details className="project-run-log">
+                    <summary>
+                      {active ? "查看实时日志" : "查看已采集日志"}{" "}
+                      <CaretDown size={12} aria-hidden="true" />
+                    </summary>
+                    <pre aria-live={active ? "polite" : undefined}>{displayedOutput}</pre>
+                  </details>
+                ) : null}
+                {run.error ? <p className="project-run-error">{run.error.message ?? run.error}</p> : null}
+                {pending || active ? (
+                  <footer className="project-run-request-actions">
+                    <button
+                      type="button"
+                      disabled={Boolean(workspaceRunAction)}
+                      onClick={() => onCancelWorkspaceRun?.(run)}
+                    >
+                      {workspaceRunAction === `cancel:${run.id}` ? "正在停止" : active ? "停止运行" : "取消"}
+                    </button>
+                    {pending ? (
+                      <button
+                        type="button"
+                        disabled={Boolean(workspaceRunAction)}
+                        onClick={() => onConfirmWorkspaceRun?.(run)}
+                      >
+                        {workspaceRunAction === `confirm:${run.id}` ? "正在排队" : "确认并运行"}
+                      </button>
+                    ) : null}
+                  </footer>
+                ) : null}
+              </article>
+            );
+          })}
+        </section>
+      ) : null}
+      <ProjectSubagentRuns events={conversation.events} />
       <ProjectBrowserQaResults
         conversationId={conversation.id}
         runs={conversation.browserQaRuns ?? []}
@@ -5269,7 +5936,7 @@ function RunArtifact({
           <div>
             <strong>修复与复测尚未完成</strong>
             <p>
-              已保留当前修改和验证记录。继续会再次调用当前模型，然后在隔离工作区复测。
+              已保留当前修改和验证记录。继续会再次调用当前模型，然后在当前 Workspace 复测。
             </p>
           </div>
           <button
@@ -5302,7 +5969,7 @@ function RunArtifact({
           </h3>
           <p>
             {command
-              ? "点击“运行验证”后，会核对隔离修改并保留真实退出码与完整有界日志。"
+              ? "点击“运行验证”后，会在当前 Workspace 执行并保留真实退出码与完整有界日志。"
               : "Pi 保存验证命令后，这里才会出现可运行操作。"}
           </p>
         </section>
@@ -5410,6 +6077,10 @@ function ArtifactPane({
   onUndoApply,
   undoingApplyId,
   undoError,
+  onConfirmWorkspaceWrite,
+  onCancelWorkspaceWrite,
+  workspaceWriteAction,
+  workspaceWriteError,
   onConfirmGitCloseout,
   gitCloseoutConfirming,
   gitCloseoutError,
@@ -5421,6 +6092,10 @@ function ArtifactPane({
   browserQaRunning,
   browserQaError,
   onRunVerification,
+  onConfirmWorkspaceRun,
+  onCancelWorkspaceRun,
+  workspaceRunAction,
+  workspaceRunLogs,
   onResumeVerificationRepair,
   resumingOperationId,
   verificationError,
@@ -5436,7 +6111,11 @@ function ArtifactPane({
   removingDocumentId,
   onError,
 }) {
-  const changeCount = conversation.pendingChangeSet?.files?.length ?? 0;
+  const pendingWorkspaceWriteCount = (conversation.workspaceWrites ?? []).filter(
+    (write) => write.status === "pending",
+  ).length;
+  const changeCount = pendingWorkspaceWriteCount
+    + (conversation.pendingChangeSet?.files?.length ?? 0);
   const standalone = conversation.scope === "standalone"
     || conversation.workspaceKind === "scratch"
     || conversation.projectId === null;
@@ -5624,6 +6303,10 @@ function ArtifactPane({
               onUndoApply={onUndoApply}
               undoingApplyId={undoingApplyId}
               undoError={undoError}
+              onConfirmWorkspaceWrite={onConfirmWorkspaceWrite}
+              onCancelWorkspaceWrite={onCancelWorkspaceWrite}
+              workspaceWriteAction={workspaceWriteAction}
+              workspaceWriteError={workspaceWriteError}
               running={conversationRunning}
             />
           ) : activeArtifactId === "preview" ? (
@@ -5638,7 +6321,11 @@ function ArtifactPane({
           ) : (
             <RunArtifact
               conversation={conversation}
+              workspaceRunLogs={workspaceRunLogs}
               onRunVerification={onRunVerification}
+              onConfirmWorkspaceRun={onConfirmWorkspaceRun}
+              onCancelWorkspaceRun={onCancelWorkspaceRun}
+              workspaceRunAction={workspaceRunAction}
               onResumeVerificationRepair={onResumeVerificationRepair}
               resumingOperationId={resumingOperationId}
               running={verificationRunning}
@@ -5705,6 +6392,7 @@ export function LiveProjectWorkbench({
   pollIntervalMs = 1_000,
   onConversationChange,
   onConversationForked,
+  onCreateConversationInWorkspace,
   onError,
 }) {
   const [snapshot, setSnapshot] = useState(conversation);
@@ -5742,6 +6430,14 @@ export function LiveProjectWorkbench({
   const [action, setAction] = useState(null);
   const [actionError, setActionError] = useState(null);
   const [applyError, setApplyError] = useState(null);
+  const [workspaceWriteError, setWorkspaceWriteError] = useState(null);
+  const [workspaceCatalog, setWorkspaceCatalog] = useState({
+    status: "idle",
+    items: [],
+  });
+  const [workspaceAction, setWorkspaceAction] = useState(null);
+  const [workspaceError, setWorkspaceError] = useState(null);
+  const [workspaceRunLogs, setWorkspaceRunLogs] = useState({});
   const [undoError, setUndoError] = useState(null);
   const [gitCloseoutError, setGitCloseoutError] = useState(null);
   const [previewError, setPreviewError] = useState(null);
@@ -5764,6 +6460,8 @@ export function LiveProjectWorkbench({
   const pdfUploadAbort = useRef(null);
   const pendingImageRef = useRef(null);
   const pendingAttachmentsRef = useRef([]);
+  const verificationAutoOpenRef = useRef(new Set());
+  const workspaceRunLogStateRef = useRef(new Map());
 
   const replacePendingImage = useCallback((nextImage) => {
     const current = pendingImageRef.current;
@@ -5861,6 +6559,12 @@ export function LiveProjectWorkbench({
     ));
     setActionError(null);
     setApplyError(null);
+    setWorkspaceWriteError(null);
+    setWorkspaceCatalog({ status: "idle", items: [] });
+    setWorkspaceAction(null);
+    setWorkspaceError(null);
+    workspaceRunLogStateRef.current = new Map();
+    setWorkspaceRunLogs({});
     setUndoError(null);
     setPreviewError(null);
     setVerificationError(null);
@@ -5880,6 +6584,16 @@ export function LiveProjectWorkbench({
     replacePendingAttachments,
     replacePendingImage,
   ]);
+
+  const unresolvedVerification = verificationAttention(snapshot);
+  useEffect(() => {
+    if (!snapshot?.id || !unresolvedVerification) return;
+    const key = `${snapshot.id}:${unresolvedVerification.requestKey}`;
+    if (verificationAutoOpenRef.current.has(key)) return;
+    verificationAutoOpenRef.current.add(key);
+    setActiveArtifactId("run_result");
+    setArtifactOpen(true);
+  }, [snapshot?.id, unresolvedVerification?.requestKey]);
 
   useEffect(() => {
     if (!selectedCheckpointId) return;
@@ -6541,23 +7255,80 @@ export function LiveProjectWorkbench({
     }), setApplyError);
   }, [api, executeAction, snapshot]);
 
+  const confirmWorkspaceWrite = useCallback((write) => {
+    if (!write?.id || typeof api.confirmWorkspaceWrite !== "function") return;
+    executeAction(
+      `workspace-write-confirm:${write.id}`,
+      () => api.confirmWorkspaceWrite({
+        conversationId: snapshot.id,
+        writeId: write.id,
+      }),
+      setWorkspaceWriteError,
+    );
+  }, [api, executeAction, snapshot?.id]);
+
+  const cancelWorkspaceWrite = useCallback((write) => {
+    if (!write?.id || typeof api.cancelWorkspaceWrite !== "function") return;
+    executeAction(
+      `workspace-write-cancel:${write.id}`,
+      () => api.cancelWorkspaceWrite({
+        conversationId: snapshot.id,
+        writeId: write.id,
+      }),
+      setWorkspaceWriteError,
+    );
+  }, [api, executeAction, snapshot?.id]);
+
+  const confirmWorkspaceRun = useCallback((run) => {
+    if (
+      !run?.id
+      || !run.requestHash
+      || typeof api.confirmWorkspaceRun !== "function"
+    ) return;
+    openArtifact("run_result");
+    executeAction(
+      `workspace-run-confirm:${run.id}`,
+      () => api.confirmWorkspaceRun({
+        conversationId: snapshot.id,
+        requestId: run.id,
+        requestHash: run.requestHash,
+      }),
+      setVerificationError,
+    );
+  }, [api, executeAction, openArtifact, snapshot?.id]);
+
+  const cancelWorkspaceRun = useCallback((run) => {
+    if (!run?.id || typeof api.cancelWorkspaceRun !== "function") return;
+    executeAction(
+      `workspace-run-cancel:${run.id}`,
+      () => api.cancelWorkspaceRun({
+        conversationId: snapshot.id,
+        requestId: run.id,
+      }),
+      setVerificationError,
+    );
+  }, [api, executeAction, snapshot?.id]);
+
   const undoAppliedChanges = useCallback((record) => {
+    const workspaceWrite = record?.status === "written";
     if (
       !record?.id
-      || record.status !== "applied"
+      || (!workspaceWrite && record.status !== "applied")
       || record.undo?.status !== "available"
       || !record.undo?.hash
       || typeof api.undoApply !== "function"
     ) {
       return;
     }
-    const recordFiles = record.files ?? [];
+    const recordFiles = workspaceWrite
+      ? [{ path: record.path }]
+      : record.files ?? [];
     const fileList = recordFiles.map((file) => `• ${file.path}`).join("\n");
     const confirmed = typeof window === "undefined" || window.confirm(
       [
         "撤销这次已应用的修改？",
         "",
-        `将恢复以下 ${recordFiles.length} 个文件到应用前版本：`,
+        `将恢复以下 ${recordFiles.length} 个文件到写入前版本：`,
         fileList || "• 当前记录没有可显示的文件",
         "",
         "服务端会重新核对当前文件；任何外部变化都会阻止撤销。",
@@ -6744,6 +7515,187 @@ export function LiveProjectWorkbench({
     if (!conversationRunning) setRunningMessageMode("steer");
   }, [conversationRunning]);
 
+  useEffect(() => {
+    if (
+      !pathOpen
+      || standalone
+      || !project?.id
+      || typeof api.listWorkspaces !== "function"
+    ) return undefined;
+    const controller = new AbortController();
+    setWorkspaceCatalog((current) => ({
+      status: current.items.length > 0 ? "refreshing" : "loading",
+      items: current.items,
+    }));
+    setWorkspaceError(null);
+    api.listWorkspaces({ projectId: project.id, signal: controller.signal })
+      .then((items) => setWorkspaceCatalog({ status: "ready", items }))
+      .catch((error) => {
+        if (error?.name === "AbortError") return;
+        setWorkspaceCatalog((current) => ({ ...current, status: "error" }));
+        setWorkspaceError(error.message || "无法读取 Workspace");
+      });
+    return () => controller.abort();
+  }, [api, pathOpen, project?.id, standalone]);
+
+  const refreshWorkspaces = useCallback(async () => {
+    if (!project?.id || typeof api.listWorkspaces !== "function") return [];
+    const items = await api.listWorkspaces({ projectId: project.id });
+    setWorkspaceCatalog({ status: "ready", items });
+    return items;
+  }, [api, project?.id]);
+
+  const createConversationInWorkspace = useCallback(async (workspace) => {
+    if (!workspace?.id || !project?.id || !onCreateConversationInWorkspace) return;
+    setWorkspaceAction(`conversation:${workspace.id}`);
+    setWorkspaceError(null);
+    try {
+      await onCreateConversationInWorkspace({
+        projectId: project.id,
+        workspaceId: workspace.id,
+      });
+    } catch (error) {
+      setWorkspaceError(error.message || "无法在此 Workspace 新建会话");
+      await refreshWorkspaces().catch(() => undefined);
+    } finally {
+      setWorkspaceAction(null);
+    }
+  }, [onCreateConversationInWorkspace, project?.id, refreshWorkspaces]);
+
+  const createWorktreeConversation = useCallback(async (sourceWorkspace) => {
+    if (
+      !sourceWorkspace?.id
+      || !sourceWorkspace.head
+      || !project?.id
+      || typeof api.createWorkspace !== "function"
+    ) return;
+    setWorkspaceAction("create");
+    setWorkspaceError(null);
+    try {
+      const created = await api.createWorkspace({
+        projectId: project.id,
+        sourceWorkspaceId: sourceWorkspace.id,
+        expectedHead: sourceWorkspace.head,
+        title: snapshot?.title || "task",
+      });
+      setWorkspaceCatalog((current) => ({
+        status: "ready",
+        items: [...current.items.filter((item) => item.id !== created.id), created],
+      }));
+      if (onCreateConversationInWorkspace) {
+        await onCreateConversationInWorkspace({
+          projectId: project.id,
+          workspaceId: created.id,
+        });
+      }
+    } catch (error) {
+      setWorkspaceError(error.message || "无法创建 Workspace");
+      await refreshWorkspaces().catch(() => undefined);
+    } finally {
+      setWorkspaceAction(null);
+    }
+  }, [api, onCreateConversationInWorkspace, project?.id, refreshWorkspaces, snapshot?.title]);
+
+  const removeWorkspace = useCallback(async (workspace) => {
+    if (
+      !workspace?.id
+      || !workspace.head
+      || !project?.id
+      || typeof api.removeWorkspace !== "function"
+    ) return;
+    const confirmed = typeof window === "undefined" || window.confirm(
+      `删除干净的 Workspace“${workspace.label || workspace.branch}”？\n\n工作目录会被移除，Git 分支仍会保留；不会使用强制删除。`,
+    );
+    if (!confirmed) return;
+    setWorkspaceAction(`delete:${workspace.id}`);
+    setWorkspaceError(null);
+    try {
+      await api.removeWorkspace({
+        projectId: project.id,
+        workspaceId: workspace.id,
+        expectedHead: workspace.head,
+      });
+      await refreshWorkspaces();
+    } catch (error) {
+      setWorkspaceError(error.message || "无法删除 Workspace");
+      await refreshWorkspaces().catch(() => undefined);
+    } finally {
+      setWorkspaceAction(null);
+    }
+  }, [api, project?.id, refreshWorkspaces]);
+
+  const workspaceRunRevision = (snapshot?.workspaceRuns ?? [])
+    .map((run) => `${run.id}:${run.runId ?? ""}:${run.status}`)
+    .join("|");
+  useEffect(() => {
+    const conversationId = snapshot?.id;
+    const runs = (snapshot?.workspaceRuns ?? []).filter((run) => run.runId);
+    if (!conversationId || runs.length === 0 || typeof api.fetchWorkspaceRun !== "function") {
+      return undefined;
+    }
+    let disposed = false;
+    let timeoutId = null;
+    const controllers = new Set();
+    const publishLogs = () => {
+      const next = {};
+      for (const [runId, state] of workspaceRunLogStateRef.current) {
+        next[runId] = { events: state.events, afterSeq: state.afterSeq };
+      }
+      setWorkspaceRunLogs(next);
+    };
+    const fetchRun = async (run) => {
+      const previous = workspaceRunLogStateRef.current.get(run.runId) ?? {
+        afterSeq: 0,
+        events: [],
+      };
+      let afterSeq = previous.afterSeq;
+      let events = previous.events;
+      let hasMore = true;
+      while (!disposed && hasMore) {
+        const controller = new AbortController();
+        controllers.add(controller);
+        try {
+          const page = await api.fetchWorkspaceRun({
+            conversationId,
+            runId: run.runId,
+            afterSeq,
+            limit: 500,
+            signal: controller.signal,
+          });
+          const incoming = Array.isArray(page?.events) ? page.events : [];
+          events = [...new Map([...events, ...incoming]
+            .filter((event) => Number.isSafeInteger(event?.seq))
+            .map((event) => [event.seq, event])).values()]
+            .sort((left, right) => left.seq - right.seq);
+          afterSeq = Number.isSafeInteger(page?.nextSeq)
+            ? page.nextSeq
+            : events.at(-1)?.seq ?? afterSeq;
+          hasMore = page?.hasMore === true;
+        } finally {
+          controllers.delete(controller);
+        }
+      }
+      workspaceRunLogStateRef.current.set(run.runId, { afterSeq, events });
+    };
+    const poll = async () => {
+      try {
+        await Promise.all(runs.map(fetchRun));
+        if (!disposed) publishLogs();
+      } catch (error) {
+        if (!disposed && error?.name !== "AbortError") errorRef.current?.(error);
+      }
+      if (!disposed && runs.some((run) => ["queued", "running"].includes(run.status))) {
+        timeoutId = window.setTimeout(poll, Math.min(pollIntervalMs, 750));
+      }
+    };
+    void poll();
+    return () => {
+      disposed = true;
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      for (const controller of controllers) controller.abort();
+    };
+  }, [api, pollIntervalMs, snapshot?.id, workspaceRunRevision]);
+
   const removeFollowUp = useCallback((itemId) => {
     if (!itemId || typeof api.removeFollowUp !== "function") return;
     executeAction(`follow-up-remove:${itemId}`, async () => {
@@ -6925,7 +7877,9 @@ export function LiveProjectWorkbench({
             {titleStatusLabel}
           </span>
         </div>
-        <h1>{snapshot?.title ?? "项目工作"}</h1>
+        <h1 title={snapshot?.title ?? "项目工作"}>
+          {snapshot?.title ?? "项目工作"}
+        </h1>
       </div>
     </div>
   );
@@ -7010,6 +7964,14 @@ export function LiveProjectWorkbench({
             onRetryCheckpoint={retryCheckpoint}
             onStartBranch={startCheckpointBranch}
             onForkCheckpoint={forkCheckpoint}
+            workspaces={workspaceCatalog.items}
+            currentWorkspaceId={snapshot.workspace?.id ?? snapshot.workspaceId}
+            workspacesLoading={["loading", "refreshing"].includes(workspaceCatalog.status)}
+            workspaceAction={workspaceAction}
+            workspaceError={workspaceError}
+            onCreateWorktreeConversation={createWorktreeConversation}
+            onCreateConversationInWorkspace={createConversationInWorkspace}
+            onRemoveWorkspace={removeWorkspace}
             busy={conversationRunning || Boolean(action)}
             standalone={standalone}
           />
@@ -7224,6 +8186,12 @@ export function LiveProjectWorkbench({
           onUndoApply={undoAppliedChanges}
           undoingApplyId={undoingApplyId}
           undoError={undoError}
+          onConfirmWorkspaceWrite={confirmWorkspaceWrite}
+          onCancelWorkspaceWrite={cancelWorkspaceWrite}
+          workspaceWriteAction={String(action ?? "").startsWith("workspace-write-")
+            ? action
+            : null}
+          workspaceWriteError={workspaceWriteError}
           onConfirmGitCloseout={confirmGitCloseout}
           gitCloseoutConfirming={String(action ?? "").startsWith("git-closeout:")}
           gitCloseoutError={gitCloseoutError}
@@ -7236,6 +8204,14 @@ export function LiveProjectWorkbench({
             || snapshot.browserQaRuns?.some((run) => run.status === "running")}
           browserQaError={browserQaError}
           onRunVerification={runVerification}
+          onConfirmWorkspaceRun={confirmWorkspaceRun}
+          onCancelWorkspaceRun={cancelWorkspaceRun}
+          workspaceRunAction={String(action ?? "").startsWith("workspace-run-")
+            ? action
+                .replace("workspace-run-confirm:", "confirm:")
+                .replace("workspace-run-cancel:", "cancel:")
+            : null}
+          workspaceRunLogs={workspaceRunLogs}
           onResumeVerificationRepair={resumeVerificationRepair}
           resumingOperationId={resumingVerificationRepairId}
           verificationError={verificationError}

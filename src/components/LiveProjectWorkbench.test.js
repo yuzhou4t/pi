@@ -1539,7 +1539,7 @@ test("failed and passing verification evidence keeps the saved command retryable
   }, { exposeArtifact: true });
 });
 
-test("pending changes can be verified inside the isolated workspace before apply", async () => {
+test("saved verification runs in the current Workspace and reuses its toolchain", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
       project,
@@ -1575,8 +1575,8 @@ test("pending changes can be verified inside the isolated workspace before apply
     }));
 
     assert.match(html, />运行验证</);
-    assert.match(html, /在隔离工作区运行/);
-    assert.match(html, /待审阅修改不会提前写入真实项目/);
+    assert.match(html, /在当前 Workspace 运行/);
+    assert.match(html, /复用项目工具链与构建缓存/);
     assert.doesNotMatch(html, /先审阅修改|等待修改确认|验证才会变为可运行/);
   }, { exposeArtifact: true });
 });
@@ -1960,7 +1960,7 @@ test("latest settled activity is coalesced and remains open above the final answ
     assert.match(html, /aria-expanded="true"/);
     assert.match(html, /class="project-activity-body">/);
     assert.match(html, /已完成/);
-    assert.match(html, /3 项 · 查看过程/);
+    assert.match(html, /4 项 · 查看过程/);
     assert.match(html, /透明模式/);
     assert.doesNotMatch(html, /Harness 快照/);
     assert.match(html, /查看与检索了 1 次/);
@@ -2199,7 +2199,7 @@ test("every executed turn keeps its activity while only history starts collapsed
   });
 });
 
-test("the active plan stays pinned while the latest settled plan remains visible", async () => {
+test("the active plan stays in a fixed dock while historical plans remain visible", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const messages = [
       {
@@ -2281,7 +2281,7 @@ test("the active plan stays pinned while the latest settled plan remains visible
 
     assert.equal((runningHtml.match(/>第一轮对应计划<\/span>/g) ?? []).length, 1);
     assert.equal((runningHtml.match(/>第二轮对应计划<\/span>/g) ?? []).length, 1);
-    assert.equal((runningHtml.match(/project-plan-card is-pinned/g) ?? []).length, 1);
+    assert.equal((runningHtml.match(/project-plan-dock is-running is-expanded/g) ?? []).length, 1);
     assert.equal((runningHtml.match(/project-plan-card is-history/g) ?? []).length, 1);
 
     const settledHtml = renderToStaticMarkup(React.createElement(
@@ -2315,7 +2315,9 @@ test("the active plan stays pinned while the latest settled plan remains visible
     ));
 
     assert.equal((settledHtml.match(/project-plan-card is-history/g) ?? []).length, 1);
-    assert.doesNotMatch(settledHtml, /project-plan-card is-pinned/);
+    assert.match(settledHtml, /project-plan-dock is-settled/);
+    assert.match(settledHtml, /aria-label="当前 Agent 计划"/);
+    assert.match(settledHtml, /aria-expanded="false"/);
     assert.equal((settledHtml.match(/>第一轮对应计划<\/span>/g) ?? []).length, 1);
     assert.equal((settledHtml.match(/>第二轮对应计划<\/span>/g) ?? []).length, 1);
 
@@ -2337,18 +2339,20 @@ test("the active plan stays pinned while the latest settled plan remains visible
       },
     ));
     assert.equal((noNewPlanHtml.match(/>第一轮对应计划<\/span>/g) ?? []).length, 1);
-    assert.doesNotMatch(noNewPlanHtml, /project-plan-card is-pinned/);
+    assert.match(noNewPlanHtml, /project-plan-dock is-running is-expanded/);
     assert.match(runningHtml, /aria-label="进行中：第二轮对应计划"/);
   });
 
   const styles = await readFile(STYLES_URL, "utf8");
-  const pinnedStart = styles.indexOf(".project-plan-card.is-pinned {");
-  const pinnedEnd = styles.indexOf("}", pinnedStart);
-  assert.notEqual(pinnedStart, -1);
-  assert.match(styles.slice(pinnedStart, pinnedEnd), /position: sticky/);
-  assert.match(styles.slice(pinnedStart, pinnedEnd), /top: 0/);
-  assert.match(styles.slice(pinnedStart, pinnedEnd), /max-height:/);
-  assert.match(styles.slice(pinnedStart, pinnedEnd), /overflow-y: auto/);
+  const dockStart = styles.indexOf(".project-plan-dock {");
+  const dockEnd = styles.indexOf("}", dockStart);
+  assert.notEqual(dockStart, -1);
+  assert.match(styles.slice(dockStart, dockEnd), /flex: 0 0 auto/);
+  const source = await readFile(COMPONENT_URL, "utf8");
+  const paneStart = source.indexOf("export function ProjectAgentPane");
+  const dockPosition = source.indexOf("<ProjectPlanDock", paneStart);
+  const streamPosition = source.indexOf('className="project-agent-stream"', paneStart);
+  assert.ok(dockPosition > paneStart && dockPosition < streamPosition);
 });
 
 test("the current executed turn expands while prior activity stays collapsed", async () => {
@@ -3773,7 +3777,7 @@ test("adding file context only updates removable composer context until submit",
   assert.match(source, /useState\(\s*readLastArtifact\(/);
 });
 
-test("workspace status explains isolation and recovery without exposing runtime details", async () => {
+test("workspace status explains direct Workspace use and recovery without exposing runtime details", async () => {
   await withLiveWorkbench(({ ProjectWorkspaceStatus }) => {
     const readyHtml = renderToStaticMarkup(React.createElement(ProjectWorkspaceStatus, {
       workspace: {
@@ -3783,16 +3787,16 @@ test("workspace status explains isolation and recovery without exposing runtime 
         status: "ready",
       },
     }));
-    assert.match(readyHtml, /修改在隔离副本中准备/);
-    assert.match(readyHtml, /真实项目只会在你确认更改后更新/);
+    assert.match(readyHtml, /真实 Workspace 已连接/);
+    assert.match(readyHtml, /读取、写入、构建与测试使用同一工作区/);
 
     const forkHtml = renderToStaticMarkup(React.createElement(ProjectWorkspaceStatus, {
       workspace: { status: "ready" },
       fork: { status: "ready" },
     }));
-    assert.match(forkHtml, /分支对话已隔离/);
+    assert.match(forkHtml, /已从检查点继续/);
     assert.match(forkHtml, /继承检查点上下文/);
-    assert.match(forkHtml, /项目文件按当前状态重新读取/);
+    assert.match(forkHtml, /继续使用当前 Workspace/);
 
     const recoveringHtml = renderToStaticMarkup(React.createElement(ProjectWorkspaceStatus, {
       workspace: { status: "recovering" },
@@ -3921,4 +3925,227 @@ test("large project files keep one bounded listbox focus surface", async () => {
     /visibleFileLines\.map\([\s\S]{0,500}<button/,
   );
   assert.doesNotMatch(fileArtifact, /role="option"[\s\S]{0,160}tabIndex=/);
+});
+
+test("desktop title keeps a readable single-line allocation with a full tooltip", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const title = "优化 QQ 式快捷截图并核对跨模型工作台状态";
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({ title }),
+    }));
+    assert.match(html, new RegExp(`<h1 title="${title}">${title}</h1>`));
+  });
+  const styles = await readFile(STYLES_URL, "utf8");
+  const allocationStart = styles.indexOf(
+    ".reading-workbench-topbar > .workflow-title-block {",
+  );
+  const allocationEnd = styles.indexOf("}", allocationStart);
+  const titleStart = styles.indexOf(
+    ".reading-workbench-topbar .workflow-title-block h1 {",
+  );
+  const titleEnd = styles.indexOf("}", titleStart);
+  assert.match(styles.slice(allocationStart, allocationEnd), /min-width: 260px/);
+  assert.match(styles.slice(titleStart, titleEnd), /text-overflow: ellipsis/);
+  assert.match(styles.slice(titleStart, titleEnd), /white-space: nowrap/);
+});
+
+test("activity keeps five hundred public events in event-sequence order", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const events = [
+      { seq: 1, type: "message.created", status: "accepted" },
+      ...Array.from({ length: 500 }, (_, index) => ({
+        seq: index + 2,
+        type: "agent.progress",
+        data: { summary: `公开进展 ${index + 1}` },
+      })).reverse(),
+    ];
+    const normalized = normalizeActivityEvents(events, true);
+    assert.equal(normalized.length, 500);
+    assert.deepEqual(
+      normalized.map((event) => event.seq),
+      Array.from({ length: 500 }, (_, index) => index + 2),
+    );
+  });
+});
+
+test("native reasoning remains interleaved with public progress without repeated completion copy", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+      events: [
+        { seq: 1, type: "message.created", status: "accepted" },
+        { seq: 2, type: "agent.thinking", status: "active" },
+        { seq: 3, type: "agent.progress", data: { summary: "先核对入口。" } },
+        { seq: 4, type: "agent.thinking", status: "finished" },
+        {
+          seq: 5,
+          type: "tool.completed",
+          toolName: "read",
+          toolCallId: "read-visible",
+          path: "src/App.jsx",
+          status: "completed",
+        },
+        { seq: 6, type: "agent.progress", data: { summary: "入口已核对。" } },
+      ],
+      running: false,
+      compact: false,
+      onOpenArtifact: () => {},
+    }));
+    assert.match(html, /先核对入口/);
+    assert.match(html, /已完成这一步分析/);
+    assert.match(html, /查看与检索了 1 次/);
+    assert.match(html, /入口已核对/);
+    assert.doesNotMatch(html, /思考完成/);
+    assert.ok(html.indexOf("先核对入口") < html.indexOf("查看与检索了 1 次"));
+  });
+});
+
+test("subagent task tree renders safe structured evidence in Run and a compact center card", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench, normalizeSubagentRun }) => {
+    const unsafe = normalizeSubagentRun({
+      seq: 2,
+      status: "failed",
+      data: {
+        subagentRun: {
+          index: 1,
+          task: "检查工作台",
+          status: "failed",
+          currentTool: "read",
+          currentPath: "/Users/private/project/src/App.jsx",
+          toolCount: 4,
+          turnCount: 2,
+          tokens: 1_200,
+          durationMs: 2_500,
+          error: "failed at /Users/private/project sk-secret12345678",
+          summary: "3/3 succeeded === Task 1: pi-agent-contained-scout === 已完成核对",
+          children: [{ task: "检查标题", status: "completed", toolCount: 1 }],
+        },
+      },
+    });
+    assert.equal(unsafe.currentPath, "<workspace>");
+    assert.doesNotMatch(JSON.stringify(unsafe), /Users\/private|sk-secret/);
+    assert.match(unsafe.summary, /3\/3 个子任务已完成 子任务 1：已完成核对/u);
+    assert.doesNotMatch(unsafe.summary, /pi-agent-contained-scout/u);
+
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        activeArtifactId: "run_result",
+        events: [
+          { seq: 1, type: "message.created", status: "accepted" },
+          {
+            seq: 2,
+            type: "tool.completed",
+            toolName: "subagent",
+            toolCallId: "subagent-structured",
+            status: "failed",
+            data: { subagentRun: unsafe },
+          },
+        ],
+      }),
+    }));
+    assert.match(html, /子智能体任务/);
+    assert.match(html, /检查工作台/);
+    assert.match(html, /检查标题/);
+    assert.match(html, /4 次工具 · 2 轮 · 1\.2k Token · 2\.5 秒/);
+    assert.match(html, /查看运行/);
+    assert.doesNotMatch(html, /Users\/private|sk-secret/);
+  }, { exposeArtifact: true });
+});
+
+test("an unresolved verification stays prominent and suppresses a false completed state", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench, verificationAttention }) => {
+    const failed = conversation({
+      status: "completed",
+      turnStatus: "completed",
+      verificationCommand: {
+        id: "command-failed",
+        label: "测试",
+        displayCommand: "npm test",
+        status: "saved",
+      },
+      verificationRuns: [{
+        id: "run-failed",
+        commandId: "command-failed",
+        status: "failed",
+        command: "npm test",
+        summary: "仍有一个断言失败",
+        checks: [],
+        logs: ["failed"],
+      }],
+      events: [{
+        seq: 1,
+        type: "loop.lifecycle",
+        lifecycleState: "completed",
+      }],
+    });
+    assert.equal(verificationAttention(failed).status, "failed");
+    assert.equal(verificationAttention(conversation({
+      workspaceRuns: [{
+        id: "old-failed",
+        status: "failed",
+        executable: "node",
+        argv: ["--test"],
+      }, {
+        id: "latest-passed",
+        status: "succeeded",
+        executable: "node",
+        argv: ["--test"],
+      }],
+    })), null);
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: failed,
+    }));
+    assert.match(html, /验证未通过/);
+    assert.match(html, /仍有一个断言失败/);
+    assert.match(html, /打开运行/);
+    assert.doesNotMatch(html, /本轮已完成|Pi Agent 已完成本轮工作/);
+  });
+});
+
+test("pending Workspace writes keep exact diff confirmation in Changes and a compact center prompt", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: conversation({
+        activeArtifactId: "changes",
+        workspaceWrites: [{
+          id: "workspace-write-1",
+          turnId: "turn-write-1",
+          toolCallId: "tool-write-1",
+          path: "src/App.jsx",
+          operation: "update",
+          status: "pending",
+          approvalMode: "manual_review",
+          baseHash: "sha256:workspace-before",
+          afterHash: "sha256:workspace-after",
+          patch: [
+            "--- a/src/App.jsx",
+            "+++ b/src/App.jsx",
+            "@@ -1 +1 @@",
+            "-旧标题",
+            "+新标题",
+          ].join("\n"),
+        }],
+      }),
+    }));
+    assert.match(html, /1 次文件写入等待确认/);
+    assert.match(html, /核对精确 Diff/);
+    assert.match(html, /Workspace 写入/);
+    assert.match(html, /src\/App\.jsx/);
+    assert.match(html, /精确 unified diff · 逐次确认/);
+    assert.match(html, /旧标题/);
+    assert.match(html, /新标题/);
+    assert.match(html, /sha256:workspace-before/);
+    assert.match(html, /sha256:workspace-after/);
+    assert.match(html, /取消写入/);
+    assert.match(html, /确认写入/);
+    assert.match(html, /重新核对基础哈希/);
+  }, { exposeArtifact: true });
+
+  const source = await readFile(COMPONENT_URL, "utf8");
+  assert.match(source, /api\.confirmWorkspaceWrite\(\{/);
+  assert.match(source, /api\.cancelWorkspaceWrite\(\{/);
+  assert.match(source, /writeId: write\.id/);
 });

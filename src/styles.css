@@ -1123,6 +1123,120 @@ button:disabled {
   line-height: 1.45;
 }
 
+.project-session-workspaces {
+  display: grid;
+  gap: 7px;
+  padding: 9px 10px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-session-workspaces > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.project-session-workspaces > header strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.project-session-workspaces > header small,
+.project-session-workspaces > p {
+  margin: 0;
+  color: var(--weak);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.project-session-workspaces > p.is-error {
+  color: var(--risk);
+}
+
+.project-session-workspaces ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.project-session-workspaces li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 5px;
+  min-height: 44px;
+  padding: 5px 6px;
+  background: var(--surface-soft);
+  border: 1px solid transparent;
+  border-radius: 7px;
+}
+
+.project-session-workspaces li > div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.project-session-workspaces li strong,
+.project-session-workspaces li small,
+.project-session-workspaces li span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-session-workspaces li strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.project-session-workspaces li small,
+.project-session-workspaces li span {
+  color: var(--weak);
+  font-size: 10.5px;
+}
+
+.project-session-workspaces li > button,
+.project-session-workspace-create {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 7px;
+  cursor: pointer;
+  color: var(--teal-accent);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 10.5px;
+  font-weight: 620;
+}
+
+.project-session-workspaces li > button.is-danger {
+  width: 28px;
+  padding: 0;
+  color: var(--risk);
+}
+
+.project-session-workspaces button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.project-session-workspaces button:hover:not(:disabled) {
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+}
+
+.project-session-workspace-create {
+  justify-self: stretch;
+  min-height: 31px;
+}
+
 .project-session-path-turns {
   display: grid;
   gap: 0;
@@ -8975,6 +9089,116 @@ h4.reader-rail-full-heading {
   overscroll-behavior: contain;
 }
 
+.project-plan-dock {
+  position: relative;
+  z-index: 5;
+  flex: 0 0 auto;
+  margin: 10px 16px 0;
+  padding: 0 11px;
+  background: color-mix(in srgb, var(--surface) 94%, var(--teal-tint));
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  box-shadow: 0 5px 14px rgba(64, 54, 38, 0.05);
+}
+
+.project-plan-dock.is-running {
+  border-color: var(--teal-border);
+  box-shadow: 0 7px 18px rgba(33, 93, 83, 0.08);
+}
+
+.project-plan-dock > button {
+  display: grid;
+  width: 100%;
+  min-height: 38px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text);
+  text-align: left;
+  background: transparent;
+}
+
+.project-plan-dock > button > svg:first-child {
+  color: var(--teal-accent);
+}
+
+.project-plan-dock.is-running > button > svg:first-child {
+  animation: project-spin 0.9s linear infinite;
+}
+
+.project-plan-dock > button > span {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.project-plan-dock > button strong {
+  font-size: 12px;
+}
+
+.project-plan-dock > button small {
+  overflow: hidden;
+  color: var(--weak);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-plan-dock > button > svg:last-child {
+  color: var(--weak);
+  transition: transform 120ms ease;
+}
+
+.project-plan-dock.is-expanded > button > svg:last-child {
+  transform: rotate(180deg);
+}
+
+.project-plan-dock-body {
+  max-height: min(32vh, 280px);
+  padding: 7px 1px 10px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+
+.project-plan-dock-body[hidden] {
+  display: none;
+}
+
+.project-plan-dock ol {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.project-plan-dock li {
+  display: flex;
+  min-height: 26px;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.project-plan-dock li.is-in_progress,
+.project-plan-dock li.is-running {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.project-plan-dock li.is-completed {
+  color: var(--teal-accent);
+}
+
+.project-plan-dock li.is-in_progress svg,
+.project-plan-dock li.is-running svg {
+  animation: project-spin 0.9s linear infinite;
+}
+
 .project-agent-load-history {
   display: inline-flex;
   min-height: 30px;
@@ -9378,20 +9602,91 @@ h4.reader-rail-full-heading {
   background: var(--surface);
 }
 
+.project-verification-attention {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px 10px;
+  padding: 12px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--risk-pale) 58%, var(--surface));
+  border: 1px solid rgba(124, 58, 45, 0.2);
+  border-radius: 10px;
+  box-shadow: 0 7px 16px rgba(64, 54, 38, 0.06);
+}
+
+.project-verification-attention.is-running,
+.project-verification-attention.is-queued,
+.project-verification-attention.is-requested,
+.project-verification-attention.is-saved,
+.project-verification-attention.is-ready {
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+}
+
+.project-verification-attention > svg {
+  margin-top: 1px;
+  color: var(--risk);
+}
+
+.project-verification-attention.is-running > svg,
+.project-verification-attention.is-queued > svg,
+.project-verification-attention.is-requested > svg,
+.project-verification-attention.is-saved > svg,
+.project-verification-attention.is-ready > svg {
+  color: var(--teal-accent);
+}
+
+.project-verification-attention.is-running > svg,
+.project-verification-attention.is-queued > svg {
+  animation: project-spin 0.9s linear infinite;
+}
+
+.project-verification-attention > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.project-verification-attention strong {
+  font-size: 12.5px;
+}
+
+.project-verification-attention p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.project-verification-attention code {
+  overflow: hidden;
+  color: var(--weak);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-verification-attention > button {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 9px;
+  cursor: pointer;
+  color: var(--teal-accent);
+  background: var(--surface);
+  border: 1px solid var(--teal-border);
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 650;
+}
+
 .project-plan-card {
   display: grid;
   gap: 9px;
   padding: 11px 12px;
-}
-
-.project-plan-card.is-pinned {
-  position: sticky;
-  z-index: 4;
-  top: 0;
-  max-height: min(38vh, 340px);
-  overflow-y: auto;
-  border-color: var(--teal-border);
-  box-shadow: 0 8px 18px rgba(64, 54, 38, 0.08);
 }
 
 .project-plan-card.is-history {
@@ -9766,6 +10061,66 @@ h4.reader-rail-full-heading {
 .project-activity-progress.is-latest .project-activity-progress-dot {
   background: var(--teal-accent);
   box-shadow: 0 0 0 3px rgba(33, 93, 83, 0.1);
+}
+
+.project-subagent-activity {
+  display: grid;
+  min-height: 45px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 2px;
+  border-top: 1px solid var(--border);
+}
+
+.project-subagent-activity > svg {
+  color: var(--teal-accent);
+}
+
+.project-subagent-activity > div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.project-subagent-activity strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-subagent-activity small {
+  overflow: hidden;
+  color: var(--weak);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-subagent-activity > button {
+  display: inline-flex;
+  min-height: 28px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 3px;
+  padding: 0 7px;
+  cursor: pointer;
+  color: var(--teal-accent);
+  background: transparent;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.project-subagent-activity > button:hover {
+  background: var(--teal-tint);
+}
+
+.project-subagent-activity.is-failed > svg,
+.project-subagent-activity.is-timed_out > svg,
+.project-subagent-activity.is-interrupted > svg {
+  color: var(--risk);
 }
 
 .project-activity details {
@@ -11652,6 +12007,17 @@ h4.reader-rail-full-heading {
   font-size: 10.5px;
 }
 
+.project-change-artifact.is-workspace-writes .project-change-file > button {
+  width: 100%;
+  padding: 5px 4px;
+}
+
+.project-diff-viewer > header > span.is-failed,
+.project-diff-viewer > header > span.is-stale {
+  color: var(--risk);
+  background: var(--risk-pale);
+}
+
 .project-diff-viewer > header > span {
   padding: 2px 7px;
   color: var(--teal-accent);
@@ -11781,6 +12147,41 @@ h4.reader-rail-full-heading {
   flex-direction: column;
   overflow: auto;
   background: var(--bg);
+}
+
+.project-workspace-run-requests {
+  display: grid;
+  gap: 10px;
+}
+
+.project-workspace-run-requests .live-project-saved-command {
+  gap: 7px;
+}
+
+.project-run-request-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.project-run-request-actions button {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background: var(--surface);
+}
+
+.project-run-request-actions button:last-child {
+  border-color: color-mix(in srgb, var(--teal) 42%, var(--line));
+  color: var(--teal-strong);
+}
+
+.project-change-completed-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .project-preview-artifact > header,
@@ -12158,6 +12559,114 @@ h4.reader-rail-full-heading {
   display: grid;
   gap: 10px;
   padding: 16px;
+}
+
+.project-subagent-runs {
+  display: grid;
+  gap: 10px;
+  margin: 16px 16px 0;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+
+.project-subagent-runs > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.project-subagent-runs > header > svg {
+  color: var(--teal-accent);
+}
+
+.project-subagent-runs > header > div {
+  display: grid;
+  gap: 1px;
+}
+
+.project-subagent-runs > header strong {
+  font-size: 12.5px;
+}
+
+.project-subagent-runs > header small {
+  color: var(--weak);
+  font-size: 10.5px;
+}
+
+.project-subagent-run-tree,
+.project-subagent-run-tree ol {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.project-subagent-run-tree ol {
+  margin: 7px 0 0 15px;
+  padding-left: 12px;
+  border-left: 1px solid var(--teal-border);
+}
+
+.project-subagent-run-row {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 7px;
+  padding: 8px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.project-subagent-run-state {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+  border-radius: 50%;
+}
+
+.project-subagent-run-tree li.is-running .project-subagent-run-state svg {
+  animation: project-spin 0.9s linear infinite;
+}
+
+.project-subagent-run-tree li.is-failed .project-subagent-run-state,
+.project-subagent-run-tree li.is-timed_out .project-subagent-run-state,
+.project-subagent-run-tree li.is-interrupted .project-subagent-run-state {
+  color: var(--risk);
+  background: var(--risk-pale);
+}
+
+.project-subagent-run-row > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.project-subagent-run-row strong {
+  font-size: 11.5px;
+}
+
+.project-subagent-run-row small,
+.project-subagent-run-row footer {
+  color: var(--weak);
+  font-size: 10.5px;
+}
+
+.project-subagent-run-row p {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.project-subagent-run-row p.is-error {
+  color: var(--risk);
 }
 
 .project-browser-qa-results {
@@ -12913,9 +13422,24 @@ h4.reader-rail-full-heading {
   border-bottom: 1px solid var(--border);
 }
 
+.reading-workbench-topbar > .workflow-title-block {
+  min-width: 260px;
+  max-width: min(46vw, 620px);
+  flex: 1 1 360px;
+  overflow: hidden;
+}
+
+.reading-workbench-topbar > .workflow-title-block > div {
+  min-width: 0;
+  overflow: hidden;
+}
+
 .reading-workbench-topbar .workflow-title-block h1 {
+  overflow: hidden;
   margin: 0;
   font-size: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .live-project-title-meta {
@@ -12956,6 +13480,8 @@ h4.reader-rail-full-heading {
 
 .reading-workbench-meta {
   display: flex;
+  min-width: 0;
+  flex: 0 1 auto;
   align-items: center;
   gap: 7px;
 }
