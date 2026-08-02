@@ -520,6 +520,94 @@ test("log chunks preserve UTF-8 offsets and emit one durable truncation marker",
   assert.equal(failed.output.stdoutBytes, expectedOffset);
 });
 
+test("native Pi shell output is adopted without spawning a second process", async (t) => {
+  const setup = await fixture(t);
+  const started = await setup.supervisor.startExternal({
+    workspaceId: "workspace-main",
+    workspaceRoot: setup.workspaceRoot,
+    command: `printf 'api_key=private-value' > ${setup.workspaceRoot}/result.txt`,
+    metadata: {
+      kind: "pi_shell",
+      conversationId: "conversation-native",
+      toolCallId: "tool-call-native",
+    },
+  });
+
+  assert.equal(setup.spawnCalls.length, 0);
+  assert.equal(started.run.status, "running");
+  assert.equal(started.run.metadata.kind, "pi_shell");
+  assert.match(started.run.args.join(" "), /<workspace>\/result\.txt/);
+  assert.doesNotMatch(started.run.args.join(" "), /private-value/);
+
+  await setup.supervisor.appendExternalOutput(started.run.id, {
+    text: `checking ${setup.workspaceRoot}/Package.swift\n`,
+  });
+  await setup.supervisor.appendExternalOutput(started.run.id, {
+    stream: "stderr",
+    text: "token=another-private-value\n",
+  });
+  const completed = await setup.supervisor.finishExternalRun(started.run.id, {
+    status: "succeeded",
+    exitCode: 0,
+  });
+  assert.equal(await started.completion, completed);
+  assert.equal(completed.status, "succeeded");
+  assert.equal(completed.exitCode, 0);
+
+  const snapshot = await setup.supervisor.snapshot(started.run.id);
+  const output = snapshot.events
+    .filter((event) => event.type === "chunk")
+    .map((event) => event.text)
+    .join("");
+  assert.match(output, /checking <workspace>\/Package\.swift/);
+  assert.match(output, /token=<redacted>/);
+  assert.doesNotMatch(output, /another-private-value/);
+  assert.deepEqual(
+    snapshot.events
+      .filter((event) => event.type === "status")
+      .map((event) => event.status),
+    ["running", "succeeded"],
+  );
+});
+
+test("cancelling an adopted Pi shell delegates to its Session and settles once", async (t) => {
+  let cancelCalls = 0;
+  let started;
+  const setup = await fixture(t, {
+    interruptGraceMs: 10,
+    terminateGraceMs: 10,
+    killGraceMs: 10,
+  });
+  started = await setup.supervisor.startExternal({
+    workspaceId: "workspace-main",
+    workspaceRoot: setup.workspaceRoot,
+    command: "swift test",
+    metadata: { kind: "pi_shell" },
+    cancelHandler: async () => {
+      cancelCalls += 1;
+      await setup.supervisor.finishExternalRun(started.run.id, {
+        status: "cancelled",
+        signal: "SIGINT",
+      });
+    },
+  });
+
+  const cancelled = await setup.supervisor.cancel(started.run.id);
+  assert.equal(cancelCalls, 1);
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(await started.completion, cancelled);
+  const snapshot = await setup.supervisor.snapshot(started.run.id);
+  assert.equal(
+    snapshot.events.filter((event) => (
+      event.type === "status"
+      && ["succeeded", "failed", "cancelled", "interrupted"].includes(
+        event.status,
+      )
+    )).length,
+    1,
+  );
+});
+
 test("metadata rejects credential-shaped fields before a run is persisted", async (t) => {
   const setup = await fixture(t);
   await assert.rejects(

@@ -194,7 +194,6 @@ test("workspace-v2 conversations bind to discovered Git workspaces and remember 
   const service = createProjectWorkService({
     storageRoot,
     sessionFactory: sessionFactory(),
-    workspaceRuntimeMode: "workspace-v2",
     picker: async () => ({ rootPath: projectRoot }),
     idFactory: incrementalId(),
   });
@@ -258,7 +257,6 @@ test("workspace-v2 non-Git projects stay bound to the selected original director
   const service = createProjectWorkService({
     storageRoot: path.join(temporaryRoot, "state"),
     sessionFactory: sessionFactory(),
-    workspaceRuntimeMode: "workspace-v2",
     picker: async () => ({ rootPath: projectRoot }),
     idFactory: incrementalId(),
   });
@@ -306,7 +304,6 @@ test("workspace-v2 direct writes require exact confirmation, settle stale review
   const service = createProjectWorkService({
     storageRoot: path.join(temporaryRoot, "state"),
     sessionFactory: agentFactory,
-    workspaceRuntimeMode: "workspace-v2",
     picker: async () => ({ rootPath: projectRoot }),
     idFactory: incrementalId(),
   });
@@ -409,7 +406,6 @@ test("workspace-v2 exact commands run in place without fake verification interru
   const service = createProjectWorkService({
     storageRoot: path.join(temporaryRoot, "state"),
     sessionFactory: agentFactory,
-    workspaceRuntimeMode: "workspace-v2",
     picker: async () => ({ rootPath: projectRoot }),
     idFactory: incrementalId(),
   });
@@ -492,7 +488,6 @@ for (const persistedState of ["queued", "running"]) {
     const firstService = createProjectWorkService({
       storageRoot,
       sessionFactory: agentFactory,
-      workspaceRuntimeMode: "workspace-v2",
       picker: async () => ({ rootPath: projectRoot }),
       runSupervisor: supervisor,
       idFactory: incrementalId(),
@@ -529,7 +524,6 @@ for (const persistedState of ["queued", "running"]) {
     const restoredService = createProjectWorkService({
       storageRoot,
       sessionFactory: sessionFactory(),
-      workspaceRuntimeMode: "workspace-v2",
       picker: async () => ({ rootPath: projectRoot }),
       runSupervisor: controlledRunSupervisor(),
       idFactory: incrementalId(),
@@ -650,7 +644,6 @@ test("workspace-v2 recipe verification shares the Workspace lease and rejects st
   const service = createProjectWorkService({
     storageRoot,
     sessionFactory: agentFactory,
-    workspaceRuntimeMode: "workspace-v2",
     picker: async () => ({ rootPath: projectRoot }),
     runSupervisor: supervisor,
     verificationOutputCompactor: async ({ output }) => ({

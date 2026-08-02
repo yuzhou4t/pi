@@ -8,6 +8,7 @@ export const AUTO_REVIEW_POLICY_VERSION = 1;
 export const EXECUTION_POLICY_MODES = Object.freeze([
   "manual_review",
   "auto_review",
+  "native",
 ]);
 
 const EXECUTION_POLICY_MODE_SET = new Set(EXECUTION_POLICY_MODES);

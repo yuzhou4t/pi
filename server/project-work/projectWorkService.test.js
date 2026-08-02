@@ -18,10 +18,18 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import {
   aggregateProjectWorkUsage,
-  createProjectWorkService,
+  createLegacyOverlayProjectWorkServiceForTests,
+  createProjectWorkService as createProjectWorkServiceRuntime,
 } from "./projectWorkService.js";
 import { legacyConversationTitleFromMessage } from "./conversationTitle.js";
-import { applySelectedChangeSet } from "./workspace.js";
+import { applySelectedChangeSet, sha256 } from "./workspace.js";
+
+// This suite retains explicit coverage for the legacy overlay recovery
+// contract. Production and new integration coverage use workspace-v2 by
+// default, even when a test session factory is injected.
+function createProjectWorkService(options = {}) {
+  return createLegacyOverlayProjectWorkServiceForTests(options);
+}
 
 function incrementalId(prefix = "test") {
   let sequence = 0;
@@ -467,6 +475,7 @@ function createPlanningSessionFactory() {
     let subscriber = null;
     const record = {
       activeToolCalls: [],
+      activeToolOptions: [],
       prompts: [],
     };
     const host = {
@@ -487,8 +496,9 @@ function createPlanningSessionFactory() {
         });
         subscriber?.({ type: "agent_settled" });
       },
-      setActiveToolsByName(names) {
+      setActiveToolsByName(names, options) {
         record.activeToolCalls.push([...names]);
+        record.activeToolOptions.push({ ...options });
         return [...names];
       },
       async steer() {},
@@ -1085,6 +1095,7 @@ function createSubagentProgressSessionFactory() {
         const progress = [{
           index: 0,
           status: "completed",
+          model: "deepseek/deepseek-v4-flash",
           currentTool: "read_file",
           currentPath,
           currentToolArgs: {
@@ -1098,6 +1109,7 @@ function createSubagentProgressSessionFactory() {
         }, {
           index: 1,
           status: "failed",
+          model: "/Users/private/model-config",
           currentTool: "search_files",
           currentPath: path.join(options.workspaceRoot, "src"),
           currentToolArgs: {
@@ -1517,6 +1529,291 @@ function createThinkingSessionFactory() {
     };
     record.host = host;
     sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createPublicActivitySessionFactory() {
+  const sessions = [];
+  const factory = async () => {
+    let subscriber = null;
+    const record = {};
+    const reasoningBlock = {
+      type: "thinking",
+      thinking: "private reasoning must never be stored",
+      thinkingSignature: JSON.stringify({
+        type: "reasoning",
+        summary: [{
+          type: "summary_text",
+          text: "已定位到公开事件恢复边界。",
+        }],
+        content: [{
+          type: "reasoning_text",
+          text: "private signed reasoning must never be stored",
+        }],
+      }),
+    };
+    const commentaryBlock = {
+      type: "text",
+      text: "我先核对会话事件，再检查最终投影。",
+      textSignature: JSON.stringify({
+        v: 1,
+        id: "commentary-1",
+        phase: "commentary",
+      }),
+    };
+    const finalBlock = {
+      type: "text",
+      text: "公开最终回答",
+      textSignature: JSON.stringify({
+        v: 1,
+        id: "final-1",
+        phase: "final_answer",
+      }),
+    };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt() {
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({ type: "turn_start" });
+        subscriber?.({ type: "message_start", message: { role: "assistant" } });
+        subscriber?.({
+          type: "message_update",
+          message: { role: "assistant", content: [reasoningBlock] },
+          assistantMessageEvent: {
+            type: "thinking_start",
+            contentIndex: 0,
+          },
+        });
+        subscriber?.({
+          type: "message_update",
+          message: { role: "assistant", content: [reasoningBlock] },
+          assistantMessageEvent: {
+            type: "thinking_delta",
+            contentIndex: 0,
+            delta: "private delta must never be stored",
+          },
+        });
+        subscriber?.({
+          type: "message_update",
+          message: { role: "assistant", content: [reasoningBlock] },
+          assistantMessageEvent: {
+            type: "thinking_end",
+            contentIndex: 0,
+            content: reasoningBlock.thinking,
+          },
+        });
+        subscriber?.({
+          type: "message_update",
+          message: {
+            role: "assistant",
+            content: [reasoningBlock, commentaryBlock],
+          },
+          assistantMessageEvent: {
+            type: "text_end",
+            contentIndex: 1,
+            content: commentaryBlock.text,
+          },
+        });
+        subscriber?.({
+          type: "message_update",
+          message: {
+            role: "assistant",
+            content: [reasoningBlock, commentaryBlock, finalBlock],
+          },
+          assistantMessageEvent: {
+            type: "text_delta",
+            contentIndex: 2,
+            delta: finalBlock.text,
+          },
+        });
+        subscriber?.({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            provider: "openai-codex",
+            model: "gpt-5.6-sol",
+            content: [reasoningBlock, commentaryBlock, finalBlock],
+            stopReason: "stop",
+          },
+        });
+        subscriber?.({ type: "turn_end" });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        subscriber?.({ type: "agent_settled" });
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createNativeAuditSessionFactory({ beforeText, afterText }) {
+  const sessions = [];
+  const factory = async (options) => {
+    let subscriber = null;
+    const record = { options };
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt() {
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({ type: "turn_start" });
+        const filePath = path.join(options.workspaceRoot, "app.js");
+        await writeFile(filePath, afterText, "utf8");
+        await options.onNativeFileChange({
+          schemaVersion: 1,
+          phase: "completed",
+          toolCallId: "native-edit-1",
+          toolName: "edit",
+          path: "app.js",
+          workspacePath: "app.js",
+          absolutePath: filePath,
+          operation: "update",
+          beforeHash: sha256(Buffer.from(beforeText)),
+          afterHash: sha256(Buffer.from(afterText)),
+          beforeContent: beforeText,
+          afterContent: afterText,
+          beforeMode: 0o644,
+          afterMode: 0o644,
+          diff: "--- app.js\n+++ app.js\n@@ -1 +1 @@\n-old\n+new\n",
+        });
+        await options.onNativeBashEvent({
+          schemaVersion: 1,
+          phase: "started",
+          toolCallId: "native-bash-1",
+          toolName: "bash",
+          cwd: options.workspaceRoot,
+          command: "printf 'alpha\\nbeta\\n'",
+          startedAt: Date.now(),
+        });
+        await options.onNativeBashEvent({
+          schemaVersion: 1,
+          phase: "update",
+          toolCallId: "native-bash-1",
+          toolName: "bash",
+          update: { content: [{ type: "text", text: "alpha\n" }] },
+        });
+        await options.onNativeBashEvent({
+          schemaVersion: 1,
+          phase: "update",
+          toolCallId: "native-bash-1",
+          toolName: "bash",
+          update: { content: [{ type: "text", text: "alpha\nbeta\n" }] },
+        });
+        await options.onNativeBashEvent({
+          schemaVersion: 1,
+          phase: "completed",
+          toolCallId: "native-bash-1",
+          toolName: "bash",
+          result: { content: [{ type: "text", text: "alpha\nbeta\n" }] },
+          endedAt: Date.now(),
+        });
+        subscriber?.({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            provider: "deepseek",
+            model: "deepseek-v4-flash",
+            content: [{ type: "text", text: "修改和命令均已完成。" }],
+            stopReason: "stop",
+          },
+        });
+        subscriber?.({ type: "turn_end" });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        subscriber?.({ type: "agent_settled" });
+      },
+      setActiveToolsByName(names) {
+        return [...names];
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    record.host = host;
+    sessions.push(record);
+    return host;
+  };
+  factory.listModels = async () => modelCatalog();
+  factory.dispose = async () => {};
+  factory.sessions = sessions;
+  return factory;
+}
+
+function createToolDrivenProgressSessionFactory() {
+  const sessions = [];
+  const factory = async () => {
+    let subscriber = null;
+    const host = {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      async prompt() {
+        subscriber?.({ type: "agent_start" });
+        subscriber?.({ type: "turn_start" });
+        subscriber?.({ type: "message_start", message: { role: "assistant" } });
+        subscriber?.({
+          type: "tool_execution_start",
+          toolCallId: "read-1",
+          toolName: "read",
+          args: { path: "src/app.js" },
+        });
+        subscriber?.({
+          type: "tool_execution_end",
+          toolCallId: "read-1",
+          toolName: "read",
+          args: { path: "src/app.js" },
+          result: { content: [{ type: "text", text: "文件已读取" }] },
+          isError: false,
+        });
+        subscriber?.({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            provider: "deepseek",
+            model: "deepseek-v4-flash",
+            content: [{ type: "text", text: "已检查文件" }],
+            stopReason: "stop",
+          },
+        });
+        subscriber?.({ type: "turn_end" });
+        subscriber?.({ type: "agent_end", willRetry: false });
+        subscriber?.({ type: "agent_settled" });
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+    sessions.push({ host });
     return host;
   };
   factory.listModels = async () => modelCatalog();
@@ -2311,6 +2608,7 @@ test("planning workflow settles without creating changes, verification, or previ
   );
   const selectedTools = sessionFactory.sessions[0].activeToolCalls[0];
   for (const forbidden of [
+    "bash",
     "edit",
     "write",
     "request_verification",
@@ -2319,6 +2617,10 @@ test("planning workflow settles without creating changes, verification, or previ
   ]) {
     assert.equal(selectedTools.includes(forbidden), false);
   }
+  assert.equal(
+    sessionFactory.sessions[0].activeToolOptions[0].allowSubagentWrites,
+    false,
+  );
 });
 
 test("a verification-only turn waits for review without reporting completion", async (t) => {
@@ -4703,6 +5005,7 @@ test("subagent events persist public progress while excluding private prompts an
   assert.deepEqual(progressChildren.map((child) => ({
     task: child.task,
     status: child.status,
+    model: child.model,
     currentTool: child.currentTool,
     currentPath: child.currentPath,
     toolCount: child.toolCount,
@@ -4712,6 +5015,7 @@ test("subagent events persist public progress while excluding private prompts an
   })), [{
     task: "并行检查项 1",
     status: "completed",
+    model: "deepseek/deepseek-v4-flash",
     currentTool: "read_file",
     currentPath: "src/app.js",
     toolCount: 3,
@@ -4721,6 +5025,7 @@ test("subagent events persist public progress while excluding private prompts an
   }, {
     task: "并行检查项 2",
     status: "failed",
+    model: null,
     currentTool: "search_files",
     currentPath: "src",
     toolCount: 5,
@@ -5019,7 +5324,7 @@ test("restoring an interrupted automatic compaction terminates its running state
   assert.equal(restored.conversation.lastError.code, "PROJECT_WORK_SESSION_INTERRUPTED");
 });
 
-test("assistant text persists throttled cumulative partials before completion", async (t) => {
+test("assistant text persists true deltas before canonical completion", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-message-partials-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const sessionFactory = createStreamingSessionFactory();
@@ -5037,17 +5342,17 @@ test("assistant text persists throttled cumulative partials before completion", 
   const streaming = await eventually(
     () => service.getConversation(conversation.id),
     (snapshot) => (
-      snapshot.events.some((event) => event.type === "message.partial")
+      snapshot.events.some((event) => event.type === "message.delta")
       && !snapshot.events.some((event) => event.type === "message.completed")
     ),
-    "first assistant partial did not arrive before completion",
+    "first assistant delta did not arrive before completion",
   );
-  const firstPartial = streaming.events.find(
-    (event) => event.type === "message.partial",
+  const firstDelta = streaming.events.find(
+    (event) => event.type === "message.delta",
   );
-  assert.equal(firstPartial.data.text, "首段");
-  assert.equal(firstPartial.data.status, "streaming");
-  assert.equal(firstPartial.data.isFinal, false);
+  assert.equal(firstDelta.data.delta, "首段");
+  assert.equal(firstDelta.data.status, "streaming");
+  assert.equal(firstDelta.data.isFinal, false);
 
   sessionFactory.sessions[0].release();
   const settled = await eventually(
@@ -5058,34 +5363,32 @@ test("assistant text persists throttled cumulative partials before completion", 
     ),
     "streaming assistant turn did not settle",
   );
-  const partials = settled.events.filter(
-    (event) => event.type === "message.partial",
+  const fullEventPage = await service.getConversation(conversation.id, {
+    afterSeq: 0,
+    eventLimit: 1_000,
+  });
+  const deltas = fullEventPage.events.filter(
+    (event) => event.type === "message.delta",
   );
-  const completed = settled.events.find(
+  const completed = fullEventPage.events.find(
     (event) => event.type === "message.completed",
   );
   const finalText = `首段${"x".repeat(520)}尾声`;
-  assert.equal(partials.length, 3);
+  assert.equal(deltas.length, 522);
+  assert.equal(deltas.map((event) => event.data.delta).join(""), finalText);
+  assert.ok(deltas.every((event) => !("text" in event.data)));
   assert.deepEqual(
-    partials.map((event) => event.data.text),
-    [
-      "首段",
-      `首段${"x".repeat(512)}`,
-      finalText,
-    ],
+    deltas.map((event) => event.data.revision),
+    Array.from({ length: 522 }, (_, index) => index + 1),
   );
-  assert.deepEqual(
-    partials.map((event) => event.data.revision),
-    [1, 2, 3],
-  );
-  assert.ok(partials.every((event) => (
+  assert.ok(deltas.every((event) => (
     event.data.id === completed.data.id
     && event.data.turnId === completed.data.turnId
     && event.data.turnSeq === completed.data.turnSeq
     && event.data.attempt === completed.data.attempt
     && event.data.status === "streaming"
   )));
-  assert.ok(partials.at(-1).seq < completed.seq);
+  assert.ok(deltas.at(-1).seq < completed.seq);
   assert.equal(completed.data.text, finalText);
 });
 
@@ -5147,7 +5450,233 @@ test("thinking blocks persist lifecycle pairs without private reasoning", async 
   assert.ok(thinkingEvents[7].seq < completedEvents[1].seq);
 });
 
-test("public progress is turn-bound, sanitized, deduplicated, and capped without persisting thinking", async (t) => {
+test("explicit provider summaries and signed commentary persist while final text stays separate", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-public-activity-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const firstService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createPublicActivitySessionFactory(),
+    idFactory: incrementalId("public-activity-first"),
+  });
+  const conversation = await firstService.createStandaloneConversation();
+  await firstService.sendMessage(conversation.id, { text: "检查公开过程" });
+  const settled = await eventually(
+    () => firstService.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.messages.length === 2
+    ),
+    "public activity turn did not settle",
+  );
+  const progressEvents = settled.events.filter(
+    (event) => event.type === "agent.progress",
+  );
+  assert.deepEqual(
+    progressEvents.map((event) => event.data.source),
+    ["provider_reasoning_summary", "provider_commentary"],
+  );
+  assert.equal(
+    progressEvents[0].data.text,
+    "已定位到公开事件恢复边界。",
+  );
+  assert.equal(
+    progressEvents[1].data.text,
+    "我先核对会话事件，再检查最终投影。",
+  );
+  assert.equal(settled.conversation.messages[1].text, "公开最终回答");
+  const persisted = JSON.stringify(settled);
+  assert.equal(persisted.includes("private reasoning must never be stored"), false);
+  assert.equal(persisted.includes("private signed reasoning must never be stored"), false);
+  assert.equal(persisted.includes("private delta must never be stored"), false);
+  await firstService.dispose();
+
+  const restoredService = createProjectWorkService({
+    storageRoot,
+    sessionFactory: createFakeSessionFactory(),
+    idFactory: incrementalId("public-activity-restored"),
+  });
+  t.after(() => restoredService.dispose());
+  const restored = await restoredService.getConversation(conversation.id);
+  assert.deepEqual(
+    restored.events
+      .filter((event) => event.type === "agent.progress")
+      .map((event) => event.data.text),
+    [
+      "已定位到公开事件恢复边界。",
+      "我先核对会话事件，再检查最终投影。",
+    ],
+  );
+});
+
+test("DeepSeek without public reasoning still gets deterministic tool progress", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-tool-progress-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory: createToolDrivenProgressSessionFactory(),
+    idFactory: incrementalId("tool-progress"),
+  });
+  t.after(() => service.dispose());
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "检查 src/app.js" });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.messages.length === 2
+    ),
+    "tool-driven progress turn did not settle",
+  );
+  const progress = settled.events.find(
+    (event) => event.type === "agent.progress",
+  );
+  const toolStarted = settled.events.find(
+    (event) => event.type === "tool.started",
+  );
+  assert.equal(progress.data.source, "deterministic_tool");
+  assert.equal(progress.data.summary, "正在查看文件");
+  assert.equal(progress.data.detail, "src/app.js");
+  assert.ok(progress.seq < toolStarted.seq);
+  assert.equal(settled.conversation.messages[1].providerId, "deepseek");
+  assert.equal(JSON.stringify(settled).includes("private reasoning"), false);
+});
+
+test("native Pi file and bash operations persist audit, delta logs, and safe undo", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-native-audit-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  const storageRoot = path.join(temporaryRoot, "private-state");
+  const beforeText = "old\n";
+  const afterText = "new\n";
+  await mkdir(projectRoot);
+  await writeFile(path.join(projectRoot, "app.js"), beforeText, "utf8");
+  const sessionFactory = createNativeAuditSessionFactory({
+    beforeText,
+    afterText,
+  });
+  let gitInspectionCount = 0;
+  const gitInspectionRoots = [];
+  const gitInspector = async (rootPath) => {
+    gitInspectionCount += 1;
+    gitInspectionRoots.push(rootPath);
+    return {
+      available: true,
+      branch: "main",
+      head: "a".repeat(40),
+      staged: [],
+      unstaged: ["app.js"],
+      untracked: gitInspectionCount > 2 ? ["command.log"] : [],
+      truncated: false,
+    };
+  };
+  const service = createProjectWorkServiceRuntime({
+    storageRoot,
+    sessionFactory,
+    gitInspector,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId("native-audit"),
+  });
+  t.after(() => service.dispose());
+  const selection = await service.pickProjectRoot({ mode: "existing" });
+  const project = await service.registerProject({
+    selectionId: selection.selectionId,
+  });
+  const conversation = await service.createConversation(project.id);
+  assert.equal(conversation.executionPolicy.mode, "native");
+  await service.sendMessage(conversation.id, { text: "修改并验证" });
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      ["idle", "applied", "completed"].includes(snapshot.conversation.status)
+      && snapshot.conversation.workspaceWrites?.[0]?.status === "written"
+      && snapshot.conversation.workspaceRuns?.[0]?.status === "succeeded"
+    ),
+    "native file and bash evidence did not settle",
+  );
+
+  const write = settled.conversation.workspaceWrites[0];
+  const run = settled.conversation.workspaceRuns[0];
+  const canonicalProjectRoot = await realpath(projectRoot);
+  assert.equal(write.approvalMode, "native");
+  assert.equal(write.path, "app.js");
+  assert.equal(write.undo.status, "available");
+  assert.equal(run.kind, "pi_shell");
+  assert.equal(run.executable, "bash");
+  assert.equal(run.output, "alpha\nbeta\n");
+  assert.equal(gitInspectionCount, 3);
+  assert.deepEqual(gitInspectionRoots, [
+    canonicalProjectRoot,
+    canonicalProjectRoot,
+    canonicalProjectRoot,
+  ]);
+  assert.deepEqual(run.gitBefore.unstaged, ["app.js"]);
+  assert.deepEqual(run.gitAfter.unstaged, ["app.js"]);
+  assert.deepEqual(run.gitBefore.untracked, []);
+  assert.deepEqual(run.gitAfter.untracked, ["command.log"]);
+  assert.equal(run.gitBefore.head, "a".repeat(40));
+  assert.equal(await readFile(path.join(projectRoot, "app.js"), "utf8"), afterText);
+  const log = await service.getWorkspaceRun(conversation.id, run.runId, {
+    afterSeq: 0,
+    limit: 100,
+  });
+  assert.equal(
+    log.events
+      .filter((event) => event.type === "chunk")
+      .map((event) => event.text)
+      .join(""),
+    "alpha\nbeta\n",
+  );
+  assert.equal(
+    settled.events.some((event) => (
+      event.type === "workspace_write.requested"
+      || event.type === "workspace_run.requested"
+    )),
+    false,
+  );
+  await service.undoApply(conversation.id, write.id, {
+    undoHash: write.undo.hash,
+  });
+  assert.equal(await readFile(path.join(projectRoot, "app.js"), "utf8"), beforeText);
+});
+
+test("assistant final text is preserved beyond the former 64K limit", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-long-answer-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const repeatedDelta = "长".repeat(70_000);
+  const sessionFactory = createStreamingSessionFactory({
+    firstDelta: "开始",
+    repeatedDelta,
+    repeatedCount: 1,
+    finalDelta: "结束",
+  });
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    idFactory: incrementalId("long-answer"),
+  });
+  t.after(() => service.dispose());
+  const conversation = await service.createStandaloneConversation();
+  await service.sendMessage(conversation.id, { text: "生成长回答" });
+  sessionFactory.sessions[0].release();
+  const settled = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => (
+      snapshot.conversation.status === "idle"
+      && snapshot.conversation.messages.length === 2
+    ),
+    "long assistant answer did not settle",
+  );
+  const expected = `开始${repeatedDelta}结束`;
+  assert.equal(settled.conversation.messages[1].text.length, expected.length);
+  assert.equal(settled.conversation.messages[1].text, expected);
+  assert.equal(
+    settled.events.find((event) => event.type === "message.completed").data.text,
+    expected,
+  );
+});
+
+test("public progress is turn-bound, sanitized, deduplicated, and not silently capped", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-public-progress-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const storageRoot = path.join(temporaryRoot, "private-state");
@@ -5184,7 +5713,7 @@ test("public progress is turn-bound, sanitized, deduplicated, and capped without
     () => service.getConversation(conversation.id),
     (snapshot) => (
       snapshot.conversation.status === "idle"
-      && snapshot.events.filter((event) => event.type === "agent.progress").length === 8
+      && snapshot.events.filter((event) => event.type === "agent.progress").length === 9
     ),
     "public progress did not settle",
   );
@@ -5192,10 +5721,10 @@ test("public progress is turn-bound, sanitized, deduplicated, and capped without
   const progressEvents = settled.events.filter(
     (event) => event.type === "agent.progress",
   );
-  assert.equal(progressEvents.length, 8);
+  assert.equal(progressEvents.length, 9);
   assert.deepEqual(
     progressEvents.map((event) => event.data.index),
-    [1, 2, 3, 4, 5, 6, 7, 8],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9],
   );
   assert.ok(progressEvents.every((event) => (
     event.data.turnId === settled.conversation.messages[0].turnId
@@ -5231,14 +5760,14 @@ test("public progress is turn-bound, sanitized, deduplicated, and capped without
       "recorded",
       "recorded",
       "recorded",
-      "limit_reached",
+      "recorded",
     ],
   );
   const persisted = JSON.stringify(settled.events);
   assert.equal(persisted.includes("top-secret-value"), false);
   assert.equal(persisted.includes("abcdefghijklmnop"), false);
   assert.equal(persisted.includes("private progress reasoning"), false);
-  assert.equal(persisted.includes("这条超过上限"), false);
+  assert.equal(persisted.includes("这条超过上限"), true);
 
   await delay(0);
   await service.sendMessage(conversation.id, { text: "继续检查第二轮公开进展" });
@@ -5246,7 +5775,7 @@ test("public progress is turn-bound, sanitized, deduplicated, and capped without
     () => service.getConversation(conversation.id),
     (snapshot) => (
       snapshot.conversation.status === "idle"
-      && snapshot.events.filter((event) => event.type === "agent.progress").length === 16
+      && snapshot.events.filter((event) => event.type === "agent.progress").length === 18
     ),
     "second public-progress turn did not settle",
   );
@@ -5257,7 +5786,7 @@ test("public progress is turn-bound, sanitized, deduplicated, and capped without
     history.turns.map((turn) => (
       turn.events.filter((event) => event.type === "agent.progress").length
     )),
-    [8, 8],
+    [9, 9],
   );
   assert.ok(history.turns.every((turn) => turn.events.every((event) => (
     !event.data?.turnId || event.data.turnId === turn.id

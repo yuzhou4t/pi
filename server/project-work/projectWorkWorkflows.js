@@ -21,8 +21,23 @@ const READ_ONLY_TOOL_NAMES = [
   "read_office_artifact",
   PROJECT_WORK_PROGRESS_TOOL_NAME,
   "update_plan",
-  "request_verification",
 ];
+
+const RETIRED_NATIVE_REQUEST_TOOL_NAMES = new Set([
+  "request_verification",
+  "request_workspace_command",
+  "request_git_closeout",
+]);
+
+const READ_ONLY_FORBIDDEN_TOOL_NAMES = new Set([
+  "bash",
+  "edit",
+  "write",
+  "write_word_document",
+  "write_excel_workbook",
+  "request_preview",
+  ...RETIRED_NATIVE_REQUEST_TOOL_NAMES,
+]);
 
 const PLANNING_TOOL_NAMES = [
   "read",
@@ -44,6 +59,7 @@ const PLANNING_TOOL_NAMES = [
 
 const WORKFLOW_RULES = {
   planning: {
+    readOnly: true,
     toolNames: PLANNING_TOOL_NAMES,
     allowedCapabilityIds: ["web_search", "docs_search"],
     guidance: [
@@ -53,6 +69,7 @@ const WORKFLOW_RULES = {
     ].join(" "),
   },
   code_review: {
+    readOnly: true,
     toolNames: READ_ONLY_TOOL_NAMES,
     guidance: [
       "Review only: do not edit or write files in this turn.",
@@ -61,6 +78,7 @@ const WORKFLOW_RULES = {
     ].join(" "),
   },
   bug_diagnosis: {
+    readOnly: true,
     toolNames: READ_ONLY_TOOL_NAMES,
     guidance: [
       "Diagnose only: do not edit or write files in this turn.",
@@ -69,6 +87,7 @@ const WORKFLOW_RULES = {
     ].join(" "),
   },
   official_docs: {
+    readOnly: true,
     toolNames: READ_ONLY_TOOL_NAMES,
     capabilityIds: ["docs_search"],
     guidance: [
@@ -78,6 +97,7 @@ const WORKFLOW_RULES = {
     ].join(" "),
   },
   screenshot_review: {
+    readOnly: true,
     toolNames: READ_ONLY_TOOL_NAMES,
     requiresImages: true,
     guidance: [
@@ -177,12 +197,22 @@ export function resolveProjectWorkTurn({
 
   const activeCapabilityIds = [...new Set(requiredCapabilityIds)];
   const activeToolNames = new Set(
-    workflowRule?.toolNames ?? PROJECT_WORK_DEFAULT_TOOL_NAMES,
+    (workflowRule?.toolNames ?? PROJECT_WORK_DEFAULT_TOOL_NAMES).filter(
+      (toolName) => !RETIRED_NATIVE_REQUEST_TOOL_NAMES.has(toolName),
+    ),
   );
   for (const capabilityId of activeCapabilityIds) {
     const capability = projectWorkCapability(capabilityId);
     for (const toolName of capability?.toolNames ?? []) {
       activeToolNames.add(toolName);
+    }
+  }
+  for (const toolName of RETIRED_NATIVE_REQUEST_TOOL_NAMES) {
+    activeToolNames.delete(toolName);
+  }
+  if (workflowRule?.readOnly) {
+    for (const toolName of READ_ONLY_FORBIDDEN_TOOL_NAMES) {
+      activeToolNames.delete(toolName);
     }
   }
   const capabilityGuidance = activeCapabilityIds.map((capabilityId) => {

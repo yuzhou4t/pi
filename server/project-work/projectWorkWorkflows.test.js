@@ -24,6 +24,9 @@ test("a normal turn keeps the default tools without extra guidance", () => {
   assert.ok(turn.toolNames.includes("list_office_artifacts"));
   assert.ok(turn.toolNames.includes("read_office_artifact"));
   assert.equal(turn.toolNames.includes("generate_image"), false);
+  assert.equal(turn.toolNames.includes("request_verification"), false);
+  assert.equal(turn.toolNames.includes("request_workspace_command"), false);
+  assert.equal(turn.toolNames.includes("request_git_closeout"), false);
   assert.equal(turn.guidance, "");
 });
 
@@ -38,12 +41,15 @@ test("planning is enforced as a read-only question-and-plan workflow", () => {
   assert.ok(turn.toolNames.includes("ask_user"));
   assert.ok(turn.toolNames.includes("update_plan"));
   assert.ok(turn.toolNames.includes("report_progress"));
+  assert.equal(turn.toolNames.includes("bash"), false);
   assert.equal(turn.toolNames.includes("edit"), false);
   assert.equal(turn.toolNames.includes("write"), false);
   assert.equal(turn.toolNames.includes("write_word_document"), false);
   assert.equal(turn.toolNames.includes("write_excel_workbook"), false);
   assert.equal(turn.toolNames.includes("request_preview"), false);
   assert.equal(turn.toolNames.includes("request_verification"), false);
+  assert.equal(turn.toolNames.includes("request_workspace_command"), false);
+  assert.equal(turn.toolNames.includes("request_git_closeout"), false);
   assert.match(turn.guidance, /Planning only/);
 
   assert.throws(
@@ -54,6 +60,38 @@ test("planning is enforced as a read-only question-and-plan workflow", () => {
     }),
     { code: "PROJECT_WORK_WORKFLOW_CAPABILITY_INVALID" },
   );
+});
+
+test("every inspection workflow stays read-only and excludes retired request tools", () => {
+  for (const workflowId of [
+    "code_review",
+    "bug_diagnosis",
+    "official_docs",
+    "screenshot_review",
+  ]) {
+    const turn = resolveProjectWorkTurn({
+      workflowId,
+      capabilityStatus: availableCapabilities,
+      hasImages: workflowId === "screenshot_review",
+    });
+    for (const toolName of [
+      "bash",
+      "edit",
+      "write",
+      "write_word_document",
+      "write_excel_workbook",
+      "request_preview",
+      "request_verification",
+      "request_workspace_command",
+      "request_git_closeout",
+    ]) {
+      assert.equal(
+        turn.toolNames.includes(toolName),
+        false,
+        `${workflowId} unexpectedly exposed ${toolName}`,
+      );
+    }
+  }
 });
 
 test("image generation is enabled only by an explicit available turn capability", () => {

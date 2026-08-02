@@ -947,6 +947,42 @@ export function createWorkspaceRunSupervisor({
     activeRun.exitWaiters.clear();
   }
 
+  function createActiveRun(record, {
+    child = null,
+    external = false,
+    cancelHandler = null,
+  } = {}) {
+    let resolveCompletion;
+    const completion = new Promise((resolve) => {
+      resolveCompletion = resolve;
+    });
+    return {
+      record,
+      child,
+      external,
+      cancelHandler,
+      completion,
+      resolveCompletion,
+      eventQueue: Promise.resolve(),
+      persistenceError: null,
+      finishingPromise: null,
+      cancelPromise: null,
+      exitWaiters: new Set(),
+      streams: {
+        stdout: {
+          decoder: new StringDecoder("utf8"),
+          pending: "",
+          truncated: false,
+        },
+        stderr: {
+          decoder: new StringDecoder("utf8"),
+          pending: "",
+          truncated: false,
+        },
+      },
+    };
+  }
+
   async function finalize(activeRun, {
     exitCode = null,
     signal = null,
@@ -1130,33 +1166,7 @@ export function createWorkspaceRunSupervisor({
       },
       pid: null,
     };
-    let resolveCompletion;
-    const completion = new Promise((resolve) => {
-      resolveCompletion = resolve;
-    });
-    const activeRun = {
-      record,
-      child: null,
-      completion,
-      resolveCompletion,
-      eventQueue: Promise.resolve(),
-      persistenceError: null,
-      finishingPromise: null,
-      cancelPromise: null,
-      exitWaiters: new Set(),
-      streams: {
-        stdout: {
-          decoder: new StringDecoder("utf8"),
-          pending: "",
-          truncated: false,
-        },
-        stderr: {
-          decoder: new StringDecoder("utf8"),
-          pending: "",
-          truncated: false,
-        },
-      },
-    };
+    const activeRun = createActiveRun(record);
     try {
       await mkdir(runDirectory(runId), { recursive: false, mode: 0o700 });
     } catch (error) {
@@ -1199,8 +1209,143 @@ export function createWorkspaceRunSupervisor({
 
     return {
       run: publicRun(record, sanitize),
-      completion,
+      completion: activeRun.completion,
     };
+  }
+
+  async function startExternal({
+    workspaceId,
+    workspaceRoot,
+    command,
+    metadata,
+    cancelHandler,
+  } = {}) {
+    if (disposed) {
+      throw runError("PROJECT_WORK_RUN_SUPERVISOR_CLOSED", "运行服务已停止", 503);
+    }
+    await initialize();
+    const normalizedWorkspaceId = assertWorkspaceId(workspaceId);
+    const requestedRoot = path.resolve(workspaceRoot);
+    const canonicalRoot = await realpathImpl(requestedRoot);
+    const commandText = String(command ?? "");
+    const storedCommand = commandText.slice(0, 64 * 1024);
+    const runId = assertRunId(idFactory());
+    const createdAt = nowIso(now);
+    const record = {
+      schemaVersion: RUN_RECORD_SCHEMA_VERSION,
+      id: runId,
+      workspaceId: normalizedWorkspaceId,
+      workspaceRoot: canonicalRoot,
+      workspaceAliases: [canonicalRoot, requestedRoot]
+        .filter((value, index, values) => values.indexOf(value) === index),
+      status: "running",
+      command: {
+        file: "bash",
+        args: ["-lc", storedCommand],
+        cwd: ".",
+      },
+      metadata: cloneMetadata({
+        ...(metadata ?? {}),
+        external: true,
+        commandTruncated: storedCommand.length !== commandText.length,
+      }),
+      createdAt,
+      startedAt: createdAt,
+      completedAt: null,
+      updatedAt: createdAt,
+      cancelRequestedAt: null,
+      exitCode: null,
+      signal: null,
+      durationMs: null,
+      error: null,
+      lastSeq: 0,
+      output: {
+        stdoutBytes: 0,
+        stderrBytes: 0,
+        truncated: false,
+      },
+      pid: null,
+    };
+    const activeRun = createActiveRun(record, {
+      external: true,
+      cancelHandler: typeof cancelHandler === "function" ? cancelHandler : null,
+    });
+    try {
+      await mkdir(runDirectory(runId), { recursive: false, mode: 0o700 });
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        throw runError("PROJECT_WORK_RUN_EXISTS", "运行记录已经存在", 409);
+      }
+      throw error;
+    }
+    active.set(runId, activeRun);
+    await persistRecord(record);
+    await enqueue(activeRun, async () => {
+      await appendEvent(record, { type: "status", status: "running" });
+      await persistRecord(record);
+    });
+    return {
+      run: publicRun(record, sanitize),
+      completion: activeRun.completion,
+    };
+  }
+
+  async function appendExternalOutput(runId, {
+    stream = "stdout",
+    text,
+  } = {}) {
+    await initialize();
+    const id = assertRunId(runId);
+    const activeRun = active.get(id);
+    if (!activeRun?.external || activeRun.finishingPromise) {
+      throw runError(
+        "PROJECT_WORK_EXTERNAL_RUN_NOT_ACTIVE",
+        "原生 Pi 运行已经结束或无法继续记录",
+        409,
+        true,
+      );
+    }
+    if (!STREAMS.has(stream)) {
+      throw runError("PROJECT_WORK_RUN_STREAM_INVALID", "运行日志类型无效", 400);
+    }
+    acceptOutput(activeRun, stream, String(text ?? ""));
+    return publicRun(activeRun.record, sanitize);
+  }
+
+  async function finishExternalRun(runId, {
+    status,
+    exitCode,
+    signal,
+    error,
+  } = {}) {
+    await initialize();
+    const id = assertRunId(runId);
+    const activeRun = active.get(id);
+    if (!activeRun?.external) {
+      const record = await readRecord(id);
+      if (TERMINAL_STATUSES.has(record.status)) return publicRun(record, sanitize);
+      throw runError(
+        "PROJECT_WORK_EXTERNAL_RUN_NOT_ACTIVE",
+        "原生 Pi 运行无法完成持久化",
+        409,
+        true,
+      );
+    }
+    const normalizedStatus = TERMINAL_STATUSES.has(status)
+      ? status
+      : Number.isInteger(exitCode) && exitCode === 0
+        ? "succeeded"
+        : "failed";
+    return finalize(activeRun, {
+      status: normalizedStatus,
+      exitCode: Number.isInteger(exitCode)
+        ? exitCode
+        : normalizedStatus === "succeeded"
+          ? 0
+          : null,
+      signal,
+      error,
+    });
   }
 
   async function get(runId) {
@@ -1310,6 +1455,25 @@ export function createWorkspaceRunSupervisor({
         });
         await persistRecord(record);
       });
+      if (activeRun.external) {
+        try {
+          await Promise.resolve(activeRun.cancelHandler?.());
+        } catch {
+          // The bounded wait below still settles the durable record safely.
+        }
+        const totalGraceMs = interruptGraceMs
+          + terminateGraceMs
+          + killGraceMs;
+        if (await waitForExit(activeRun, totalGraceMs)) {
+          return activeRun.completion;
+        }
+        await finalize(activeRun, {
+          status: "interrupted",
+          signal: "SIGKILL",
+          error: "Pi Session 未确认命令已退出；请检查 Workspace 后再继续",
+        });
+        return activeRun.completion;
+      }
       for (const [signal, graceMs] of [
         ["SIGINT", interruptGraceMs],
         ["SIGTERM", terminateGraceMs],
@@ -1345,6 +1509,9 @@ export function createWorkspaceRunSupervisor({
   return {
     initialize,
     start,
+    startExternal,
+    appendExternalOutput,
+    finishExternalRun,
     get,
     list,
     snapshot,

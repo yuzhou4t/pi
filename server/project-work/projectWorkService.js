@@ -84,9 +84,15 @@ import {
   createWorkspaceRegistry,
   publicWorkspace,
 } from "./workspaceRegistry.js";
+import { createNativeChildWorkspaceAllocator } from "./nativeChildWorkspaces.js";
 import { createSkillPackageService } from "./skillPackageService.js";
 import { normalizeTurnUsage } from "./turnEvidence.js";
 import { createVerificationRunner } from "./verificationRunner.js";
+import {
+  publicFinalAnswerText,
+  publicReasoningSummary,
+  publicTextPhase,
+} from "./publicAssistantActivity.js";
 import {
   createWorkspaceRunSupervisor,
   validateWorkspaceRunCommand,
@@ -97,6 +103,7 @@ import {
 import {
   createVerificationOutputCompactor,
 } from "./verificationOutputCompactor.js";
+import { migrateLegacyProjectWorkSession } from "./legacySessionMigrator.js";
 import { resolveVerificationRecipe } from "./verificationRecipes.js";
 import {
   applyBoundFileTransitions,
@@ -105,6 +112,7 @@ import {
   getProjectFileTree,
   getProjectOverlayFileTree,
   getProjectWorkspaceRevision,
+  isFilteredProjectPath,
   normalizeProjectPath,
   readBoundFileState,
   readProjectImageFile,
@@ -135,9 +143,7 @@ const WORKER_TURN_GUIDANCE = [
   "Your answer may become an editable local draft. Actual delivery is a separate exact-preview and hash-bound user confirmation handled by the application.",
 ].join("\n");
 const SELECTION_TTL_MS = 10 * 60 * 1_000;
-const ASSISTANT_PARTIAL_INTERVAL_MS = 250;
-const ASSISTANT_PARTIAL_GROWTH_CHARS = 512;
-const MAX_PUBLIC_PROGRESS_PER_TURN = 8;
+const MAX_LEGACY_MIGRATION_EXPORT_BYTES = 16 * 1024 * 1024;
 const MAX_PUBLIC_PROGRESS_SUMMARY_CHARS = 200;
 const MAX_PUBLIC_PROGRESS_DETAIL_CHARS = 500;
 const LEGACY_THINKING_LEVELS = [
@@ -897,6 +903,38 @@ function publicVerification(verification) {
   const publicRecord = structuredClone(verification);
   delete publicRecord.modelOutput;
   return publicRecord;
+}
+
+function publicGitEvidenceSnapshot(evidence) {
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+    return null;
+  }
+  const safePaths = (values) => (Array.isArray(values) ? values : [])
+    .flatMap((value) => {
+      if (typeof value !== "string") return [];
+      try {
+        const normalized = normalizeProjectPath(value);
+        return isFilteredProjectPath(normalized) ? [] : [normalized];
+      } catch {
+        return [];
+      }
+    })
+    .slice(0, 2_000);
+  const head = String(evidence.head ?? "").trim();
+  return {
+    available: evidence.available === true,
+    branch: compactText(evidence.branch, 180) || null,
+    head: /^[a-f0-9]{7,64}$/iu.test(head) ? head : null,
+    staged: safePaths(evidence.staged),
+    unstaged: safePaths(evidence.unstaged),
+    untracked: safePaths(evidence.untracked),
+    truncated: evidence.truncated === true,
+    reason: evidence.available === true
+      ? null
+      : ["git_unavailable", "not_a_git_worktree"].includes(evidence.reason)
+        ? evidence.reason
+        : null,
+  };
 }
 
 function publicGitCloseout(record) {
@@ -1804,6 +1842,12 @@ function publicConversationSummary(conversation) {
       : null,
     workspaceKind,
     workspace: publicWorkspaceRecord(conversation),
+    runtimeProfile: compactText(conversation.runtimeProfile, 80) || null,
+    legacyMigration: conversation.legacyMigration
+      && typeof conversation.legacyMigration === "object"
+      && !Array.isArray(conversation.legacyMigration)
+      ? structuredClone(conversation.legacyMigration)
+      : null,
     scope: workspaceKind === "scratch" ? "standalone" : "project",
     rootLabel: workspaceKind === "scratch"
       ? STANDALONE_ROOT_LABEL
@@ -1842,8 +1886,10 @@ function publicPreviewState(preview) {
   } catch {
     // Persisted legacy or malformed previews remain visible without executable data.
   }
-  const executionPolicyMode = preview.executionPolicyMode === "auto_review"
-    ? "auto_review"
+  const executionPolicyMode = ["auto_review", "native"].includes(
+    preview.executionPolicyMode,
+  )
+    ? preview.executionPolicyMode
     : "manual_review";
   return {
     id: compactText(preview.id, 180) || null,
@@ -1947,7 +1993,9 @@ function publicConversationState(conversation, lastEventSeq, {
           : "failed",
         approvalMode: write.approvalMode === "auto_review"
           ? "auto_review"
-          : "manual_review",
+          : write.approvalMode === "native"
+            ? "native"
+            : "manual_review",
         baseHash: compactText(write.baseHash, 80) || null,
         afterHash: compactText(write.afterHash, 80) || null,
         patch: compactText(write.patch, 64_000),
@@ -1970,7 +2018,9 @@ function publicConversationState(conversation, lastEventSeq, {
         id: compactText(run.id, 180),
         runId: compactText(run.runId, 180) || null,
         turnId: compactText(run.turnId, 180) || null,
-        kind: run.kind === "custom" ? "custom" : "verification",
+        kind: ["custom", "pi_shell"].includes(run.kind)
+          ? run.kind
+          : "verification",
         status: [
           "requested",
           "queued",
@@ -1991,8 +2041,12 @@ function publicConversationState(conversation, lastEventSeq, {
           : null,
         exitCode: Number.isInteger(run.exitCode) ? run.exitCode : null,
         durationMs: Number.isFinite(run.durationMs) ? run.durationMs : null,
-        output: compactText(run.output, 64_000),
+        output: typeof run.output === "string"
+          ? run.output.slice(-64_000)
+          : "",
         truncated: run.truncated === true,
+        gitBefore: publicGitEvidenceSnapshot(run.gitBefore),
+        gitAfter: publicGitEvidenceSnapshot(run.gitAfter),
         createdAt: compactText(run.createdAt, 80) || null,
         startedAt: compactText(run.startedAt, 80) || null,
         completedAt: compactText(run.completedAt, 80) || null,
@@ -2664,10 +2718,11 @@ export function aggregateProjectWorkUsage({
   };
 }
 
-export function createProjectWorkService({
+function createProjectWorkServiceRuntime({
   storageRoot = resolveProjectWorkStorageRoot(),
   sessionFactory,
-  workspaceRuntimeMode = sessionFactory ? "overlay-v1" : "workspace-v2",
+  workspaceRuntimeMode = "workspace-v2",
+  allowLegacyOverlayFixtureExecution = false,
   documentParser = defaultDocumentParser(),
   documentPollIntervalMs = defaultDocumentPollInterval(),
   documentMaxPollAttempts = defaultDocumentMaxPollAttempts(
@@ -2688,6 +2743,7 @@ export function createProjectWorkService({
   officeArtifactProbe = probeOfficeArtifactRuntime,
   previewSupervisor = createProjectPreviewSupervisor(),
   workspaceRegistry,
+  sessionMigrator = migrateLegacyProjectWorkSession,
   browserQaService,
   skillPackageService,
   onLifecycleEvent,
@@ -2747,6 +2803,9 @@ export function createProjectWorkService({
       now,
       idFactory,
     });
+  if (typeof sessionMigrator !== "function") {
+    throw new TypeError("sessionMigrator must be a function");
+  }
   const conversationStore = createConversationStore({
     storageRoot: configuredStorageRoot,
   });
@@ -2755,6 +2814,7 @@ export function createProjectWorkService({
   const activeMessageClaims = new Map();
   const conversationOperationClaims = new Map();
   const blockedOverlayRecoveryRuns = new Map();
+  const legacyWorkspaceMigrationRuns = new Map();
   const verificationControllers = new Map();
   const activeWorkspaceRunRequests = new Set();
   const browserQaRuns = new Map();
@@ -2929,6 +2989,8 @@ export function createProjectWorkService({
   });
   let modelCatalogCache = null;
   let disposed = false;
+  let startupLegacyWorkspaceMigration = Promise.resolve();
+  let startupLegacyWorkspaceMigrationError = null;
 
   function timestamp() {
     return now().toISOString();
@@ -3211,6 +3273,10 @@ export function createProjectWorkService({
     return (await sanitizeConversationPaths(conversationId, value)).slice(0, 64_000);
   }
 
+  async function sanitizeFullForConversation(conversationId, value) {
+    return sanitizeConversationPaths(conversationId, value);
+  }
+
   function redactPublicProgressSecrets(value) {
     return String(value ?? "")
       .replace(
@@ -3288,17 +3354,11 @@ export function createProjectWorkService({
         index: runtime.progressState.count,
       };
     }
-    if (runtime.progressState.count >= MAX_PUBLIC_PROGRESS_PER_TURN) {
-      return {
-        recorded: false,
-        status: "limit_reached",
-        index: runtime.progressState.count,
-      };
-    }
     const index = runtime.progressState.count + 1;
     await appendEvent(runtime.conversationId, "agent.progress", {
       summary,
       detail: detail || null,
+      source: compactText(progress?.source, 80) || "agent_report",
       turnId,
       turnSeq: Number.isSafeInteger(turnSettings?.turnSeq)
         ? turnSettings.turnSeq
@@ -3316,6 +3376,111 @@ export function createProjectWorkService({
       status: "recorded",
       index,
     };
+  }
+
+  function progressTextParts(value) {
+    const text = String(value ?? "").trim();
+    if (!text) return null;
+    const firstLine = text.split(/\r\n|\n|\r/u, 1)[0].trim();
+    const summary = (firstLine || text)
+      .replaceAll(/\s+/gu, " ")
+      .slice(0, MAX_PUBLIC_PROGRESS_SUMMARY_CHARS);
+    const remaining = text.startsWith(firstLine)
+      ? text.slice(firstLine.length).trim()
+      : text.startsWith(summary)
+      ? text.slice(summary.length).trim()
+      : text;
+    const detail = remaining
+      .replaceAll(/\s+/gu, " ")
+      .slice(0, MAX_PUBLIC_PROGRESS_DETAIL_CHARS)
+      || null;
+    return {
+      summary,
+      detail,
+      text: [summary, detail].filter(Boolean).join("\n"),
+    };
+  }
+
+  async function recordProviderPublicProgress(runtime, value, source) {
+    const turnSettings = runtime.activeTurnSettings;
+    const turnId = compactText(turnSettings?.turnId, 180);
+    if (!turnId) return { recorded: false, status: "no_turn", index: 0 };
+    const sanitized = redactPublicProgressSecrets(
+      await sanitizeFullForConversation(runtime.conversationId, value),
+    ).trim();
+    const presentation = progressTextParts(sanitized);
+    if (!presentation) {
+      return { recorded: false, status: "empty", index: 0 };
+    }
+    if (runtime.progressState?.turnKey !== turnId) {
+      runtime.progressState = {
+        turnKey: turnId,
+        count: 0,
+        lastFingerprint: null,
+      };
+    }
+    const fingerprint = sha256(`${source}\u0000${presentation.text}`);
+    if (runtime.progressState.lastFingerprint === fingerprint) {
+      return {
+        recorded: false,
+        status: "duplicate",
+        index: runtime.progressState.count,
+      };
+    }
+    const index = runtime.progressState.count + 1;
+    await appendEvent(runtime.conversationId, "agent.progress", {
+      ...presentation,
+      source,
+      turnId,
+      turnSeq: Number.isSafeInteger(turnSettings?.turnSeq)
+        ? turnSettings.turnSeq
+        : null,
+      attempt: Number.isSafeInteger(turnSettings?.attempt)
+        && turnSettings.attempt > 0
+        ? turnSettings.attempt
+        : 1,
+      index,
+    });
+    runtime.progressState = {
+      turnKey: turnId,
+      count: index,
+      lastFingerprint: fingerprint,
+    };
+    runtime.providerPublicProgressCount += 1;
+    return { recorded: true, status: "recorded", index };
+  }
+
+  function deterministicToolProgress(event) {
+    const name = compactText(event?.toolName, 80);
+    if (!name || ["report_progress", "update_plan"].includes(name)) return null;
+    const labels = {
+      read: "正在查看文件",
+      grep: "正在检索项目内容",
+      find: "正在查找项目文件",
+      ls: "正在查看项目结构",
+      edit: "正在修改文件",
+      write: "正在写入文件",
+      bash: "正在运行项目命令",
+      subagent: "正在启动子任务",
+    };
+    return {
+      summary: labels[name] ?? `正在使用 ${name}`,
+      detail: typeof event?.args?.path === "string" ? event.args.path : "",
+    };
+  }
+
+  async function recordDeterministicToolProgress(runtime, event) {
+    if (runtime.providerPublicProgressCount > 0) return;
+    const progress = deterministicToolProgress(event);
+    if (!progress) return;
+    const detail = progress.detail
+      ? await sanitizeFullForConversation(runtime.conversationId, progress.detail)
+      : "";
+    await recordRuntimeProgress(runtime, {
+      summary: progress.summary,
+      detail,
+      source: "deterministic_tool",
+    }, runtime.activeTurnSettings);
   }
 
   async function updateConversation(conversationId, patch) {
@@ -4325,6 +4490,418 @@ export function createProjectWorkService({
       }
     }
     return waitForWorkspaceWrite(`${conversationId}:${writeId}`);
+  }
+
+  function nativeToolText(value) {
+    if (typeof value === "string") return value;
+    const content = Array.isArray(value?.content) ? value.content : [];
+    return content
+      .filter((item) => item?.type === "text" && typeof item.text === "string")
+      .map((item) => item.text)
+      .join("");
+  }
+
+  function nativeOutputDelta(previousValue, nextValue) {
+    const previous = String(previousValue ?? "");
+    const next = String(nextValue ?? "");
+    if (!next || next === previous) return "";
+    if (next.startsWith(previous)) return next.slice(previous.length);
+    const maximumOverlap = Math.min(previous.length, next.length, 64 * 1024);
+    for (let length = maximumOverlap; length > 0; length -= 1) {
+      if (previous.endsWith(next.slice(0, length))) return next.slice(length);
+    }
+    return next;
+  }
+
+  async function recordNativeFileChange(runtime, evidence) {
+    const turnSettings = runtime.activeTurnSettings;
+    if (
+      turnSettings?.workType !== PROJECT_WORK_TYPE
+      || turnSettings?.workflowId
+    ) {
+      throw projectWorkError(
+        "PROJECT_NATIVE_FILE_CHANGE_FORBIDDEN",
+        "当前只读工作流不能写入文件",
+        403,
+      );
+    }
+    if (
+      !evidence
+      || evidence.phase !== "completed"
+      || !SHA256_PATTERN.test(String(evidence.afterHash ?? ""))
+      || evidence.beforeHash === evidence.afterHash
+    ) {
+      return { status: "unchanged" };
+    }
+    const conversationId = runtime.conversationId;
+    let normalizedPath = null;
+    try {
+      normalizedPath = evidence.workspacePath === null
+        ? null
+        : normalizeProjectPath(evidence.workspacePath);
+    } catch {
+      normalizedPath = null;
+    }
+    if (!normalizedPath || normalizedPath === ".") {
+      const displayPath = await sanitizePublicProgressText(
+        conversationId,
+        evidence.path || "Workspace 外文件",
+        500,
+      );
+      await appendEvent(conversationId, "native_file_change.completed", {
+        turnId: compactText(turnSettings.turnId, 180) || null,
+        toolCallId: compactText(evidence.toolCallId, 180) || null,
+        toolName: compactText(evidence.toolName, 80) || null,
+        path: displayPath || "Workspace 外文件",
+        operation: evidence.operation === "create" ? "create" : "update",
+        baseHash: SHA256_PATTERN.test(String(evidence.beforeHash ?? ""))
+          ? evidence.beforeHash
+          : null,
+        afterHash: evidence.afterHash,
+        undoAvailable: false,
+        artifactId: "changes",
+      });
+      return { status: "recorded_external" };
+    }
+    const writeId = `native-write-${createHash("sha256")
+      .update(`${conversationId}:${turnSettings.turnId}:${evidence.toolCallId}`)
+      .digest("hex")
+      .slice(0, 32)}`;
+    const existingConversation = await conversationStore.get(conversationId);
+    const existing = (existingConversation.workspaceWrites ?? []).find(
+      (write) => write.id === writeId,
+    );
+    if (existing) return existing;
+
+    const before = Buffer.from(String(evidence.beforeContent ?? ""), "utf8");
+    const after = Buffer.from(String(evidence.afterContent ?? ""), "utf8");
+    const baseExists = SHA256_PATTERN.test(String(evidence.beforeHash ?? ""));
+    if (
+      sha256(after) !== evidence.afterHash
+      || (baseExists && sha256(before) !== evidence.beforeHash)
+    ) {
+      throw projectWorkError(
+        "PROJECT_NATIVE_FILE_CHANGE_EVIDENCE_INVALID",
+        "原生文件修改的审计证据未通过哈希校验",
+        500,
+      );
+    }
+    const payloadDirectory = workspaceWritePayloadDirectory(
+      conversationId,
+      writeId,
+    );
+    await mkdir(payloadDirectory, { recursive: true, mode: 0o700 });
+    if (baseExists) {
+      await writeWorkspacePayloadOnce(
+        path.join(payloadDirectory, "before.txt"),
+        before,
+      );
+    }
+    await writeWorkspacePayloadOnce(
+      path.join(payloadDirectory, "after.txt"),
+      after,
+    );
+    const workspace = await resolveConversationWorkspace(existingConversation);
+    const gitAfter = await gitInspector(workspace.workspaceRoot)
+      .catch(() => ({ available: false }));
+    const completedAt = timestamp();
+    const written = {
+      schemaVersion: 1,
+      id: writeId,
+      turnId: compactText(turnSettings.turnId, 180) || null,
+      toolCallId: compactText(evidence.toolCallId, 180) || null,
+      toolName: compactText(evidence.toolName, 80) || null,
+      path: normalizedPath,
+      operation: baseExists ? "update" : "create",
+      status: "written",
+      approvalMode: "native",
+      native: true,
+      baseExists,
+      baseHash: baseExists ? evidence.beforeHash : null,
+      baseMode: Number.isInteger(evidence.beforeMode)
+        ? evidence.beforeMode
+        : null,
+      afterHash: evidence.afterHash,
+      afterMode: Number.isInteger(evidence.afterMode)
+        ? evidence.afterMode
+        : Number.isInteger(evidence.beforeMode)
+          ? evidence.beforeMode
+          : 0o644,
+      patch: compactText(evidence.diff, 64_000),
+      gitAfter,
+      createdAt: completedAt,
+      completedAt,
+      error: null,
+      undo: {
+        status: "available",
+        hash: sha256({
+          schemaVersion: 1,
+          conversationId,
+          writeId,
+          path: normalizedPath,
+          baseHash: baseExists ? evidence.beforeHash : null,
+          afterHash: evidence.afterHash,
+        }),
+        usedAt: null,
+      },
+    };
+    await updateConversation(conversationId, (current) => ({
+      workspace: {
+        ...normalizedWorkspaceRecord(current, completedAt),
+        dirty: true,
+        revision: normalizedWorkspaceRecord(current, completedAt).revision + 1,
+        updatedAt: completedAt,
+      },
+      workspaceWrites: [
+        ...(current.workspaceWrites ?? []).slice(-199),
+        written,
+      ],
+    }));
+    const changeSet = await buildWorkspaceChangeSet(
+      conversationId,
+      written.turnId,
+    );
+    await updateConversation(conversationId, { activeChangeSet: changeSet });
+    await appendEvent(conversationId, "workspace_write.completed", {
+      id: writeId,
+      turnId: written.turnId,
+      toolCallId: written.toolCallId,
+      path: normalizedPath,
+      operation: written.operation,
+      status: "written",
+      approvalMode: "native",
+      baseHash: written.baseHash,
+      afterHash: written.afterHash,
+      patch: written.patch,
+      artifactId: "changes",
+    });
+    return written;
+  }
+
+  async function recordNativeBashEvent(runtime, nativeEvent) {
+    const turnSettings = runtime.activeTurnSettings;
+    if (
+      turnSettings?.workType !== PROJECT_WORK_TYPE
+      || turnSettings?.workflowId
+    ) {
+      throw projectWorkError(
+        "PROJECT_NATIVE_BASH_FORBIDDEN",
+        "当前只读工作流不能运行命令",
+        403,
+      );
+    }
+    const conversationId = runtime.conversationId;
+    const toolCallId = compactText(nativeEvent?.toolCallId, 180);
+    if (!toolCallId) {
+      throw projectWorkError(
+        "PROJECT_NATIVE_BASH_EVENT_INVALID",
+        "原生 Pi 命令缺少工具调用标识",
+        500,
+      );
+    }
+    runtime.nativeBashRuns ??= new Map();
+    if (nativeEvent.phase === "started") {
+      const existing = runtime.nativeBashRuns.get(toolCallId);
+      if (existing) return existing.record;
+      const conversation = await conversationStore.get(conversationId);
+      const workspace = await resolveConversationWorkspace(conversation);
+      const rawCommand = String(nativeEvent.command ?? "");
+      const publicCommand = redactPublicProgressSecrets(
+        await sanitizeFullForConversation(conversationId, rawCommand),
+      ).slice(0, 64 * 1024);
+      const requestId = `pi-shell-${createHash("sha256")
+        .update(`${conversationId}:${turnSettings.turnId}:${toolCallId}`)
+        .digest("hex")
+        .slice(0, 32)}`;
+      const [started, gitBefore] = await Promise.all([
+        effectiveRunSupervisor.startExternal({
+          workspaceId: conversation.workspaceId,
+          workspaceRoot: workspace.workspaceRoot,
+          command: rawCommand,
+          metadata: { kind: "pi_shell" },
+          cancelHandler: () => runtime.host?.abort?.(),
+        }),
+        gitInspector(workspace.workspaceRoot)
+          .catch(() => ({ available: false, reason: "git_unavailable" })),
+      ]);
+      const record = {
+        schemaVersion: 1,
+        id: requestId,
+        runId: started.run.id,
+        turnId: compactText(turnSettings.turnId, 180) || null,
+        toolCallId,
+        kind: "pi_shell",
+        status: "running",
+        executable: "bash",
+        argv: ["-lc", publicCommand],
+        relativeCwd: ".",
+        purpose: "Pi 原生命令",
+        requestHash: sha256({
+          schemaVersion: 1,
+          conversationId,
+          turnId: turnSettings.turnId,
+          toolCallId,
+          command: rawCommand,
+        }),
+        exitCode: null,
+        durationMs: null,
+        output: "",
+        truncated: false,
+        gitBefore,
+        gitAfter: null,
+        createdAt: started.run.createdAt ?? timestamp(),
+        startedAt: started.run.startedAt ?? timestamp(),
+        completedAt: null,
+        error: null,
+      };
+      runtime.nativeBashRuns.set(toolCallId, {
+        record,
+        runId: started.run.id,
+        workspaceRoot: workspace.workspaceRoot,
+        lastText: "",
+      });
+      activeWorkspaceRunRequests.add(conversationId);
+      try {
+        await updateConversation(conversationId, (current) => ({
+          workspaceRuns: [
+            ...(current.workspaceRuns ?? []).slice(-199),
+            record,
+          ],
+        }));
+        await appendEvent(conversationId, "workspace_run.started", {
+          id: requestId,
+          runId: started.run.id,
+          turnId: record.turnId,
+          toolCallId,
+          kind: "pi_shell",
+          status: "running",
+          executable: "bash",
+          argv: record.argv,
+          relativeCwd: ".",
+          purpose: record.purpose,
+          artifactId: "run_result",
+        });
+      } catch (error) {
+        runtime.nativeBashRuns.delete(toolCallId);
+        if (runtime.nativeBashRuns.size === 0) {
+          activeWorkspaceRunRequests.delete(conversationId);
+        }
+        await effectiveRunSupervisor.finishExternalRun(started.run.id, {
+          status: "failed",
+          error: "原生 Pi 运行证据未能开始持久化",
+        }).catch(() => undefined);
+        throw error;
+      }
+      return record;
+    }
+
+    const activeRun = runtime.nativeBashRuns.get(toolCallId);
+    if (!activeRun) return null;
+    if (nativeEvent.phase === "update") {
+      const nextText = nativeToolText(nativeEvent.update);
+      const delta = nativeOutputDelta(activeRun.lastText, nextText);
+      activeRun.lastText = nextText;
+      if (delta) {
+        await effectiveRunSupervisor.appendExternalOutput(activeRun.runId, {
+          stream: "stdout",
+          text: delta,
+        });
+      }
+      return activeRun.record;
+    }
+
+    if (!["completed", "failed", "aborted"].includes(nativeEvent.phase)) {
+      return activeRun.record;
+    }
+    try {
+      const finalText = nativeEvent.phase === "completed"
+      ? nativeToolText(nativeEvent.result)
+      : String(nativeEvent.error ?? "");
+      const finalDelta = nativeOutputDelta(activeRun.lastText, finalText);
+      if (finalDelta) {
+        await effectiveRunSupervisor.appendExternalOutput(activeRun.runId, {
+          stream: nativeEvent.phase === "completed" ? "stdout" : "stderr",
+          text: finalDelta,
+        });
+      }
+      activeRun.lastText = finalText || activeRun.lastText;
+      const exitMatch = finalText.match(/Command exited with code\s+(\d+)/iu);
+      const exitCode = nativeEvent.phase === "completed"
+        ? 0
+        : exitMatch
+          ? Number.parseInt(exitMatch[1], 10)
+          : null;
+      const status = nativeEvent.phase === "completed"
+        ? "succeeded"
+        : nativeEvent.phase === "aborted"
+          ? "cancelled"
+          : "failed";
+      const completed = await effectiveRunSupervisor.finishExternalRun(
+        activeRun.runId,
+        {
+          status,
+          exitCode,
+          signal: nativeEvent.phase === "aborted" ? "SIGINT" : null,
+          error: nativeEvent.phase === "completed"
+            ? null
+            : finalText.split(/\r\n|\n|\r/u).filter(Boolean).at(-1)
+              || "Pi 原生命令运行失败",
+        },
+      );
+      const outputTail = redactPublicProgressSecrets(
+        await sanitizeFullForConversation(
+          conversationId,
+          (activeRun.lastText || "").slice(-16_000),
+        ),
+      );
+      const completedAt = completed.completedAt ?? timestamp();
+      const gitAfter = await gitInspector(activeRun.workspaceRoot)
+        .catch(() => ({ available: false, reason: "git_unavailable" }));
+      const safeError = completed.error
+        ? {
+            code: status === "cancelled"
+              ? "PROJECT_NATIVE_BASH_CANCELLED"
+              : "PROJECT_NATIVE_BASH_FAILED",
+            message: compactText(completed.error, 500),
+            retryable: false,
+          }
+        : null;
+      await updateConversation(conversationId, (current) => ({
+        workspaceRuns: (current.workspaceRuns ?? []).map((run) => (
+          run.id === activeRun.record.id
+            ? {
+                ...run,
+                status,
+                exitCode: completed.exitCode,
+                durationMs: completed.durationMs,
+                output: outputTail,
+                truncated: completed.output?.truncated === true,
+                gitAfter,
+                completedAt,
+                error: safeError,
+              }
+            : run
+        )),
+      }));
+      await appendEvent(conversationId, "workspace_run.completed", {
+        id: activeRun.record.id,
+        runId: activeRun.runId,
+        turnId: activeRun.record.turnId,
+        toolCallId,
+        kind: "pi_shell",
+        status,
+        exitCode: completed.exitCode,
+        durationMs: completed.durationMs,
+        truncated: completed.output?.truncated === true,
+        artifactId: "run_result",
+      });
+      return completed;
+    } finally {
+      runtime.nativeBashRuns.delete(toolCallId);
+      if (runtime.nativeBashRuns.size === 0) {
+        activeWorkspaceRunRequests.delete(conversationId);
+      }
+    }
   }
 
   async function confirmWorkspaceWrite(conversationId, writeId) {
@@ -5912,7 +6489,7 @@ export function createProjectWorkService({
     );
     if (
       conversationWorkspaceKind(conversation) !== "bound_project"
-      || !["manual_review", "auto_review"].includes(
+      || !["manual_review", "auto_review", "native"].includes(
         turnSettings?.executionPolicyMode,
       )
       || executionPolicy.mode !== turnSettings.executionPolicyMode
@@ -5983,7 +6560,9 @@ export function createProjectWorkService({
       executionPolicyMode: previewRequest.executionPolicyMode,
       detail: previewRequest.executionPolicyMode === "manual_review"
         ? "已登记受控本机预览，等待明确确认"
-        : "已登记受控本机预览，等待本轮安全判断",
+        : previewRequest.executionPolicyMode === "native"
+          ? "已登记受控本机预览，将在当前原生回合直接启动"
+          : "已登记受控本机预览，等待本轮安全判断",
     });
     return previewRequest;
   }
@@ -6490,10 +7069,20 @@ export function createProjectWorkService({
     const previewRequest = (current.previewRequests ?? []).find((item) => (
       item.status === "requested"
       && item.turnId === turnSettings.turnId
-      && item.executionPolicyMode === "auto_review"
+      && ["auto_review", "native"].includes(item.executionPolicyMode)
       && item.executionPolicyRevision === turnSettings.executionPolicyRevision
     ));
     if (!previewRequest) return;
+
+    if (previewRequest.executionPolicyMode === "native") {
+      await updatePreviewRequest(conversationId, previewRequest.id, {
+        status: "starting",
+        blockedReason: null,
+        error: null,
+      });
+      await launchClaimedPreview(conversationId, previewRequest);
+      return;
+    }
 
     const previewDecision = reviewAutoPreview(previewRequest, {
       workflowId: turnSettings.workflowId,
@@ -7148,51 +7737,48 @@ export function createProjectWorkService({
     });
   }
 
-  function resetAssistantPartialState(runtime) {
-    runtime.partialPublished = false;
-    runtime.partialPublishedLength = 0;
-    runtime.partialLastPublishedAtMs = null;
-    runtime.partialRevision = 0;
+  function resetAssistantStreamState(runtime) {
+    runtime.assistantDeltaRevision = 0;
+    runtime.publishedPublicBlocks = new Set();
   }
 
-  async function flushAssistantPartial(runtime, turnSettings, {
-    force = false,
-  } = {}) {
-    if (!runtime.activeAssistantId || runtime.assistantText.length === 0) {
-      return false;
+  function assistantContentBlock(event, contentIndex) {
+    if (!Number.isSafeInteger(contentIndex) || contentIndex < 0) return null;
+    const candidates = [
+      event?.message,
+      event?.assistantMessageEvent?.partial,
+    ];
+    for (const candidate of candidates) {
+      if (Array.isArray(candidate?.content) && candidate.content[contentIndex]) {
+        return candidate.content[contentIndex];
+      }
     }
-    const textLength = runtime.assistantText.length;
-    if (
-      runtime.partialPublished
-      && textLength === runtime.partialPublishedLength
-    ) {
-      return false;
-    }
-    const currentTimeMs = now().getTime();
-    const elapsedMs = runtime.partialLastPublishedAtMs === null
-      ? 0
-      : currentTimeMs - runtime.partialLastPublishedAtMs;
-    const growth = textLength - runtime.partialPublishedLength;
-    if (
-      !force
-      && runtime.partialPublished
-      && elapsedMs < ASSISTANT_PARTIAL_INTERVAL_MS
-      && growth < ASSISTANT_PARTIAL_GROWTH_CHARS
-    ) {
-      return false;
-    }
-    const text = await sanitizeForConversation(
-      runtime.conversationId,
-      runtime.assistantText,
+    return null;
+  }
+
+  async function appendAssistantDelta(runtime, event, turnSettings) {
+    if (!runtime.activeAssistantId) return false;
+    const assistantEvent = event?.assistantMessageEvent;
+    const rawDelta = String(assistantEvent?.delta ?? "");
+    if (!rawDelta) return false;
+    runtime.assistantText += rawDelta;
+    const delta = redactPublicProgressSecrets(
+      await sanitizeFullForConversation(runtime.conversationId, rawDelta),
     );
-    const revision = runtime.partialRevision + 1;
-    await appendEvent(runtime.conversationId, "message.partial", {
+    if (!delta) return false;
+    const revision = runtime.assistantDeltaRevision + 1;
+    const block = assistantContentBlock(event, assistantEvent.contentIndex);
+    await appendEvent(runtime.conversationId, "message.delta", {
       id: runtime.activeAssistantId,
       role: "assistant",
-      text,
+      delta,
       status: "streaming",
       isFinal: false,
       revision,
+      contentIndex: Number.isSafeInteger(assistantEvent.contentIndex)
+        ? assistantEvent.contentIndex
+        : null,
+      phase: publicTextPhase(block),
       turnId: turnSettings.turnId ?? runtime.activeAssistantId,
       turnSeq: Number.isSafeInteger(turnSettings.turnSeq)
         ? turnSettings.turnSeq
@@ -7202,16 +7788,64 @@ export function createProjectWorkService({
         ? turnSettings.attempt
         : 1,
     });
-    runtime.partialPublished = true;
-    runtime.partialPublishedLength = textLength;
-    runtime.partialLastPublishedAtMs = currentTimeMs;
-    runtime.partialRevision = revision;
+    runtime.assistantDeltaRevision = revision;
     return true;
+  }
+
+  async function recordPublicBlock(runtime, block, contentIndex) {
+    if (!block || !runtime.activeAssistantId) return false;
+    const phase = publicTextPhase(block);
+    const source = phase === "commentary"
+      ? "provider_commentary"
+      : block.type === "thinking"
+        ? "provider_reasoning_summary"
+        : null;
+    if (!source) return false;
+    const key = `${source}:${Number.isSafeInteger(contentIndex)
+      ? contentIndex
+      : sha256(block).slice(0, 16)}`;
+    if (runtime.publishedPublicBlocks.has(key)) return false;
+    const text = phase === "commentary"
+      ? String(block.text ?? "")
+      : publicReasoningSummary(block);
+    if (!text.trim()) return false;
+    await recordProviderPublicProgress(runtime, text, source);
+    runtime.publishedPublicBlocks.add(key);
+    return true;
+  }
+
+  async function recordCompletedPublicBlock(runtime, event) {
+    const assistantEvent = event?.assistantMessageEvent;
+    if (!assistantEvent || !["text_end", "thinking_end"].includes(
+      assistantEvent.type,
+    )) {
+      return false;
+    }
+    return recordPublicBlock(
+      runtime,
+      assistantContentBlock(event, assistantEvent.contentIndex),
+      assistantEvent.contentIndex,
+    );
+  }
+
+  async function recordMessagePublicBlocks(runtime, message) {
+    const blocks = Array.isArray(message?.content) ? message.content : [];
+    for (let index = 0; index < blocks.length; index += 1) {
+      await recordPublicBlock(runtime, blocks[index], index);
+    }
   }
 
   function boundedSubagentMetric(value) {
     const number = Number(value);
     return Number.isFinite(number) && number >= 0 ? number : null;
+  }
+
+  function publicSubagentModel(value) {
+    if (typeof value !== "string") return null;
+    const model = value.trim();
+    return /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,159}$/u.test(model)
+      ? model
+      : null;
   }
 
   function publicSubagentStatus(progress, result, event) {
@@ -7230,15 +7864,25 @@ export function createProjectWorkService({
     return event.type === "tool_execution_start" ? "running" : "queued";
   }
 
-  function publicSubagentPath(runtime, value) {
+  function publicSubagentPath(runtime, value, childWorkspaceRoot = null) {
     if (typeof value !== "string" || !value.trim()) return null;
     let candidate = value.trim();
     if (path.isAbsolute(candidate)) {
-      const relative = path.relative(runtime.workspaceRoot, candidate);
-      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
-        return null;
+      const roots = [
+        typeof childWorkspaceRoot === "string" && path.isAbsolute(childWorkspaceRoot)
+          ? childWorkspaceRoot
+          : null,
+        runtime.workspaceRoot,
+      ].filter(Boolean);
+      candidate = null;
+      for (const root of [...new Set(roots)]) {
+        const relative = path.relative(root, value.trim());
+        if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
+          candidate = relative;
+          break;
+        }
       }
-      candidate = relative;
+      if (!candidate) return null;
     }
     try {
       return normalizeProjectPath(candidate);
@@ -7262,6 +7906,41 @@ export function createProjectWorkService({
   }
 
   async function safeSubagentRun(runtime, event) {
+    const controlAction = typeof event.args?.action === "string"
+      ? event.args.action
+      : null;
+    if (controlAction) {
+      const labels = {
+        status: "查看子任务状态",
+        interrupt: "暂停子任务",
+        stop: "停止子任务",
+        resume: "恢复子任务",
+        steer: "引导子任务",
+      };
+      const completed = event.type === "tool_execution_end";
+      const failed = completed && event.isError === true;
+      return {
+        index: 1,
+        task: labels[controlAction] ?? "管理子任务",
+        status: failed
+          ? "failed"
+          : completed
+            ? ["stop", "interrupt"].includes(controlAction)
+              ? "stopped"
+              : "completed"
+            : "running",
+        model: null,
+        currentTool: null,
+        currentPath: null,
+        toolCount: null,
+        turnCount: null,
+        tokens: null,
+        durationMs: null,
+        summary: completed && !failed ? "操作已完成" : null,
+        error: failed ? "操作未完成" : null,
+        children: [],
+      };
+    }
     const payload = event.type === "tool_execution_update"
       ? event.partialResult
       : event.type === "tool_execution_end"
@@ -7272,6 +7951,11 @@ export function createProjectWorkService({
       : {};
     const progressItems = Array.isArray(details.progress) ? details.progress : [];
     const results = Array.isArray(details.results) ? details.results : [];
+    const requestedItems = Array.isArray(event.args?.tasks)
+      ? event.args.tasks
+      : event.args?.agent || event.args?.task
+        ? [event.args]
+        : [];
     const requestedCount = Array.isArray(event.args?.tasks)
       ? event.args.tasks.length
       : event.args?.agent || event.args?.task
@@ -7296,16 +7980,29 @@ export function createProjectWorkService({
     const children = await Promise.all(Array.from({ length: count }, async (_, index) => {
       const progress = indexedProgress.get(index) ?? progressItems[index] ?? null;
       const result = results[index] ?? null;
+      const requested = requestedItems[index] ?? null;
+      const writer = requested?.agent === "worker";
       const currentTool = typeof progress?.currentTool === "string"
         && /^[A-Za-z0-9_.-]{1,80}$/u.test(progress.currentTool)
         ? progress.currentTool
         : null;
       return {
         index: index + 1,
-        task: count === 1 ? "只读项目检查" : `并行检查项 ${index + 1}`,
+        task: count === 1
+          ? writer ? "写入子任务" : "只读项目检查"
+          : writer ? `并行写入项 ${index + 1}` : `并行检查项 ${index + 1}`,
         status: forcedStatus ?? publicSubagentStatus(progress, result, event),
+        model: publicSubagentModel(
+          progress?.model
+            ?? result?.model
+            ?? requested?.model,
+        ),
         currentTool,
-        currentPath: publicSubagentPath(runtime, progress?.currentPath),
+        currentPath: publicSubagentPath(
+          runtime,
+          progress?.currentPath,
+          requested?.cwd,
+        ),
         toolCount: boundedSubagentMetric(
           progress?.toolCount ?? result?.progressSummary?.toolCount,
         ),
@@ -7345,10 +8042,14 @@ export function createProjectWorkService({
     const completedCount = children.filter(
       (child) => child.status === "completed",
     ).length;
+    const writerRun = requestedItems.some((item) => item?.agent === "worker");
     return {
       index: 1,
-      task: count === 1 ? "只读项目检查" : `并行项目检查（${count} 项）`,
+      task: count === 1
+        ? writerRun ? "写入子任务" : "只读项目检查"
+        : writerRun ? `并行写入任务（${count} 项）` : `并行项目检查（${count} 项）`,
       status: rootStatus,
+      model: count === 1 ? children[0].model : null,
       currentTool: count === 1 ? children[0].currentTool : null,
       currentPath: count === 1 ? children[0].currentPath : null,
       toolCount: count === 1 ? children[0].toolCount : null,
@@ -7594,7 +8295,8 @@ export function createProjectWorkService({
     switch (event?.type) {
       case "agent_start":
         await finishRuntimeThinking(runtime);
-        resetAssistantPartialState(runtime);
+        resetAssistantStreamState(runtime);
+        runtime.providerPublicProgressCount = 0;
         runtime.codeEvidence = [];
         runtime.turnFailure = null;
         await updateConversation(conversationId, {
@@ -7759,7 +8461,7 @@ export function createProjectWorkService({
         } else if (event.message?.role === "assistant") {
           runtime.activeAssistantId = `message-${idFactory()}`;
           runtime.assistantText = "";
-          resetAssistantPartialState(runtime);
+          resetAssistantStreamState(runtime);
           await appendEvent(conversationId, "message.started", {
             id: runtime.activeAssistantId,
             role: "assistant",
@@ -7770,21 +8472,18 @@ export function createProjectWorkService({
       case "message_update": {
         const assistantEvent = event.assistantMessageEvent;
         if (assistantEvent?.type === "text_delta" && runtime.activeAssistantId) {
-          if (runtime.assistantText.length < 256_000) {
-            runtime.assistantText += String(assistantEvent.delta ?? "").slice(
-              0,
-              256_000 - runtime.assistantText.length,
-            );
+          await appendAssistantDelta(runtime, event, turnSettings);
+        } else if (["text_end", "thinking_end"].includes(
+          assistantEvent?.type,
+        )) {
+          await recordCompletedPublicBlock(runtime, event);
+          if (assistantEvent.type === "thinking_end") {
+            await finishRuntimeThinking(runtime);
           }
-          await flushAssistantPartial(runtime, turnSettings);
         } else if (
           assistantEvent?.type?.startsWith("thinking_")
         ) {
-          if (assistantEvent.type === "thinking_end") {
-            await finishRuntimeThinking(runtime);
-          } else {
-            await beginRuntimeThinking(runtime);
-          }
+          await beginRuntimeThinking(runtime);
         }
         break;
       }
@@ -7797,11 +8496,20 @@ export function createProjectWorkService({
           break;
         }
         if (event.message?.role === "assistant" && runtime.activeAssistantId) {
-          await flushAssistantPartial(runtime, turnSettings, { force: true });
+          await recordMessagePublicBlocks(runtime, event.message);
           await finishRuntimeThinking(runtime);
-          const fullText = await sanitizeForConversation(
+          const contentBlocks = Array.isArray(event.message?.content)
+            ? event.message.content
+            : [];
+          const hasPublicTextPhase = contentBlocks.some(
+            (block) => publicTextPhase(block) !== null,
+          );
+          const canonicalFinalText = publicFinalAnswerText(event.message);
+          const fullText = await sanitizeFullForConversation(
             conversationId,
-            extractMessageText(event.message) || runtime.assistantText,
+            hasPublicTextPhase
+              ? canonicalFinalText
+              : canonicalFinalText || runtime.assistantText,
           );
           const turnAborted = event.message.stopReason === "aborted"
             || runtime.abortRequested === true;
@@ -7811,7 +8519,7 @@ export function createProjectWorkService({
           const turnFailure = turnAborted
             ? {
                 code: "PROJECT_WORK_TURN_ABORTED",
-                message: "本轮已停止，停止前的修改不会应用",
+                message: "本轮已停止；停止前已成功完成的 Workspace 修改仍会保留",
                 retryable: true,
               }
             : event.message.stopReason === "error"
@@ -7930,7 +8638,7 @@ export function createProjectWorkService({
           runtime.activeAssistantId = null;
           runtime.assistantText = "";
           if (finalAnswer) runtime.activePiUserEntryId = null;
-          resetAssistantPartialState(runtime);
+          resetAssistantStreamState(runtime);
         }
         break;
       case "queue_update":
@@ -7944,6 +8652,7 @@ export function createProjectWorkService({
         });
         break;
       case "tool_execution_start":
+        await recordDeterministicToolProgress(runtime, event);
         await appendEvent(
           conversationId,
           "tool.started",
@@ -7998,6 +8707,25 @@ export function createProjectWorkService({
 
   async function getRuntime(conversationId) {
     assertConversationNotDeleting(conversationId);
+    const migratedConversation = await awaitStartupLegacyWorkspaceMigration(
+      conversationId,
+    );
+    if (migratedConversation?.legacyMigration?.status === "needs_review") {
+      throw projectWorkError(
+        "PROJECT_WORK_LEGACY_MIGRATION_REVIEW_REQUIRED",
+        "请先处理旧会话中尚未应用的修改，再继续运行 Agent",
+        409,
+        true,
+      );
+    }
+    if (migratedConversation?.legacyMigration?.status === "blocked") {
+      throw projectWorkError(
+        "PROJECT_WORK_LEGACY_MIGRATION_BLOCKED",
+        "旧会话迁移需要恢复，当前不会创建新的空会话",
+        409,
+        true,
+      );
+    }
     await recoverInterruptedForkTarget(conversationId);
     const current = runtimes.get(conversationId);
     const skillRevision = typeof effectiveSkillPackageService.getRevision === "function"
@@ -8041,6 +8769,15 @@ export function createProjectWorkService({
         workspaceSnapshot = { truncated: true };
       }
     }
+    const allocateNativeChildWorkspaces = directWorkspace
+      && workspace.workspaceKind === "bound_project"
+      && workspace.workspace
+      ? createNativeChildWorkspaceAllocator({
+          project: await registry.get(conversation.projectId),
+          sourceWorkspace: workspace.workspace,
+          workspaceRegistry: effectiveWorkspaceRegistry,
+        })
+      : null;
     const runtime = {
       conversationId,
       workType: conversationWorkType(conversation),
@@ -8055,10 +8792,9 @@ export function createProjectWorkService({
         ?.rollbackEntryId ?? null,
       assistantText: "",
       thinkingActive: false,
-      partialPublished: false,
-      partialPublishedLength: 0,
-      partialLastPublishedAtMs: null,
-      partialRevision: 0,
+      assistantDeltaRevision: 0,
+      publishedPublicBlocks: new Set(),
+      providerPublicProgressCount: 0,
       progressState: null,
       codeEvidence: [],
       completion: null,
@@ -8073,7 +8809,8 @@ export function createProjectWorkService({
       host: null,
       unsubscribe: null,
     };
-    runtime.host = await effectiveSessionFactory({
+    try {
+      runtime.host = await effectiveSessionFactory({
       conversationId,
       projectRoot: workspace.workspaceRoot,
       baseRoot: runtimeBaseRoot,
@@ -8129,6 +8866,12 @@ export function createProjectWorkService({
         write,
         runtime.activeTurnSettings,
       ),
+      onNativeFileChange: (evidence) => recordNativeFileChange(
+        runtime,
+        evidence,
+      ),
+      onNativeBashEvent: (event) => recordNativeBashEvent(runtime, event),
+      prepareNativeChildWorkspaces: allocateNativeChildWorkspaces,
       onVerificationRequest: (request) => recordVerificationRequest(
         conversationId,
         request,
@@ -8177,11 +8920,40 @@ export function createProjectWorkService({
         request,
         runtime.activeTurnSettings,
       ),
-      onAskUserRequest: (request) => requestAgentInput(
-        conversationId,
-        request,
-      ),
-    });
+        onAskUserRequest: (request) => requestAgentInput(
+          conversationId,
+          request,
+        ),
+      });
+    } catch (error) {
+      if (
+        conversation.legacyMigration?.sourceRuntimeMode === "overlay-v1"
+        && [
+          "PROJECT_WORK_SESSION_WORKSPACE_MIGRATION_BLOCKED",
+          "PROJECT_WORK_SESSION_INVALID",
+        ].includes(error?.code)
+      ) {
+        const blockedAt = timestamp();
+        const safeError = safeProjectWorkError(error);
+        await updateConversation(conversationId, (current) => ({
+          status: "recovery_blocked",
+          lastError: safeError,
+          legacyMigration: {
+            ...current.legacyMigration,
+            status: "blocked",
+            completedAt: blockedAt,
+            error: safeError,
+          },
+        }));
+        await appendEvent(conversationId, "workspace.migration_blocked", {
+          sourceRuntimeMode: "overlay-v1",
+          targetRuntimeMode: "workspace-v2",
+          phase: "pi_session",
+          error: safeError,
+        });
+      }
+      throw error;
+    }
     if (!runtime.host || typeof runtime.host.subscribe !== "function") {
       throw new Error("sessionFactory must return a subscribable Pi session host");
     }
@@ -8861,6 +9633,7 @@ export function createProjectWorkService({
 
   async function listWorkspaces(projectId) {
     assertActive();
+    await awaitStartupLegacyWorkspaceMigration();
     const project = await registry.get(projectId);
     const { conversationCounts, busyWorkspaceIds } = await projectWorkspaceUsage(
       project.id,
@@ -9055,6 +9828,9 @@ export function createProjectWorkService({
           : null,
         workspaceKind,
         runtimeMode: directWorkspace ? "workspace-v2" : "overlay-v1",
+        runtimeProfile: directWorkspace && workType === PROJECT_WORK_TYPE
+          ? "pi-native-v1"
+          : null,
         workspaceId: compactText(workspaceId, 180)
           || `workspace-${conversationId}`,
         rootLabel,
@@ -9066,13 +9842,21 @@ export function createProjectWorkService({
         modelRef: selectedModel.modelRef,
         thinkingLevel: selectedThinkingLevel,
         executionPolicy: normalizeExecutionPolicy(
-          executionPolicyMode
+          directWorkspace
+            && workspaceKind === "bound_project"
+            && workType === PROJECT_WORK_TYPE
             ? {
-                mode: executionPolicyMode,
+                mode: "native",
                 revision: 1,
                 policyVersion: AUTO_REVIEW_POLICY_VERSION,
               }
-            : undefined,
+            : executionPolicyMode
+              ? {
+                  mode: executionPolicyMode,
+                  revision: 1,
+                  policyVersion: AUTO_REVIEW_POLICY_VERSION,
+                }
+              : undefined,
         ),
         messages: [],
         activeCheckpointId: null,
@@ -9138,6 +9922,17 @@ export function createProjectWorkService({
         readMutationReceipts: [],
         lastError: null,
         lastEventSeq: 0,
+        legacyMigration: directWorkspace && workType === PROJECT_WORK_TYPE
+          ? {
+              schemaVersion: 1,
+              status: "completed",
+              sourceRuntimeMode: null,
+              targetRuntimeMode: "workspace-v2",
+              startedAt: createdAt,
+              completedAt: createdAt,
+              error: null,
+            }
+          : null,
         createdAt,
         updatedAt: createdAt,
       };
@@ -9174,6 +9969,7 @@ export function createProjectWorkService({
 
   async function createConversation(projectId, options = {}) {
     assertActive();
+    await awaitStartupLegacyWorkspaceMigration();
     if (deletingProjects.has(projectId)) {
       throw projectWorkError(
         "PROJECT_WORK_PROJECT_DELETE_IN_PROGRESS",
@@ -9377,12 +10173,549 @@ export function createProjectWorkService({
     });
   }
 
+  function requiresLegacyWorkspaceMigration(conversation) {
+    return (
+      workspaceRuntimeMode === "workspace-v2"
+      && conversationWorkType(conversation) === PROJECT_WORK_TYPE
+      && conversationWorkspaceKind(conversation) === "bound_project"
+      && (
+        conversation.runtimeMode !== "workspace-v2"
+        || !compactText(conversation.workspaceId, 180)
+        || conversation.runtimeProfile !== "pi-native-v1"
+        || normalizeExecutionPolicy(conversation.executionPolicy).mode
+          !== "native"
+      )
+      && conversation.legacyMigration?.status !== "blocked"
+    );
+  }
+
+  function supersedeLegacyVerifications(
+    verifications,
+    completedAt,
+    { legacyOverlay = true } = {},
+  ) {
+    if (!legacyOverlay) return [...(verifications ?? [])];
+    return (verifications ?? []).map((verification) => (
+      ["requested", "pending_approval", "running"].includes(
+        verification?.status,
+      )
+        ? {
+            ...verification,
+            status: "legacy_superseded",
+            blockedReason: "legacy_workspace_migration",
+            completedAt,
+          }
+        : verification
+    ));
+  }
+
+  function legacySessionCheckpoints(conversation) {
+    const checkpoints = [];
+    const seen = new Set();
+    for (const message of normalizedConversationMessages(conversation)) {
+      for (const [field, role] of [
+        ["userEntryId", "user"],
+        ["assistantEntryId", "assistant"],
+      ]) {
+        const id = compactText(message.piCheckpoint?.[field], 180);
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        checkpoints.push({ id, role });
+      }
+    }
+    return checkpoints;
+  }
+
+  async function inspectLegacyOverlay(conversation) {
+    if (conversation.runtimeMode === "workspace-v2") {
+      return { status: "clean", files: [] };
+    }
+    const paths = conversationPaths(conversation.id);
+    let baseStat;
+    let workspaceStat;
+    try {
+      [baseStat, workspaceStat] = await Promise.all([
+        lstat(paths.baseRoot),
+        lstat(paths.workspaceRoot),
+      ]);
+    } catch {
+      throw projectWorkError(
+        "PROJECT_WORK_LEGACY_WORKSPACE_MISSING",
+        "旧会话的审阅工作区不完整，已保留原记录等待恢复",
+        409,
+        true,
+      );
+    }
+    if (
+      !baseStat.isDirectory()
+      || baseStat.isSymbolicLink()
+      || !workspaceStat.isDirectory()
+      || workspaceStat.isSymbolicLink()
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_LEGACY_WORKSPACE_INVALID",
+        "旧会话的审阅工作区不安全，已保留原记录等待恢复",
+        409,
+        true,
+      );
+    }
+    const changeSet = await recomputeChangeSet({
+      conversationId: conversation.id,
+      baseRoot: paths.baseRoot,
+      workspaceRoot: paths.workspaceRoot,
+      allowDeletes: conversation.workspaceSnapshot?.mode !== "sparse_overlay",
+    });
+    if (
+      conversation.legacyMigration?.resolution === "abandoned"
+      && conversation.legacyMigration?.resolvedChangeSetHash === changeSet.hash
+    ) {
+      return {
+        ...changeSet,
+        status: "clean",
+        files: [],
+      };
+    }
+    return changeSet;
+  }
+
+  async function migrateLegacyProjectConversation(conversationId) {
+    if (workspaceRuntimeMode !== "workspace-v2") {
+      return conversationStore.get(conversationId);
+    }
+    const existing = legacyWorkspaceMigrationRuns.get(conversationId);
+    if (existing) return existing;
+    const migration = (async () => {
+      let conversation = await conversationStore.get(conversationId);
+      if (!requiresLegacyWorkspaceMigration(conversation)) return conversation;
+      if (
+        conversation.legacyMigration?.status === "needs_review"
+        && conversation.activeChangeSet?.status === "ready"
+      ) {
+        return conversation;
+      }
+      const startedAt = timestamp();
+      const sourceRuntimeMode = compactText(
+        conversation.runtimeMode,
+        80,
+        "overlay-v1",
+      );
+      conversation = await updateConversation(conversationId, (current) => {
+        if (!requiresLegacyWorkspaceMigration(current)) return {};
+        return {
+          legacyMigration: {
+            schemaVersion: 1,
+            status: "migrating",
+            sourceRuntimeMode,
+            targetRuntimeMode: "workspace-v2",
+            targetWorkspaceId: null,
+            startedAt,
+            completedAt: null,
+            error: null,
+            resolution: current.legacyMigration?.resolution ?? null,
+            resolvedChangeSetHash: current.legacyMigration
+              ?.resolvedChangeSetHash ?? null,
+          },
+        };
+      });
+      await appendEvent(conversationId, "workspace.migration_started", {
+        sourceRuntimeMode,
+        targetRuntimeMode: "workspace-v2",
+      });
+      try {
+        const project = await registry.get(conversation.projectId);
+        let selectedWorkspace;
+        if (
+          conversation.runtimeMode === "workspace-v2"
+          && compactText(conversation.workspaceId, 180)
+        ) {
+          selectedWorkspace = await effectiveWorkspaceRegistry.resolveWorkspace({
+            project,
+            workspaceId: conversation.workspaceId,
+          });
+        } else {
+          const workspaces = await effectiveWorkspaceRegistry.list({ project });
+          const mainWorkspace = workspaces.find((workspace) => workspace.isMain);
+          if (!mainWorkspace) {
+            throw projectWorkError(
+              "PROJECT_WORK_WORKSPACE_NOT_FOUND",
+              "没有可用于迁移旧会话的主 Workspace",
+              404,
+              true,
+            );
+          }
+          selectedWorkspace = await effectiveWorkspaceRegistry.resolveWorkspace({
+            project,
+            workspaceId: mainWorkspace.id,
+          });
+        }
+        const changeSet = await inspectLegacyOverlay(conversation);
+        const settledAt = timestamp();
+        const verifications = supersedeLegacyVerifications(
+          conversation.verifications,
+          settledAt,
+          { legacyOverlay: sourceRuntimeMode !== "workspace-v2" },
+        );
+        if (changeSet.status === "ready" && changeSet.files.length > 0) {
+          const activeChangeSet = {
+            ...changeSet,
+            turnId: compactText(conversation.activeChangeSet?.turnId, 160)
+              || null,
+            workflowId: compactText(
+              conversation.activeChangeSet?.workflowId,
+              120,
+            ) || null,
+            executionPolicyRevision: Number.isSafeInteger(
+              conversation.activeChangeSet?.executionPolicyRevision,
+            )
+              ? conversation.activeChangeSet.executionPolicyRevision
+              : null,
+            createdAt: settledAt,
+            appliedAt: null,
+          };
+          const needsReview = await updateConversation(
+            conversationId,
+            (current) => ({
+              status: current.status === "awaiting_user"
+                ? "awaiting_user"
+                : "awaiting_confirmation",
+              activeChangeSet,
+              verifications: supersedeLegacyVerifications(
+                current.verifications,
+                settledAt,
+                { legacyOverlay: sourceRuntimeMode !== "workspace-v2" },
+              ),
+              legacyMigration: {
+                schemaVersion: 1,
+                status: "needs_review",
+                sourceRuntimeMode,
+                targetRuntimeMode: "workspace-v2",
+                targetWorkspaceId: selectedWorkspace.id,
+                startedAt,
+                completedAt: null,
+                error: null,
+                resolution: null,
+                resolvedChangeSetHash: null,
+                recovery: {
+                  changeSetId: activeChangeSet.id,
+                  changeSetHash: activeChangeSet.hash,
+                  fileCount: activeChangeSet.files.length,
+                  actions: ["apply", "export", "abandon"],
+                },
+              },
+            }),
+          );
+          await appendEvent(conversationId, "workspace.migration_needs_review", {
+            targetWorkspaceId: selectedWorkspace.id,
+            changeSetId: activeChangeSet.id,
+            changeSetHash: activeChangeSet.hash,
+            fileCount: activeChangeSet.files.length,
+            artifactId: "changes",
+          });
+          return needsReview;
+        }
+        let sessionMigration = {
+          status: "not_required",
+          entryCount: 0,
+          leafId: null,
+        };
+        if (sourceRuntimeMode !== "workspace-v2") {
+          const paths = conversationPaths(conversationId);
+          sessionMigration = await sessionMigrator({
+            conversationId,
+            legacyWorkspaceRoot: paths.workspaceRoot,
+            targetWorkspaceRoot: selectedWorkspace.rootPath,
+            sessionDir: paths.sessionDir,
+            checkpoints: legacySessionCheckpoints(conversation),
+          });
+        }
+        const completed = await updateConversation(
+          conversationId,
+          (current) => {
+            const nextVerifications = supersedeLegacyVerifications(
+              current.verifications,
+              settledAt,
+              { legacyOverlay: sourceRuntimeMode !== "workspace-v2" },
+            );
+            const directConversation = {
+              ...current,
+              runtimeMode: "workspace-v2",
+              workspaceId: selectedWorkspace.id,
+              workspace: {
+                ...publicWorkspace(selectedWorkspace),
+                id: selectedWorkspace.id,
+                status: "ready",
+                revision: (current.workspace?.revision ?? 1) + 1,
+                createdAt: current.workspace?.createdAt ?? current.createdAt,
+                updatedAt: settledAt,
+              },
+              verifications: nextVerifications,
+            };
+            return {
+              runtimeMode: "workspace-v2",
+              runtimeProfile: "pi-native-v1",
+              executionPolicy: {
+                mode: "native",
+                revision: normalizeExecutionPolicy(
+                  current.executionPolicy,
+                ).revision + 1,
+                policyVersion: AUTO_REVIEW_POLICY_VERSION,
+              },
+              workspaceId: selectedWorkspace.id,
+              workspace: normalizedWorkspaceRecord(
+                directConversation,
+                settledAt,
+              ),
+              workspaceSnapshot: {
+                schemaVersion: 1,
+                rulesVersion: 3,
+                mode: "real_workspace",
+                includedFiles: 0,
+                includedBytes: 0,
+                skippedBinaryFiles: 0,
+                skippedOversizedFiles: 0,
+                truncated: false,
+              },
+              verifications: nextVerifications,
+              status: stableStatusAfterOperation(
+                directConversation,
+                "idle",
+              ),
+              legacyMigration: {
+                schemaVersion: 1,
+                status: "completed",
+                sourceRuntimeMode,
+                targetRuntimeMode: "workspace-v2",
+                targetWorkspaceId: selectedWorkspace.id,
+                startedAt,
+                completedAt: settledAt,
+                error: null,
+                resolution: current.legacyMigration?.resolution
+                  ?? (
+                    current.activeChangeSet?.status === "applied"
+                      ? "applied"
+                      : "clean"
+                  ),
+                resolvedChangeSetHash: current.legacyMigration
+                  ?.resolvedChangeSetHash
+                  ?? current.activeChangeSet?.hash
+                  ?? null,
+                recovery: null,
+                session: {
+                  status: compactText(
+                    sessionMigration?.status,
+                    80,
+                    "migrated",
+                  ),
+                  entryCount: Number.isSafeInteger(
+                    sessionMigration?.entryCount,
+                  )
+                    ? sessionMigration.entryCount
+                    : null,
+                  leafPreserved: sourceRuntimeMode === "workspace-v2"
+                    || sessionMigration?.leafId !== undefined,
+                },
+              },
+            };
+          },
+        );
+        await appendEvent(conversationId, "workspace.migration_completed", {
+          sourceRuntimeMode,
+          targetRuntimeMode: "workspace-v2",
+          targetWorkspaceId: selectedWorkspace.id,
+          sessionStatus: compactText(
+            sessionMigration?.status,
+            80,
+            "migrated",
+          ),
+          supersededVerificationCount: verifications.filter(
+            (verification) => verification.status === "legacy_superseded",
+          ).length,
+        });
+        return completed;
+      } catch (error) {
+        const blockedAt = timestamp();
+        const safeError = safeProjectWorkError(error);
+        const blocked = await updateConversation(conversationId, (current) => ({
+          status: "recovery_blocked",
+          lastError: safeError,
+          verifications: supersedeLegacyVerifications(
+            current.verifications,
+            blockedAt,
+            { legacyOverlay: sourceRuntimeMode !== "workspace-v2" },
+          ),
+          legacyMigration: {
+            schemaVersion: 1,
+            status: "blocked",
+            sourceRuntimeMode,
+            targetRuntimeMode: "workspace-v2",
+            targetWorkspaceId: current.legacyMigration?.targetWorkspaceId
+              ?? null,
+            startedAt,
+            completedAt: blockedAt,
+            error: safeError,
+          },
+        }));
+        await appendEvent(conversationId, "workspace.migration_blocked", {
+          sourceRuntimeMode,
+          targetRuntimeMode: "workspace-v2",
+          error: safeError,
+        });
+        return blocked;
+      }
+    })();
+    legacyWorkspaceMigrationRuns.set(conversationId, migration);
+    try {
+      return await migration;
+    } finally {
+      if (legacyWorkspaceMigrationRuns.get(conversationId) === migration) {
+        legacyWorkspaceMigrationRuns.delete(conversationId);
+      }
+    }
+  }
+
+  async function migrateLegacyProjectConversations() {
+    if (workspaceRuntimeMode !== "workspace-v2") return;
+    const conversations = await conversationStore.list(undefined);
+    await Promise.all(conversations.map(async (conversation) => {
+      if (!requiresLegacyWorkspaceMigration(conversation)) return;
+      await migrateLegacyProjectConversation(conversation.id);
+    }));
+  }
+
+  async function awaitStartupLegacyWorkspaceMigration(conversationId = null) {
+    await startupLegacyWorkspaceMigration;
+    if (startupLegacyWorkspaceMigrationError) {
+      throw startupLegacyWorkspaceMigrationError;
+    }
+    if (conversationId) {
+      return migrateLegacyProjectConversation(conversationId);
+    }
+    return null;
+  }
+
+  async function boundLegacyMigrationChangeSet(
+    conversationId,
+    { changeSetId, changeSetHash } = {},
+  ) {
+    const conversation = await awaitStartupLegacyWorkspaceMigration(
+      conversationId,
+    );
+    assertProjectWorkConversation(conversation);
+    if (
+      conversation.legacyMigration?.status !== "needs_review"
+      || conversation.activeChangeSet?.status !== "ready"
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_LEGACY_MIGRATION_NOT_REVIEWABLE",
+        "当前没有待处理的旧会话修改",
+        409,
+        true,
+      );
+    }
+    const current = await inspectLegacyOverlay(conversation);
+    if (
+      current.status !== "ready"
+      || current.id !== changeSetId
+      || current.hash !== changeSetHash
+      || conversation.activeChangeSet.id !== changeSetId
+      || conversation.activeChangeSet.hash !== changeSetHash
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_CHANGE_BINDING_MISMATCH",
+        "旧会话修改已变化，请刷新后重新选择",
+        409,
+        true,
+      );
+    }
+    return { conversation, changeSet: current };
+  }
+
+  async function exportLegacyMigrationChanges(
+    conversationId,
+    binding = {},
+  ) {
+    assertActive();
+    const { changeSet } = await boundLegacyMigrationChangeSet(
+      conversationId,
+      binding,
+    );
+    const content = changeSet.files
+      .map((file) => file.diff)
+      .join("\n");
+    const byteLength = Buffer.byteLength(content, "utf8");
+    if (byteLength > MAX_LEGACY_MIGRATION_EXPORT_BYTES) {
+      throw projectWorkError(
+        "PROJECT_WORK_LEGACY_MIGRATION_EXPORT_TOO_LARGE",
+        "旧会话修改过大，无法生成单个 patch 文件",
+        413,
+      );
+    }
+    return {
+      fileName: `pi-agent-legacy-${conversationId}.patch`,
+      mimeType: "text/x-diff; charset=utf-8",
+      bytes: Buffer.from(content, "utf8"),
+      byteLength,
+      sha256: sha256(content),
+      changeSetId: changeSet.id,
+      changeSetHash: changeSet.hash,
+    };
+  }
+
+  async function abandonLegacyMigrationChanges(
+    conversationId,
+    binding = {},
+  ) {
+    assertActive();
+    assertConversationNotDeleting(conversationId);
+    const initial = await boundLegacyMigrationChangeSet(
+      conversationId,
+      binding,
+    );
+    const workspace = await resolveConversationWorkspace(initial.conversation);
+    return withApplyLock(workspace.lockKey, async () => {
+      const { changeSet } = await boundLegacyMigrationChangeSet(
+        conversationId,
+        binding,
+      );
+      const resolvedAt = timestamp();
+      await updateConversation(conversationId, (current) => ({
+        activeChangeSet: {
+          ...current.activeChangeSet,
+          status: "cancelled",
+          cancelledAt: resolvedAt,
+          files: current.activeChangeSet.files.map((file) => ({
+            ...file,
+            status: "cancelled",
+            actionable: false,
+          })),
+        },
+        legacyMigration: {
+          ...current.legacyMigration,
+          status: "pending",
+          resolution: "abandoned",
+          resolvedChangeSetHash: changeSet.hash,
+          resolvedAt,
+          recovery: null,
+        },
+      }));
+      await appendEvent(conversationId, "workspace.migration_abandoned", {
+        changeSetId: changeSet.id,
+        changeSetHash: changeSet.hash,
+        fileCount: changeSet.files.length,
+        artifactId: "changes",
+      });
+      await migrateLegacyProjectConversation(conversationId);
+      return snapshot(conversationId);
+    });
+  }
+
   async function migrateLegacyConversationTitles(conversations) {
     return Promise.all(conversations.map(migrateLegacyConversationTitle));
   }
 
   async function listConversations(projectId) {
     assertActive();
+    await awaitStartupLegacyWorkspaceMigration();
     await registry.get(projectId);
     const retained = await recoverInterruptedForkTargets(
       await conversationStore.list(projectId),
@@ -9407,6 +10740,7 @@ export function createProjectWorkService({
 
   async function getConversation(conversationId, options = {}) {
     assertActive();
+    await awaitStartupLegacyWorkspaceMigration(conversationId);
     await recoverInterruptedForkTarget(conversationId);
     await recoverDurableCheckpointNavigation(conversationId);
     await migrateLegacyConversationTitle(await conversationStore.get(conversationId));
@@ -9428,6 +10762,7 @@ export function createProjectWorkService({
     limit = 20,
   } = {}) {
     assertActive();
+    await awaitStartupLegacyWorkspaceMigration(conversationId);
     assertConversationNotDeleting(conversationId);
     await recoverInterruptedForkTarget(conversationId);
     if (
@@ -9450,15 +10785,36 @@ export function createProjectWorkService({
         400,
       );
     }
-    const [conversation, events] = await Promise.all([
-      conversationStore.get(conversationId),
-      conversationStore.readAllEvents(conversationId),
-    ]);
-    const eligible = conversationTurns(conversation, events).filter(
+    const conversation = await conversationStore.get(conversationId);
+    const eligible = conversationTurns(conversation).filter(
       (turn) => beforeTurnSeq === undefined || turn.turnSeq < beforeTurnSeq,
     );
     const start = Math.max(0, eligible.length - limit);
-    const turns = eligible.slice(start);
+    const selected = eligible.slice(start);
+    const earliestTurnId = selected[0]?.id ?? null;
+    const events = [];
+    let eventCursor;
+    while (earliestTurnId) {
+      const page = await conversationStore.readEventsBefore(conversationId, {
+        beforeSeq: eventCursor,
+        limit: 1_000,
+      });
+      events.unshift(...page.events);
+      if (
+        page.events.some(
+          (event) => activityBoundaryTurnId(event) === earliestTurnId,
+        )
+        || !page.hasMore
+        || !page.nextBeforeSeq
+      ) {
+        break;
+      }
+      eventCursor = page.nextBeforeSeq;
+    }
+    const hydratedTurns = new Map(
+      conversationTurns(conversation, events).map((turn) => [turn.id, turn]),
+    );
+    const turns = selected.map((turn) => hydratedTurns.get(turn.id) ?? turn);
     return {
       schemaVersion: 1,
       turns,
@@ -9833,6 +11189,16 @@ export function createProjectWorkService({
         throw projectWorkError(
           "WORKER_EXECUTION_POLICY_LOCKED",
           "Worker 外部交付始终需要人工确认",
+          409,
+        );
+      }
+      if (
+        current.runtimeProfile === "pi-native-v1"
+        && conversationWorkspaceKind(current) === "bound_project"
+      ) {
+        throw projectWorkError(
+          "PROJECT_WORK_EXECUTION_POLICY_NATIVE",
+          "可信项目使用 Pi 原生运行模式，不需要逐次切换审批方式",
           409,
         );
       }
@@ -10295,6 +11661,9 @@ export function createProjectWorkService({
             conversationWorkType(existingConversation) === PROJECT_WORK_TYPE
             && selectedThinkingLevel === "ultra"
           ),
+          ...(conversationWorkType(existingConversation) === PROJECT_WORK_TYPE
+            ? { allowSubagentWrites: turn.workflowId !== "planning" }
+            : {}),
         },
       );
       if (!toolsConfigured) {
@@ -10816,6 +12185,9 @@ export function createProjectWorkService({
             turnSettings.workType === PROJECT_WORK_TYPE
             && selectedConversation.thinkingLevel === "ultra"
           ),
+          ...(turnSettings.workType === PROJECT_WORK_TYPE
+            ? { allowSubagentWrites: turn.workflowId !== "planning" }
+            : {}),
         },
       );
       if (toolsConfigured) {
@@ -13705,6 +15077,7 @@ export function createProjectWorkService({
     } = {},
   ) {
     assertActive();
+    await awaitStartupLegacyWorkspaceMigration(conversationId);
     assertConversationNotDeleting(conversationId);
     assertProjectWorkConversation(await conversationStore.get(conversationId));
     const operationClaim = autoReviewSettlement || repairOperationId
@@ -13806,6 +15179,14 @@ export function createProjectWorkService({
       commandBindingHash = lockedCommandBindingHash;
     const paths = conversationPaths(conversationId);
     const directWorkspace = conversation.runtimeMode === "workspace-v2";
+    if (!directWorkspace && !allowLegacyOverlayFixtureExecution) {
+      throw projectWorkError(
+        "PROJECT_WORK_LEGACY_MIGRATION_REQUIRED",
+        "旧会话只能先完成 Workspace 迁移或恢复，不能再运行复制验证",
+        409,
+        true,
+      );
+    }
     let verificationChangeSet = null;
     if (directWorkspace) {
       if (
@@ -14479,6 +15860,7 @@ export function createProjectWorkService({
 
   async function dispose() {
     if (disposed) return;
+    await startupLegacyWorkspaceMigration.catch(() => undefined);
     disposed = true;
     await documentService.dispose();
     for (const controller of verificationControllers.values()) controller.abort();
@@ -14498,6 +15880,7 @@ export function createProjectWorkService({
     activeMessageClaims.clear();
     conversationOperationClaims.clear();
     blockedOverlayRecoveryRuns.clear();
+    legacyWorkspaceMigrationRuns.clear();
     followUpMutationQueues.clear();
     for (const resolve of askUserWaiters.values()) {
       resolve({
@@ -14519,6 +15902,14 @@ export function createProjectWorkService({
     await previewSupervisor.dispose?.();
     await effectiveRunSupervisor.dispose?.();
     await effectiveSessionFactory.dispose?.();
+  }
+
+  if (workspaceRuntimeMode === "workspace-v2") {
+    startupLegacyWorkspaceMigration = Promise.resolve()
+      .then(() => migrateLegacyProjectConversations())
+      .catch((error) => {
+        startupLegacyWorkspaceMigrationError = error;
+      });
   }
 
   return Object.freeze({
@@ -14543,6 +15934,7 @@ export function createProjectWorkService({
     createStandaloneConversation,
     createWorkerConversation,
     dispose,
+    exportLegacyMigrationChanges,
     getChangeSet,
     getConversation,
     getConversationTurns,
@@ -14577,6 +15969,7 @@ export function createProjectWorkService({
     readProjectFile,
     readProjectImage,
     registerProject,
+    abandonLegacyMigrationChanges,
     inspectSkillPackage,
     installSkillPackage,
     removeConversation,
@@ -14608,6 +16001,24 @@ export function createProjectWorkService({
     undoApply,
     uploadConversationAttachment,
     uploadConversationDocument,
+  });
+}
+
+export function createProjectWorkService(options = {}) {
+  return createProjectWorkServiceRuntime({
+    ...options,
+    workspaceRuntimeMode: "workspace-v2",
+    allowLegacyOverlayFixtureExecution: false,
+  });
+}
+
+// Legacy-only fixture for tests that preserve the old overlay recovery
+// contract. Product code must use createProjectWorkService above.
+export function createLegacyOverlayProjectWorkServiceForTests(options = {}) {
+  return createProjectWorkServiceRuntime({
+    ...options,
+    workspaceRuntimeMode: "overlay-v1",
+    allowLegacyOverlayFixtureExecution: true,
   });
 }
 

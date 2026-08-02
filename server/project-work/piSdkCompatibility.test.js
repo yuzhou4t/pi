@@ -4,6 +4,8 @@ import {
   mkdtemp,
   readFile,
   rm,
+  symlink,
+  writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +13,11 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   createAgentSession,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
+  createGrepTool,
+  createReadTool,
   DefaultResourceLoader,
   defineTool,
   getAgentDir,
@@ -84,6 +91,9 @@ test("Pi SDK stays pinned to 0.82.1 in manifest, lockfile, and installed runtime
 test("Pi SDK 0.82.1 exposes the runtime contracts used by piSessionHost", async (t) => {
   for (const [name, value] of Object.entries({
     createAgentSession,
+    createAgentSessionFromServices,
+    createAgentSessionRuntime,
+    createAgentSessionServices,
     DefaultResourceLoader,
     defineTool,
     getAgentDir,
@@ -191,4 +201,75 @@ test("Pi SDK 0.82.1 exposes the runtime contracts used by piSessionHost", async 
     content: [{ type: "text", text: "ok" }],
     details: { ok: true },
   });
+
+  const createRuntime = async ({
+    cwd,
+    sessionManager,
+    sessionStartEvent,
+  }) => {
+    const services = await createAgentSessionServices({
+      cwd,
+      agentDir: temporaryRoot,
+      modelRuntime: runtime,
+      settingsManager: settings,
+      resourceLoaderOptions: {
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+      },
+    });
+    return {
+      ...(await createAgentSessionFromServices({
+        services,
+        sessionManager,
+        sessionStartEvent,
+        noTools: "all",
+      })),
+      services,
+      diagnostics: services.diagnostics,
+    };
+  };
+  const agentRuntime = await createAgentSessionRuntime(createRuntime, {
+    cwd: workspaceRoot,
+    agentDir: temporaryRoot,
+    sessionManager: SessionManager.inMemory(workspaceRoot),
+  });
+  assert.equal(path.resolve(agentRuntime.cwd), path.resolve(workspaceRoot));
+  assert.equal(typeof agentRuntime.session.prompt, "function");
+  assert.equal(typeof agentRuntime.services.resourceLoader.reload, "function");
+  assert.equal(Array.isArray(agentRuntime.diagnostics), true);
+  await agentRuntime.dispose();
+});
+
+test("Pi native read and grep cross the retired project snapshot limits", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-sdk-native-files-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const largePath = path.join(temporaryRoot, "large.txt");
+  const linkedPath = path.join(temporaryRoot, "linked-large.txt");
+  const paddingLines = 1_200_000;
+  const marker = "PI_NATIVE_SEARCH_MARKER_AFTER_EIGHT_MEGABYTES";
+  await writeFile(
+    largePath,
+    `${"padding\n".repeat(paddingLines)}${marker}\n`,
+  );
+  await symlink(largePath, linkedPath);
+
+  const read = createReadTool(temporaryRoot);
+  const readPage = await read.execute("read-large-page", {
+    path: "linked-large.txt",
+    offset: paddingLines + 1,
+    limit: 2,
+  });
+  assert.match(readPage.content[0].text, new RegExp(marker));
+
+  const grep = createGrepTool(temporaryRoot);
+  const search = await grep.execute("grep-large-file", {
+    path: "large.txt",
+    pattern: marker,
+    literal: true,
+  });
+  assert.match(search.content[0].text, new RegExp(marker));
+  assert.match(search.content[0].text, new RegExp(`${paddingLines + 1}`));
 });

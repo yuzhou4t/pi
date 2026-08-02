@@ -14,13 +14,19 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createTwoFilesPatch } from "diff";
 import { createJiti } from "jiti";
 import { Type } from "typebox";
 import {
   createAgentSession,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
+  createBashToolDefinition,
+  createEditToolDefinition,
+  createWriteToolDefinition,
   DefaultResourceLoader,
   defineTool,
   getAgentDir,
@@ -48,18 +54,15 @@ import {
 } from "./vercelReadConnector.js";
 import { VERIFICATION_RECIPE_IDS } from "./verificationRecipes.js";
 import {
-  applyBoundFileTransitions,
-  createFilteredProjectSnapshot,
   isFilteredProjectPath,
   normalizeProjectPath,
-  readBoundFileState,
   readSafeAgentsFiles,
-  recomputeChangeSet,
   sha256,
 } from "./workspace.js";
 
 export const PROJECT_WORK_DEFAULT_TOOL_NAMES = [
   "read",
+  "bash",
   "edit",
   "write",
   "grep",
@@ -78,9 +81,6 @@ export const PROJECT_WORK_DEFAULT_TOOL_NAMES = [
   "report_progress",
   "update_plan",
   "ask_user",
-  "request_verification",
-  "request_workspace_command",
-  "request_git_closeout",
 ];
 export const PROJECT_WORK_IMAGE_TOOL_NAME = "generate_image";
 export const PROJECT_WORK_PREVIEW_TOOL_NAME = "request_preview";
@@ -110,6 +110,9 @@ export function restoreProjectWorkSessionEntry({
 }
 const TOOL_NAMES = [
   ...PROJECT_WORK_DEFAULT_TOOL_NAMES,
+  "request_verification",
+  "request_workspace_command",
+  "request_git_closeout",
   PROJECT_WORK_IMAGE_TOOL_NAME,
   PROJECT_WORK_PREVIEW_TOOL_NAME,
   PROJECT_WORK_SUBAGENT_TOOL_NAME,
@@ -117,6 +120,15 @@ const TOOL_NAMES = [
   ...GITHUB_READ_TOOL_NAMES,
   ...VERCEL_READ_TOOL_NAMES,
 ];
+const PI_NATIVE_BUILTIN_TOOL_NAMES = new Set([
+  "read",
+  "bash",
+  "edit",
+  "write",
+  "grep",
+  "find",
+  "ls",
+]);
 const MAX_TOOL_FILE_BYTES = 1024 * 1024;
 const MAX_SEARCH_BYTES = 8 * 1024 * 1024;
 const MAX_SEARCH_FILES = 2_000;
@@ -128,20 +140,258 @@ const STANDARD_THINKING_LEVELS = [
   "medium",
   "high",
 ];
+const NATIVE_SHELL_PRIVATE_PREFIX = /^(?:PI_|CODEX_|ANTHROPIC_|ARK_|AZURE_OPENAI_|DEEPSEEK_|FEISHU_|GEMINI_|GOOGLE_AI_|LARK_|MISTRAL_|NOTIFICATION_|OPENAI_|SLACK_|TAVILY_|TEAMS_|VOLCENGINE_)/iu;
+const NATIVE_SHELL_SECRET_NAME = /(?:^|_)(?:API_?KEY|AUTH(?:ORIZATION)?|CREDENTIALS?|PASSWORD|SECRET|TOKEN|WEBHOOK)(?:_|$)/iu;
+const NATIVE_SHELL_TRUSTED_AUTH_NAMES = new Set([
+  "SSH_AGENT_PID",
+  "SSH_AUTH_SOCK",
+]);
+
+async function notifyNativeToolEvent(listener, event, { required = false } = {}) {
+  if (typeof listener !== "function") return;
+  const notification = Promise.resolve().then(() => listener(event));
+  if (required) {
+    await notification;
+  } else {
+    await notification.catch(() => undefined);
+  }
+}
+
+export function createNativeProjectShellEnvironment(baseEnvironment) {
+  return Object.fromEntries(
+    Object.entries(baseEnvironment ?? {}).filter(([name, value]) => (
+      typeof value === "string"
+      && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)
+      && !NATIVE_SHELL_PRIVATE_PREFIX.test(name)
+      && (
+        NATIVE_SHELL_TRUSTED_AUTH_NAMES.has(name)
+        || !NATIVE_SHELL_SECRET_NAME.test(name)
+      )
+    )),
+  );
+}
+
+function resolveNativeToolPath(cwd, filePath) {
+  const source = String(filePath ?? "")
+    .replace(/^@(?=\/|~\/)/u, "");
+  if (source === "~") return homedir();
+  if (source.startsWith("~/")) return path.join(homedir(), source.slice(2));
+  return path.isAbsolute(source) ? path.normalize(source) : path.resolve(cwd, source);
+}
+
+async function readNativeMutationState(absolutePath) {
+  try {
+    const stats = await lstat(absolutePath);
+    if (!stats.isFile() && !stats.isSymbolicLink()) return null;
+    const content = await readFile(absolutePath);
+    return {
+      content,
+      hash: sha256(content),
+      mode: stats.mode & 0o777,
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    return null;
+  }
+}
+
+function nativeMutationEvidence({
+  cwd,
+  toolCallId,
+  toolName,
+  input,
+  before,
+  after,
+  result,
+}) {
+  const absolutePath = resolveNativeToolPath(cwd, input.path);
+  const relativePath = path.relative(cwd, absolutePath);
+  const workspacePath = relativePath === "" || (
+    relativePath !== ".."
+    && !relativePath.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relativePath)
+  )
+    ? (relativePath || ".").replaceAll(path.sep, "/")
+    : null;
+  const beforeText = before?.content.toString("utf8") ?? "";
+  const afterText = after?.content.toString("utf8") ?? "";
+  const displayPath = workspacePath ?? String(input.path ?? "");
+  return {
+    schemaVersion: 1,
+    phase: "completed",
+    toolCallId,
+    toolName,
+    path: String(input.path ?? ""),
+    workspacePath,
+    absolutePath,
+    operation: before ? "update" : "create",
+    beforeHash: before?.hash ?? null,
+    afterHash: after?.hash ?? null,
+    beforeMode: before?.mode ?? null,
+    afterMode: after?.mode ?? null,
+    beforeContent: beforeText,
+    afterContent: afterText,
+    diff: createTwoFilesPatch(
+      displayPath,
+      displayPath,
+      beforeText,
+      afterText,
+      "before",
+      "after",
+      { context: 3 },
+    ),
+    resultDetails: result?.details ?? null,
+  };
+}
+
+function wrapNativeMutationTool(definition, cwd, onNativeFileChange) {
+  return {
+    ...definition,
+    async execute(toolCallId, input, signal, onUpdate, context) {
+      const absolutePath = resolveNativeToolPath(cwd, input.path);
+      const before = await readNativeMutationState(absolutePath);
+      const result = await definition.execute(
+        toolCallId,
+        input,
+        signal,
+        onUpdate,
+        context,
+      );
+      const after = await readNativeMutationState(absolutePath);
+      await notifyNativeToolEvent(
+        onNativeFileChange,
+        nativeMutationEvidence({
+          cwd,
+          toolCallId,
+          toolName: definition.name,
+          input,
+          before,
+          after,
+          result,
+        }),
+      );
+      return result;
+    },
+  };
+}
+
+export function createNativeProjectMutationTools(
+  cwd,
+  { onNativeFileChange } = {},
+) {
+  return [
+    wrapNativeMutationTool(
+      createEditToolDefinition(cwd),
+      cwd,
+      onNativeFileChange,
+    ),
+    wrapNativeMutationTool(
+      createWriteToolDefinition(cwd),
+      cwd,
+      onNativeFileChange,
+    ),
+  ];
+}
+
+export function createNativeProjectBashTool(
+  cwd,
+  { settingsManager, onNativeBashEvent } = {},
+) {
+  const definition = createBashToolDefinition(cwd, {
+    commandPrefix: settingsManager?.getShellCommandPrefix?.(),
+    shellPath: settingsManager?.getShellPath?.(),
+    exposeSessionEnvironment: false,
+    spawnHook(context) {
+      return {
+        ...context,
+        env: createNativeProjectShellEnvironment(context.env),
+      };
+    },
+  });
+  return {
+    ...definition,
+    async execute(toolCallId, input, signal, onUpdate, context) {
+      const startedAt = Date.now();
+      await notifyNativeToolEvent(onNativeBashEvent, {
+        schemaVersion: 1,
+        phase: "started",
+        toolCallId,
+        toolName: "bash",
+        cwd,
+        command: input.command,
+        timeout: input.timeout ?? null,
+        startedAt,
+      }, { required: true });
+      let eventQueue = Promise.resolve();
+      const forwardUpdate = (update) => {
+        onUpdate?.(update);
+        eventQueue = eventQueue.then(() => notifyNativeToolEvent(
+          onNativeBashEvent,
+          {
+            schemaVersion: 1,
+            phase: "update",
+            toolCallId,
+            toolName: "bash",
+            update,
+          },
+        ));
+      };
+      try {
+        const result = await definition.execute(
+          toolCallId,
+          input,
+          signal,
+          forwardUpdate,
+          context,
+        );
+        await eventQueue;
+        await notifyNativeToolEvent(onNativeBashEvent, {
+          schemaVersion: 1,
+          phase: "completed",
+          toolCallId,
+          toolName: "bash",
+          result,
+          startedAt,
+          endedAt: Date.now(),
+        });
+        return result;
+      } catch (error) {
+        await eventQueue;
+        await notifyNativeToolEvent(onNativeBashEvent, {
+          schemaVersion: 1,
+          phase: signal?.aborted ? "aborted" : "failed",
+          toolCallId,
+          toolName: "bash",
+          error: error instanceof Error ? error.message : String(error),
+          startedAt,
+          endedAt: Date.now(),
+        });
+        throw error;
+      }
+    },
+  };
+}
+
 const PI_SUBAGENTS_EXTENSION_PATH = fileURLToPath(import.meta.resolve("pi-subagents"));
-const PI_SUBAGENT_CONTAINED_TOOLS_EXTENSION_PATH = fileURLToPath(
-  new URL("./subagentContainedTools.js", import.meta.url),
-);
 const PI_SUBAGENT_PROCESS_SUPERVISOR_PATH = fileURLToPath(
   new URL("./subagentProcessSupervisor.js", import.meta.url),
 );
-const PI_AGENT_CONTAINED_SUBAGENT_NAME = "pi-agent-contained-scout";
-const PI_AGENT_SUBAGENT_VIEW_PREFIX = "pi-agent-ultra-read-view-";
-const PI_AGENT_SUBAGENT_VIEW_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const SUBAGENT_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
-const SUBAGENT_MAX_TASKS_PER_TURN = 3;
-const SUBAGENT_TURN_BUDGET = Object.freeze({ maxTurns: 12, graceTurns: 1 });
-const SUBAGENT_TOOL_BUDGET = Object.freeze({ soft: 20, hard: 28, block: "*" });
+const SUBAGENT_WRITE_TOOLS = [
+  ...SUBAGENT_READ_ONLY_TOOLS,
+  "bash",
+  "edit",
+  "write",
+];
+const SUBAGENT_READ_AGENT = "delegate";
+const SUBAGENT_WRITE_AGENT = "worker";
+const SUBAGENT_CONTROL_ACTIONS = new Set([
+  "status",
+  "interrupt",
+  "stop",
+  "resume",
+  "steer",
+]);
 const SUBAGENT_ALLOWED_TOP_LEVEL_FIELDS = new Set([
   "agent",
   "task",
@@ -166,31 +416,30 @@ const SUBAGENT_ALLOWED_TASK_FIELDS = new Set([
   "toolBudget",
   "reads",
   "acceptance",
+  "model",
+  "thinking",
 ]);
 const ULTRA_GUIDANCE = [
-  "Ultra mode combines the current model's native max thinking level with bounded read-only subagents.",
-  "Delegate only independent codebase inspection or review tasks that materially benefit from parallel work.",
-  "Use the subagent tool in foreground mode only, with the built-in delegate agent, fresh context, and at most three total child tasks in this turn.",
-  "Use only one of these minimal shapes: {\"agent\":\"delegate\",\"task\":\"...\"} or {\"tasks\":[{\"agent\":\"delegate\",\"task\":\"...\"}]}. Omit reads, acceptance, budgets, cwd, model, output, and management fields; the server fixes those safely.",
-  "The delegate agent is already available. Do not call subagent management actions such as list or status.",
-  "Subagents can only read, grep, find, and list relative paths in a temporary filtered project view. They cannot edit files, run shell commands, load extensions, approve changes, or inspect arbitrary absolute paths.",
-  "Treat child reports as advisory. Verify relevant findings with the parent's contained tools before proposing changes or making claims.",
+  "Ultra mode combines the current model's native max thinking level with Pi child sessions managed by this Runtime.",
+  "Use delegate for independent read-only inspection and worker only for an explicitly useful implementation task. Do not mix readers and writers in one parallel call.",
+  "Read-only children use the current real Workspace. Git writer children receive separate persistent registered worktrees; never request pi-subagents' temporary worktree mode or choose a cwd yourself.",
+  "A child may use a different configured Pi model through the model field. Keep child calls foreground so the parent can inspect the real result before continuing.",
+  "Use status, interrupt, stop, resume, or steer only for a child run already created by this session. Do not expose raw prompts, absolute paths, session ids, credentials, or internal runtime details in the final response.",
+  "Treat child reports as advisory. Verify relevant findings before making user-facing claims.",
 ].join("\n");
 const subagentJiti = createJiti(import.meta.url);
 let subagentCapabilityApiPromise = null;
 const APP_GUIDANCE = [
   "You are working directly in the user's selected persistent project Workspace.",
-  "Reads always use the current Workspace files. Writes are executed only through the app's exact per-write approval policy and are recorded with before/after hashes.",
-  "Use only the provided contained file tools. Project reads cannot access paths outside the Workspace; read may additionally load text resources only under the exact enabled Skill directories advertised in the Skills list.",
-  "Every contained project-tool path must be relative to the project root. Use \".\" for the root directory; never pass an absolute working-directory, runtime, or home path.",
+  "Use Pi's native read, bash, edit, write, grep, find, and ls tools. Edits and writes update this trusted Workspace immediately; inspect the current file before changing it and verify important changes with the real project toolchain.",
+  "Bash runs in this same Workspace and returns output to the current tool call, so continue the normal inspect, run, fix, and rerun loop without asking the user to shuttle command output. The host removes its own model, notification, and internal credentials from child shell environments.",
+  "Project and global Pi Settings, AGENTS.md or CLAUDE.md, Skills, prompt templates, and extensions are active. Treat their diagnostics as runtime evidence rather than silently pretending a missing resource loaded.",
   "For non-trivial tasks, use report_progress in the user's language with 1-2 concise sentences stating the fact just confirmed and what comes next. Report only before the first substantive inspection, at a key finding or phase change, when blocked, or before verification. When work continues, include it in the same assistant turn as the next substantive tool call instead of pausing only to report. Never narrate every tool call, and never expose private reasoning, hidden chain-of-thought, secrets, raw tool arguments, or unfiltered tool output.",
   "Keep the public plan current with update_plan.",
-  "Use request_verification only with one registered recipe ID. Never provide a command, argv, shell, installer, watch process, or network option. The app's deterministic server policy resolves the recipe and decides whether it waits, is blocked, or continues after the turn settles.",
-  "Use request_workspace_command only when a registered recipe cannot express an exact project check. It creates a visible confirmation request and never runs immediately; provide one executable, argv array, and relative cwd without Shell, PTY, installers, inline code, backgrounding, or environment overrides.",
+  "Use native Bash for project tests, builds, Git, package commands, and other development work. Do not push, deploy, publish, or send external messages unless the user's request explicitly authorizes that external effect.",
   "Use generate_image only when the user's current explicit message asks to create an image. It creates one conversation-owned image and never writes that binary asset into the project.",
-  "Use write_word_document or write_excel_workbook only when the user's current explicit message asks for a Word document or Excel workbook. These tools create versioned conversation-owned downloads in Files; they never overwrite or add a binary file to the project review overlay.",
-  "Never claim that a write succeeded until the write tool reports that the hash-bound Workspace update was committed and read back.",
-  "Use request_git_closeout only after the exact project changes were applied and their bound verification passed. It creates a reviewed local-commit proposal; it never commits, pushes, opens a PR, or approves itself.",
+  "Use write_word_document or write_excel_workbook only when the user's current explicit message asks for a Word document or Excel workbook. These tools create versioned conversation-owned downloads in Files; they never overwrite or add a binary file to the trusted Workspace.",
+  "Report a file change as complete only after the native tool succeeds, and report verification from the exact command result rather than inferred status.",
 ].join("\n");
 const STANDALONE_GUIDANCE = [
   "This conversation is not connected to any user folder or project.",
@@ -393,14 +642,20 @@ export function createPublicHarnessSnapshot({
   model,
   thinkingLevel,
   activeTools,
+  availableTools,
   enabledSkillPaths,
   workspaceKind,
   workspaceSnapshot,
   agentsFiles,
+  resourceSummary,
 } = {}) {
+  const availableToolNames = new Set([
+    ...TOOL_NAMES,
+    ...(Array.isArray(availableTools) ? availableTools : []),
+  ]);
   const toolNames = Array.isArray(activeTools)
     ? [...new Set(activeTools.filter((name) => (
-        typeof name === "string" && TOOL_NAMES.includes(name)
+        typeof name === "string" && availableToolNames.has(name)
       )))]
     : [];
   const skillNames = Array.isArray(enabledSkillPaths)
@@ -431,6 +686,20 @@ export function createPublicHarnessSnapshot({
       projectRules: projectRuleCount,
       conversationDocuments: "on_demand",
       conversationAttachments: "on_demand",
+    },
+    resources: {
+      settings: resourceSummary?.settings === "project_and_global"
+        ? "project_and_global"
+        : "in_memory",
+      extensions: Number.isSafeInteger(resourceSummary?.extensions)
+        ? resourceSummary.extensions
+        : 0,
+      prompts: Number.isSafeInteger(resourceSummary?.prompts)
+        ? resourceSummary.prompts
+        : 0,
+      themes: Number.isSafeInteger(resourceSummary?.themes)
+        ? resourceSummary.themes
+        : 0,
     },
     prompt: {
       layers: promptLayers,
@@ -491,21 +760,22 @@ function requestedSubagentTaskCount(input) {
 }
 
 export function createProjectWorkSubagentPolicyExtension({
-  prepareReadOnlyView = async () => null,
-  releaseReadOnlyView = async () => undefined,
+  prepareNativeChildWorkspaces = async () => [],
+  getWritesAllowed = () => false,
+  setCapabilityCeiling = () => undefined,
 } = {}) {
-  let spawnedThisTurn = 0;
   return {
     name: "pi-agent-subagent-policy",
     hidden: true,
     factory(pi) {
-      pi.on("agent_start", async () => {
-        spawnedThisTurn = 0;
-        await releaseReadOnlyView();
+      const useReadOnlyCeiling = () => setCapabilityCeiling({
+        allowedTools: SUBAGENT_READ_ONLY_TOOLS,
+        denyExtensions: true,
       });
-      pi.on("tool_result", async (event) => {
+      pi.on("agent_start", useReadOnlyCeiling);
+      pi.on("tool_result", (event) => {
         if (event.toolName === PROJECT_WORK_SUBAGENT_TOOL_NAME) {
-          await releaseReadOnlyView();
+          useReadOnlyCeiling();
         }
       });
       pi.on("tool_call", async (event) => {
@@ -514,24 +784,35 @@ export function createProjectWorkSubagentPolicyExtension({
         }
         const input = event.input;
         if (
+          input
+          && typeof input === "object"
+          && !Array.isArray(input)
+          && input.action !== undefined
+        ) {
+          if (!SUBAGENT_CONTROL_ACTIONS.has(input.action)) {
+            return {
+              block: true,
+              reason: "这里只允许查看、引导、停止或恢复当前 Session 的子任务。",
+            };
+          }
+          return undefined;
+        }
+        if (
           !input
           || typeof input !== "object"
           || Array.isArray(input)
           || !isAllowedSubagentFieldSet(input, SUBAGENT_ALLOWED_TOP_LEVEL_FIELDS)
-          || input.action !== undefined
           || input.chain !== undefined
           || input.worktree !== undefined
           || input.cwd !== undefined
           || input.output !== undefined
-          || input.model !== undefined
-          || input.thinking !== undefined
           || input.skill !== undefined
           || input.sessionDir !== undefined
           || input.share !== undefined
         ) {
           return {
             block: true,
-            reason: "Ultra 子智能体只允许前台只读的单任务或并行检查。",
+            reason: "子 Session 只能使用受管的单任务或同类型并行任务。",
           };
         }
         const tasks = Array.isArray(input.tasks) ? input.tasks : null;
@@ -544,230 +825,143 @@ export function createProjectWorkSubagentPolicyExtension({
               || typeof task !== "object"
               || Array.isArray(task)
               || !isAllowedSubagentFieldSet(task, SUBAGENT_ALLOWED_TASK_FIELDS)
-              || task.agent !== "delegate"
+              || ![SUBAGENT_READ_AGENT, SUBAGENT_WRITE_AGENT].includes(task.agent)
               || (task.count !== undefined && task.count !== 1)
             ))
           )
         ) {
           return {
             block: true,
-            reason: "Ultra 并行任务只能使用内置 delegate，且每项只能启动一次。",
+            reason: "并行子 Session 只能使用内置 delegate 或 worker，且每项只能启动一次。",
           };
         }
-        if (!tasks && input.agent !== "delegate") {
-          return {
-            block: true,
-            reason: "Ultra 子智能体只能使用经过约束的内置 delegate。",
-          };
-        }
-        const requestedTasks = requestedSubagentTaskCount(input);
         if (
-          requestedTasks < 1
-          || requestedTasks > SUBAGENT_MAX_TASKS_PER_TURN
-          || spawnedThisTurn > 0
+          !tasks
+          && ![SUBAGENT_READ_AGENT, SUBAGENT_WRITE_AGENT].includes(input.agent)
         ) {
           return {
             block: true,
-            reason: "Ultra 每轮只允许一次并行检查，单次最多启动 3 个只读子智能体。",
+            reason: "子 Session 只能使用内置 delegate 或 worker。",
           };
         }
-        const taskTexts = tasks
-          ? tasks.map((task) => task.task)
-          : [input.task];
-        if (taskTexts.some((task) => (
-          typeof task !== "string"
-          || !task.trim()
-          || task.length > 16_000
+        const requestedTasks = requestedSubagentTaskCount(input);
+        if (requestedTasks < 1) {
+          return {
+            block: true,
+            reason: "子 Session 任务不能为空。",
+          };
+        }
+        const requestedItems = tasks ?? [{
+          agent: input.agent,
+          task: input.task,
+          model: input.model,
+          thinking: input.thinking,
+        }];
+        if (requestedItems.some((task) => (
+          typeof task.task !== "string"
+          || !task.task.trim()
+          || task.task.length > 16_000
+          || (
+            task.model !== undefined
+            && (
+              typeof task.model !== "string"
+              || !task.model.trim()
+              || task.model.length > 240
+              || /[\u0000-\u001f\u007f]/u.test(task.model)
+            )
+          )
+          || (
+            task.thinking !== undefined
+            && typeof task.thinking !== "string"
+          )
         ))) {
           return {
             block: true,
-            reason: "Ultra 子智能体任务必须是非空的有界文本。",
+            reason: "子 Session 的任务、模型或思考强度无效。",
           };
         }
-        spawnedThisTurn = requestedTasks;
-        let readOnlyView;
+        const modes = new Set(requestedItems.map((task) => (
+          task.agent === SUBAGENT_WRITE_AGENT ? "write" : "read"
+        )));
+        if (modes.size !== 1) {
+          return {
+            block: true,
+            reason: "只读与写入子 Session 不能在同一个并行调用中混用。",
+          };
+        }
+        const mode = [...modes][0];
+        if (mode === "write" && getWritesAllowed() !== true) {
+          return {
+            block: true,
+            reason: "当前只读工作流不能启动写入子 Session。",
+          };
+        }
+        let allocations;
         try {
-          readOnlyView = await prepareReadOnlyView();
+          allocations = await prepareNativeChildWorkspaces({
+            tasks: requestedItems.map((task) => ({
+              mode,
+              model: task.model?.trim() || null,
+            })),
+          });
         } catch {
-          spawnedThisTurn = 0;
           return {
             block: true,
-            reason: "Ultra 子智能体的受控只读项目视图未能准备完成。",
+            reason: mode === "write"
+              ? "写入子 Session 的长期 Workspace 未能准备完成。"
+              : "子 Session 无法连接当前 Workspace。",
           };
         }
-        const readOnlyCwd = readOnlyView?.cwd;
-        if (typeof readOnlyCwd !== "string" || !path.isAbsolute(readOnlyCwd)) {
-          spawnedThisTurn = 0;
-          await releaseReadOnlyView();
+        if (
+          !Array.isArray(allocations)
+          || allocations.length !== requestedItems.length
+          || allocations.some((allocation) => (
+            !allocation
+            || typeof allocation.cwd !== "string"
+            || !path.isAbsolute(allocation.cwd)
+            || allocation.persistent !== true
+          ))
+        ) {
           return {
             block: true,
-            reason: "Ultra 子智能体的受控只读项目视图尚未准备完成。",
+            reason: "子 Session 的持久 Workspace 尚未准备完成。",
           };
         }
-        const snapshotGuidance = readOnlyView.snapshot?.truncated === true
-          ? [
-              "The server-created read-only project view is truncated by safety limits.",
-              Number.isSafeInteger(readOnlyView.snapshot.includedFiles)
-                ? `It contains ${readOnlyView.snapshot.includedFiles} files.`
-                : "It contains only a bounded subset of files.",
-              "Do not claim complete-project coverage; ask the parent to verify missing paths.",
-            ].join(" ")
-          : "";
-        const boundedTask = (task) => [task.trim(), snapshotGuidance]
-          .filter(Boolean)
-          .join("\n\n");
-        const singleTask = input.task;
+        setCapabilityCeiling({
+          allowedTools: mode === "write"
+            ? SUBAGENT_WRITE_TOOLS
+            : SUBAGENT_READ_ONLY_TOOLS,
+          denyExtensions: true,
+        });
         for (const key of Object.keys(input)) delete input[key];
         if (tasks) {
-          input.tasks = tasks.map((task) => ({
-            agent: PI_AGENT_CONTAINED_SUBAGENT_NAME,
-            task: boundedTask(task.task),
+          input.tasks = requestedItems.map((task, index) => ({
+            agent: task.agent,
+            task: task.task.trim(),
+            ...(task.model ? { model: task.model.trim() } : {}),
+            ...(task.thinking ? { thinking: task.thinking } : {}),
+            cwd: allocations[index].cwd,
             acceptance: false,
           }));
         } else {
-          input.agent = PI_AGENT_CONTAINED_SUBAGENT_NAME;
-          input.task = boundedTask(singleTask);
+          input.agent = requestedItems[0].agent;
+          input.task = requestedItems[0].task.trim();
+          if (requestedItems[0].model) input.model = requestedItems[0].model.trim();
+          if (requestedItems[0].thinking) input.thinking = requestedItems[0].thinking;
+          input.cwd = allocations[0].cwd;
         }
         input.async = false;
         input.clarify = false;
         input.context = "fresh";
         input.artifacts = false;
-        input.agentScope = "project";
-        input.cwd = readOnlyCwd;
-        input.timeoutMs = 180_000;
-        input.turnBudget = { ...SUBAGENT_TURN_BUDGET };
-        input.toolBudget = { ...SUBAGENT_TOOL_BUDGET };
+        input.agentScope = "both";
+        input.worktree = false;
         input.acceptance = false;
-        if (tasks) {
-          input.concurrency = Math.min(
-            SUBAGENT_MAX_TASKS_PER_TURN,
-            requestedTasks,
-          );
-        }
+        if (tasks) input.concurrency = requestedTasks;
         return undefined;
       });
     },
   };
-}
-
-async function cleanupStaleProjectWorkSubagentViews() {
-  const cutoff = Date.now() - PI_AGENT_SUBAGENT_VIEW_MAX_AGE_MS;
-  const entries = await readdir(tmpdir(), { withFileTypes: true });
-  await Promise.all(entries.map(async (entry) => {
-    if (
-      !entry.isDirectory()
-      || !entry.name.startsWith(PI_AGENT_SUBAGENT_VIEW_PREFIX)
-    ) {
-      return;
-    }
-    const target = path.join(tmpdir(), entry.name);
-    try {
-      const targetStat = await lstat(target);
-      if (
-        targetStat.isSymbolicLink()
-        || !targetStat.isDirectory()
-        || targetStat.mtimeMs > cutoff
-      ) {
-        return;
-      }
-      await rm(target, { recursive: true, force: true });
-    } catch {
-      // Cleanup is best-effort; preparing the current isolated view stays primary.
-    }
-  }));
-}
-
-export async function createProjectWorkSubagentView({
-  projectRoot,
-  baseRoot,
-  workspaceRoot,
-  directWorkspace = false,
-} = {}) {
-  await cleanupStaleProjectWorkSubagentViews().catch(() => undefined);
-  const temporaryRoot = await mkdtemp(
-    path.join(tmpdir(), PI_AGENT_SUBAGENT_VIEW_PREFIX),
-  );
-  const snapshotBaseRoot = path.join(temporaryRoot, "base");
-  const snapshotWorkspaceRoot = path.join(temporaryRoot, "workspace");
-  try {
-    const snapshot = await createFilteredProjectSnapshot({
-      projectRoot,
-      baseRoot: snapshotBaseRoot,
-      workspaceRoot: snapshotWorkspaceRoot,
-    });
-    if (!directWorkspace) {
-      const changeSet = await recomputeChangeSet({
-        conversationId: "ultra-read-view",
-        baseRoot,
-        workspaceRoot,
-        allowDeletes: false,
-      });
-      const transitions = [];
-      for (const file of changeSet.files) {
-        const overlayState = await readBoundFileState(workspaceRoot, file.path);
-        const snapshotState = await readBoundFileState(snapshotWorkspaceRoot, file.path);
-        transitions.push({
-          path: file.path,
-          expectedHash: snapshotState.hash,
-          targetBuffer: overlayState.exists ? overlayState.buffer : null,
-          targetHash: file.afterHash,
-          targetMode: overlayState.mode,
-        });
-      }
-      await applyBoundFileTransitions({
-        root: snapshotWorkspaceRoot,
-        transitions,
-      });
-    }
-    const settingsDirectory = path.join(temporaryRoot, ".pi");
-    const agentDirectory = path.join(settingsDirectory, "agents");
-    await mkdir(settingsDirectory, { recursive: true, mode: 0o700 });
-    await mkdir(agentDirectory, { mode: 0o700 });
-    await writeFile(
-      path.join(settingsDirectory, "settings.json"),
-      `${JSON.stringify({
-        subagents: {
-          defaultExtensions: [],
-        },
-      }, null, 2)}\n`,
-      { mode: 0o600 },
-    );
-    await writeFile(
-      path.join(agentDirectory, `${PI_AGENT_CONTAINED_SUBAGENT_NAME}.md`),
-      [
-        "---",
-        `name: ${PI_AGENT_CONTAINED_SUBAGENT_NAME}`,
-        "description: Server-owned bounded read-only project inspector",
-        "tools:",
-        ...SUBAGENT_READ_ONLY_TOOLS.map((tool) => `  - ${tool}`),
-        "extensions:",
-        `subagentOnlyExtensions: ${PI_SUBAGENT_CONTAINED_TOOLS_EXTENSION_PATH}`,
-        "systemPromptMode: replace",
-        "inheritProjectContext: false",
-        "inheritSkills: false",
-        "defaultContext: fresh",
-        "output: false",
-        "acceptanceRole: read-only",
-        "completionGuard: false",
-        "---",
-        "Inspect only the assigned task through the contained relative-path read tools.",
-        "Return concise findings and never claim access outside the provided view.",
-        "",
-      ].join("\n"),
-      { mode: 0o600 },
-    );
-    return {
-      root: temporaryRoot,
-      cwd: snapshotWorkspaceRoot,
-      snapshot,
-      async dispose() {
-        await rm(temporaryRoot, { recursive: true, force: true });
-      },
-    };
-  } catch (error) {
-    await rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
-    throw error;
-  }
 }
 
 function workspaceSnapshotGuidance(workspaceSnapshot) {
@@ -2458,6 +2652,19 @@ function toNativeThinkingLevel(model, thinkingLevel) {
   return thinkingLevel;
 }
 
+function toPublicThinkingLevel(model, nativeThinkingLevel, requestedThinkingLevel) {
+  if (
+    nativeThinkingLevel === "max"
+    && requestedThinkingLevel === PROJECT_WORK_ULTRA_THINKING_LEVEL
+    && getProjectWorkThinkingLevels(model).includes(
+      PROJECT_WORK_ULTRA_THINKING_LEVEL,
+    )
+  ) {
+    return PROJECT_WORK_ULTRA_THINKING_LEVEL;
+  }
+  return nativeThinkingLevel;
+}
+
 function findSelectedModel(available, requestedModelId, defaults) {
   if (requestedModelId) {
     const separator = requestedModelId.indexOf("/");
@@ -2834,28 +3041,15 @@ export function createPiSessionFactory({
     onPreviewRequest,
     onProgress,
     onWorkspaceWrite,
+    onNativeFileChange,
+    onNativeBashEvent,
+    prepareNativeChildWorkspaces,
     directWorkspace = false,
   } = {}) => {
     const cwd = await realpath(workspaceRoot);
     const runtime = await runtimePromise;
     const available = [...await runtime.getAvailable()];
-    const model = findSelectedModel(available, modelRef, defaults);
-    if (!model) {
-      throw projectWorkError(
-        "PROJECT_WORK_MODEL_UNAVAILABLE",
-        "所选 Pi 模型当前不可用",
-        409,
-        true,
-      );
-    }
-    const availableThinkingLevels = getProjectWorkThinkingLevels(model);
-    if (!availableThinkingLevels.includes(thinkingLevel)) {
-      throw projectWorkError(
-        "PROJECT_WORK_THINKING_LEVEL_UNSUPPORTED",
-        "所选模型不支持该思考强度",
-        400,
-      );
-    }
+    const requestedModel = findSelectedModel(available, modelRef, defaults);
     let sessionManager = SessionManager.continueRecent(cwd, sessionDir);
     if (
       sessionManager.getEntries().length === 0
@@ -2899,18 +3093,33 @@ export function createPiSessionFactory({
     if (path.resolve(sessionManager.getCwd()) !== path.resolve(cwd)) {
       throw projectWorkError(
         "PROJECT_WORK_SESSION_INVALID",
-        "Pi 会话工作目录与私有审阅层不一致",
+        "Pi 会话工作目录与绑定 Workspace 不一致",
         500,
       );
     }
-    const settingsManager = SettingsManager.inMemory(
-      {
-        retry: { enabled: true, maxRetries: 2 },
-        compaction: { enabled: true },
-      },
-      { projectTrusted: false },
-    );
-    const agentsFiles = workspaceKind === "scratch"
+    const nativeParentRuntime = directWorkspace === true
+      && workspaceKind === "bound_project";
+    const continuingSession = sessionManager.getEntries().length > 0;
+    if (!requestedModel && !(nativeParentRuntime && continuingSession)) {
+      throw projectWorkError(
+        "PROJECT_WORK_MODEL_UNAVAILABLE",
+        "所选 Pi 模型当前不可用",
+        409,
+        true,
+      );
+    }
+    if (
+      requestedModel
+      && !(nativeParentRuntime && continuingSession)
+      && !getProjectWorkThinkingLevels(requestedModel).includes(thinkingLevel)
+    ) {
+      throw projectWorkError(
+        "PROJECT_WORK_THINKING_LEVEL_UNSUPPORTED",
+        "所选模型不支持该思考强度",
+        400,
+      );
+    }
+    let agentsFiles = workspaceKind === "scratch"
       ? []
       : await readSafeAgentsFiles(projectRoot);
     const appendedGuidance = [
@@ -2921,22 +3130,20 @@ export function createPiSessionFactory({
     let pendingTurnGuidance = "";
     let publicThinkingLevel = thinkingLevel;
     let subagentsAllowedForTurn = false;
-    let activeSubagentView = null;
-    async function releaseActiveSubagentView() {
-      const view = activeSubagentView;
-      activeSubagentView = null;
-      await view?.dispose();
-    }
-    async function prepareActiveSubagentView() {
-      await releaseActiveSubagentView();
-      const view = await createProjectWorkSubagentView({
-        projectRoot,
-        baseRoot,
-        workspaceRoot: cwd,
-        directWorkspace,
-      });
-      activeSubagentView = view;
-      return view;
+    let subagentWritesAllowedForTurn = false;
+    let subagentCapabilityCeiling = null;
+    async function resolveNativeChildWorkspaces(request) {
+      if (typeof prepareNativeChildWorkspaces === "function") {
+        return prepareNativeChildWorkspaces(request);
+      }
+      if (request.tasks.some((task) => task.mode === "write")) {
+        throw new Error("write child workspaces require a server allocator");
+      }
+      return request.tasks.map(() => ({
+        cwd,
+        kind: "shared_workspace",
+        persistent: true,
+      }));
     }
     const turnGuidanceExtension = createProjectWorkTurnGuidanceExtension(
       () => [
@@ -2948,67 +3155,16 @@ export function createPiSessionFactory({
       ].filter(Boolean).join("\n\n"),
     );
     const subagentPolicyExtension = createProjectWorkSubagentPolicyExtension({
-      prepareReadOnlyView: prepareActiveSubagentView,
-      releaseReadOnlyView: releaseActiveSubagentView,
+      prepareNativeChildWorkspaces: resolveNativeChildWorkspaces,
+      getWritesAllowed: () => subagentWritesAllowedForTurn,
+      setCapabilityCeiling: (ceiling) => {
+        subagentCapabilityCeiling?.update(ceiling);
+      },
     });
     const enabledSkillPaths = typeof skillProvider === "function"
       ? await skillProvider()
       : [];
-    const resourceLoader = new DefaultResourceLoader({
-      cwd,
-      agentDir,
-      settingsManager,
-      noExtensions: true,
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
-      noContextFiles: true,
-      additionalExtensionPaths: [PI_SUBAGENTS_EXTENSION_PATH],
-      additionalSkillPaths: enabledSkillPaths,
-      extensionFactories: [turnGuidanceExtension, subagentPolicyExtension],
-      systemPrompt: "",
-      appendSystemPrompt: appendedGuidance,
-      extensionsOverride: (base) => ({
-        ...base,
-        extensions: base.extensions.filter(
-          (extension) => (
-            extension.path === "<inline:pi-agent-turn-guidance>"
-            || extension.path === "<inline:pi-agent-subagent-policy>"
-            || path.resolve(extension.resolvedPath) === path.resolve(
-              PI_SUBAGENTS_EXTENSION_PATH,
-            )
-          ),
-        ),
-        errors: base.errors.filter(
-          (error) => path.resolve(error.path) === path.resolve(
-            PI_SUBAGENTS_EXTENSION_PATH,
-          ),
-        ),
-      }),
-      skillsOverride: (base) => base,
-      promptsOverride: () => ({ prompts: [], diagnostics: [] }),
-      themesOverride: () => ({ themes: [], diagnostics: [] }),
-      agentsFilesOverride: () => ({ agentsFiles }),
-      systemPromptOverride: () => undefined,
-      appendSystemPromptOverride: () => appendedGuidance,
-    });
-    await resourceLoader.reload();
-    const subagentExtensionResult = resourceLoader.getExtensions();
-    const subagentLoadError = subagentExtensionResult.errors[0];
-    const subagentLoaded = subagentExtensionResult.extensions.some(
-      (extension) => path.resolve(extension.resolvedPath) === path.resolve(
-        PI_SUBAGENTS_EXTENSION_PATH,
-      ),
-    );
-    if (subagentLoadError || !subagentLoaded) {
-      throw projectWorkError(
-        "PROJECT_WORK_SUBAGENT_RUNTIME_UNAVAILABLE",
-        "Ultra 子智能体运行时未能加载",
-        500,
-        true,
-      );
-    }
-    const customTools = await createProjectWorkTools({
+    const projectWorkTools = await createProjectWorkTools({
       projectRoot,
       baseRoot,
       workspaceRoot: cwd,
@@ -3032,32 +3188,189 @@ export function createPiSessionFactory({
       directWorkspace,
       enabledSkillPaths,
     });
-    const { session } = await createAgentSession({
-      cwd,
-      agentDir,
-      modelRuntime: runtime,
-      model,
-      thinkingLevel: toNativeThinkingLevel(model, thinkingLevel),
-      settingsManager,
-      resourceLoader,
-      sessionManager,
-      noTools: "builtin",
-      customTools,
-    });
+    const customTools = nativeParentRuntime
+      ? projectWorkTools.filter(
+          (tool) => !PI_NATIVE_BUILTIN_TOOL_NAMES.has(tool.name),
+        )
+      : projectWorkTools;
+    let settingsManager;
+    let resourceLoader;
+    let sessionRuntime = null;
+    let session;
+    let modelFallbackMessage = null;
+    let runtimeDiagnostics = [];
+    if (nativeParentRuntime) {
+      const createRuntime = async ({
+        cwd: runtimeCwd,
+        sessionManager: runtimeSessionManager,
+        sessionStartEvent,
+      }) => {
+        const services = await createAgentSessionServices({
+          cwd: runtimeCwd,
+          agentDir,
+          modelRuntime: runtime,
+          resourceLoaderOptions: {
+            additionalExtensionPaths: [PI_SUBAGENTS_EXTENSION_PATH],
+            additionalSkillPaths: enabledSkillPaths,
+            extensionFactories: [turnGuidanceExtension, subagentPolicyExtension],
+            appendSystemPromptOverride: (base) => [
+              ...base,
+              ...appendedGuidance,
+            ],
+          },
+        });
+        services.settingsManager.applyOverrides({
+          retry: { enabled: true, maxRetries: 2 },
+          compaction: { enabled: true },
+        });
+        const hasHistory = runtimeSessionManager.getEntries().length > 0;
+        const created = await createAgentSessionFromServices({
+          services,
+          sessionManager: runtimeSessionManager,
+          sessionStartEvent,
+          model: hasHistory ? undefined : requestedModel,
+          thinkingLevel: hasHistory
+            ? undefined
+            : toNativeThinkingLevel(requestedModel, thinkingLevel),
+          customTools: [
+            ...customTools,
+            ...createNativeProjectMutationTools(runtimeCwd, {
+              onNativeFileChange,
+            }),
+            createNativeProjectBashTool(runtimeCwd, {
+              settingsManager: services.settingsManager,
+              onNativeBashEvent,
+            }),
+          ],
+        });
+        return {
+          ...created,
+          services,
+          diagnostics: services.diagnostics,
+        };
+      };
+      sessionRuntime = await createAgentSessionRuntime(createRuntime, {
+        cwd,
+        agentDir,
+        sessionManager,
+      });
+      session = sessionRuntime.session;
+      settingsManager = sessionRuntime.services.settingsManager;
+      resourceLoader = sessionRuntime.services.resourceLoader;
+      modelFallbackMessage = sessionRuntime.modelFallbackMessage ?? null;
+      runtimeDiagnostics = [...sessionRuntime.diagnostics];
+      agentsFiles = resourceLoader.getAgentsFiles().agentsFiles;
+      publicThinkingLevel = toPublicThinkingLevel(
+        session.model,
+        session.thinkingLevel,
+        thinkingLevel,
+      );
+    } else {
+      settingsManager = SettingsManager.inMemory(
+        {
+          retry: { enabled: true, maxRetries: 2 },
+          compaction: { enabled: true },
+        },
+        { projectTrusted: false },
+      );
+      resourceLoader = new DefaultResourceLoader({
+        cwd,
+        agentDir,
+        settingsManager,
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        additionalExtensionPaths: [PI_SUBAGENTS_EXTENSION_PATH],
+        additionalSkillPaths: enabledSkillPaths,
+        extensionFactories: [turnGuidanceExtension, subagentPolicyExtension],
+        systemPrompt: "",
+        appendSystemPrompt: appendedGuidance,
+        extensionsOverride: (base) => ({
+          ...base,
+          extensions: base.extensions.filter(
+            (extension) => (
+              extension.path === "<inline:pi-agent-turn-guidance>"
+              || extension.path === "<inline:pi-agent-subagent-policy>"
+              || path.resolve(extension.resolvedPath) === path.resolve(
+                PI_SUBAGENTS_EXTENSION_PATH,
+              )
+            ),
+          ),
+          errors: base.errors.filter(
+            (error) => path.resolve(error.path) === path.resolve(
+              PI_SUBAGENTS_EXTENSION_PATH,
+            ),
+          ),
+        }),
+        skillsOverride: (base) => base,
+        promptsOverride: () => ({ prompts: [], diagnostics: [] }),
+        themesOverride: () => ({ themes: [], diagnostics: [] }),
+        agentsFilesOverride: () => ({ agentsFiles }),
+        systemPromptOverride: () => undefined,
+        appendSystemPromptOverride: () => appendedGuidance,
+      });
+      await resourceLoader.reload();
+      ({ session } = await createAgentSession({
+        cwd,
+        agentDir,
+        modelRuntime: runtime,
+        model: requestedModel,
+        thinkingLevel: toNativeThinkingLevel(requestedModel, thinkingLevel),
+        settingsManager,
+        resourceLoader,
+        sessionManager,
+        noTools: "builtin",
+        customTools,
+      }));
+    }
+    const subagentExtensionResult = resourceLoader.getExtensions();
+    const subagentLoadError = subagentExtensionResult.errors.find(
+      (error) => path.resolve(error.path) === path.resolve(
+        PI_SUBAGENTS_EXTENSION_PATH,
+      ),
+    );
+    const subagentLoaded = subagentExtensionResult.extensions.some(
+      (extension) => path.resolve(extension.resolvedPath) === path.resolve(
+        PI_SUBAGENTS_EXTENSION_PATH,
+      ),
+    );
+    if (subagentLoadError || !subagentLoaded) {
+      if (sessionRuntime) {
+        await sessionRuntime.dispose().catch(() => undefined);
+      } else {
+        session?.dispose();
+      }
+      throw projectWorkError(
+        "PROJECT_WORK_SUBAGENT_RUNTIME_UNAVAILABLE",
+        "Ultra 子智能体运行时未能加载",
+        500,
+        true,
+      );
+    }
+    const loadedSkillPaths = [
+      ...enabledSkillPaths,
+      ...resourceLoader.getSkills().skills.map((skill) => skill.filePath),
+    ].filter((skillPath) => typeof skillPath === "string" && skillPath);
     const { registerSubagentCapabilityCeiling } = await loadSubagentCapabilityApi();
-    const subagentCapabilityCeiling = registerSubagentCapabilityCeiling({
+    subagentCapabilityCeiling = registerSubagentCapabilityCeiling({
       sessionId: sessionManager.getSessionId(),
       source: "pi-agent-project-work",
       ceiling: {
         allowedTools: SUBAGENT_READ_ONLY_TOOLS,
-        // Ambient and model-selected extensions are disabled by the server-owned
-        // project settings. This one fixed child-only extension replaces Pi's
-        // absolute-path-capable builtins with contained equivalents.
-        denyExtensions: false,
+        denyExtensions: true,
       },
     });
-    session.setActiveToolsByName(PROJECT_WORK_DEFAULT_TOOL_NAMES);
-    let requestedToolNames = [...PROJECT_WORK_DEFAULT_TOOL_NAMES];
+    const nativeAmbientToolNames = nativeParentRuntime
+      ? session.getActiveToolNames().filter(
+          (name) => !TOOL_NAMES.includes(name),
+        )
+      : [];
+    let requestedToolNames = [
+      ...PROJECT_WORK_DEFAULT_TOOL_NAMES,
+      ...nativeAmbientToolNames,
+    ];
     function applyActiveTools() {
       const activeTools = (
         publicThinkingLevel === PROJECT_WORK_ULTRA_THINKING_LEVEL
@@ -3068,6 +3381,7 @@ export function createPiSessionFactory({
       session.setActiveToolsByName([...new Set(activeTools)]);
       return session.getActiveToolNames();
     }
+    applyActiveTools();
     async function setModel(nextModelRef) {
       const currentAvailable = [...await runtime.getAvailable()];
       const nextModel = findSelectedModel(currentAvailable, nextModelRef, defaults);
@@ -3081,23 +3395,30 @@ export function createPiSessionFactory({
       }
       await session.setModel(nextModel);
       const nextThinkingLevels = getProjectWorkThinkingLevels(nextModel);
+      const requestedPublicThinkingLevel = publicThinkingLevel;
       if (!nextThinkingLevels.includes(publicThinkingLevel)) {
-        publicThinkingLevel = getProjectWorkDefaultThinkingLevel(
+        const fallbackThinkingLevel = getProjectWorkDefaultThinkingLevel(
           nextModel,
           defaults.thinkingLevel,
         );
         session.setThinkingLevel(
-          toNativeThinkingLevel(nextModel, publicThinkingLevel),
+          toNativeThinkingLevel(nextModel, fallbackThinkingLevel),
         );
       }
+      publicThinkingLevel = toPublicThinkingLevel(
+        session.model,
+        session.thinkingLevel,
+        requestedPublicThinkingLevel,
+      );
       applyActiveTools();
+      const actualModel = session.model;
       return {
-        providerId: nextModel.provider,
-        modelId: nextModel.id,
-        modelRef: `${nextModel.provider}/${nextModel.id}`,
-        thinkingLevels: getProjectWorkThinkingLevels(nextModel),
+        providerId: actualModel.provider,
+        modelId: actualModel.id,
+        modelRef: `${actualModel.provider}/${actualModel.id}`,
+        thinkingLevels: getProjectWorkThinkingLevels(actualModel),
         defaultThinkingLevel: getProjectWorkDefaultThinkingLevel(
-          nextModel,
+          actualModel,
           defaults.thinkingLevel,
         ),
       };
@@ -3114,13 +3435,20 @@ export function createPiSessionFactory({
       session.setThinkingLevel(
         toNativeThinkingLevel(session.model, nextThinkingLevel),
       );
-      publicThinkingLevel = nextThinkingLevel;
+      publicThinkingLevel = toPublicThinkingLevel(
+        session.model,
+        session.thinkingLevel,
+        nextThinkingLevel,
+      );
       applyActiveTools();
       return publicThinkingLevel;
     }
     function setActiveToolsByName(
       nextToolNames,
-      { allowSubagents = false } = {},
+      {
+        allowSubagents = false,
+        allowSubagentWrites = false,
+      } = {},
     ) {
       if (!Array.isArray(nextToolNames)) {
         throw projectWorkError(
@@ -3134,27 +3462,28 @@ export function createPiSessionFactory({
         normalized.some(
           (name) => (
             typeof name !== "string"
-            || !TOOL_NAMES.includes(name)
+            || !session.getToolDefinition(name)
             || name === PROJECT_WORK_SUBAGENT_TOOL_NAME
           ),
         )
       ) {
         throw projectWorkError(
           "PROJECT_WORK_TOOL_UNAVAILABLE",
-          "请求启用的工具不在 Pi Agent 白名单中",
+          "请求启用的工具不在当前 Pi 会话中",
           400,
         );
       }
-      requestedToolNames = normalized;
+      const usesNativeDefaults = nativeParentRuntime
+        && PROJECT_WORK_DEFAULT_TOOL_NAMES.every(
+          (name) => normalized.includes(name),
+        );
+      requestedToolNames = usesNativeDefaults
+        ? [...new Set([...normalized, ...nativeAmbientToolNames])]
+        : normalized;
       subagentsAllowedForTurn = allowSubagents === true;
+      subagentWritesAllowedForTurn = subagentsAllowedForTurn
+        && allowSubagentWrites === true;
       return applyActiveTools();
-    }
-    async function withSubagentCleanup(operation) {
-      try {
-        return await operation();
-      } finally {
-        await releaseActiveSubagentView();
-      }
     }
     function assertTreeOperationReady(action) {
       if (session.isStreaming) {
@@ -3196,10 +3525,8 @@ export function createPiSessionFactory({
       const content = structuredClone(entry.message.content);
       pendingTurnGuidance = String(options.turnGuidance ?? "").trim();
       try {
-        return await withSubagentCleanup(async () => {
-          await navigateToEntry(piUserEntryId);
-          return session.sendUserMessage(content);
-        });
+        await navigateToEntry(piUserEntryId);
+        return session.sendUserMessage(content);
       } finally {
         pendingTurnGuidance = "";
       }
@@ -3229,10 +3556,8 @@ export function createPiSessionFactory({
       } = options;
       pendingTurnGuidance = String(turnGuidance ?? "").trim();
       try {
-        return await withSubagentCleanup(async () => {
-          await navigateToEntry(piAssistantEntryId);
-          return session.prompt(promptText, promptOptions);
-        });
+        await navigateToEntry(piAssistantEntryId);
+        return session.prompt(promptText, promptOptions);
       } finally {
         pendingTurnGuidance = "";
       }
@@ -3250,15 +3575,46 @@ export function createPiSessionFactory({
       get thinkingLevel() {
         return publicThinkingLevel;
       },
+      get modelRef() {
+        return session.model
+          ? `${session.model.provider}/${session.model.id}`
+          : null;
+      },
+      get modelFallbackMessage() {
+        return modelFallbackMessage;
+      },
+      get runtimeDiagnostics() {
+        return runtimeDiagnostics.map((diagnostic) => ({
+          type: diagnostic.type,
+          message: diagnostic.message,
+        }));
+      },
+      getToolSources() {
+        return Object.fromEntries(
+          session.getAllTools().map((tool) => [
+            tool.name,
+            tool.sourceInfo.source,
+          ]),
+        );
+      },
       getHarnessSnapshot() {
         return createPublicHarnessSnapshot({
           model: session.model,
           thinkingLevel: publicThinkingLevel,
           activeTools: session.getActiveToolNames(),
-          enabledSkillPaths,
+          availableTools: session.getAllTools().map((tool) => tool.name),
+          enabledSkillPaths: loadedSkillPaths,
           workspaceKind,
           workspaceSnapshot,
           agentsFiles,
+          resourceSummary: {
+            settings: nativeParentRuntime
+              ? "project_and_global"
+              : "in_memory",
+            extensions: resourceLoader.getExtensions().extensions.length,
+            prompts: resourceLoader.getPrompts().prompts.length,
+            themes: resourceLoader.getThemes().themes.length,
+          },
         });
       },
       async prompt(text, options = {}) {
@@ -3275,9 +3631,7 @@ export function createPiSessionFactory({
         }
         pendingTurnGuidance = String(turnGuidance ?? "").trim();
         try {
-          return await withSubagentCleanup(
-            () => session.prompt(text, promptOptions),
-          );
+          return await session.prompt(text, promptOptions);
         } finally {
           pendingTurnGuidance = "";
         }
@@ -3384,11 +3738,12 @@ export function createPiSessionFactory({
           },
         };
         const content = [
-          "A previously user-confirmed verification command failed inside the isolated verification workspace.",
-          "Fix only the project files available through the contained overlay tools.",
+          "A previously registered legacy verification command failed. This compatibility repair runs in the conversation's real persistent Workspace.",
+          "Inspect and repair only files in this bound Workspace with the currently enabled tools. Edits take effect in the Workspace immediately and are recorded as native mutation evidence.",
+          "Treat any older isolated-copy or review-overlay records as historical evidence only; do not recreate or execute them.",
           "For this non-trivial repair, use report_progress in the user's language with 1-2 concise sentences only at a key finding, phase change, blocker, or before verification; state the fact just confirmed and what comes next. When work continues, include it in the same assistant turn as the next substantive tool call instead of pausing only to report. Never narrate every tool call, and never include private reasoning, secrets, raw tool arguments, or unfiltered tool output.",
-          "Do not request, invent, replace, or run another command. Do not ask for write approval, apply changes to the real project, start a preview, enqueue follow-ups, or ask the user a question.",
-          "The application will rerun only the exact bound command after this repair turn. The resulting diff still requires the normal hash-bound user confirmation.",
+          "Do not request, invent, replace, or run another command. Do not start a preview, enqueue follow-ups, or ask the user a question.",
+          "The application may rerun only the exact bound legacy command after this repair turn. Do not report success until that exact rerun passes.",
           JSON.stringify(payload),
         ].join("\n\n");
         return session.sendCustomMessage({
@@ -3454,9 +3809,13 @@ export function createPiSessionFactory({
         return session.subscribe(listener);
       },
       dispose() {
-        releaseActiveSubagentView().catch(() => undefined);
-        subagentCapabilityCeiling.dispose();
-        session.dispose();
+        subagentCapabilityCeiling?.dispose();
+        if (sessionRuntime) {
+          return sessionRuntime.dispose().catch(() => undefined);
+        } else {
+          session.dispose();
+          return undefined;
+        }
       },
     };
   };
