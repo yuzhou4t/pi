@@ -1357,6 +1357,34 @@ test("conversation mapping preserves blocked auto-review evidence", () => {
   assert.equal(mapped.verificationCommand, null);
 });
 
+test("conversation mapping preserves retired verification provenance", () => {
+  const mapped = mapProjectWorkConversation({
+    id: "conversation-legacy-verification",
+    project_id: "project-1",
+    verifications: [{
+      id: "legacy-attempt",
+      command_id: "legacy-request",
+      status: "legacy_superseded",
+      legacy_status: "failed",
+      error_code: "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE",
+      superseded_at: "2026-08-03T00:00:00.000Z",
+      command: "swift test",
+    }],
+  });
+
+  assert.equal(mapped.verificationRuns[0].status, "legacy_superseded");
+  assert.equal(mapped.verificationRuns[0].legacyStatus, "failed");
+  assert.equal(
+    mapped.verificationRuns[0].errorCode,
+    "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE",
+  );
+  assert.equal(
+    mapped.verificationRuns[0].supersededAt,
+    "2026-08-03T00:00:00.000Z",
+  );
+  assert.equal(mapped.verificationCommand, null);
+});
+
 test("execution policy mutation is revision-bound and maps the returned policy", async () => {
   const nativeConversation = mapProjectWorkConversation({
     conversation: {

@@ -3317,6 +3317,74 @@ test("thinking lifecycle copy follows waiting, stopped, and failed terminal stat
   });
 });
 
+test("a retired verification failure follows the normalized conversation status", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+      events: [
+        {
+          seq: 1,
+          type: "message.created",
+          data: { id: "user-native", turnId: "turn-native", turnSeq: 1 },
+        },
+        { seq: 2, type: "agent.thinking", status: "active" },
+        { seq: 3, type: "agent.thinking", status: "finished" },
+        {
+          seq: 4,
+          type: "message.completed",
+          status: "completed",
+          data: { isFinal: true, text: "本轮回答已经完成" },
+        },
+        { seq: 5, type: "turn.completed", status: "completed" },
+        { seq: 6, type: "agent.status", status: "verification_failed" },
+      ],
+      running: false,
+      compact: false,
+      transparentMode: true,
+      terminalStatus: "idle",
+      onOpenArtifact: () => {},
+    }));
+
+    assert.match(html, /Agent 透视 · 已完成/);
+    assert.match(html, /已完成当前阶段的判断/);
+    assert.doesNotMatch(html, /Agent 透视 · 未完成|本轮思考未完成/);
+  });
+});
+
+test("a current failed verification still keeps the completed model turn incomplete", async () => {
+  await withLiveWorkbench(({ ActivityTimeline }) => {
+    const html = renderToStaticMarkup(React.createElement(ActivityTimeline, {
+      events: [
+        {
+          seq: 1,
+          type: "message.created",
+          data: { id: "user-failed", turnId: "turn-failed", turnSeq: 1 },
+        },
+        {
+          seq: 2,
+          type: "message.completed",
+          status: "completed",
+          data: { isFinal: true, text: "验证结果如下" },
+        },
+        {
+          seq: 3,
+          type: "verification.completed",
+          status: "failed",
+          data: { status: "failed" },
+        },
+        { seq: 4, type: "agent.status", status: "verification_failed" },
+      ],
+      running: false,
+      compact: false,
+      transparentMode: true,
+      terminalStatus: "verification_failed",
+      onOpenArtifact: () => {},
+    }));
+
+    assert.match(html, /Agent 透视 · 未完成/);
+    assert.doesNotMatch(html, /Agent 透视 · 已完成/);
+  });
+});
+
 test("public progress narration uses comfortable desktop working text", async () => {
   const styles = await readFile(STYLES_URL, "utf8");
   const progressStart = styles.indexOf(".project-activity-progress p {");
@@ -4300,6 +4368,42 @@ test("an unresolved verification stays prominent and suppresses a false complete
     assert.match(html, /仍有一个断言失败/);
     assert.match(html, /打开运行/);
     assert.doesNotMatch(html, /本轮已完成|Pi Agent 已完成本轮工作/);
+  });
+});
+
+test("retired copied verification chains never reopen the verification card", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench, verificationAttention }) => {
+    const retired = conversation({
+      status: "verification_failed",
+      verificationCommand: {
+        id: "legacy-command",
+        label: "Swift 测试",
+        displayCommand: "swift test --disable-automatic-resolution",
+        status: "legacy_superseded",
+      },
+      verificationRuns: [{
+        id: "legacy-command",
+        status: "legacy_superseded",
+        command: "swift test --disable-automatic-resolution",
+        logs: [],
+        checks: [],
+      }, {
+        id: "legacy-attempt",
+        commandId: "legacy-command",
+        status: "failed",
+        errorCode: "PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE",
+        command: "swift test --disable-automatic-resolution",
+        summary: "旧验证副本超过限制",
+        logs: ["PROJECT_WORK_VERIFICATION_WORKSPACE_TOO_LARGE"],
+        checks: [],
+      }],
+    });
+    assert.equal(verificationAttention(retired), null);
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project,
+      conversation: retired,
+    }));
+    assert.doesNotMatch(html, /验证未通过|打开运行/);
   });
 });
 
