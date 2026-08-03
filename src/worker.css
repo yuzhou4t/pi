@@ -19,17 +19,6 @@
   overflow-y: auto;
 }
 
-.worker-new-task-form {
-  display: grid;
-  gap: 8px;
-  margin: 2px 0 6px;
-  padding: 9px;
-  background: var(--surface);
-  border: 1px solid var(--teal-border);
-  border-radius: 8px;
-}
-
-.worker-new-task-form label,
 .worker-delivery-form label,
 .worker-source-import label {
   display: grid;
@@ -39,7 +28,6 @@
   font-size: 11.5px;
 }
 
-.worker-new-task-form input,
 .worker-delivery-form input,
 .worker-delivery-form select,
 .worker-delivery-form textarea,
@@ -59,35 +47,11 @@
   font: inherit;
 }
 
-.worker-new-task-form input:focus,
 .worker-delivery-form :is(input, select, textarea):focus,
 .worker-source-import :is(input, select, textarea):focus,
 .worker-ask-user-card :is(input, select):focus {
   border-color: var(--teal-accent);
   box-shadow: 0 0 0 2px var(--teal-tint);
-}
-
-.worker-new-task-form > div {
-  display: flex;
-  justify-content: flex-end;
-  gap: 6px;
-}
-
-.worker-new-task-form button {
-  min-height: 29px;
-  padding: 0 9px;
-  cursor: pointer;
-  color: var(--muted);
-  background: var(--surface-soft);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-size: 11.5px;
-}
-
-.worker-new-task-form button[type="submit"] {
-  color: #fff;
-  background: var(--teal-accent);
-  border-color: transparent;
 }
 
 .worker-list-heading {
@@ -362,16 +326,73 @@
 }
 
 .worker-plan-progress {
-  display: grid;
   max-width: 680px;
-  gap: 10px;
-  padding: 11px 12px;
   background: var(--surface-soft);
   border: 1px solid var(--border);
   border-radius: 9px;
+  overflow: hidden;
 }
 
-.worker-plan-progress > div {
+.worker-plan-progress-toggle {
+  display: flex;
+  width: 100%;
+  min-height: 46px;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  cursor: pointer;
+  color: var(--muted);
+  background: transparent;
+  text-align: left;
+}
+
+.worker-plan-progress-toggle:hover,
+.worker-plan-progress-toggle:focus-visible {
+  background: var(--surface);
+  outline: none;
+}
+
+.worker-plan-progress-toggle > svg:first-child {
+  flex: 0 0 auto;
+  color: var(--teal-accent);
+}
+
+.worker-plan-progress-toggle > span {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 1px;
+}
+
+.worker-plan-progress-toggle strong {
+  font-size: 12.5px;
+}
+
+.worker-plan-progress-toggle small {
+  color: var(--weak);
+  font-size: 11.5px;
+}
+
+.worker-plan-progress-toggle > svg:last-child {
+  color: var(--weak);
+  transition: transform 140ms ease;
+}
+
+.worker-plan-progress.is-expanded .worker-plan-progress-toggle > svg:last-child {
+  transform: rotate(180deg);
+}
+
+.worker-plan-progress-body {
+  display: grid;
+  gap: 10px;
+  padding: 0 12px 11px;
+}
+
+.worker-plan-progress-body[hidden] {
+  display: none;
+}
+
+.worker-plan-progress-body > div {
   display: grid;
   gap: 6px;
 }

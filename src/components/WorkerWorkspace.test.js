@@ -30,7 +30,7 @@ async function withViteModule(path, callback) {
   }
 }
 
-test("WorkerRail is an embeddable list fragment with three built-in Workers and no duplicated shell", async () => {
+test("WorkerRail is an embeddable list fragment with three collapsed built-in Workers", async () => {
   await withViteModule("/src/components/WorkerWorkspace.jsx", ({ WorkerRail }) => {
     const html = renderToStaticMarkup(React.createElement(WorkerRail, {
       activeWorkerId: WORKER_IDS.AGENT_MAIL,
@@ -42,14 +42,11 @@ test("WorkerRail is an embeddable list fragment with three built-in Workers and 
     }));
 
     assert.match(html, /搜索 Worker 和任务/);
-    assert.match(html, /aria-label="在“飞书文档 Worker”下新建任务"/);
-    assert.match(html, /aria-label="在“Agent 邮箱 Worker”下新建任务"/);
-    assert.match(html, /aria-label="在“IMA 笔记 Worker”下新建任务"/);
     assert.match(html, /飞书文档 Worker/);
     assert.match(html, /Agent 邮箱 Worker/);
     assert.match(html, /IMA 笔记 Worker/);
-    assert.match(html, /整理本周项目进展/);
-    assert.match(html, /给导师发送本周进展/);
+    assert.equal((html.match(/aria-expanded="false"/g) ?? []).length, 3);
+    assert.doesNotMatch(html, /整理本周项目进展|给导师发送本周进展|任务名称/);
     assert.match(html, /aria-label="Worker 任务"/);
     assert.doesNotMatch(html, /选择 Worker 后开始一项文字工作/);
     assert.doesNotMatch(html, /<select/);
@@ -499,6 +496,7 @@ test("Worker Agent renders bounded plan progress, safe assistant Markdown, and l
     }));
 
     assert.match(html, /当前计划/);
+    assert.match(html, /aria-expanded="true"/);
     assert.match(html, /核对资料/);
     assert.match(html, /最新进度/);
     assert.match(html, /正在形成草稿/);
@@ -506,6 +504,32 @@ test("Worker Agent renders bounded plan progress, safe assistant Markdown, and l
     assert.match(html, /&lt;strong&gt;不要渲染&lt;\/strong&gt;/);
     assert.doesNotMatch(html, /<script>|danger\(\)/);
     assert.match(html, /作为草稿编辑/);
+  });
+});
+
+test("Worker process collapses after a final answer but remains inspectable", async () => {
+  await withViteModule("/src/components/WorkerWorkspace.jsx", ({ WorkerWorkspace }) => {
+    const state = createInitialWorkerState({
+      messages: [
+        { id: "user-final", role: "user", content: "整理这份材料" },
+        { id: "assistant-final", role: "assistant", content: "材料已经整理完成。" },
+      ],
+      conversation: {
+        status: "idle",
+        plan: { steps: [{ id: "step-1", title: "整理材料", status: "completed" }] },
+        events: [{ seq: 1, type: "message.completed", data: { detail: "回答已形成" } }],
+      },
+    });
+    const html = renderToStaticMarkup(React.createElement(WorkerWorkspace, {
+      state,
+      dispatch() {},
+    }));
+
+    assert.match(html, /工作过程已完成/);
+    assert.match(html, /aria-expanded="false"/);
+    assert.match(html, /worker-plan-progress-body" hidden=""/);
+    assert.match(html, /整理材料/);
+    assert.match(html, /回答已形成/);
   });
 });
 

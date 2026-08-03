@@ -109,17 +109,13 @@ export function WorkerRail({
 }) {
   const searchId = useId();
   const [internalQuery, setInternalQuery] = useState("");
-  const [expandedWorkerIds, setExpandedWorkerIds] = useState(() => workers.map((worker) => worker.id));
-  const [newTaskWorkerId, setNewTaskWorkerId] = useState(null);
-  const [newTaskTitle, setNewTaskTitle] = useState("");
+  const [expandedWorkerIds, setExpandedWorkerIds] = useState([]);
   const query = controlledQuery ?? internalQuery;
   const normalizedQuery = query.trim().toLocaleLowerCase("zh-CN");
 
   useEffect(() => {
-    setExpandedWorkerIds((current) => Array.from(new Set([
-      ...current,
-      ...workers.map((worker) => worker.id),
-    ])));
+    const workerIds = new Set(workers.map((worker) => worker.id));
+    setExpandedWorkerIds((current) => current.filter((id) => workerIds.has(id)));
   }, [workers]);
 
   const visibleWorkers = useMemo(() => workers.flatMap((worker) => {
@@ -151,28 +147,14 @@ export function WorkerRail({
     ));
   };
 
-  const submitNewTask = async (event) => {
-    event.preventDefault();
-    if (!newTaskWorkerId || !newTaskTitle.trim() || creatingTask) return;
-    const created = await onNewTask?.({
-      workerId: newTaskWorkerId,
-      title: newTaskTitle.trim(),
-    });
-    if (created !== false) {
-      setNewTaskTitle("");
-      setNewTaskWorkerId(null);
-    }
-  };
-
-  const toggleNewTask = (workerId) => {
+  const createNewTask = async (workerId) => {
     if (creatingTask) return;
-    setNewTaskTitle("");
-    setNewTaskWorkerId((current) => current === workerId ? null : workerId);
-  };
-
-  const closeNewTask = () => {
-    setNewTaskTitle("");
-    setNewTaskWorkerId(null);
+    const created = await onNewTask?.({ workerId });
+    if (created !== false) {
+      setExpandedWorkerIds((current) => (
+        current.includes(workerId) ? current : [...current, workerId]
+      ));
+    }
   };
 
   return (
@@ -199,8 +181,6 @@ export function WorkerRail({
             ? true
             : expandedWorkerIds.includes(worker.id);
           const connection = connectionFor(worker, connections);
-          const newTaskFormOpen = newTaskWorkerId === worker.id;
-          const newTaskFormId = `worker-new-task-${worker.id}`;
           return (
             <section
               className={`worker-rail-group${selected ? " is-selected" : ""}`}
@@ -236,44 +216,15 @@ export function WorkerRail({
                   <button
                     className="worker-task-create-button"
                     type="button"
-                    onClick={() => toggleNewTask(worker.id)}
+                    onClick={() => createNewTask(worker.id)}
                     disabled={creatingTask}
-                    aria-busy={creatingTask && newTaskFormOpen}
-                    aria-controls={newTaskFormId}
-                    aria-expanded={newTaskFormOpen}
+                    aria-busy={creatingTask}
                     aria-label={`在“${worker.name}”下新建任务`}
                     title={`在“${worker.name}”下新建任务`}
                   >
                     <Plus size={14} weight="bold" aria-hidden="true" />
-                    <span>{creatingTask && newTaskFormOpen ? "正在创建…" : "新建任务"}</span>
+                    <span>{creatingTask ? "正在创建…" : "新建任务"}</span>
                   </button>
-
-                  {newTaskFormOpen ? (
-                    <form
-                      id={newTaskFormId}
-                      className="worker-new-task-form"
-                      aria-label={`在“${worker.name}”下创建任务`}
-                      onSubmit={submitNewTask}
-                    >
-                      <label>
-                        <span>任务名称</span>
-                        <input
-                          value={newTaskTitle}
-                          onChange={(event) => setNewTaskTitle(event.target.value)}
-                          placeholder="例如：整理并发送本周进展"
-                          maxLength={160}
-                          autoFocus
-                          required
-                        />
-                      </label>
-                      <div>
-                        <button type="button" onClick={closeNewTask}>取消</button>
-                        <button type="submit" disabled={creatingTask || !newTaskTitle.trim()}>
-                          {creatingTask ? "创建中…" : "创建任务"}
-                        </button>
-                      </div>
-                    </form>
-                  ) : null}
 
                   {workerTasks.length > 0 ? workerTasks.map((task) => {
                     const taskSelected = task.id === activeTaskId;
@@ -437,7 +388,7 @@ function WorkerAssistantMarkdown({ children }) {
   );
 }
 
-function WorkerPlanProgress({ conversation, running }) {
+function WorkerPlanProgress({ conversation, messages = [], running }) {
   const steps = conversation?.plan?.steps ?? conversation?.plan?.items ?? [];
   const safeEvents = (conversation?.events ?? []).filter((event) => [
     "message.started",
@@ -447,44 +398,79 @@ function WorkerPlanProgress({ conversation, running }) {
     "compaction.started",
     "compaction.completed",
   ].includes(event?.type)).slice(-3);
-  if (steps.length === 0 && (!running || safeEvents.length === 0)) return null;
+  const latestMessage = messages.at(-1);
+  const settledWithFinal = !running
+    && latestMessage?.role === "assistant"
+    && String(latestMessage.content ?? "").trim().length > 0;
+  const [expanded, setExpanded] = useState(() => !settledWithFinal);
+
+  useEffect(() => {
+    if (running || !settledWithFinal) {
+      setExpanded(true);
+      return;
+    }
+    setExpanded(false);
+  }, [running, settledWithFinal]);
+
+  if (steps.length === 0 && safeEvents.length === 0) return null;
   return (
-    <section className="worker-plan-progress" aria-label="Worker 计划与进度">
-      {steps.length > 0 ? (
-        <div>
-          <strong>当前计划</strong>
-          <ol>
-            {steps.map((step, index) => (
-              <li className={`is-${step.status || "pending"}`} key={step.id || index}>
-                <span aria-hidden="true" />
-                <p>{step.title || step.step || step.detail || `步骤 ${index + 1}`}</p>
-              </li>
-            ))}
-          </ol>
-        </div>
-      ) : null}
-      {running && safeEvents.length > 0 ? (
-        <div>
-          <strong>最新进度</strong>
-          <ul>
-            {safeEvents.map((event, index) => (
-              <li key={event.seq || `${event.type}-${index}`}>
-                {event.data?.detail
-                  || event.data?.message
-                  || event.data?.status
-                  || ({
-                    "message.started": "Agent 开始处理",
-                    "message.completed": "Agent 已形成回答",
-                    "agent.status": "Agent 状态已更新",
-                    "agent.progress": "正在推进当前任务",
-                    "compaction.started": "正在压缩上下文",
-                    "compaction.completed": "上下文压缩完成",
-                  }[event.type] ?? "Worker 状态已更新")}
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
+    <section className={`worker-plan-progress${expanded ? " is-expanded" : ""}`} aria-label="Worker 计划与进度">
+      <button
+        className="worker-plan-progress-toggle"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        {running ? (
+          <SpinnerGap className="spin" size={15} weight="bold" aria-hidden="true" />
+        ) : settledWithFinal ? (
+          <CheckCircle size={15} weight="fill" aria-hidden="true" />
+        ) : (
+          <WarningCircle size={15} weight="fill" aria-hidden="true" />
+        )}
+        <span>
+          <strong>{running ? "Worker 正在工作" : settledWithFinal ? "工作过程已完成" : "工作过程需要处理"}</strong>
+          <small>{steps.length > 0 ? `${steps.length} 个步骤` : `${safeEvents.length} 项过程`}</small>
+        </span>
+        <CaretDown size={13} aria-hidden="true" />
+      </button>
+      <div className="worker-plan-progress-body" hidden={!expanded}>
+        {steps.length > 0 ? (
+          <div>
+            <strong>当前计划</strong>
+            <ol>
+              {steps.map((step, index) => (
+                <li className={`is-${step.status || "pending"}`} key={step.id || index}>
+                  <span aria-hidden="true" />
+                  <p>{step.title || step.step || step.detail || `步骤 ${index + 1}`}</p>
+                </li>
+              ))}
+            </ol>
+          </div>
+        ) : null}
+        {safeEvents.length > 0 ? (
+          <div>
+            <strong>{running ? "最新进度" : "过程记录"}</strong>
+            <ul>
+              {safeEvents.map((event, index) => (
+                <li key={event.seq || `${event.type}-${index}`}>
+                  {event.data?.detail
+                    || event.data?.message
+                    || event.data?.status
+                    || ({
+                      "message.started": "Agent 开始处理",
+                      "message.completed": "Agent 已形成回答",
+                      "agent.status": "Agent 状态已更新",
+                      "agent.progress": "正在推进当前任务",
+                      "compaction.started": "正在压缩上下文",
+                      "compaction.completed": "上下文压缩完成",
+                    }[event.type] ?? "Worker 状态已更新")}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </div>
     </section>
   );
 }
@@ -585,7 +571,11 @@ function WorkerAgentPane({
             </div>
           </div>
         ) : null}
-        <WorkerPlanProgress conversation={state.conversation} running={running} />
+        <WorkerPlanProgress
+          conversation={state.conversation}
+          messages={state.messages}
+          running={running}
+        />
         {state.messages.length === 0 ? (
           <section className="project-agent-welcome worker-agent-welcome">
             <WorkerTypeIcon workerId={state.worker.id} size={24} />
@@ -716,6 +706,7 @@ function WorkerAgentPane({
         <label>
           <span className="sr-only">给 Worker Agent 的消息</span>
           <textarea
+            autoFocus={state.messages.length === 0}
             value={state.composerDraft}
             onChange={(event) => dispatch({
               type: WORKER_ACTIONS.SET_COMPOSER_DRAFT,

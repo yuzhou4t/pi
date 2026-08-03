@@ -5,6 +5,7 @@ import {
 } from "./errors.js";
 
 const SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+const DEFAULT_WORKER_TASK_TITLE = "新工作会话";
 
 function segment(value, label) {
   let decoded;
@@ -33,6 +34,19 @@ function workerFormat(workerId, format) {
   return "markdown";
 }
 
+function taskWithConversationTitle(task, conversationValue) {
+  const conversation = conversationValue?.conversation ?? conversationValue;
+  const conversationTitle = typeof conversation?.title === "string"
+    ? conversation.title.trim()
+    : "";
+  return {
+    ...task,
+    title: conversationTitle && conversationTitle !== DEFAULT_WORKER_TASK_TITLE
+      ? conversationTitle
+      : task.title || DEFAULT_WORKER_TASK_TITLE,
+  };
+}
+
 async function taskBundle(workerService, projectWorkService, taskId) {
   const task = await workerService.getTask(taskId);
   const [conversation, draft, sources, files, actions, receipts] = await Promise.all([
@@ -44,7 +58,7 @@ async function taskBundle(workerService, projectWorkService, taskId) {
     workerService.listReceipts(task.id),
   ]);
   return {
-    task,
+    task: taskWithConversationTitle(task, conversation),
     conversation,
     draft,
     sources,
@@ -77,11 +91,21 @@ export function createWorkerHttpApi({
     }
 
     if (request.method === "GET" && url.pathname === "/api/v1/worker/tasks") {
-      sendJson(response, 200, {
-        schema_version: 1,
-        tasks: await workerService.listTasks({
+      const [tasks, conversations] = await Promise.all([
+        workerService.listTasks({
           workerId: url.searchParams.get("worker_id") || null,
         }),
+        projectWorkService.listWorkerConversations(),
+      ]);
+      const conversationsById = new Map(
+        conversations.map((conversation) => [conversation.id, conversation]),
+      );
+      sendJson(response, 200, {
+        schema_version: 1,
+        tasks: tasks.map((task) => taskWithConversationTitle(
+          task,
+          conversationsById.get(task.conversationId),
+        )),
       }, origin);
       return true;
     }
@@ -89,9 +113,12 @@ export function createWorkerHttpApi({
     if (request.method === "POST" && url.pathname === "/api/v1/worker/tasks") {
       requireMutationOrigin(origin);
       const payload = requireSchema(await readJson(request));
+      const requestedTitle = typeof payload.title === "string" && payload.title.trim()
+        ? payload.title.trim()
+        : null;
       const conversation = await projectWorkService.createWorkerConversation({
         workerId: payload.worker_id,
-        title: payload.title,
+        title: requestedTitle ?? undefined,
         sourceProjectId: payload.source_project_id ?? null,
         providerId: payload.provider_id,
         modelId: payload.model_id,
@@ -101,12 +128,12 @@ export function createWorkerHttpApi({
         const task = await workerService.createTask({
           workerId: payload.worker_id,
           conversationId: conversation.id,
-          title: payload.title,
+          title: requestedTitle ?? DEFAULT_WORKER_TASK_TITLE,
           sourceProjectId: payload.source_project_id ?? null,
         });
         sendJson(response, 201, {
           schema_version: 1,
-          task,
+          task: taskWithConversationTitle(task, conversation),
           conversation,
         }, origin);
       } catch (error) {

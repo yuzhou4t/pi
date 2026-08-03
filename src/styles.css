@@ -425,62 +425,75 @@ button:disabled {
   overflow-y: auto;
 }
 
-.standalone-new-button {
-  display: flex;
-  width: calc(100% - 16px);
-  min-height: 48px;
+.standalone-conversations {
+  margin: 8px 8px 0;
+  padding: 7px 0 0;
+  border-top: 1px solid var(--border);
+}
+
+.standalone-conversation-heading {
+  display: grid;
+  min-height: 36px;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 9px;
-  margin: 0 8px 8px;
-  padding: 7px 10px;
+  gap: 4px;
+}
+
+.standalone-conversation-toggle {
+  display: flex;
+  min-width: 0;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px;
   cursor: pointer;
-  color: var(--text);
-  background: var(--surface);
-  border: 1px solid var(--teal-border);
-  border-radius: 7px;
+  color: var(--muted);
+  background: transparent;
+  border-radius: 6px;
   text-align: left;
 }
 
-.standalone-new-button:hover:not(:disabled) {
-  background: var(--teal-tint);
-  border-color: var(--teal-accent);
+.standalone-conversation-toggle:hover,
+.standalone-conversation-toggle:focus-visible {
+  color: var(--text);
+  background: var(--surface);
+  outline: none;
 }
 
-.standalone-new-button:disabled {
-  cursor: wait;
-  opacity: 0.72;
-}
-
-.standalone-new-button > svg {
+.standalone-conversation-toggle > svg {
   flex: 0 0 auto;
+  color: var(--weak);
+}
+
+.standalone-conversation-toggle > span {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.standalone-conversation-toggle strong {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.standalone-conversation-toggle small {
+  color: var(--weak);
+  font-size: 10.5px;
+}
+
+.standalone-conversation-new {
   color: var(--teal-accent);
 }
 
-.standalone-new-button > span {
-  display: grid;
-  min-width: 0;
-  gap: 1px;
-}
-
-.standalone-new-button strong {
-  font-size: 12.5px;
-  font-weight: 650;
-}
-
-.standalone-new-button small {
-  color: var(--weak);
-  font-size: 11.5px;
-}
-
-.standalone-conversations {
-  margin: 0 8px 9px;
-  padding: 0 0 8px;
-  border-bottom: 1px solid var(--border);
-}
-
-.standalone-conversations > .project-list-heading {
-  min-height: 27px;
-  padding: 0 4px 3px;
+.standalone-conversations > .project-conversation-list {
+  padding: 2px 0 6px 19px;
+  border-left: 1px solid var(--teal-border);
 }
 
 .project-row {

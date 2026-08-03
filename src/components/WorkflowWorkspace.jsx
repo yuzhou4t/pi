@@ -661,13 +661,25 @@ function PaperTabs({ papers, activePaperId, onSetActivePaper }) {
 // 发现窗口与服务端判定一致：以扫描时刻为终点的近 30 天滚动区间，
 // 而不是自然月；月窗口 key 只用于 Run 去重。
 function monthWindowLabel(fallbackDate = null) {
-  const end = fallbackDate ? new Date(fallbackDate) : null;
-  if (!end || !Number.isFinite(end.getTime())) return null;
+  const instant = fallbackDate ? new Date(fallbackDate) : null;
+  if (!instant || !Number.isFinite(instant.getTime())) return null;
+  const end = new Date(instant.getTime() + 8 * 60 * 60 * 1_000);
   end.setUTCHours(0, 0, 0, 0);
   const start = new Date(end);
   start.setUTCDate(start.getUTCDate() - 30);
   const fmt = (date) => `${date.getUTCMonth() + 1}月${date.getUTCDate()}日`;
   return `${start.getUTCFullYear()}年${fmt(start)} – ${fmt(end)}`;
+}
+
+function shanghaiDateLabel(value) {
+  const instant = value ? new Date(value) : null;
+  if (!instant || !Number.isFinite(instant.getTime())) return null;
+  const local = new Date(instant.getTime() + 8 * 60 * 60 * 1_000);
+  return [
+    String(local.getUTCFullYear()).padStart(4, "0"),
+    String(local.getUTCMonth() + 1).padStart(2, "0"),
+    String(local.getUTCDate()).padStart(2, "0"),
+  ].join("-");
 }
 
 function CandidateReview({
@@ -711,6 +723,11 @@ function CandidateReview({
   const scanInProgress = ["starting", "running"].includes(journalRunState?.status);
   const scanSummary = liveRun?.scanSummary
     ?? (liveScanStarted || !hasFixtureCandidates ? null : workflowFixture.scanSummary);
+  const latestScanEvidenceAt = liveRun?.candidateRefresh?.lastScanObservedAt
+    ?? liveRun?.candidateRefresh?.lastRefreshedAt
+    ?? scanSummary?.observed_at
+    ?? scanSummary?.observedAt
+    ?? liveRun?.createdAt;
   const sourceProgress = liveRun?.sourceProgress;
   const successfulSourceCount = liveRun?.scanSummary?.successful_source_count
     ?? sourceProgress?.successful_source_ids?.length;
@@ -797,7 +814,7 @@ function CandidateReview({
             </span>
             <h2 id="review-title">选择本月要读的论文</h2>
             {(() => {
-              const windowLabel = monthWindowLabel(liveRun?.createdAt);
+              const windowLabel = monthWindowLabel(latestScanEvidenceAt);
               return windowLabel ? (
                 <p className="workflow-week-window">本月发现窗口：{windowLabel}（此区间内发表的算本月新论文）</p>
               ) : null;
@@ -823,9 +840,13 @@ function CandidateReview({
                 >
                   {refreshBusy ? "正在刷新新论文…" : "刷新本月推荐"}
                 </button>
-                {liveRun?.candidateRefresh?.lastRefreshedAt ? (
+                {liveRun?.candidateRefresh?.lastScanObservedAt
+                  || liveRun?.candidateRefresh?.lastRefreshedAt ? (
                   <small className="workflow-refresh-note">
-                    上次刷新 {String(liveRun.candidateRefresh.lastRefreshedAt).slice(0, 10)}
+                    上次刷新 {shanghaiDateLabel(
+                      liveRun.candidateRefresh.lastScanObservedAt
+                      ?? liveRun.candidateRefresh.lastRefreshedAt,
+                    )}
                   </small>
                 ) : null}
                 {refreshError || durableRefreshError ? (

@@ -277,6 +277,7 @@ export function ProjectRail({
 }) {
   const [openConversationMenuId, setOpenConversationMenuId] = useState(null);
   const [expandedConversationGroups, setExpandedConversationGroups] = useState({});
+  const [standaloneListOpen, setStandaloneListOpen] = useState(false);
   const [topicListOpen, setTopicListOpen] = usePersistentState(
     "pi-agent-topic-list-open-v1",
     true,
@@ -308,12 +309,19 @@ export function ProjectRail({
   const creatingProjectIds = new Set(creatingConversationProjectIds);
   const normalizedQuery = query.trim().toLowerCase();
   const matchesQuery = (value) => String(value ?? "").toLowerCase().includes(normalizedQuery);
-  const standaloneConversations = conversations.filter((conversation) => (
-    conversation.projectId === null
-    && (!normalizedQuery || matchesQuery(
+  const allStandaloneConversations = conversations.filter(
+    (conversation) => conversation.projectId === null,
+  );
+  const standaloneConversations = allStandaloneConversations.filter((conversation) => (
+    !normalizedQuery || matchesQuery(
       `${conversation.title} ${conversation.subtitle} ${conversation.kind}`,
-    ))
+    )
   ));
+  const standaloneSectionOpen = Boolean(
+    standaloneListOpen
+    || normalizedQuery
+    || creatingStandaloneConversation,
+  );
   const filteredProjects = projects.filter((project) => {
     if (!normalizedQuery) return true;
     const projectMatches = matchesQuery(`${project.name} ${project.state} ${project.rootLabel}`);
@@ -394,67 +402,6 @@ export function ProjectRail({
       <div className="project-list">
         {workspaceMode === "worker" ? workerRail : (
           <>
-        {workspaceMode === "project_work" ? (
-          <>
-            <button
-              className="standalone-new-button"
-              type="button"
-              onClick={onNewStandaloneConversation}
-              disabled={creatingStandaloneConversation}
-              aria-busy={creatingStandaloneConversation}
-            >
-              {creatingStandaloneConversation ? (
-                <CircleNotch className="spin" size={17} weight="bold" aria-hidden="true" />
-              ) : (
-                <Plus size={17} weight="bold" aria-hidden="true" />
-              )}
-              <span>
-                <strong>新建对话</strong>
-              </span>
-            </button>
-            {creatingStandaloneConversation || standaloneConversations.length > 0 ? (
-              <section className="standalone-conversations" aria-label="独立对话">
-                <div className="project-list-heading">
-                  <span className="eyebrow">独立对话</span>
-                </div>
-                <div className="project-conversation-list">
-                  {creatingStandaloneConversation ? (
-                    <button
-                      className={`project-conversation-row${preparingStandaloneConversation ? " is-active" : ""}`}
-                      type="button"
-                      disabled
-                      aria-live="polite"
-                    >
-                      <CircleNotch className="spin" size={16} weight="bold" aria-hidden="true" />
-                      <span>
-                        <strong>新工作会话</strong>
-                        <small>正在创建会话…</small>
-                      </span>
-                    </button>
-                  ) : null}
-                  <ConversationList
-                    conversations={standaloneConversations}
-                    selectedConversationId={selectedConversationId}
-                    deletingConversationId={deletingConversationId}
-                    onSelectConversation={onSelectConversation}
-                    onRenameConversation={onRenameConversation}
-                    onDeleteConversation={onDeleteConversation}
-                    openConversationMenuId={openConversationMenuId}
-                    setOpenConversationMenuId={setOpenConversationMenuId}
-                    expanded={conversationGroupExpanded(
-                      getProjectRailConversationGroupKey(workspaceMode, "standalone"),
-                    )}
-                    groupLabel="独立对话"
-                    onExpandedChange={(expanded) => setConversationGroupExpanded(
-                      getProjectRailConversationGroupKey(workspaceMode, "standalone"),
-                      expanded,
-                    )}
-                  />
-                </div>
-              </section>
-            ) : null}
-          </>
-        ) : null}
         <div className="project-list-heading">
           <span className="eyebrow">{workspaceMode === "paper_reading" ? "研读项目" : "工作项目"}</span>
           <button
@@ -791,6 +738,82 @@ export function ProjectRail({
             </Fragment>
           );
         })}
+        {workspaceMode === "project_work" ? (
+          <section className="standalone-conversations" aria-label="独立对话">
+            <div className="standalone-conversation-heading">
+              <button
+                className="standalone-conversation-toggle"
+                type="button"
+                aria-expanded={standaloneSectionOpen}
+                aria-label={standaloneSectionOpen ? "收起独立对话" : "展开独立对话"}
+                onClick={() => setStandaloneListOpen((current) => !current)}
+              >
+                {standaloneSectionOpen
+                  ? <CaretDown size={12} weight="bold" aria-hidden="true" />
+                  : <CaretRight size={12} weight="bold" aria-hidden="true" />}
+                <span>
+                  <strong>独立对话</strong>
+                  <small>{allStandaloneConversations.length}</small>
+                </span>
+              </button>
+              <button
+                className="icon-button standalone-conversation-new"
+                type="button"
+                onClick={() => {
+                  setStandaloneListOpen(true);
+                  onNewStandaloneConversation?.();
+                }}
+                disabled={creatingStandaloneConversation}
+                aria-busy={creatingStandaloneConversation}
+                aria-label="新建独立对话"
+                title="新建独立对话"
+              >
+                {creatingStandaloneConversation
+                  ? <CircleNotch className="spin" size={15} weight="bold" aria-hidden="true" />
+                  : <Plus size={15} weight="bold" aria-hidden="true" />}
+              </button>
+            </div>
+            {standaloneSectionOpen ? (
+              <div className="project-conversation-list">
+                {creatingStandaloneConversation ? (
+                  <button
+                    className={`project-conversation-row${preparingStandaloneConversation ? " is-active" : ""}`}
+                    type="button"
+                    disabled
+                    aria-live="polite"
+                  >
+                    <CircleNotch className="spin" size={16} weight="bold" aria-hidden="true" />
+                    <span>
+                      <strong>新工作会话</strong>
+                      <small>正在创建会话…</small>
+                    </span>
+                  </button>
+                ) : null}
+                <ConversationList
+                  conversations={standaloneConversations}
+                  selectedConversationId={selectedConversationId}
+                  deletingConversationId={deletingConversationId}
+                  onSelectConversation={onSelectConversation}
+                  onRenameConversation={onRenameConversation}
+                  onDeleteConversation={onDeleteConversation}
+                  openConversationMenuId={openConversationMenuId}
+                  setOpenConversationMenuId={setOpenConversationMenuId}
+                  expanded={conversationGroupExpanded(
+                    getProjectRailConversationGroupKey(workspaceMode, "standalone"),
+                  )}
+                  groupLabel="独立对话"
+                  onExpandedChange={(expanded) => setConversationGroupExpanded(
+                    getProjectRailConversationGroupKey(workspaceMode, "standalone"),
+                    expanded,
+                  )}
+                />
+                {standaloneConversations.length === 0 && !creatingStandaloneConversation ? (
+                  <p className="project-child-empty">还没有独立对话</p>
+                ) : null}
+              </div>
+            ) : null}
+          </section>
+        ) : null}
         {filteredProjects.length === 0 && (
           workspaceMode !== "project_work" || standaloneConversations.length === 0
         ) ? (

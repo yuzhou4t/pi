@@ -24,3 +24,10 @@ Pi is a local-first, project-centered Agent workbench. Review changes against th
 
 - Prioritize correctness, data loss, authorization bypass, privacy leaks, non-idempotent recovery, and disagreement between server state and UI state.
 - Cite the exact file and line, then explain the trigger, impact, and smallest safe fix. Leave formatting checks to CI.
+
+### Conversation activity and scheduling
+
+- Keep independent conversations below project conversations and collapsed by default. Worker groups also start collapsed and must not reopen on refresh.
+- Show only safe public progress and tool activity. Never expose or persist private chain-of-thought. Completed activity collapses after a durable final answer, while failed, stopped, or user-blocked activity remains open and inspectable.
+- New Worker tasks derive their title deterministically from the first explicit user message without another model call. Never overwrite an assigned or manually edited title.
+- Monthly candidate refresh follows the `Asia/Shanghai` Monday `00:00` natural-week boundary. Persist real scan observation evidence, retry task-level failures without advancing the week watermark, and never derive the displayed coverage window from the browser clock.

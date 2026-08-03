@@ -6149,6 +6149,7 @@ test("Worker turns receive only bounded untrusted references and never activate 
     "Worker turn did not settle",
   );
   assert.equal(settled.conversation.workType, "worker");
+  assert.equal(settled.conversation.title, "整理收件箱");
   assert.equal(settled.conversation.workspaceKind, "scratch");
   assert.equal(settled.conversation.activeChangeSet, null);
   assert.deepEqual(settled.conversation.verifications, []);
@@ -6194,6 +6195,31 @@ test("Worker turns receive only bounded untrusted references and never activate 
     }),
     { code: "WORKER_REFERENCE_CONTEXT_FORBIDDEN" },
   );
+});
+
+test("an untitled Worker conversation derives its title from the first explicit prompt", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-worker-title-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionFactory = createScratchSessionFactory();
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "private-state"),
+    sessionFactory,
+    idFactory: incrementalId("worker-title"),
+  });
+  t.after(() => service.dispose());
+
+  const worker = await service.createWorkerConversation({ workerId: "ima_note" });
+  assert.equal(worker.title, "新工作会话");
+  await service.sendMessage(worker.id, { text: "整理并总结本周 IMA 笔记" });
+  const settled = await eventually(
+    () => service.getConversation(worker.id),
+    (snapshot) => snapshot.conversation.status === "idle",
+    "Untitled Worker turn did not settle",
+  );
+
+  assert.notEqual(settled.conversation.title, "新工作会话");
+  assert.match(settled.conversation.title, /整理|总结|IMA/u);
+  assert.equal(sessionFactory.sessions[0].prompts.length, 1);
 });
 
 test("Worker model execution fails closed when tool isolation is missing or throws", async (t) => {

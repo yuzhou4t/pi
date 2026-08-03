@@ -111,6 +111,7 @@ const runBody = {
   }],
   candidate_refresh: {
     last_refreshed_at: "2026-07-23T07:30:00.000Z",
+    last_scan_observed_at: "2026-07-23T07:25:00.000Z",
     last_added_count: 0,
     last_error: { code: "REFRESH_FAILED", message: "刷新暂时失败" },
   },
@@ -138,6 +139,7 @@ test("journal runs keep classic origin and MinerU state visible", () => {
   assert.equal(run.phase, "candidate_review");
   assert.equal(run.scanSummary.source_count, 11);
   assert.equal(run.candidateRefresh.lastError.message, "刷新暂时失败");
+  assert.equal(run.candidateRefresh.lastScanObservedAt, "2026-07-23T07:25:00.000Z");
 });
 
 test("journal run maps recent-classic summaries, impacts, and date precision", () => {
