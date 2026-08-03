@@ -318,7 +318,12 @@ test("refreshRunCandidates appends this-month papers and records refresh state",
       assert.ok(scanKey, "refresh scan must pass a scanKey");
       assert.equal(deferCursorCommit, true);
       return {
-        summary: { source_count: 11, successful_source_count: 11, failed_source_ids: [] },
+        summary: {
+          observed_at: "2026-08-03T00:05:00.000Z",
+          source_count: 11,
+          successful_source_count: 11,
+          failed_source_ids: [],
+        },
         candidateBatch: {
           mode: "new_papers",
           candidates: [
@@ -367,6 +372,10 @@ test("refreshRunCandidates appends this-month papers and records refresh state",
   assert.equal(freshIds.filter((id) => id === "paper-1").length, 1);
   assert.equal(refreshed.candidate_refresh.last_added_count, 1);
   assert.ok(refreshed.candidate_refresh.last_refreshed_at);
+  assert.equal(
+    refreshed.candidate_refresh.last_scan_observed_at,
+    "2026-08-03T00:05:00.000Z",
+  );
   assert.equal(
     refreshed.candidates.find((paper) => paper.paper_id === "fresh-1").display_label,
     "本月新论文 · 领域视野",
@@ -531,7 +540,7 @@ test("refreshRunCandidates honors a paper dismissed while translation is running
       },
     },
     sourceScanner: async () => ({
-      summary: {},
+      summary: { observed_at: "2026-08-03T00:10:00.000Z" },
       candidateBatch: {
         mode: "new_papers",
         candidates: [{
@@ -558,6 +567,10 @@ test("refreshRunCandidates honors a paper dismissed while translation is running
   continueTranslation();
   const refreshed = await refresh;
   assert.equal(refreshed.candidate_refresh.last_added_count, 0);
+  assert.equal(
+    refreshed.candidate_refresh.last_scan_observed_at,
+    "2026-08-03T00:10:00.000Z",
+  );
   assert.equal(refreshed.candidates.some(
     (paper) => paper.paper_id === "dismissed-during-refresh",
   ), false);

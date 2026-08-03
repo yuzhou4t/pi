@@ -192,7 +192,7 @@ test("left rail shows the selected work type, nested conversations, and one proj
   });
 });
 
-test("normal work rail exposes first-class standalone conversations before projects", async () => {
+test("normal work rail keeps standalone conversations collapsed after projects", async () => {
   await withViteModule("/src/components/ProjectRail.jsx", ({ ProjectRail }) => {
     const html = renderToStaticMarkup(React.createElement(ProjectRail, {
       projects: [{
@@ -220,11 +220,11 @@ test("normal work rail exposes first-class standalone conversations before proje
       onAddProject() {},
     }));
 
-    assert.match(html, /新建对话/);
+    assert.match(html, /新建独立对话/);
     assert.match(html, /独立对话/);
-    assert.match(html, /整理需求/);
-    assert.match(html, /未连接文件夹/);
-    assert.ok(html.indexOf("独立对话") < html.indexOf("工作项目"));
+    assert.doesNotMatch(html, /整理需求|未连接文件夹/);
+    assert.match(html, /aria-label="展开独立对话"/);
+    assert.ok(html.indexOf("工作项目") < html.indexOf("独立对话"));
   });
 });
 

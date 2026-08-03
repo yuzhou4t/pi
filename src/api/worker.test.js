@@ -9,6 +9,27 @@ function jsonResponse(payload, status = 200) {
   });
 }
 
+test("Worker task creation omits an empty manual title", async () => {
+  const originalFetch = globalThis.fetch;
+  let request = null;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse({ task: { id: "task-1" } }, 201);
+  };
+  try {
+    await workerApi.createTask({ workerId: "agent_mail" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(request.url, "/api/v1/worker/tasks");
+  assert.deepEqual(JSON.parse(request.options.body), {
+    schema_version: 1,
+    worker_id: "agent_mail",
+    source_project_id: null,
+  });
+});
+
 test("Worker action proposal sends only persisted source bindings, never browser before/after content", async () => {
   const originalFetch = globalThis.fetch;
   let request = null;

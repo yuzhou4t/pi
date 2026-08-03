@@ -597,6 +597,7 @@ export function mapJournalRun(run) {
     candidateRefresh: run.candidate_refresh && typeof run.candidate_refresh === "object"
       ? {
           lastRefreshedAt: run.candidate_refresh.last_refreshed_at ?? null,
+          lastScanObservedAt: run.candidate_refresh.last_scan_observed_at ?? null,
           lastAddedCount: Number.isInteger(run.candidate_refresh.last_added_count)
             ? run.candidate_refresh.last_added_count
             : 0,

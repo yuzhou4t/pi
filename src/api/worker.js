@@ -49,7 +49,7 @@ export const workerApi = Object.freeze({
       body: {
         schema_version: 1,
         worker_id: workerId,
-        title,
+        ...(typeof title === "string" && title.trim() ? { title: title.trim() } : {}),
         source_project_id: sourceProjectId,
       },
     });

@@ -8,8 +8,8 @@ import {
 import path from "node:path";
 
 const RETRY_MS = 5 * 60 * 1_000;
-// 本月推荐在月内每周自动刷新一次，把新发表的论文追加进候选。
-const REFRESH_INTERVAL_MS = 7 * 24 * 60 * 60 * 1_000;
+const SHANGHAI_UTC_OFFSET_MS = 8 * 60 * 60 * 1_000;
+const WEEK_MS = 7 * 24 * 60 * 60 * 1_000;
 
 function boundedInteger(value, fallback, min, max) {
   const parsed = Number(value);
@@ -23,6 +23,30 @@ function monthKeyOf(date) {
     String(date.getFullYear()).padStart(4, "0"),
     String(date.getMonth() + 1).padStart(2, "0"),
   ].join("-");
+}
+
+// Asia/Shanghai 自 1991 年起固定为 UTC+8。调度器以本地周一 00:00
+// 作为自然周边界，避免“上次成功后七天”造成刷新日期漂移。
+export function shanghaiNaturalWeekWindow(nowValue) {
+  const instant = new Date(nowValue);
+  if (!Number.isFinite(instant.getTime())) {
+    throw new TypeError("nowValue must be a valid date");
+  }
+  const localMidnight = new Date(instant.getTime() + SHANGHAI_UTC_OFFSET_MS);
+  localMidnight.setUTCHours(0, 0, 0, 0);
+  const daysSinceMonday = (localMidnight.getUTCDay() + 6) % 7;
+  localMidnight.setUTCDate(localMidnight.getUTCDate() - daysSinceMonday);
+  const weekKey = [
+    String(localMidnight.getUTCFullYear()).padStart(4, "0"),
+    String(localMidnight.getUTCMonth() + 1).padStart(2, "0"),
+    String(localMidnight.getUTCDate()).padStart(2, "0"),
+  ].join("-");
+  const startMs = localMidnight.getTime() - SHANGHAI_UTC_OFFSET_MS;
+  return {
+    weekKey,
+    dueAt: new Date(startMs).toISOString(),
+    nextDueAt: new Date(startMs + WEEK_MS).toISOString(),
+  };
 }
 
 // day 限定 1-28，避免月末溢出；due 为本月第 day 天 hour:minute，未到则回退到上一个月。
@@ -107,26 +131,34 @@ export function createMonthlyJournalScheduler({
     running = (async () => {
       const currentTime = now();
       const window = monthlyScheduleWindow(currentTime, schedule);
+      const weekWindow = shanghaiNaturalWeekWindow(currentTime);
       const previous = await readState(statePath);
       if (previous?.last_started_month_key === window.monthKey) {
-        // 本月 Run 已启动：到点就刷新本月推荐，否则等到下次到期。
-        const refreshBase = Date.parse(
-          previous.last_refresh_at ?? previous.last_started_at ?? window.dueAt,
-        );
-        const refreshDueMs = (Number.isFinite(refreshBase) ? refreshBase : currentTime.getTime())
-          + REFRESH_INTERVAL_MS;
+        const previousScanAt = previous.last_refresh_at
+          ?? previous.last_started_at
+          ?? window.dueAt;
+        const previousWeekKey = previous.last_scan_week_key
+          ?? shanghaiNaturalWeekWindow(previousScanAt).weekKey;
         if (
-          currentTime.getTime() >= refreshDueMs
+          previousWeekKey !== weekWindow.weekKey
           && typeof workflowService.refreshCurrentMonthCandidates === "function"
         ) {
           let next;
           try {
-            await workflowService.refreshCurrentMonthCandidates();
+            const refreshedRun = await workflowService.refreshCurrentMonthCandidates();
+            if (!refreshedRun) {
+              const error = new Error("当前没有可刷新的本月候选");
+              error.code = "MONTHLY_REFRESH_RUN_NOT_READY";
+              throw error;
+            }
             next = {
               ...previous,
-              last_refresh_at: currentTime.toISOString(),
+              last_scan_week_key: weekWindow.weekKey,
+              last_refresh_at: refreshedRun.candidate_refresh?.last_refreshed_at
+                ?? currentTime.toISOString(),
               last_refresh_attempt_at: currentTime.toISOString(),
               last_refresh_error: null,
+              next_refresh_due_at: weekWindow.nextDueAt,
             };
           } catch (error) {
             next = {
@@ -150,13 +182,13 @@ export function createMonthlyJournalScheduler({
           }
           arm(Math.min(
             new Date(window.nextDueAt).getTime() - currentTime.getTime(),
-            REFRESH_INTERVAL_MS,
+            new Date(weekWindow.nextDueAt).getTime() - currentTime.getTime(),
           ));
           return next;
         }
         arm(Math.min(
           new Date(window.nextDueAt).getTime() - currentTime.getTime(),
-          Math.max(1, refreshDueMs - currentTime.getTime()),
+          new Date(weekWindow.nextDueAt).getTime() - currentTime.getTime(),
         ));
         return previous;
       }
@@ -168,16 +200,18 @@ export function createMonthlyJournalScheduler({
           last_started_month_key: window.monthKey,
           last_started_run_id: run?.run_id ?? null,
           last_started_at: currentTime.toISOString(),
+          last_scan_week_key: weekWindow.weekKey,
           last_refresh_at: null,
           last_refresh_attempt_at: null,
           last_refresh_error: null,
           last_error: null,
           next_due_at: window.nextDueAt,
+          next_refresh_due_at: weekWindow.nextDueAt,
         };
         await writeJsonAtomic(statePath, next);
         arm(Math.min(
           new Date(window.nextDueAt).getTime() - currentTime.getTime(),
-          REFRESH_INTERVAL_MS,
+          new Date(weekWindow.nextDueAt).getTime() - currentTime.getTime(),
         ));
         return next;
       } catch (error) {

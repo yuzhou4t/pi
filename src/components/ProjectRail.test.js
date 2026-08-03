@@ -71,7 +71,7 @@ test("conversation list keeps the existing first five and exposes one compact re
   assert.match(selectedTailHtml, /展开其余 2 个/);
 });
 
-test("normal work folds standalone and project groups without hiding creation or row actions", async () => {
+test("normal work places the collapsed standalone group after projects and expands it for search", async () => {
   const { ProjectRail } = await vite.ssrLoadModule("/src/components/ProjectRail.jsx");
   const standalone = conversations({ projectId: null, prefix: "独立" });
   const projectItems = conversations({ projectId: "project-1", prefix: "项目" });
@@ -97,14 +97,40 @@ test("normal work folds standalone and project groups without hiding creation or
     onAddProject() {},
   }));
 
-  assert.match(html, /新建对话/);
+  assert.match(html, /aria-label="新建独立对话"/);
+  assert.match(html, /aria-label="展开独立对话"/);
   assert.match(html, /在 Pi Agent 中新建会话/);
-  assert.match(html, /打开“独立 1”的更多操作/);
   assert.match(html, /打开“项目 1”的更多操作/);
-  assert.match(html, /独立 5/);
   assert.match(html, /项目 5/);
-  assert.doesNotMatch(html, /独立 6|项目 6/);
-  assert.equal((html.match(/展开其余 2 个/g) ?? []).length, 2);
+  assert.doesNotMatch(html, /独立 1|独立 6|项目 6/);
+  assert.equal((html.match(/展开其余 2 个/g) ?? []).length, 1);
+  assert.ok(html.indexOf("工作项目") < html.indexOf("独立对话"));
+
+  const searchHtml = renderToStaticMarkup(React.createElement(ProjectRail, {
+    projects: [{
+      id: "project-1",
+      name: "Pi Agent",
+      state: "7 个会话",
+      updated: "刚刚",
+    }],
+    selectedId: "project-1",
+    conversations: [...standalone, ...projectItems],
+    selectedConversationId: "standalone-1",
+    workspaceMode: "project_work",
+    query: "独立",
+    onQueryChange() {},
+    onSelect() {},
+    onSelectConversation() {},
+    onNewStandaloneConversation() {},
+    onDeleteConversation() {},
+    onRenameConversation() {},
+    onAddProject() {},
+  }));
+  assert.match(searchHtml, /aria-label="收起独立对话"/);
+  assert.match(searchHtml, /打开“独立 1”的更多操作/);
+  assert.match(searchHtml, /独立 5/);
+  assert.doesNotMatch(searchHtml, /独立 6/);
+  assert.match(searchHtml, /展开其余 2 个/);
 });
 
 test("paper-reading groups use the same five-item limit without changing their workflow entries", async () => {

@@ -2056,7 +2056,7 @@ test("a ready change event links to changes instead of matching read inside read
   });
 });
 
-test("latest settled activity is coalesced and remains open above the final answer", async () => {
+test("latest settled activity is coalesced and collapses above the final answer", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const events = [
       { seq: 1, type: "message.created", status: "accepted" },
@@ -2085,8 +2085,8 @@ test("latest settled activity is coalesced and remains open above the final answ
       }),
     }));
 
-    assert.match(html, /aria-expanded="true"/);
-    assert.match(html, /class="project-activity-body">/);
+    assert.match(html, /aria-expanded="false"/);
+    assert.match(html, /class="project-activity-body" hidden=""/);
     assert.match(html, /已完成/);
     assert.match(html, /4 项 · 查看过程/);
     assert.match(html, /透明模式/);
@@ -2243,7 +2243,7 @@ test("loaded historical turns restore their durable activity events", async () =
   });
 });
 
-test("every executed turn keeps its activity while only history starts collapsed", async () => {
+test("every completed turn keeps its activity collapsed beside its final answer", async () => {
   await withLiveWorkbench(({ LiveProjectWorkbench }) => {
     const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
       project,
@@ -2316,7 +2316,7 @@ test("every executed turn keeps its activity while only history starts collapsed
     assert.equal((html.match(/aria-label="Pi Agent 活动"/g) ?? []).length, 2);
     assert.equal(
       (html.match(/class="project-activity-body" hidden=""/g) ?? []).length,
-      1,
+      2,
     );
     assert.match(html, /正在核对第一处/);
     assert.match(html, /正在核对第二处/);
@@ -2631,7 +2631,7 @@ test("agent insight shows a safe harness snapshot and compact turn totals", asyn
     }));
 
     assert.match(html, /Agent 透视/);
-    assert.match(html, /aria-expanded="true"/);
+    assert.match(html, /aria-expanded="false"/);
     assert.match(html, /1 轮模型 · 1 次工具 · 3 秒 · 1\.2k Token/);
     assert.match(html, /Harness 快照/);
     assert.match(html, /openai-codex \/ gpt-5\.3-codex/);

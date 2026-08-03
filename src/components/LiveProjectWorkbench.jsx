@@ -2422,9 +2422,7 @@ export function ActivityTimeline({
   terminalStatus = null,
   onOpenArtifact,
 }) {
-  const [expanded, setExpanded] = useState(
-    transparentMode ? true : !compact,
-  );
+  const [expanded, setExpanded] = useState(!compact);
   const normalizedEvents = normalizeActivityEvents(
     withRuntimeProgressFallback(events, running),
     running,
@@ -2446,8 +2444,8 @@ export function ActivityTimeline({
     : "";
 
   useEffect(() => {
-    setExpanded(transparentMode ? true : !compact);
-  }, [compact, transparentMode]);
+    setExpanded(!compact);
+  }, [compact]);
 
   if (
     visibleEvents.length === 0
@@ -3576,6 +3574,9 @@ export function ProjectAgentPane({
   }
   const hasUnscopedActivity = activityByUserMessageId.size === 0
     && conversation.events.length > 0;
+  const latestVisibleMessage = visibleMessages.at(-1);
+  const hasUnscopedFinalAnswer = latestVisibleMessage?.role === "assistant"
+    && latestVisibleMessage.isFinal !== false;
   const latestEventSeq = conversation.events.at(-1)?.seq
     ?? conversation.lastEventSeq
     ?? 0;
@@ -3761,6 +3762,18 @@ export function ProjectAgentPane({
             const isLatestExecutedTurn = turnActivity?.startSeq
               === latestExecutedTurnStartSeq;
             const turnRunning = Boolean(running && isLatestExecutedTurn);
+            const followingMessages = visibleMessages.slice(index + 1);
+            const nextUserOffset = followingMessages.findIndex(
+              (candidate) => candidate.role === "user",
+            );
+            const turnMessages = nextUserOffset === -1
+              ? followingMessages
+              : followingMessages.slice(0, nextUserOffset);
+            const turnHasFinalAnswer = message.role === "user"
+              && turnMessages.some((candidate) => (
+                candidate.role === "assistant"
+                && candidate.isFinal !== false
+              ));
             const scopedPlan = turnActivity
               ? planFromActivityEvents(turnActivity.events)
               : [];
@@ -3854,7 +3867,7 @@ export function ProjectAgentPane({
                     <ActivityTimeline
                       events={turnActivity.events}
                       running={turnRunning}
-                      compact={!isLatestExecutedTurn}
+                      compact={turnHasFinalAnswer && !turnRunning}
                       transparentMode={transparentMode}
                       terminalStatus={isLatestExecutedTurn
                         ? activeStatus(conversation)
@@ -3882,7 +3895,7 @@ export function ProjectAgentPane({
           <ActivityTimeline
             events={conversation.events}
             running={running}
-            compact={!running}
+            compact={hasUnscopedFinalAnswer && !running}
             transparentMode={transparentMode}
             terminalStatus={activeStatus(conversation)}
             onOpenArtifact={onOpenArtifact}

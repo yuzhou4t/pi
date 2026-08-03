@@ -71,8 +71,10 @@ test("live candidate review shows appended papers and a durable refresh failure"
         run: {
           status: "review_ready",
           phase: "candidate_review",
+          createdAt: "2026-08-01T00:00:00.000Z",
           candidates: papers,
           candidateRefresh: {
+            lastScanObservedAt: "2026-08-02T20:05:00.000Z",
             lastError: { message: "后台刷新失败，请稍后重试" },
           },
           scanSummary: {
@@ -88,6 +90,8 @@ test("live candidate review shows appended papers and a durable refresh failure"
     assert.match(html, /Newly appended sixth paper/);
     assert.match(html, /<strong>6<\/strong> 条重点候选/);
     assert.match(html, /后台刷新失败，请稍后重试/);
+    assert.match(html, /2026年7月4日 – 8月3日/);
+    assert.match(html, /上次刷新 2026-08-03/);
     assert.match(html, /is-classic[^>]*>本月补发现 · 非本月新论文/);
   } finally {
     await vite.close();

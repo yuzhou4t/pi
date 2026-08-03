@@ -6,7 +6,17 @@ import test from "node:test";
 import {
   createMonthlyJournalScheduler,
   monthlyScheduleWindow,
+  shanghaiNaturalWeekWindow,
 } from "./monthlyScheduler.js";
+
+test("Shanghai natural weeks turn over at Monday 00:00", () => {
+  const before = shanghaiNaturalWeekWindow("2026-08-02T15:59:59.000Z");
+  const after = shanghaiNaturalWeekWindow("2026-08-02T16:00:00.000Z");
+  assert.equal(before.weekKey, "2026-07-27");
+  assert.equal(before.nextDueAt, "2026-08-02T16:00:00.000Z");
+  assert.equal(after.weekKey, "2026-08-03");
+  assert.equal(after.dueAt, "2026-08-02T16:00:00.000Z");
+});
 
 test("monthly schedule resolves the current local month window and next due time", () => {
   const now = new Date(2026, 6, 29, 9, 30);
@@ -72,6 +82,44 @@ test("scheduler catches up once on startup and does not duplicate the same month
   current = new Date(2026, 7, 1, 8, 1);
   await scheduler.tick();
   assert.deepEqual(starts, [{ run_id: "run-1" }, { run_id: "run-2" }]);
+  scheduler.dispose();
+});
+
+test("an August 1 monthly scan refreshes once after the August 3 week boundary", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-natural-week-refresh-"));
+  let current = new Date("2026-08-01T00:01:00.000Z");
+  let refreshes = 0;
+  const scheduler = createMonthlyJournalScheduler({
+    dataDir,
+    now: () => new Date(current),
+    workflowService: {
+      async startRun() {
+        return { run_id: "run-august" };
+      },
+      async refreshCurrentMonthCandidates() {
+        refreshes += 1;
+        return { run_id: "run-august" };
+      },
+    },
+    setTimer: () => ({ unref() {} }),
+    clearTimer: () => {},
+  });
+
+  await scheduler.start();
+  await scheduler.tick();
+  assert.equal(refreshes, 0);
+
+  current = new Date("2026-08-02T16:01:00.000Z");
+  await scheduler.tick();
+  await scheduler.tick();
+  assert.equal(refreshes, 1);
+
+  const state = JSON.parse(await readFile(
+    path.join(dataDir, "scheduler", "monthly.json"),
+    "utf8",
+  ));
+  assert.equal(state.last_scan_week_key, "2026-08-03");
+  assert.equal(state.next_refresh_due_at, "2026-08-09T16:00:00.000Z");
   scheduler.dispose();
 });
 

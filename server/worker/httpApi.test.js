@@ -99,6 +99,66 @@ test("Worker task bundle exposes imported sources without performing another rea
   assert.equal(externalReads, 0);
 });
 
+test("Worker task titles project from the bound Pi conversation", async () => {
+  const worker = {
+    async listTasks() {
+      return [{
+        id: "worker_task_1",
+        workerId: "agent_mail",
+        conversationId: "conversation_1",
+        title: "新工作会话",
+      }];
+    },
+  };
+  const project = {
+    async listWorkerConversations() {
+      return [{ id: "conversation_1", title: "整理导师邮件" }];
+    },
+  };
+  const context = harness({ worker, project });
+  await context.api.handle(
+    request("GET"),
+    {},
+    new URL("http://localhost/api/v1/worker/tasks"),
+    null,
+  );
+
+  assert.equal(context.responses[0].body.tasks[0].title, "整理导师邮件");
+});
+
+test("Worker task creation accepts no title and keeps the conversation prompt-derived", async () => {
+  const calls = [];
+  const worker = {
+    async createTask(input) {
+      calls.push(["task", input]);
+      return { id: "worker_task_1", ...input };
+    },
+  };
+  const project = {
+    async createWorkerConversation(input) {
+      calls.push(["conversation", input]);
+      return { id: "conversation_1", title: "新工作会话" };
+    },
+    async removeWorkerConversation() {},
+  };
+  const context = harness({
+    worker,
+    project,
+    payload: { schema_version: 1, worker_id: "agent_mail" },
+  });
+  await context.api.handle(
+    request("POST"),
+    {},
+    new URL("http://localhost/api/v1/worker/tasks"),
+    "http://127.0.0.1:5173",
+  );
+
+  assert.equal(calls[0][0], "conversation");
+  assert.equal(calls[0][1].title, undefined);
+  assert.equal(calls[1][1].title, "新工作会话");
+  assert.equal(context.responses[0].body.task.title, "新工作会话");
+});
+
 test("Worker messages receive persisted reference context and Lark drafts default to XML", async () => {
   const sent = [];
   const saved = [];

@@ -15,6 +15,7 @@ import { workerReducer } from "./workerState.js";
 
 const POLL_INTERVAL_MS = 700;
 const MAX_POLL_ATTEMPTS = 180;
+const DEFAULT_WORKER_TASK_TITLE = "新工作会话";
 
 function requestId(prefix) {
   return `${prefix}:${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
@@ -158,10 +159,24 @@ export function useWorkerController({
 
   const renderBundle = useCallback((nextBundle, { preserveLocal = true } = {}) => {
     if (!nextBundle?.task?.id) return null;
-    bundleRef.current = nextBundle;
-    setBundle(nextBundle);
-    const taskId = nextBundle.task.id;
-    setState((current) => adaptWorkerBundle(nextBundle, {
+    const conversation = unwrapWorkerConversation(nextBundle.conversation);
+    const conversationTitle = typeof conversation?.title === "string"
+      ? conversation.title.trim()
+      : "";
+    const projectedBundle = conversationTitle
+      && conversationTitle !== DEFAULT_WORKER_TASK_TITLE
+      ? {
+          ...nextBundle,
+          task: { ...nextBundle.task, title: conversationTitle },
+        }
+      : nextBundle;
+    bundleRef.current = projectedBundle;
+    setBundle(projectedBundle);
+    const taskId = projectedBundle.task.id;
+    setTasks((current) => current.map((task) => (
+      task.id === taskId ? { ...task, ...projectedBundle.task } : task
+    )));
+    setState((current) => adaptWorkerBundle(projectedBundle, {
       definitions: definitionsRef.current,
       connections: connectionsRef.current,
       projectOptions: projectOptionsRef.current,
@@ -171,7 +186,7 @@ export function useWorkerController({
       defaultProviderId,
       defaultModelId,
     }));
-    return nextBundle;
+    return projectedBundle;
   }, [defaultModelId, defaultProviderId]);
 
   const refreshTask = useCallback(async (taskId, { epoch = epochRef.current } = {}) => {
@@ -377,12 +392,11 @@ export function useWorkerController({
 
   const createTask = useCallback(async (input) => {
     const workerId = typeof input === "string" ? input : input?.workerId;
-    const title = typeof input === "object" ? input?.title : "新任务";
-    if (!workerId || !title?.trim()) return false;
+    if (!workerId) return false;
     setBusyAction("create_task");
     setError(null);
     try {
-      const created = await workerApi.createTask({ workerId, title: title.trim() });
+      const created = await workerApi.createTask({ workerId });
       const nextTasks = await workerApi.listTasks();
       setTasks(nextTasks);
       return selectTask(created.task.id, workerId);

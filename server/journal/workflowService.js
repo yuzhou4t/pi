@@ -1480,6 +1480,7 @@ export function createJournalWorkflowService({
             scanKey,
             ...(journalFieldSlots === undefined ? {} : { fieldSlots: journalFieldSlots }),
           });
+          const scanObservedAt = scan.summary?.observed_at ?? attemptedAt;
           const afterScan = await runStore.getRun(runId);
           if (
             afterScan?.candidate_refresh?.last_scan_key === scanKey
@@ -1609,6 +1610,7 @@ export function createJournalWorkflowService({
                 last_attempt_at: attemptedAt,
                 last_applied_at: appliedAt,
                 last_scan_key: scanKey,
+                last_scan_observed_at: scanObservedAt,
                 last_added_count: added.length,
                 last_added_paper_ids: added.map((paper) => paper.paper_id),
                 language_artifact: languageArtifact(translation),
@@ -1683,6 +1685,9 @@ export function createJournalWorkflowService({
             ...(current.candidate_refresh ?? appliedRefresh),
             last_attempt_at: attemptedAt,
             last_refreshed_at: refreshedAt,
+            last_scan_observed_at: current.candidate_refresh?.last_scan_observed_at
+              ?? appliedRefresh?.last_scan_observed_at
+              ?? attemptedAt,
             last_error: null,
           },
         }), {
