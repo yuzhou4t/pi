@@ -324,6 +324,16 @@ test("refreshRunCandidates appends this-month papers and records refresh state",
           successful_source_count: 11,
           failed_source_ids: [],
         },
+        sourceScans: [{
+          source_id: "journal-jmlr",
+          status: "success",
+          dispatch: {
+            status: "primary",
+            selected_route: "primary",
+            selected_adapter: "jmlr-papers-index",
+            attempts: [{ role: "primary", status: "success", adapter: "jmlr-papers-index", error: null }],
+          },
+        }],
         candidateBatch: {
           mode: "new_papers",
           candidates: [
@@ -376,11 +386,58 @@ test("refreshRunCandidates appends this-month papers and records refresh state",
     refreshed.candidate_refresh.last_scan_observed_at,
     "2026-08-03T00:05:00.000Z",
   );
+  assert.equal(refreshed.candidate_refresh.last_scan_summary.successful_source_count, 11);
+  assert.equal(refreshed.candidate_refresh.last_source_statuses[0].short_name, "JMLR");
+  assert.equal(refreshed.weekly_recommendation.week_key, "2026-08-03");
   assert.equal(
     refreshed.candidates.find((paper) => paper.paper_id === "fresh-1").display_label,
     "本月新论文 · 领域视野",
   );
   assert.equal(commitCalls, 1);
+});
+
+test("getRun hydrates latest scan evidence for runs created before summary projection", async () => {
+  const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-refresh-hydrate-");
+  const scanKey = "refresh-2026-08-03";
+  await runStore.updateRun(runId, {
+    candidate_refresh: {
+      last_scan_key: scanKey,
+      last_scan_observed_at: "2026-08-03T00:05:00.000Z",
+    },
+  });
+  await runStore.writeArtifact(runId, `refresh/${scanKey}/inputs/scan-summary.json`, {
+    observed_at: "2026-08-03T00:05:00.000Z",
+    source_count: 11,
+    successful_source_count: 10,
+    failed_source_ids: ["journal-jmlr"],
+  });
+  await runStore.writeArtifact(runId, `refresh/${scanKey}/inputs/source-scans.json`, [{
+    source_id: "journal-jmlr",
+    status: "failed",
+    error: {
+      code: "SOURCE_ROUTES_EXHAUSTED",
+      attempts: [{
+        role: "primary",
+        adapter: "jmlr-papers-index",
+        status: "failed",
+        error: { code: "OFFICIAL_SOURCE_EMPTY" },
+      }],
+    },
+  }]);
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+  });
+
+  const hydrated = await service.getRun(runId);
+  assert.equal(hydrated.candidate_refresh.last_scan_summary.successful_source_count, 10);
+  assert.equal(hydrated.candidate_refresh.last_source_statuses[0].short_name, "JMLR");
+  assert.equal(
+    hydrated.candidate_refresh.last_source_statuses[0].attempts[0].error_code,
+    "OFFICIAL_SOURCE_EMPTY",
+  );
 });
 
 test("refreshRunCandidates does not append after the run leaves candidate review", async () => {

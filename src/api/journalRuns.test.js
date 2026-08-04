@@ -69,6 +69,16 @@ const runBody = {
   created_at: "2026-07-23T07:00:00.000Z",
   updated_at: "2026-07-23T08:00:00.000Z",
   scan_summary: { source_count: 11 },
+  source_statuses: [{
+    source_id: "journal-jmlr",
+    short_name: "JMLR",
+    status: "success",
+    route_status: "primary",
+    selected_route: "primary",
+    selected_adapter: "jmlr-papers-index",
+    attempts: [{ role: "primary", status: "success", adapter: "jmlr-papers-index", error_code: null }],
+    error_code: null,
+  }],
   mineru: {
     status: "partial",
     papers: {
@@ -114,6 +124,20 @@ const runBody = {
     last_scan_observed_at: "2026-07-23T07:25:00.000Z",
     last_added_count: 0,
     last_error: { code: "REFRESH_FAILED", message: "刷新暂时失败" },
+    last_scan_summary: { source_count: 11, successful_source_count: 10, failed_source_ids: ["conference-iccv"] },
+    last_source_statuses: [{
+      source_id: "conference-iccv",
+      short_name: "ICCV",
+      status: "failed",
+      route_status: "failed",
+      attempts: [{ role: "primary", status: "failed", adapter: "cvf-iccv", error_code: "OFFICIAL_HTTP_406" }],
+      error_code: "SOURCE_ROUTES_EXHAUSTED",
+    }],
+  },
+  weekly_recommendation: {
+    week_key: "2026-07-20",
+    observed_at: "2026-07-23T07:25:00.000Z",
+    paper_ids: ["paper-1"],
   },
 };
 
@@ -140,6 +164,11 @@ test("journal runs keep classic origin and MinerU state visible", () => {
   assert.equal(run.scanSummary.source_count, 11);
   assert.equal(run.candidateRefresh.lastError.message, "刷新暂时失败");
   assert.equal(run.candidateRefresh.lastScanObservedAt, "2026-07-23T07:25:00.000Z");
+  assert.equal(run.candidateRefresh.lastScanSummary.successful_source_count, 10);
+  assert.equal(run.candidateRefresh.sourceStatuses[0].shortName, "ICCV");
+  assert.equal(run.candidateRefresh.sourceStatuses[0].attempts[0].errorCode, "OFFICIAL_HTTP_406");
+  assert.equal(run.sourceStatuses[0].shortName, "JMLR");
+  assert.deepEqual(run.weeklyRecommendation.paperIds, ["paper-1"]);
 });
 
 test("journal run maps recent-classic summaries, impacts, and date precision", () => {

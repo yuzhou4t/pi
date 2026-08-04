@@ -12,6 +12,7 @@
     "test:contracts": "node --test server/runtimeSchema.test.js server/modelMode.test.js server/project-work/piSdkCompatibility.test.js server/promptRegistry.test.js",
     "test": "node --test --test-concurrency=1",
     "schema:check": "node scripts/check-runtime-schemas.mjs",
+    "sources:check": "node scripts/check-journal-sources.mjs",
     "verify": "npm run test:contracts && npm test && npm run build && npm run schema:check"
   },
   "dependencies": {

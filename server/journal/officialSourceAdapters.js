@@ -1,6 +1,7 @@
 const MAX_OFFICIAL_BODY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_DETAIL_PAGES = 6;
+const MAX_RSS_ITEMS = 80;
 const MAX_JSON_LD_NODES = 5_000;
 const MAX_URL_CHARS = 2_048;
 
@@ -123,6 +124,17 @@ function decodeHtml(value) {
 
 function cleanHtml(value) {
   return compact(decodeHtml(String(value ?? "").replace(/<[^>]+>/g, " ")));
+}
+
+function xmlElement(body, name) {
+  const match = String(body ?? "").match(
+    new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)</${name}>`, "i"),
+  );
+  return compact(decodeHtml(match?.[1] ?? ""));
+}
+
+function secureJmlrUrl(value) {
+  return compact(value).replace(/^http:\/\/(?:www\.)?jmlr\.org/i, "https://www.jmlr.org");
 }
 
 function attributes(tag) {
@@ -738,6 +750,77 @@ async function detailRecords({
   return records.filter(Boolean);
 }
 
+export function recordsFromJmlrRss(xml, context) {
+  const records = [];
+  for (const match of String(xml ?? "").matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)) {
+    if (records.length >= MAX_RSS_ITEMS) break;
+    const item = match[1];
+    const officialUrl = secureJmlrUrl(xmlElement(item, "link"));
+    if (!/^https:\/\/(?:www\.)?jmlr\.org\/papers\/v\d+\/[^/?#]+\.html$/i.test(officialUrl)) {
+      continue;
+    }
+    const authors = xmlElement(item, "author")
+      .split(/\s*,\s*/)
+      .map(compact)
+      .filter(Boolean);
+    records.push(officialRecord({
+      ...context,
+      pageUrl: officialUrl,
+      evidenceKind: "official_rss",
+      title: xmlElement(item, "title"),
+      authors,
+      publishedAt: xmlElement(item, "pubDate"),
+      doi: null,
+      officialUrl,
+      pdfUrl: secureJmlrUrl(xmlElement(item, "pdf")),
+      abstract: xmlElement(item, "description"),
+    }));
+  }
+  return records.filter(Boolean);
+}
+
+async function fetchJmlrRssSource(source, {
+  fetchImpl = globalThis.fetch,
+  route = source?.primary,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+  const config = OFFICIAL_ADAPTER_CONFIGS["jmlr-papers-index"];
+  if (
+    !route?.url
+    || route.url !== source?.primary?.url
+    || route.kind !== "official-rss"
+  ) {
+    throw new OfficialSourceError(
+      "OFFICIAL_ROUTE_INVALID",
+      `Source ${source?.source_id ?? "unknown"} has no supported official RSS route`,
+    );
+  }
+  const allowedHosts = routeHosts(route.url, config);
+  const feed = await fetchBoundedHtml(fetchImpl, route.url, {
+    timeoutMs,
+    allowedHosts,
+  });
+  const papers = deduplicateRecords(recordsFromJmlrRss(feed.body, {
+    source,
+    adapterName: "jmlr-papers-index",
+    routeUrl: route.url,
+    pageUrl: feed.url,
+  }));
+  if (papers.length === 0) {
+    throw new OfficialSourceError(
+      "OFFICIAL_SOURCE_EMPTY",
+      `Official source ${source.source_id} exposed no parseable paper records`,
+    );
+  }
+  return {
+    source_id: source.source_id,
+    fetched_at: new Date().toISOString(),
+    index_url: route.url,
+    target_urls: [feed.url],
+    papers,
+  };
+}
+
 export async function fetchOfficialSource(source, {
   adapterName = source?.adapter,
   fetchImpl = globalThis.fetch,
@@ -859,9 +942,11 @@ export async function fetchOfficialSource(source, {
 export const OFFICIAL_SOURCE_ADAPTERS = Object.freeze(Object.fromEntries(
   Object.keys(OFFICIAL_ADAPTER_CONFIGS).map((adapterName) => [
     adapterName,
-    (source, options = {}) => fetchOfficialSource(source, {
-      ...options,
-      adapterName,
-    }),
+    adapterName === "jmlr-papers-index"
+      ? fetchJmlrRssSource
+      : (source, options = {}) => fetchOfficialSource(source, {
+          ...options,
+          adapterName,
+        }),
   ]),
 ));

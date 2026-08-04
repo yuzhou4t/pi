@@ -4,6 +4,7 @@ import {
   fetchOfficialSource,
   OFFICIAL_SOURCE_ADAPTERS,
   OfficialSourceError,
+  recordsFromJmlrRss,
 } from "./officialSourceAdapters.js";
 import { SOURCE_REGISTRY } from "./sourceRegistry.js";
 
@@ -37,6 +38,18 @@ test("all eleven registered primary adapters request their declared official rou
       route: source.primary,
       fetchImpl: async (url) => {
         requested.push(String(url));
+        if (source.adapter === "jmlr-papers-index") {
+          return new Response([
+            "<rss><channel><item>",
+            `<title>Official LLM Agent Paper ${index + 1}</title>`,
+            "<link>http://jmlr.org/papers/v27/26-0001.html</link>",
+            "<pdf>http://jmlr.org/papers/volume27/26-0001/26-0001.pdf</pdf>",
+            "<pubDate>2026</pubDate>",
+            "<author>Ada Author</author>",
+            "<description>An official structured abstract.</description>",
+            "</item></channel></rss>",
+          ].join(""), { status: 200 });
+        }
         return new Response(jsonLdFixture(source, index), {
           status: 200,
           headers: { "content-type": "text/html; charset=utf-8" },
@@ -47,15 +60,24 @@ test("all eleven registered primary adapters request their declared official rou
     assert.equal(requested[0], source.primary.url);
     assert.equal(result.index_url, source.primary.url);
     assert.equal(result.papers.length, 1);
-    assert.equal(result.papers[0].publication_date_precision, "day");
-    assert.equal(result.papers[0].published_at, "2026-07-27");
+    assert.equal(
+      result.papers[0].publication_date_precision,
+      source.adapter === "jmlr-papers-index" ? "year" : "day",
+    );
+    assert.equal(
+      result.papers[0].published_at,
+      source.adapter === "jmlr-papers-index" ? "2026" : "2026-07-27",
+    );
     assert.equal(result.papers[0].provenance.adapter, source.adapter);
-    assert.equal(result.papers[0].provenance.evidence_kind, "json_ld");
+    assert.equal(
+      result.papers[0].provenance.evidence_kind,
+      source.adapter === "jmlr-papers-index" ? "official_rss" : "json_ld",
+    );
   }
 });
 
 test("citation metadata preserves exact date, authors, DOI, PDF, and provenance", async () => {
-  const source = SOURCE_REGISTRY.find((item) => item.adapter === "jmlr-papers-index");
+  const source = SOURCE_REGISTRY.find((item) => item.adapter === "springer-journal");
   const html = [
     "<html><head>",
     '<meta name="citation_title" content="Reliable LLM Agent Memory">',
@@ -82,31 +104,30 @@ test("citation metadata preserves exact date, authors, DOI, PDF, and provenance"
   assert.equal(paper.provenance.evidence_kind, "citation_meta");
 });
 
-test("an official paper link stays date-unknown when its detail page has no structured date", async () => {
+test("JMLR RSS keeps year-only publication precision and upgrades public links to HTTPS", () => {
   const source = SOURCE_REGISTRY.find((item) => item.adapter === "jmlr-papers-index");
-  const detailUrl = "https://www.jmlr.org/papers/v27/agent.html";
-  const requested = [];
-  const result = await OFFICIAL_SOURCE_ADAPTERS[source.adapter](source, {
-    route: source.primary,
-    fetchImpl: async (url) => {
-      requested.push(String(url));
-      if (String(url) === source.primary.url) {
-        return new Response(
-          `<a href="${detailUrl}">Reliable LLM Agent Memory Workflows</a>`,
-          { status: 200 },
-        );
-      }
-      return new Response("<html><body>Paper page without metadata.</body></html>", {
-        status: 200,
-      });
-    },
+  const [paper] = recordsFromJmlrRss([
+    "<rss><channel><item>",
+    "<title>Reliable LLM Agent Memory Workflows</title>",
+    "<link>http://jmlr.org/papers/v27/agent.html</link>",
+    "<pdf>http://jmlr.org/papers/volume27/agent/agent.pdf</pdf>",
+    "<pubDate>2026</pubDate>",
+    "<author>Ada Author, Lin Researcher</author>",
+    "<description>A bounded official abstract.</description>",
+    "</item></channel></rss>",
+  ].join(""), {
+    source,
+    adapterName: source.adapter,
+    routeUrl: source.primary.url,
+    pageUrl: source.primary.url,
   });
-  const [paper] = result.papers;
 
-  assert.deepEqual(requested, [source.primary.url, detailUrl]);
-  assert.equal(paper.published_at, null);
-  assert.equal(paper.publication_date_precision, "unknown");
-  assert.equal(paper.provenance.evidence_kind, "official_index_link");
+  assert.equal(paper.published_at, "2026");
+  assert.equal(paper.publication_date_precision, "year");
+  assert.equal(paper.official_url, "https://www.jmlr.org/papers/v27/agent.html");
+  assert.equal(paper.pdf_url, "https://www.jmlr.org/papers/volume27/agent/agent.pdf");
+  assert.deepEqual(paper.authors, ["Ada Author", "Lin Researcher"]);
+  assert.equal(paper.provenance.evidence_kind, "official_rss");
 });
 
 test("nested official indexes are followed once before bounded paper detail parsing", async () => {

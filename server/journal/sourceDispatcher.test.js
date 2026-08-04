@@ -240,17 +240,28 @@ test("the default dispatcher has a working primary handler for every registry ad
   });
   for (const [index, registered] of SOURCE_REGISTRY.entries()) {
     const result = await dispatch(registered, {
-      fetchImpl: async () => new Response([
-        '<script type="application/ld+json">',
-        JSON.stringify({
-          "@type": "ScholarlyArticle",
-          headline: `Registry Primary LLM Agent Paper ${index + 1}`,
-          datePublished: "2026-07-27",
-          identifier: `10.1000/registry-${index + 1}`,
-          url: registered.primary.url,
-        }),
-        "</script>",
-      ].join(""), { status: 200 }),
+      fetchImpl: async () => new Response(
+        registered.adapter === "jmlr-papers-index"
+          ? [
+              "<rss><channel><item>",
+              `<title>Registry Primary LLM Agent Paper ${index + 1}</title>`,
+              "<link>http://jmlr.org/papers/v27/registry.html</link>",
+              "<pubDate>2026</pubDate>",
+              "</item></channel></rss>",
+            ].join("")
+          : [
+              '<script type="application/ld+json">',
+              JSON.stringify({
+                "@type": "ScholarlyArticle",
+                headline: `Registry Primary LLM Agent Paper ${index + 1}`,
+                datePublished: "2026-07-27",
+                identifier: `10.1000/registry-${index + 1}`,
+                url: registered.primary.url,
+              }),
+              "</script>",
+            ].join(""),
+        { status: 200 },
+      ),
     });
 
     assert.equal(result.dispatch.status, "primary");

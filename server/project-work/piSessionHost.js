@@ -3648,6 +3648,9 @@ export function createPiSessionFactory({
         }
         return retryFromEntry(target.entryId, options);
       },
+      hasRetryableTurn() {
+        return session.getUserMessagesForForking().length > 0;
+      },
       getMessageEntryId(message) {
         return getSessionMessageEntryId(sessionManager, message);
       },

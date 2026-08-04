@@ -1,4 +1,6 @@
-const RESURFACE_LABEL = "往期未读回补 · 非本月新论文";
+const RESURFACE_LABEL = "近半年优质未读 · 再次推荐";
+const MAX_RESURFACE_COUNT = 3;
+const RECENT_WINDOW_MS = 180 * 24 * 60 * 60 * 1000;
 
 function decisionOf(run, paperId) {
   const decisions = run?.paper_decisions;
@@ -12,6 +14,17 @@ function identityKeys(paper) {
   if (typeof paper?.paper_id === "string" && paper.paper_id) keys.push(`id:${paper.paper_id}`);
   if (typeof paper?.dedupe_key === "string" && paper.dedupe_key) keys.push(`key:${paper.dedupe_key}`);
   return keys;
+}
+
+function recentEnough(paper, observedAt) {
+  const observed = Date.parse(observedAt);
+  if (!Number.isFinite(observed)) return true;
+  const evidenceAt = paper?.publication_date_precision === "day"
+    ? paper?.published_at
+    : paper?.first_seen_at ?? paper?.observed_at ?? paper?.published_at;
+  const evidence = Date.parse(evidenceAt);
+  const age = observed - evidence;
+  return Number.isFinite(age) && age >= 0 && age <= RECENT_WINDOW_MS;
 }
 
 export { RESURFACE_LABEL };
@@ -49,9 +62,12 @@ export function selectResurfaceCandidates({
       .sort((left, right) => (Number(left.rank) || 99) - (Number(right.rank) || 99));
     for (const paper of byRank) {
       if (picked.length >= limit) return picked;
-      // 经典回顾有自己的补位机制，不参与回补；已回补过的也不再套娃。
+      // 经典回顾有自己的补位机制；近期未读论文最多回补三次。
       if (paper.candidate_origin === "classic_review") continue;
-      if (paper.candidate_origin === "resurfaced_unread") continue;
+      const resurfaceCount = Number.isInteger(paper.resurface_count)
+        ? paper.resurface_count
+        : paper.candidate_origin === "resurfaced_unread" ? 1 : 0;
+      if (resurfaceCount >= MAX_RESURFACE_COUNT || !recentEnough(paper, observedAt)) continue;
       const decision = decisionOf(run, paper.paper_id);
       if (decision === "read" || decision === "collect") continue;
       const keys = identityKeys(paper);
@@ -63,6 +79,8 @@ export function selectResurfaceCandidates({
         is_new: false,
         published_this_month: false,
         display_label: RESURFACE_LABEL,
+        recent_pool_eligible: true,
+        resurface_count: resurfaceCount + 1,
         resurfaced_from_run_id: run.run_id ?? null,
         observed_at: observedAt ?? paper.observed_at ?? null,
       });

@@ -721,7 +721,8 @@ function CandidateReview({
   const hasFixtureCandidates = run?.source === "fixture"
     && papers.some((paper) => paper.isDemo !== false);
   const scanInProgress = ["starting", "running"].includes(journalRunState?.status);
-  const scanSummary = liveRun?.scanSummary
+  const scanSummary = liveRun?.candidateRefresh?.lastScanSummary
+    ?? liveRun?.scanSummary
     ?? (liveScanStarted || !hasFixtureCandidates ? null : workflowFixture.scanSummary);
   const latestScanEvidenceAt = liveRun?.candidateRefresh?.lastScanObservedAt
     ?? liveRun?.candidateRefresh?.lastRefreshedAt
@@ -729,11 +730,16 @@ function CandidateReview({
     ?? scanSummary?.observedAt
     ?? liveRun?.createdAt;
   const sourceProgress = liveRun?.sourceProgress;
-  const successfulSourceCount = liveRun?.scanSummary?.successful_source_count
+  const successfulSourceCount = scanSummary?.successful_source_count
     ?? sourceProgress?.successful_source_ids?.length;
-  const sourceCount = liveRun?.scanSummary?.source_count ?? sourceProgress?.total_count ?? 11;
-  const failedSourceIds = liveRun?.scanSummary?.failed_source_ids ?? sourceProgress?.failed_source_ids ?? [];
-  const completedSourceCount = sourceProgress?.completed_source_ids?.length;
+  const sourceCount = scanSummary?.source_count ?? sourceProgress?.total_count ?? 11;
+  const failedSourceIds = scanSummary?.failed_source_ids ?? sourceProgress?.failed_source_ids ?? [];
+  const sourceStatuses = liveRun?.candidateRefresh?.sourceStatuses?.length
+    ? liveRun.candidateRefresh.sourceStatuses
+    : liveRun?.sourceStatuses ?? [];
+  const failedSourceStatuses = sourceStatuses.filter((source) => source.status === "failed");
+  const completedSourceCount = scanSummary?.source_count
+    ?? sourceProgress?.completed_source_ids?.length;
   const canResumeMineru = hasLiveCandidates && [
     "not_configured",
     "quota_deferred",
@@ -866,16 +872,29 @@ function CandidateReview({
               </p>
             ) : null}
             {liveScanStarted ? (
-              <p className="workflow-live-scan-status" role={journalRunState?.error ? "alert" : "status"}>
-                {successfulSourceCount !== undefined ? (
-                  <>
-                    {completedSourceCount !== undefined ? <span>已检查 {completedSourceCount}/{sourceCount}</span> : null}
-                    <span>来源成功 {successfulSourceCount}/{sourceCount}</span>
-                    <span title={failedSourceIds.join("、")}>失败 {failedSourceIds.length}</span>
-                  </>
-                ) : <span>来源结果等待汇总</span>}
-                {journalRunState?.error ? <span className="is-error">{journalRunState.error}</span> : null}
-              </p>
+              <>
+                <p className="workflow-live-scan-status" role={journalRunState?.error ? "alert" : "status"}>
+                  {successfulSourceCount !== undefined ? (
+                    <>
+                      {completedSourceCount !== undefined ? <span>已检查 {completedSourceCount}/{sourceCount}</span> : null}
+                      <span>来源成功 {successfulSourceCount}/{sourceCount}</span>
+                      <span title={failedSourceIds.join("、")}>失败 {failedSourceIds.length}</span>
+                    </>
+                  ) : <span>来源结果等待汇总</span>}
+                  {journalRunState?.error ? <span className="is-error">{journalRunState.error}</span> : null}
+                </p>
+                {failedSourceStatuses.length > 0 ? (
+                  <p className="workflow-refresh-note" role="status">
+                    失败来源：{failedSourceStatuses.map((source) => {
+                      const attemptCodes = source.attempts
+                        ?.map((attempt) => attempt.errorCode)
+                        .filter(Boolean)
+                        .join(" / ");
+                      return `${source.shortName}${attemptCodes ? `（${attemptCodes}）` : ""}`;
+                    }).join("、")}
+                  </p>
+                ) : null}
+              </>
             ) : null}
             <div className="workflow-scan-model-row">
               <p className="workflow-scan-source" role="status">{summarySourceLabel}</p>
