@@ -8817,7 +8817,11 @@ function createProjectWorkServiceRuntime({
       projectRoot: workspace.workspaceRoot,
       baseRoot: runtimeBaseRoot,
       workspaceRoot: runtimeWorkspaceRoot,
-      legacyWorkspaceRoot: directWorkspace ? paths.workspaceRoot : null,
+      legacyWorkspaceRoot: directWorkspace
+        && conversation.legacyMigration?.sourceRuntimeMode
+        && conversation.legacyMigration.sourceRuntimeMode !== "workspace-v2"
+        ? paths.workspaceRoot
+        : null,
       sessionDir: paths.sessionDir,
       modelRef: conversation.modelRef,
       thinkingLevel: conversation.thinkingLevel,
@@ -12084,6 +12088,8 @@ function createProjectWorkServiceRuntime({
     let selectedCheckpoint = null;
     let selectedUserEntryId = null;
     let useEntryRetry = false;
+    let replayStoredPrompt = null;
+    let useStoredPromptReplay = false;
     await updateConversation(conversationId, (current) => {
       const existingOperation = (current.operations ?? []).find((item) => (
         item.type === "retry_last_turn"
@@ -12173,6 +12179,14 @@ function createProjectWorkServiceRuntime({
         ?? assistants.filter((message) => message.isFinal !== false).at(-1)
         ?? assistants.at(-1)
         ?? null;
+      if (
+        !targetAssistant
+        && (!Array.isArray(userMessage.images) || userMessage.images.length === 0)
+      ) {
+        replayStoredPrompt = `${userMessage.text}${projectWorkAttachmentManifestPrompt(
+          userMessage.attachments,
+        )}`;
+      }
       preserveSuccessfulAnswer = targetAssistant?.status === "completed";
       if (selectedCheckpoint) {
         assertCheckpointOperationReady(current);
@@ -12299,8 +12313,20 @@ function createProjectWorkServiceRuntime({
         selectedUserEntryId
         && typeof runtime.host.retryFromEntry === "function"
       );
+      useStoredPromptReplay = Boolean(
+        replayStoredPrompt
+        && (
+          runtime.host.hasRetryableTurn?.() === false
+          || (
+            typeof runtime.host.hasRetryableTurn !== "function"
+            && !runtime.host.getActiveEntryId?.()
+          )
+        )
+        && typeof runtime.host.prompt === "function"
+      );
       if (
         !useEntryRetry
+        && !useStoredPromptReplay
         && typeof runtime.host.retryLastTurn !== "function"
       ) {
         throw projectWorkError(
@@ -12360,6 +12386,20 @@ function createProjectWorkServiceRuntime({
             turnGuidance: [
               turn.guidance,
               selectedUserEntryId ? CHECKPOINT_CURRENT_FILES_GUIDANCE : "",
+              previewToolActive
+                ? [
+                    CONTROLLED_PREVIEW_GUIDANCE,
+                    turnSettings.executionPolicyMode === "auto_review"
+                      ? AUTO_PREVIEW_GUIDANCE
+                      : MANUAL_PREVIEW_GUIDANCE,
+                  ].join("\n")
+                : "",
+            ].filter(Boolean).join("\n"),
+          })
+        : useStoredPromptReplay
+        ? runtime.host.prompt(replayStoredPrompt, {
+            turnGuidance: [
+              turn.guidance,
               previewToolActive
                 ? [
                     CONTROLLED_PREVIEW_GUIDANCE,

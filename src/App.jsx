@@ -924,7 +924,11 @@ export function App() {
             ? runStatusLabels[run.status] ?? run.status
             : "等待开始本月扫描"),
   }), [journalRunState.run?.id, journalRunState.run?.status, journalRunState.status, run.runId, run.status]);
-  const liveJournalPapers = journalRunState.run?.candidates;
+  const liveJournalCandidates = journalRunState.run?.candidates;
+  const recommendedJournalPaperIds = journalRunState.run?.weeklyRecommendation?.paperIds ?? [];
+  const liveJournalPapers = recommendedJournalPaperIds.length > 0
+    ? liveJournalCandidates?.filter((paper) => recommendedJournalPaperIds.includes(paper.id))
+    : liveJournalCandidates;
   const obsidianAgentActionRevision = runAgentActionRevision(journalRunState.run);
   const workflowPapers = useMemo(() => (
     run.source === "live" || !WORKFLOW_FIXTURES_ENABLED

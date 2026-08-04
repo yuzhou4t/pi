@@ -75,13 +75,10 @@ export const SOURCE_REGISTRY = Object.freeze([
     source_type: "journal",
     type: "journal",
     primary: {
-      kind: "official-index",
-      url: "https://www.jmlr.org/papers/",
+      kind: "official-rss",
+      url: "https://www.jmlr.org/jmlr.xml",
     },
-    fallback: {
-      kind: "crossref-api",
-      url: "https://api.crossref.org/journals/1532-4435/works",
-    },
+    fallback: dblpFallback("/db/journals/jmlr/"),
     adapter: "jmlr-papers-index",
     dblp_path: "journals/jmlr",
     openalex_source_id: "S118988714",

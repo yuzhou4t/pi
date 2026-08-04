@@ -273,6 +273,149 @@ test("workspace-v2 non-Git projects stay bound to the selected original director
   assert.equal(workspace.id, conversation.workspace.id);
 });
 
+test("fresh workspace-v2 conversations do not probe a legacy overlay", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-workspace-fresh-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  const agentFactory = interactiveSessionFactory(async () => {});
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "state"),
+    sessionFactory: agentFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId(),
+  });
+  t.after(() => service.dispose());
+
+  const project = await registerProject(service);
+  const conversation = await service.createConversation(project.id);
+  await service.sendMessage(conversation.id, { text: "先只读检查项目" });
+
+  assert.equal(agentFactory.sessions.length, 1);
+  assert.equal(agentFactory.sessions[0].options.legacyWorkspaceRoot, null);
+  assert.equal(
+    agentFactory.sessions[0].options.workspaceRoot,
+    await realpath(projectRoot),
+  );
+  await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.status !== "running",
+    "fresh Workspace turn did not settle",
+  );
+});
+
+test("a pre-answer startup failure replays the persisted first prompt without duplicating it", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-workspace-replay-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const projectRoot = path.join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  const prompts = [];
+  let factoryAttempts = 0;
+  const agentFactory = async () => {
+    factoryAttempts += 1;
+    if (factoryAttempts === 1) {
+      const error = new Error("startup failed before Pi accepted the prompt");
+      error.code = "PROJECT_WORK_SESSION_WORKSPACE_MIGRATION_BLOCKED";
+      error.retryable = true;
+      throw error;
+    }
+    let subscriber = null;
+    const entryIds = new WeakMap();
+    return {
+      subscribe(listener) {
+        subscriber = listener;
+        return () => {
+          subscriber = null;
+        };
+      },
+      getActiveEntryId() {
+        return null;
+      },
+      hasRetryableTurn() {
+        return false;
+      },
+      getMessageEntryId(message) {
+        return entryIds.get(message) ?? null;
+      },
+      async prompt(prompt) {
+        prompts.push(prompt);
+        const userMessage = {
+          role: "user",
+          content: [{ type: "text", text: prompt }],
+        };
+        const assistantMessage = {
+          role: "assistant",
+          provider: "deepseek",
+          model: "deepseek-v4-flash",
+          content: [{ type: "text", text: "已恢复并完成只读检查" }],
+          stopReason: "stop",
+        };
+        entryIds.set(userMessage, "pi-user-replayed");
+        entryIds.set(assistantMessage, "pi-assistant-replayed");
+        subscriber?.({ type: "message_start", message: userMessage });
+        subscriber?.({ type: "message_end", message: userMessage });
+        subscriber?.({ type: "message_start", message: assistantMessage });
+        subscriber?.({ type: "message_end", message: assistantMessage });
+        subscriber?.({ type: "agent_settled" });
+      },
+      setActiveToolsByName(names) {
+        return [...names];
+      },
+      async steer() {},
+      async abort() {},
+      async compact() {},
+      async setModel() {},
+      dispose() {},
+    };
+  };
+  agentFactory.listModels = async () => ({
+    defaultProviderId: "deepseek",
+    defaultModelId: "deepseek-v4-flash",
+    providers: [{
+      id: "deepseek",
+      label: "DeepSeek",
+      models: [{ id: "deepseek-v4-flash", label: "DeepSeek V4 Flash" }],
+    }],
+  });
+  agentFactory.dispose = async () => {};
+  const service = createProjectWorkService({
+    storageRoot: path.join(temporaryRoot, "state"),
+    sessionFactory: agentFactory,
+    picker: async () => ({ rootPath: projectRoot }),
+    idFactory: incrementalId(),
+  });
+  t.after(() => service.dispose());
+
+  const project = await registerProject(service);
+  const conversation = await service.createConversation(project.id);
+  await assert.rejects(
+    service.sendMessage(conversation.id, { text: "先只读检查摘要覆盖情况" }),
+    (error) => error?.code === "PROJECT_WORK_SESSION_WORKSPACE_MIGRATION_BLOCKED",
+  );
+  const failed = await service.getConversation(conversation.id);
+  assert.equal(failed.conversation.messages.length, 1);
+
+  await service.retryLastTurn(conversation.id, {
+    clientRequestId: "retry:first-persisted-prompt",
+  });
+  const recovered = await eventually(
+    () => service.getConversation(conversation.id),
+    (snapshot) => snapshot.conversation.operations.some(
+      (operation) => operation.status === "completed",
+    ),
+    "persisted first prompt was not replayed",
+  );
+  assert.deepEqual(prompts, ["先只读检查摘要覆盖情况"]);
+  assert.equal(
+    recovered.conversation.messages.filter((message) => message.role === "user").length,
+    1,
+  );
+  assert.equal(
+    recovered.conversation.messages.at(-1).text,
+    "已恢复并完成只读检查",
+  );
+});
+
 test("workspace-v2 direct writes require exact confirmation, settle stale review, and undo by hash", async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "pi-workspace-write-"));
   t.after(() => rm(temporaryRoot, { recursive: true, force: true }));

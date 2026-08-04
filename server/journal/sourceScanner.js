@@ -1,4 +1,5 @@
 import { buildCandidateBatch } from "./classicFallback.js";
+import { prepareRankingPool } from "./candidateRanking.js";
 import { selectResurfaceCandidates } from "./resurfaceCandidates.js";
 import {
   buildSourceScan,
@@ -17,6 +18,9 @@ const MAX_ENRICHMENT_PAPERS = 40;
 const DEFAULT_FIELD_SLOTS = 2;
 // 本月新论文的发现窗口：近 30 天 + 1 天容差（时区/索引延迟）。
 const MONTH_WINDOW_MS = 31 * 24 * 60 * 60 * 1000;
+// 推荐池保留近 180 天论文；日期只有年/月时改用真实首次发现时间，
+// 不把低精度日期伪造成具体发表日。
+const RECENT_POOL_WINDOW_MS = 180 * 24 * 60 * 60 * 1000;
 const SOURCE_FETCH_TIMEOUT_MS = 4 * 60 * 1000;
 
 function fetchSourceWithWatchdog(fetchSource, source, options, timeoutMs) {
@@ -62,6 +66,20 @@ export function publicationDiscovery(
     published_this_month: publishedThisMonth,
     display_label: publishedThisMonth ? "本月新论文" : "本月补发现 · 非本月新论文",
   };
+}
+
+export function recentPoolEligibility(paper, observedAt) {
+  const observed = Date.parse(observedAt);
+  if (!Number.isFinite(observed)) return false;
+  const precision = paper?.publication_date_precision;
+  const evidenceAt = precision === "day"
+    ? paper?.published_at
+    : paper?.first_seen_at ?? paper?.observed_at;
+  const evidence = Date.parse(evidenceAt);
+  const age = observed - evidence;
+  return Number.isFinite(age)
+    && age >= -24 * 60 * 60 * 1000
+    && age <= RECENT_POOL_WINDOW_MS;
 }
 
 function candidateExclusions(previousRuns, dismissedKeys) {
@@ -462,9 +480,16 @@ export async function scanJournalSources({
       ).published_this_month)
       .filter((paper) => !isExcludedCandidate(paper, exclusions)),
   );
+  const recentPoolRecords = deduplicatePapers(
+    scannedRecords
+      .filter((paper) => !paper.is_new)
+      .filter((paper) => recentPoolEligibility(paper, observedAt))
+      .filter((paper) => !isExcludedCandidate(paper, exclusions)),
+  );
   const candidateRecords = deduplicatePapers([
     ...newRecords,
     ...reconsideredRecords,
+    ...recentPoolRecords,
   ]).filter((paper) => !isExcludedCandidate(paper, exclusions));
   const likelyRelevant = filterTopicCandidates(candidateRecords);
   // 丰富选题面：除了窄主题命中，还优先把“领域视野”命中的论文纳入富化池，
@@ -499,7 +524,17 @@ export async function scanJournalSources({
       observedAt,
       paper.publication_date_precision,
     ),
-  }));
+    recent_pool_eligible: recentPoolEligibility(paper, observedAt),
+  })).map((paper) => (
+    !paper.published_this_month && paper.recent_pool_eligible
+      ? {
+          ...paper,
+          display_label: paper.publication_date_precision === "day"
+            ? "近半年优质未读"
+            : "近期首次发现 · 发表日期待精确核验",
+        }
+      : paper
+  ));
   const topicCandidates = deduplicatePapers(filterTopicCandidates(discovered));
   const coreKeys = new Set(topicCandidates.map((paper) => paper.dedupe_key).filter(Boolean));
   // 领域视野候选：命中更宽领域规则、但不属于窄主题核心的论文，标上“领域视野”。
@@ -518,21 +553,50 @@ export async function scanJournalSources({
       }));
   const recentCore = topicCandidates.filter((paper) => paper.published_this_month);
   const recentField = fieldCandidates.filter((paper) => paper.published_this_month);
-  // 为本月的 5 篇预留领域名额：核心优先，但至少留出几个位置给领域视野。
-  const fieldReserve = Math.min(boundedFieldSlots, recentField.length, 4);
-  const coreCount = Math.min(recentCore.length, Math.max(0, 5 - fieldReserve));
-  const recentSelected = [
-    ...recentCore.slice(0, coreCount),
-    ...recentField.slice(0, fieldReserve),
-  ];
-  // 本月新论文不足时的回补：核心+领域的历史首次发现（按发表时间降序）
-  // → 往期未读回补 → 经典池。之前补发现曾被整体丢弃，导致候选全是多年前经典。
-  const historicalDiscoveries = [...topicCandidates, ...fieldCandidates]
-    .filter((paper) => !paper.published_this_month)
-    .sort((left, right) => String(right.published_at ?? "").localeCompare(String(left.published_at ?? "")))
-    .slice(0, Math.max(0, 5 - recentSelected.length));
+  const unreadCore = topicCandidates.filter(
+    (paper) => !paper.published_this_month && paper.recent_pool_eligible,
+  );
+  const unreadField = fieldCandidates.filter(
+    (paper) => !paper.published_this_month && paper.recent_pool_eligible,
+  );
+  const recentFirst = (papers) => papers.slice().sort((left, right) => (
+    String(right.published_at ?? right.first_seen_at ?? "")
+      .localeCompare(String(left.published_at ?? left.first_seen_at ?? ""))
+  ));
+  const rankedCurrentCore = prepareRankingPool(recentFirst(recentCore), recentCore.length);
+  const rankedUnreadCore = prepareRankingPool(recentFirst(unreadCore), unreadCore.length);
+  const rankedField = prepareRankingPool(
+    recentFirst([...recentField, ...unreadField]),
+    recentField.length + unreadField.length,
+  );
+  const selected = [];
+  const selectedKeys = new Set();
+  const addCandidates = (papers, limit) => {
+    for (const paper of papers) {
+      if (selected.length >= limit) return;
+      if (selectedKeys.has(paper.dedupe_key)) continue;
+      selectedKeys.add(paper.dedupe_key);
+      selected.push(paper);
+    }
+  };
+  // 默认结构：3 篇当前窗口核心 + 1 篇近半年未读 + 1 篇领域视野；
+  // 某层不足时从其余近半年池按确定性质量分补齐。
+  addCandidates(rankedCurrentCore, 3);
+  addCandidates(rankedUnreadCore, Math.min(4, selected.length + 1));
+  if (boundedFieldSlots > 0) {
+    addCandidates(rankedField, Math.min(5, selected.length + 1));
+  }
+  addCandidates(prepareRankingPool([
+    ...recentCore,
+    ...unreadCore,
+    ...recentField,
+    ...unreadField,
+  ], recentCore.length + unreadCore.length + recentField.length + unreadField.length), 5);
+  const recentSelected = selected.filter((paper) => paper.published_this_month);
+  const historicalDiscoveries = selected.filter((paper) => !paper.published_this_month);
+  const fieldReserve = selected.filter((paper) => paper.candidate_scope === "field").length;
   let resurfacedCandidates = [];
-  const filledCount = recentSelected.length + historicalDiscoveries.length;
+  const filledCount = selected.length;
   if (filledCount < 5 && previousRuns.length > 0) {
     try {
       resurfacedCandidates = selectResurfaceCandidates({
@@ -550,8 +614,7 @@ export async function scanJournalSources({
   }
   const candidateBatch = buildCandidateBatch({
     newCandidates: [
-      ...recentSelected,
-      ...historicalDiscoveries,
+      ...selected,
       ...resurfacedCandidates,
     ],
     observedAt,
@@ -569,6 +632,7 @@ export async function scanJournalSources({
     ),
     new_record_count: newRecords.length,
     reconsidered_record_count: reconsideredRecords.length,
+    recent_pool_record_count: recentPoolRecords.length,
     topic_candidate_count: topicCandidates.length,
     recent_topic_candidate_count: recentCore.length,
     field_candidate_count: fieldCandidates.length,

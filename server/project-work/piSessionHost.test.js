@@ -481,6 +481,10 @@ test("project-work session host retries by branching before the last durable use
   const source = await readFile(new URL("./piSessionHost.js", import.meta.url), "utf8");
   assert.match(source, /retryLastTurn\(options = \{\}\)/);
   assert.match(source, /session\.getUserMessagesForForking\(\)\.at\(-1\)/);
+  assert.match(
+    source,
+    /hasRetryableTurn\(\)\s*\{\s*return session\.getUserMessagesForForking\(\)\.length > 0;/,
+  );
   assert.match(source, /return retryFromEntry\(target\.entryId, options\)/);
   assert.match(source, /session\.navigateTree\(entryId,\s*\{\s*summarize: false/);
   assert.match(source, /session\.sendUserMessage\(content\)/);

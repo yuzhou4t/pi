@@ -28,11 +28,11 @@ test("every source has primary, fallback, adapter, and a DBLP path", () => {
   }
   assert.equal(
     SOURCE_REGISTRY.filter((source) => source.fallback.kind === "crossref-api").length,
-    4,
+    3,
   );
   assert.equal(
     SOURCE_REGISTRY.filter((source) => source.fallback.kind === "dblp-index").length,
-    7,
+    8,
   );
 });
 

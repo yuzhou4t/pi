@@ -32,6 +32,7 @@ import { createReadingNoteActionService } from "./readingNoteAction.js";
 import { createReadingService } from "./readingService.js";
 import { createJournalModelUsageService } from "./modelUsageService.js";
 import { createRunStore, journalMonthWindowKey } from "./runStore.js";
+import { shanghaiNaturalWeekWindow } from "./monthlyScheduler.js";
 import { collectExclusionKeys, fetchRecentClassics } from "./recentClassics.js";
 import { createDismissedPapersStore } from "./dismissedPapersStore.js";
 import {
@@ -40,6 +41,7 @@ import {
 } from "./sourceScanner.js";
 import { createSourceStateStore } from "./sourceStateStore.js";
 import { SOURCE_REGISTRY } from "./sourceRegistry.js";
+import { buildWeeklyRecommendation } from "./weeklyRecommendation.js";
 import { searchRegisteredVenues } from "./venueSearch.js";
 import { createVenueSearchService } from "./venueSearchService.js";
 import { createZoteroArchivalService } from "./zoteroArchival.js";
@@ -113,6 +115,32 @@ function publicError(error) {
     message: typeof error?.message === "string" ? error.message.slice(0, 300) : "工作流步骤失败",
     retryable: Boolean(error?.retryable),
   };
+}
+
+const SOURCE_META_BY_ID = new Map(
+  SOURCE_REGISTRY.map((source) => [source.source_id, source]),
+);
+
+function sourceStatusSnapshot(sourceScans = []) {
+  return sourceScans.map((scan) => {
+    const source = SOURCE_META_BY_ID.get(scan.source_id);
+    const attempts = scan.dispatch?.attempts ?? scan.error?.attempts ?? [];
+    return {
+      source_id: scan.source_id,
+      short_name: source?.short_name ?? scan.source_id,
+      status: scan.status,
+      route_status: scan.dispatch?.status ?? (scan.status === "success" ? "primary" : "failed"),
+      selected_route: scan.dispatch?.selected_route ?? null,
+      selected_adapter: scan.dispatch?.selected_adapter ?? null,
+      attempts: attempts.map((attempt) => ({
+        role: attempt.role,
+        status: attempt.status,
+        adapter: attempt.adapter,
+        error_code: attempt.error?.code ?? null,
+      })),
+      error_code: scan.error?.code ?? null,
+    };
+  });
 }
 
 function artifactError(code, message, status = 409) {
@@ -759,6 +787,7 @@ export function createJournalWorkflowService({
         status: "ranking",
         phase: "candidate_ranking",
         scan_summary: scan.summary,
+        source_statuses: sourceStatusSnapshot(scan.sourceScans),
       }, { type: "candidate_ranking_started" });
 
       let ranking;
@@ -803,6 +832,19 @@ export function createJournalWorkflowService({
           ? "经典回顾 · 非本月新论文"
           : paper.display_label ?? "本月新论文",
       }));
+      const previousRunsForRecommendation = await runStore.listRuns().catch(() => []);
+      const previousSelections = previousRunsForRecommendation.flatMap(
+        (previousRun) => previousRun.run_id === runId
+          ? []
+          : previousRun.weekly_recommendation?.selections ?? [],
+      );
+      const recommendationObservedAt = scan.summary?.observed_at ?? new Date().toISOString();
+      const weeklyRecommendation = buildWeeklyRecommendation({
+        candidates,
+        previousSelections,
+        weekKey: shanghaiNaturalWeekWindow(recommendationObservedAt).weekKey,
+        observedAt: recommendationObservedAt,
+      });
       // 近年高引经典栏目：确定性题录拉取，失败只降级为空栏目，不影响 Run。
       let recentClassics = null;
       try {
@@ -845,6 +887,7 @@ export function createJournalWorkflowService({
         candidates,
         candidate_language: candidatePresentation.artifact,
         recent_classics: recentClassics,
+        weekly_recommendation: weeklyRecommendation,
         ranking: {
           source: ranking.source,
           provider_id: ranking.provider_id ?? null,
@@ -1505,7 +1548,11 @@ export function createJournalWorkflowService({
               (afterScan.candidates ?? []).map((paper) => paper.dedupe_key).filter(Boolean),
             );
             const fresh = (scan.candidateBatch?.candidates ?? [])
-              .filter((paper) => paper.published_this_month === true)
+              .filter((paper) => (
+                paper.published_this_month === true
+                || paper.recent_pool_eligible === true
+                || paper.candidate_origin === "resurfaced_unread"
+              ))
               .filter((paper) => !paper.dedupe_key || !latestDismissed.has(paper.dedupe_key))
               .filter((paper) => (
                 !existingIds.has(paper.paper_id)
@@ -1613,13 +1660,29 @@ export function createJournalWorkflowService({
                 last_scan_observed_at: scanObservedAt,
                 last_added_count: added.length,
                 last_added_paper_ids: added.map((paper) => paper.paper_id),
+                last_scan_summary: scan.summary ?? null,
+                last_source_statuses: sourceStatusSnapshot(scan.sourceScans),
                 language_artifact: languageArtifact(translation),
                 last_error: null,
               };
-              if (added.length === 0) return { candidate_refresh: refreshRecord };
+              const nextCandidates = [...(current.candidates ?? []), ...added];
+              const weeklyRecommendation = buildWeeklyRecommendation({
+                candidates: nextCandidates,
+                paperDecisions: current.paper_decisions ?? {},
+                previousSelections: current.weekly_recommendation?.selections ?? [],
+                weekKey: shanghaiNaturalWeekWindow(scanObservedAt).weekKey,
+                observedAt: scanObservedAt,
+              });
+              if (added.length === 0) {
+                return {
+                  candidate_refresh: refreshRecord,
+                  weekly_recommendation: weeklyRecommendation,
+                };
+              }
               return {
-                candidates: [...(current.candidates ?? []), ...added],
+                candidates: nextCandidates,
                 candidate_refresh: refreshRecord,
+                weekly_recommendation: weeklyRecommendation,
                 mineru: {
                   ...current.mineru,
                   papers: {
@@ -3459,12 +3522,45 @@ export function createJournalWorkflowService({
   }
 
   async function getRun(runId) {
-    const run = await runStore.getRun(runId);
+    let run = await runStore.getRun(runId);
     if (
       run?.archive_batch?.status === "committing"
       || run?.status === "committing"
-    ) return resumeRun(runId);
-    return run;
+    ) run = await resumeRun(runId);
+    return hydrateLatestScanEvidence(run);
+  }
+
+  async function hydrateLatestScanEvidence(run) {
+    const refresh = run?.candidate_refresh;
+    if (
+      !run
+      || !refresh?.last_scan_key
+      || (refresh.last_scan_summary && Array.isArray(refresh.last_source_statuses))
+    ) {
+      return run;
+    }
+    try {
+      const [summary, sourceScans] = await Promise.all([
+        runStore.readArtifact(
+          run.run_id,
+          `refresh/${refresh.last_scan_key}/inputs/scan-summary.json`,
+        ),
+        runStore.readArtifact(
+          run.run_id,
+          `refresh/${refresh.last_scan_key}/inputs/source-scans.json`,
+        ),
+      ]);
+      return {
+        ...run,
+        candidate_refresh: {
+          ...refresh,
+          last_scan_summary: summary,
+          last_source_statuses: sourceStatusSnapshot(sourceScans),
+        },
+      };
+    } catch {
+      return run;
+    }
   }
 
   async function listRuns() {
@@ -3475,7 +3571,7 @@ export function createJournalWorkflowService({
         || run.status === "committing"
       ))
       .map((run) => resumeRun(run.run_id)));
-    return runStore.listRuns();
+    return Promise.all((await runStore.listRuns()).map(hydrateLatestScanEvidence));
   }
 
   async function getUsage({ period = "30d" } = {}) {

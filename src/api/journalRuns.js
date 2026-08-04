@@ -472,6 +472,23 @@ export function mapJournalRun(run) {
     updatedAt: run.updated_at,
     scanSummary: run.scan_summary,
     sourceProgress: run.source_progress,
+    sourceStatuses: Array.isArray(run.source_statuses)
+      ? run.source_statuses.map((source) => ({
+          sourceId: source.source_id,
+          shortName: source.short_name ?? source.source_id,
+          status: source.status,
+          routeStatus: source.route_status ?? null,
+          selectedRoute: source.selected_route ?? null,
+          selectedAdapter: source.selected_adapter ?? null,
+          attempts: (source.attempts ?? []).map((attempt) => ({
+            role: attempt.role,
+            status: attempt.status,
+            adapter: attempt.adapter,
+            errorCode: attempt.error_code ?? null,
+          })),
+          errorCode: source.error_code ?? null,
+        }))
+      : [],
     mineru: run.mineru,
     guides: {
       status: run.guides?.status ?? "not_started",
@@ -602,6 +619,29 @@ export function mapJournalRun(run) {
             ? run.candidate_refresh.last_added_count
             : 0,
           lastError: run.candidate_refresh.last_error ?? null,
+          lastScanSummary: run.candidate_refresh.last_scan_summary ?? null,
+          sourceStatuses: (run.candidate_refresh.last_source_statuses ?? []).map((source) => ({
+            sourceId: source.source_id,
+            shortName: source.short_name ?? source.source_id,
+            status: source.status,
+            routeStatus: source.route_status ?? null,
+            selectedRoute: source.selected_route ?? null,
+            selectedAdapter: source.selected_adapter ?? null,
+            attempts: (source.attempts ?? []).map((attempt) => ({
+              role: attempt.role,
+              status: attempt.status,
+              adapter: attempt.adapter,
+              errorCode: attempt.error_code ?? null,
+            })),
+            errorCode: source.error_code ?? null,
+          })),
+        }
+      : null,
+    weeklyRecommendation: run.weekly_recommendation && typeof run.weekly_recommendation === "object"
+      ? {
+          weekKey: run.weekly_recommendation.week_key ?? null,
+          observedAt: run.weekly_recommendation.observed_at ?? null,
+          paperIds: run.weekly_recommendation.paper_ids ?? [],
         }
       : null,
   };

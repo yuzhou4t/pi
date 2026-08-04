@@ -12,6 +12,8 @@ function paper(id, overrides = {}) {
     title: `Paper ${id}`,
     rank: 1,
     candidate_origin: "weekly_scan",
+    published_at: "2026-06-01",
+    publication_date_precision: "day",
     ...overrides,
   };
 }
@@ -78,7 +80,7 @@ test("dedupes by stable identity against current candidates and across runs", ()
   assert.deepEqual(result.map((item) => item.paper_id), ["fresh"]);
 });
 
-test("classics and already-resurfaced candidates are excluded, current run skipped", () => {
+test("classics are excluded while recent resurfaced candidates may return up to the cap", () => {
   const result = selectResurfaceCandidates({
     previousRuns: [
       run("run-current", "2026-07-27T00:00:00Z", [paper("mine")]),
@@ -92,7 +94,22 @@ test("classics and already-resurfaced candidates are excluded, current run skipp
     currentRunId: "run-current",
     limit: 5,
   });
-  assert.deepEqual(result.map((item) => item.paper_id), ["venue"]);
+  assert.deepEqual(result.map((item) => item.paper_id), ["resurfaced", "venue"]);
+  assert.equal(result[0].resurface_count, 2);
+});
+
+test("papers older than six months and papers surfaced three times stay excluded", () => {
+  const result = selectResurfaceCandidates({
+    previousRuns: [run("run-1", "2026-07-20T00:00:00Z", [
+      paper("old", { published_at: "2025-01-01" }),
+      paper("capped", { candidate_origin: "resurfaced_unread", resurface_count: 3 }),
+      paper("eligible"),
+    ])],
+    currentCandidates: [],
+    observedAt: "2026-08-03T00:00:00Z",
+    limit: 5,
+  });
+  assert.deepEqual(result.map((item) => item.paper_id), ["eligible"]);
 });
 
 test("empty history or non-positive limit yields no candidates", () => {

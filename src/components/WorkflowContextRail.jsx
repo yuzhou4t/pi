@@ -577,7 +577,8 @@ function EvidenceSection({ paper, stage, run, liveRun }) {
         .filter((item) => item.paperId === paper?.id)
         .slice(0, 3);
   const sourceProgress = liveRun?.sourceProgress;
-  const scanSummary = liveRun?.scanSummary;
+  const scanSummary = liveRun?.candidateRefresh?.lastScanSummary
+    ?? liveRun?.scanSummary;
   const sourceCount = scanSummary?.source_count
     ?? sourceProgress?.total_count
     ?? 11;

@@ -76,10 +76,30 @@ test("live candidate review shows appended papers and a durable refresh failure"
           candidateRefresh: {
             lastScanObservedAt: "2026-08-02T20:05:00.000Z",
             lastError: { message: "后台刷新失败，请稍后重试" },
+            lastScanSummary: {
+              observed_at: "2026-08-02T20:05:00.000Z",
+              source_count: 11,
+              successful_source_count: 10,
+              failed_source_ids: ["journal-jmlr"],
+              raw_record_count: 30,
+              topic_candidate_count: 7,
+            },
+            sourceStatuses: [{
+              sourceId: "journal-jmlr",
+              shortName: "JMLR",
+              status: "failed",
+              attempts: [
+                { role: "primary", status: "failed", errorCode: "OFFICIAL_SOURCE_EMPTY" },
+                { role: "fallback", status: "failed", errorCode: "SOURCE_ROUTE_EMPTY" },
+              ],
+            }],
           },
           scanSummary: {
             raw_record_count: 20,
             topic_candidate_count: 6,
+            source_count: 11,
+            successful_source_count: 9,
+            failed_source_ids: ["journal-jmlr", "conference-iccv"],
           },
         },
       },
@@ -92,6 +112,9 @@ test("live candidate review shows appended papers and a durable refresh failure"
     assert.match(html, /后台刷新失败，请稍后重试/);
     assert.match(html, /2026年7月4日 – 8月3日/);
     assert.match(html, /上次刷新 2026-08-03/);
+    assert.match(html, /来源成功 10\/11/);
+    assert.match(html, /失败来源：JMLR（OFFICIAL_SOURCE_EMPTY \/ SOURCE_ROUTE_EMPTY）/);
+    assert.doesNotMatch(html, /来源成功 9\/11/);
     assert.match(html, /is-classic[^>]*>本月补发现 · 非本月新论文/);
   } finally {
     await vite.close();

@@ -125,7 +125,7 @@ test("source cap keeps title-matched papers even when they appear after the raw 
   assert.equal(result.candidateBatch.candidates[0].title, "An LLM Agent with Tool Use");
 });
 
-test("field-diversity reserves monthly slots for broader-field papers within the venues", async () => {
+test("weekly selection keeps one broader-field slot beside current core papers", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-field-slots-"));
   const runStore = createRunStore({ dataDir });
   const sourceStateStore = createSourceStateStore({ dataDir });
@@ -181,10 +181,10 @@ test("field-diversity reserves monthly slots for broader-field papers within the
   const candidates = result.candidateBatch.candidates;
   assert.equal(candidates.length, 5);
   const fieldPicks = candidates.filter((paper) => paper.candidate_scope === "field");
-  // 保留了 2 个领域视野名额，且其余仍是窄主题。
-  assert.equal(fieldPicks.length, 2);
+  // 默认周快照优先保留 3 篇当前核心和 1 篇领域视野，空余位再由核心补齐。
+  assert.equal(fieldPicks.length, 1);
   assert.ok(fieldPicks.every((paper) => paper.display_label.includes("领域视野")));
-  assert.equal(result.summary.field_slots_reserved, 2);
+  assert.equal(result.summary.field_slots_reserved, 1);
 });
 
 test("a refresh scan commits its cursor only after the applied marker is durable", async () => {
@@ -323,12 +323,12 @@ test("historical first discoveries backfill candidates before the classic pool",
   assert.equal(result.summary.recent_topic_candidate_count, 0);
   assert.equal(result.summary.historical_backfill_count, 2);
   const titles = result.candidateBatch.candidates.map((paper) => paper.title);
-  // 补发现按发表时间降序排在前，剩余名额才由经典补位。
-  assert.equal(titles[0], "LLM Agent Memory in May");
-  assert.equal(titles[1], "LLM Agent Planning in March");
+  // 近半年补发现先按确定性质量分选择，剩余名额才由经典补位。
+  assert.equal(titles[0], "LLM Agent Planning in March");
+  assert.equal(titles[1], "LLM Agent Memory in May");
   const backfill = result.candidateBatch.candidates[0];
   assert.equal(backfill.published_this_month, false);
-  assert.equal(backfill.display_label, "本月补发现 · 非本月新论文");
+  assert.equal(backfill.display_label, "近半年优质未读");
   const classicCount = result.candidateBatch.candidates.filter(
     (paper) => paper.candidate_origin === "classic_review",
   ).length;

@@ -31,3 +31,11 @@ Pi is a local-first, project-centered Agent workbench. Review changes against th
 - Show only safe public progress and tool activity. Never expose or persist private chain-of-thought. Completed activity collapses after a durable final answer, while failed, stopped, or user-blocked activity remains open and inspectable.
 - New Worker tasks derive their title deterministically from the first explicit user message without another model call. Never overwrite an assigned or manually edited title.
 - Monthly candidate refresh follows the `Asia/Shanghai` Monday `00:00` natural-week boundary. Persist real scan observation evidence, retry task-level failures without advancing the week watermark, and never derive the displayed coverage window from the browser clock.
+
+### Journal source health and six-month recommendations
+
+- Keep all 11 registered journal and conference sources queryable through an explicit official-primary route and a declared fallback route. A fallback success is visibly degraded and the latest completed scan preserves per-route failure evidence.
+- JMLR discovery uses its official RSS feed. Preserve year-only publication precision unless a trusted source supplies a more precise date.
+- Each natural-week refresh stores one recommendation snapshot inside the monthly Run. The eligible pool covers the most recent 180 days; low-precision dates use their real first-seen time without inventing a publication day.
+- Prefer three current-window core papers, one high-quality unread paper, and one broader-field paper, then fill deterministically from the remaining eligible pool.
+- An unread paper may appear in two consecutive snapshots, then cools down for at least one snapshot, and may appear at most three times. Reading, collecting, or dismissing it removes it from future recommendations.
