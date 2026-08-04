@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
 const COMPONENT_PATH = "/src/components/ProjectSessionPathMenu.jsx";
+const STYLES = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
 
 async function withPathMenu(callback) {
   const vite = await createServer({
@@ -92,6 +94,7 @@ test("path menu groups GPT and DeepSeek attempts under one automatic checkpoint 
     assert.match(html, /header-meta-pill project-session-path-trigger/);
     assert.match(html, />路径</);
     assert.match(html, /role="dialog"/);
+    assert.match(html, /class="project-session-path-body" role="region" aria-label="会话路径内容" tabindex="0"/);
     assert.match(html, /每个已完成回答都会保留为检查点/);
     assert.match(html, /第 3 轮/);
     assert.match(html, /检查设置页切换模型后为什么没有立即更新/);
@@ -106,6 +109,21 @@ test("path menu groups GPT and DeepSeek attempts under one automatic checkpoint 
     assert.match(html, /复制为新会话/);
     assert.doesNotMatch(html, /entryId|entry_id/);
   });
+});
+
+test("path content owns the bounded vertical scroll while header and actions stay fixed", () => {
+  assert.match(
+    STYLES,
+    /\.project-session-path-popover\s*\{[^}]*grid-template-rows:\s*auto minmax\(0, 1fr\) auto;/s,
+  );
+  assert.match(
+    STYLES,
+    /\.project-session-path-body\s*\{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/s,
+  );
+  assert.doesNotMatch(
+    STYLES,
+    /\.project-session-path-turns\s*\{[^}]*overflow-y:\s*auto;/s,
+  );
 });
 
 test("selecting an attempt only reports the public checkpoint selection", async () => {

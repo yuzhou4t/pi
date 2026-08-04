@@ -152,7 +152,8 @@ test("live project workbench renders the honest empty states without starting wo
     assert.match(emptyConversationHtml, /修改先审阅/);
     assert.match(emptyConversationHtml, /命令显式运行/);
     assert.match(emptyConversationHtml, /只有显式发送才开始工作/);
-    assert.match(emptyConversationHtml, /添加项目文件/);
+    assert.match(emptyConversationHtml, />添加</);
+    assert.match(emptyConversationHtml, /引用项目文件/);
     assert.match(emptyConversationHtml, /添加本地资料/);
     assert.match(emptyConversationHtml, /aria-label="选择要添加的本地资料"/);
     assert.match(emptyConversationHtml, /type="file" multiple=""/);
@@ -414,10 +415,7 @@ test("execution policy control offers only confirmation and safe auto-review mod
         onChange: () => {},
       },
     ));
-    assert.match(nativeHtml, /Pi 原生/);
-    assert.match(nativeHtml, /可信 Workspace/);
-    assert.match(nativeHtml, /disabled=""/);
-    assert.doesNotMatch(nativeHtml, /role="dialog"/);
+    assert.equal(nativeHtml, "");
   });
 });
 
@@ -648,7 +646,7 @@ test("composer thinking control exposes only model-supported Chinese levels", as
   });
 });
 
-test("a pending model selection locks both thinking-strength entry points", async () => {
+test("a pending model selection locks the combined model control and message submit", async () => {
   const source = await readFile(COMPONENT_URL, "utf8");
   assert.match(
     source,
@@ -659,7 +657,7 @@ test("a pending model selection locks both thinking-strength entry points", asyn
     /conversationRunning\s*\|\| modelSelectionDisabled\s*\|\| !snapshot\?\.id/,
   );
   assert.match(source, /thinkingDisabled=\{thinkingBusy \|\| thinkingSaving\}/);
-  assert.match(source, /<ProjectThinkingLevelControl[\s\S]*?running=\{thinkingBusy\}/);
+  assert.doesNotMatch(source, /thinkingLevelControl=\{/);
   assert.match(source, /&& !modelSelectionDisabled\s*&& uploadingAttachments/);
   assert.match(
     source,
@@ -789,8 +787,6 @@ test("message payload controls stay frozen until image serialization and HTTP fi
       onOpenArtifact: () => {},
       action: "message",
       error: null,
-      modelLabel: "vision-model",
-      thinkingLevelControl: null,
       contextUsageControl: null,
       uploadingPdf: null,
       onRetryDocument: () => {},
@@ -821,7 +817,7 @@ test("message payload controls stay frozen until image serialization and HTTP fi
     assert.match(html, /AI 按需读取 · 不预载全文/);
     assert.match(
       html,
-      /project-composer-attachment" type="button" disabled="" title="从电脑选择资料；未知后缀会按实际内容检查/,
+      /role="menuitem" disabled="" title="从电脑选择资料；未知后缀会按实际内容检查/,
     );
     assert.match(
       html,
@@ -1026,14 +1022,15 @@ test("running composer keeps steer separate from the durable follow-up queue", a
     assert.match(html, /当前工作结束后处理/);
     assert.match(html, /aria-pressed="true"/);
     assert.match(html, /发送会加入持久后续队列/);
-    assert.match(html, /aria-label="加入后续队列"/);
+    assert.match(html, /aria-label="停止当前 Agent"/);
+    assert.match(html, /class="is-stop" type="button"/);
 
     const workbenchHtml = renderToStaticMarkup(React.createElement(
       LiveProjectWorkbench,
       { project, conversation: runningConversation },
     ));
-    assert.match(workbenchHtml, /停止并清空队列/);
-    assert.match(workbenchHtml, /停止会同时取消尚未处理的后续消息/);
+    assert.equal((workbenchHtml.match(/aria-label="停止当前 Agent"/g) ?? []).length, 1);
+    assert.doesNotMatch(workbenchHtml, /停止并清空队列/);
   });
 });
 
@@ -1355,7 +1352,7 @@ test("completed Word and Excel outputs stay in Files with verified previews and 
   }, { exposeArtifact: true });
 });
 
-test("normal-work keeps context usage beside the composer model and out of the header", async () => {
+test("normal-work keeps one combined model entry and moves low-frequency controls behind more", async () => {
   const source = await readFile(COMPONENT_URL, "utf8");
   const headerStart = source.indexOf("const headerActions");
   const headerEnd = source.indexOf("if (!snapshot)", headerStart);
@@ -1365,16 +1362,15 @@ test("normal-work keeps context usage beside the composer model and out of the h
   const composerImplementation = source.slice(composerStart, composerEnd);
 
   const providerIndex = headerImplementation.indexOf("<ProviderMenu");
-  const capabilitiesIndex = headerImplementation.indexOf("<ProjectCapabilityMenu");
+  const moreIndex = headerImplementation.indexOf("<ProjectHeaderMoreMenu");
   const policyIndex = composerImplementation.indexOf("{executionPolicyControl}");
-  const modelIndex = composerImplementation.indexOf("project-composer-model");
-  const thinkingIndex = composerImplementation.indexOf("{thinkingLevelControl}");
   const contextIndex = composerImplementation.indexOf("{contextUsageControl}");
-  assert.ok(providerIndex >= 0 && providerIndex < capabilitiesIndex);
+  assert.ok(providerIndex >= 0 && providerIndex < moreIndex);
   assert.doesNotMatch(headerImplementation, /ProjectContextUsageMenu/);
-  assert.ok(policyIndex >= 0 && policyIndex < modelIndex);
-  assert.ok(modelIndex < thinkingIndex);
-  assert.ok(thinkingIndex < contextIndex);
+  assert.ok(policyIndex >= 0 && policyIndex < contextIndex);
+  assert.doesNotMatch(composerImplementation, /project-composer-model|thinkingLevelControl/);
+  assert.match(headerImplementation, /<ProjectCapabilityMenu[\s\S]*?hideTrigger/);
+  assert.match(headerImplementation, /<ProjectSessionPathMenu[\s\S]*?hideTrigger/);
   assert.doesNotMatch(source, />\s*整理上下文\s*</);
 });
 
@@ -1792,18 +1788,14 @@ test("settled turns expose paged history, unread state, one path entry, and one 
 
     assert.match(html, /加载更早记录/);
     assert.match(html, /2 条未读/);
-    assert.match(html, />路径</);
+    assert.match(html, />更多</);
     assert.doesNotMatch(html, /重试上一轮/);
     assert.doesNotMatch(html, /这是较早的 DeepSeek 方案/);
     assert.match(html, /已经修复并复测通过/);
     assert.doesNotMatch(html, /class="project-agent-header"/);
     assert.ok(
-      html.indexOf("透明模式") < html.indexOf('class="project-agent-stream"'),
-      "transparent mode should live in the shared top bar",
-    );
-    assert.ok(
-      html.indexOf(">路径<") < html.indexOf('class="project-agent-stream"'),
-      "the compact path entry should live in the shared top bar",
+      html.indexOf(">更多<") < html.indexOf('class="project-agent-stream"'),
+      "low-frequency controls should live behind the shared more entry",
     );
     assert.match(html, /openai-codex · gpt-5\.3-codex/);
     assert.match(html, /1,536 tokens/);
@@ -2089,7 +2081,7 @@ test("latest settled activity is coalesced and collapses above the final answer"
     assert.match(html, /class="project-activity-body" hidden=""/);
     assert.match(html, /已完成/);
     assert.match(html, /4 项 · 查看过程/);
-    assert.match(html, /透明模式/);
+    assert.match(html, />更多</);
     assert.doesNotMatch(html, /Harness 快照/);
     assert.match(html, /查看与检索了 1 次/);
     assert.equal((html.match(/思考完成/g) ?? []).length, 0);

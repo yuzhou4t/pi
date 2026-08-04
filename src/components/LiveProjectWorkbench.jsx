@@ -18,6 +18,7 @@ import {
   Cloud,
   Code,
   DownloadSimple,
+  DotsThree,
   ArrowClockwise,
   Brain,
   FileCode,
@@ -39,6 +40,7 @@ import {
   Play,
   ShieldCheck,
   SidebarSimple,
+  Stop,
   StopCircle,
   TestTube,
   UploadSimple,
@@ -2733,6 +2735,8 @@ export function ProjectExecutionPolicyControl({
       ? "替我审批"
       : "需确认";
 
+  if (native) return null;
+
   return (
     <div className="provider-menu-wrap project-execution-policy-menu">
       {open && !disabled ? (
@@ -2883,6 +2887,7 @@ function capabilityAvailability(capabilityStatus, capabilityId) {
 export function ProjectCapabilityMenu({
   open,
   onOpenChange,
+  hideTrigger = false,
   capabilityStatus = {},
   selectedCapabilityIds = [],
   onToggleCapability,
@@ -2907,18 +2912,20 @@ export function ProjectCapabilityMenu({
 
   return (
     <div className="project-capability-menu">
-      <button
-        className={`header-meta-pill header-skill-pill${open ? " is-open" : ""}`}
-        type="button"
-        disabled={running}
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        onClick={() => onOpenChange(!open)}
-      >
-        <Package size={13} weight="regular" aria-hidden="true" />
-        <span>{selectedCount > 0 ? `能力 · ${selectedCount}` : "能力"}</span>
-        <CaretDown size={11} weight="bold" aria-hidden="true" />
-      </button>
+      {!hideTrigger ? (
+        <button
+          className={`header-meta-pill header-skill-pill${open ? " is-open" : ""}`}
+          type="button"
+          disabled={running}
+          aria-expanded={open}
+          aria-haspopup="dialog"
+          onClick={() => onOpenChange(!open)}
+        >
+          <Package size={13} weight="regular" aria-hidden="true" />
+          <span>{selectedCount > 0 ? `能力 · ${selectedCount}` : "能力"}</span>
+          <CaretDown size={11} weight="bold" aria-hidden="true" />
+        </button>
+      ) : null}
       {open ? (
         <>
           <button
@@ -3060,6 +3067,91 @@ export function ProjectCapabilityMenu({
             </footer>
           </section>
         </>
+      ) : null}
+    </div>
+  );
+}
+
+function ProjectHeaderMoreMenu({
+  open,
+  onOpenChange,
+  selectedCapabilityCount = 0,
+  onOpenCapabilities,
+  onOpenPath,
+  transparentMode = false,
+  onToggleTransparentMode,
+  notificationControl,
+}) {
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") onOpenChange(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onOpenChange, open]);
+
+  const runAction = (callback) => {
+    onOpenChange(false);
+    callback?.();
+  };
+
+  return (
+    <div className="project-header-more-menu">
+      {open ? (
+        <button
+          className="popover-scrim"
+          type="button"
+          aria-label="关闭更多选项"
+          onClick={() => onOpenChange(false)}
+        />
+      ) : null}
+      <button
+        className={`header-meta-pill project-header-more-trigger${open ? " is-open" : ""}`}
+        type="button"
+        aria-expanded={open}
+        aria-haspopup="menu"
+        onClick={() => onOpenChange(!open)}
+      >
+        <DotsThree size={15} weight="bold" aria-hidden="true" />
+        <span>更多</span>
+        <CaretDown size={11} weight="bold" aria-hidden="true" />
+      </button>
+      {open ? (
+        <section className="project-header-more-popover" role="menu" aria-label="更多会话选项">
+          <button type="button" role="menuitem" onClick={() => runAction(onOpenCapabilities)}>
+            <Package size={15} aria-hidden="true" />
+            <span>
+              <strong>本轮能力</strong>
+              <small>{selectedCapabilityCount > 0 ? `已选择 ${selectedCapabilityCount} 项` : "按需为下一条消息启用"}</small>
+            </span>
+            <CaretRight size={12} aria-hidden="true" />
+          </button>
+          <button type="button" role="menuitem" onClick={() => runAction(onOpenPath)}>
+            <GitBranch size={15} aria-hidden="true" />
+            <span>
+              <strong>会话路径</strong>
+              <small>查看检查点、分支与工作区</small>
+            </span>
+            <CaretRight size={12} aria-hidden="true" />
+          </button>
+          <button
+            className={transparentMode ? "is-active" : ""}
+            type="button"
+            role="menuitemcheckbox"
+            aria-checked={transparentMode}
+            onClick={() => onToggleTransparentMode?.()}
+          >
+            <Gauge size={15} weight={transparentMode ? "fill" : "regular"} aria-hidden="true" />
+            <span>
+              <strong>透明模式</strong>
+              <small>{transparentMode ? "正在显示过程细节" : "需要时查看 Harness 与用量"}</small>
+            </span>
+            <span className="project-header-more-state">{transparentMode ? "开" : "关"}</span>
+          </button>
+          {notificationControl}
+          <footer>飞书提醒等全局偏好可在左下角“设置”中管理。</footer>
+        </section>
       ) : null}
     </div>
   );
@@ -3439,6 +3531,7 @@ export function ProjectAgentPane({
   localFileInputRef,
   supportsImages,
   onSubmit,
+  onAbort,
   onLoadEarlier,
   loadingEarlier = false,
   canLoadEarlier = false,
@@ -3453,10 +3546,8 @@ export function ProjectAgentPane({
   generatedImageUrl,
   action,
   error,
-  modelLabel,
   modelSelectionDisabled = false,
   executionPolicyControl,
-  thinkingLevelControl,
   contextUsageControl,
   transparentMode = false,
   uploadingPdf,
@@ -3483,6 +3574,7 @@ export function ProjectAgentPane({
   const autoReview = conversation.executionPolicy?.mode === "auto_review";
   const nativeExecution = conversation.executionPolicy?.mode === "native";
   const streamRef = useRef(null);
+  const attachmentMenuRef = useRef(null);
   const dragDepthRef = useRef(0);
   const followLatestRef = useRef(true);
   const [dropActive, setDropActive] = useState(false);
@@ -4205,33 +4297,54 @@ export function ProjectAgentPane({
         <footer>
           <div className="project-composer-meta">
             <div className="project-composer-tools">
-              <button
-                className="project-composer-tool project-composer-attachment"
-                type="button"
-                onClick={() => onOpenArtifact("files")}
-              >
-                <Paperclip size={13} aria-hidden="true" />
-                添加项目文件
-              </button>
-              <button
-                className="project-composer-tool project-composer-attachment"
-                type="button"
-                disabled={
-                  running
-                  || turnPayloadLocked
-                  || Boolean(uploadingPdf)
-                  || uploadingAttachments.length > 0
-                }
-                onClick={() => localFileInputRef.current?.click()}
-                title="从电脑选择资料；未知后缀会按实际内容检查，也可用 ⌘⇧G 粘贴路径"
-              >
-                {uploadingPdf || uploadingAttachments.length > 0 ? (
-                  <CircleNotch className="spin" size={13} aria-hidden="true" />
-                ) : (
-                  <UploadSimple size={13} aria-hidden="true" />
-                )}
-                添加本地资料
-              </button>
+              <details className="project-composer-add-menu" ref={attachmentMenuRef}>
+                <summary className="project-composer-tool project-composer-attachment">
+                  {uploadingPdf || uploadingAttachments.length > 0 ? (
+                    <CircleNotch className="spin" size={13} aria-hidden="true" />
+                  ) : (
+                    <Paperclip size={13} aria-hidden="true" />
+                  )}
+                  添加
+                  <CaretUp size={11} weight="bold" aria-hidden="true" />
+                </summary>
+                <div className="project-composer-add-popover" role="menu" aria-label="添加内容">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      if (attachmentMenuRef.current) attachmentMenuRef.current.open = false;
+                      onOpenArtifact("files");
+                    }}
+                  >
+                    <Files size={15} aria-hidden="true" />
+                    <span>
+                      <strong>引用项目文件</strong>
+                      <small>从项目中选择上下文</small>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={
+                      running
+                      || turnPayloadLocked
+                      || Boolean(uploadingPdf)
+                      || uploadingAttachments.length > 0
+                    }
+                    onClick={() => {
+                      if (attachmentMenuRef.current) attachmentMenuRef.current.open = false;
+                      localFileInputRef.current?.click();
+                    }}
+                    title="从电脑选择资料；未知后缀会按实际内容检查，也可用 ⌘⇧G 粘贴路径"
+                  >
+                    <UploadSimple size={15} aria-hidden="true" />
+                    <span>
+                      <strong>添加本地资料</strong>
+                      <small>PDF、Word、Excel、图片或文本</small>
+                    </span>
+                  </button>
+                </div>
+              </details>
               <input
                 className="sr-only"
                 ref={localFileInputRef}
@@ -4246,10 +4359,6 @@ export function ProjectAgentPane({
                 }}
               />
               {executionPolicyControl}
-              <span className="project-composer-model">
-                {modelLabel || (standalone ? "跟随默认模型" : "跟随项目默认模型")}
-              </span>
-              {thinkingLevelControl}
               {contextUsageControl}
             </div>
             <small>
@@ -4264,20 +4373,18 @@ export function ProjectAgentPane({
             </small>
           </div>
           <button
-            type="submit"
-            disabled={!canSubmit}
-            aria-label={runningMessageMode === "follow_up" && running
-              ? "加入后续队列"
-              : running
-                ? "调整当前 Agent"
-                : "发送任务"}
-            title={runningMessageMode === "follow_up" && running
-              ? "加入后续队列"
-              : running
-                ? "调整当前 Agent"
-                : "发送任务"}
+            className={running ? "is-stop" : undefined}
+            type={running ? "button" : "submit"}
+            disabled={running ? Boolean(action) : !canSubmit}
+            aria-label={running ? "停止当前 Agent" : "发送任务"}
+            title={running ? "停止当前 Agent" : "发送任务"}
+            onClick={running ? onAbort : undefined}
           >
-            {action === "message" ? (
+            {running && action === "abort" ? (
+              <CircleNotch className="spin" size={16} weight="bold" aria-hidden="true" />
+            ) : running ? (
+              <Stop size={16} weight="fill" aria-hidden="true" />
+            ) : action === "message" ? (
               <CircleNotch size={16} weight="bold" aria-hidden="true" />
             ) : (
               <PaperPlaneTilt size={16} weight="fill" aria-hidden="true" />
@@ -6573,6 +6680,7 @@ export function LiveProjectWorkbench({
   const [executionPolicyOpen, setExecutionPolicyOpen] = useState(false);
   const [capabilityOpen, setCapabilityOpen] = useState(false);
   const [pathOpen, setPathOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
   const [selectedCheckpointId, setSelectedCheckpointId] = useState(null);
   const [branchTarget, setBranchTarget] = useState(null);
   const [transparentMode, setTransparentMode] = useState(readTransparentMode);
@@ -6719,6 +6827,7 @@ export function LiveProjectWorkbench({
     setExecutionPolicyOpen(false);
     setCapabilityOpen(false);
     setPathOpen(false);
+    setMoreOpen(false);
     setSelectedCheckpointId(null);
     setBranchTarget(null);
     setSelectedCapabilityIds([]);
@@ -7823,9 +7932,6 @@ export function LiveProjectWorkbench({
   const conversationRunning = snapshot ? isConversationRunning(snapshot) : false;
   const headerStatus = activeStatus(snapshot);
   const headerStatusLabel = STATUS_LABELS[headerStatus] ?? headerStatus;
-  const queuedHeaderFollowUps = (snapshot?.followUpQueue ?? []).filter(
-    (item) => item.status === "queued",
-  );
 
   useEffect(() => {
     if (!conversationRunning) setRunningMessageMode("steer");
@@ -8111,7 +8217,10 @@ export function LiveProjectWorkbench({
   }, [action, conversationRunning]);
 
   useEffect(() => {
-    if (providerOpen) setPathOpen(false);
+    if (providerOpen) {
+      setPathOpen(false);
+      setMoreOpen(false);
+    }
   }, [providerOpen]);
   const turnPayloadLocked = action === "message";
   const retryingDocumentId = action?.startsWith("document-retry:")
@@ -8249,6 +8358,7 @@ export function LiveProjectWorkbench({
               setExecutionPolicyOpen(false);
               setCapabilityOpen(false);
               setPathOpen(false);
+              setMoreOpen(false);
             }
             onProviderOpenChange?.(open);
           }}
@@ -8270,6 +8380,7 @@ export function LiveProjectWorkbench({
       ) : null}
       <ProjectCapabilityMenu
         open={capabilityOpen}
+        hideTrigger
         onOpenChange={(open) => {
           if (turnPayloadLocked && open) return;
           setCapabilityOpen(open);
@@ -8277,6 +8388,7 @@ export function LiveProjectWorkbench({
             setContextUsageOpen(false);
             setExecutionPolicyOpen(false);
             setPathOpen(false);
+            setMoreOpen(false);
             onProviderOpenChange?.(false);
           }
         }}
@@ -8303,12 +8415,14 @@ export function LiveProjectWorkbench({
         <>
           <ProjectSessionPathMenu
             open={pathOpen}
+            hideTrigger
             onOpenChange={(open) => {
               setPathOpen(open);
               if (open) {
                 setContextUsageOpen(false);
                 setExecutionPolicyOpen(false);
                 setCapabilityOpen(false);
+                setMoreOpen(false);
                 onProviderOpenChange?.(false);
               }
             }}
@@ -8330,36 +8444,25 @@ export function LiveProjectWorkbench({
             busy={conversationRunning || Boolean(action)}
             standalone={standalone}
           />
-          <ProjectLoopNotificationControl conversation={snapshot} />
-          <button
-            className={`header-meta-pill project-insight-toggle${transparentMode ? " is-active" : ""}`}
-            type="button"
-            aria-pressed={transparentMode}
-            title={transparentMode
-              ? "关闭后恢复精简的默认过程"
-              : "显示 Harness、模型轮次、工具与用量详情"}
-            onClick={() => setTransparentMode(!transparentMode)}
-          >
-            <Gauge size={13} weight={transparentMode ? "fill" : "regular"} aria-hidden="true" />
-            {transparentMode ? "透明模式 · 开" : "透明模式"}
-          </button>
-          {conversationRunning ? (
-            <button
-              className="header-meta-pill"
-              type="button"
-              onClick={abortConversation}
-              disabled={Boolean(action)}
-              aria-label={queuedHeaderFollowUps.length > 0
-                ? `停止 Agent 并取消 ${queuedHeaderFollowUps.length} 条后续消息`
-                : "停止 Agent"}
-              title={queuedHeaderFollowUps.length > 0
-                ? "停止会同时取消尚未处理的后续消息"
-                : "停止当前 Agent"}
-            >
-              <StopCircle size={13} aria-hidden="true" />
-              {queuedHeaderFollowUps.length > 0 ? "停止并清空队列" : "停止"}
-            </button>
-          ) : null}
+          <ProjectHeaderMoreMenu
+            open={moreOpen}
+            onOpenChange={(open) => {
+              setMoreOpen(open);
+              if (open) {
+                setContextUsageOpen(false);
+                setExecutionPolicyOpen(false);
+                setCapabilityOpen(false);
+                setPathOpen(false);
+                onProviderOpenChange?.(false);
+              }
+            }}
+            selectedCapabilityCount={selectedCapabilityIds.length + (selectedWorkflowId ? 1 : 0)}
+            onOpenCapabilities={() => setCapabilityOpen(true)}
+            onOpenPath={() => setPathOpen(true)}
+            transparentMode={transparentMode}
+            onToggleTransparentMode={() => setTransparentMode(!transparentMode)}
+            notificationControl={<ProjectLoopNotificationControl conversation={snapshot} menuItem />}
+          />
           {snapshot.unreadCount > 0 ? (
             <span className="project-agent-unread" role="status">
               {snapshot.unreadCount} 条未读
@@ -8460,6 +8563,7 @@ export function LiveProjectWorkbench({
           localFileInputRef={localFileInputRef}
           supportsImages={supportsImages}
           onSubmit={submitMessage}
+          onAbort={abortConversation}
           onLoadEarlier={loadEarlierTurns}
           loadingEarlier={loadingEarlier}
           canLoadEarlier={Boolean(historyCursor)}
@@ -8474,7 +8578,6 @@ export function LiveProjectWorkbench({
           generatedImageUrl={api.generatedImageUrl}
           action={action}
           error={actionError}
-          modelLabel={activeModelId}
           modelSelectionDisabled={modelSelectionDisabled}
           executionPolicyControl={(
             <ProjectExecutionPolicyControl
@@ -8493,16 +8596,6 @@ export function LiveProjectWorkbench({
               running={conversationRunning}
               saving={executionPolicySaving}
               onChange={changeExecutionPolicy}
-            />
-          )}
-          thinkingLevelControl={(
-            <ProjectThinkingLevelControl
-              thinkingLevels={availableThinkingLevels}
-              thinkingLevel={activeThinkingLevel}
-              supportsThinking={activeModelInfo?.supportsThinking === true}
-              running={thinkingBusy}
-              saving={thinkingSaving}
-              onChange={changeThinkingLevel}
             />
           )}
           contextUsageControl={(

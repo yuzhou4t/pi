@@ -1079,6 +1079,120 @@ button:disabled {
   z-index: 32;
 }
 
+.project-header-more-menu {
+  position: relative;
+  z-index: 32;
+}
+
+.project-header-more-trigger.is-open {
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+}
+
+.project-header-more-popover {
+  position: absolute;
+  z-index: 34;
+  top: 38px;
+  right: 0;
+  display: grid;
+  width: 278px;
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  box-shadow: var(--shadow);
+}
+
+.project-header-more-popover > button,
+.project-header-more-popover > .project-notification-control > button {
+  display: grid;
+  width: 100%;
+  min-height: 48px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px;
+  cursor: pointer;
+  color: var(--text);
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+}
+
+.project-header-more-popover > button:hover,
+.project-header-more-popover > .project-notification-control > button:hover {
+  background: var(--surface-soft);
+}
+
+.project-header-more-popover > button > svg,
+.project-header-more-popover > .project-notification-control > button > svg:first-child {
+  color: var(--teal-accent);
+}
+
+.project-header-more-popover > button > span:not(.project-header-more-state) {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.project-header-more-popover strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.project-header-more-popover small,
+.project-header-more-popover > footer {
+  color: var(--weak);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.project-header-more-popover > button.is-active,
+.project-header-more-popover > .project-notification-control > button.is-active {
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+}
+
+.project-header-more-state {
+  color: var(--weak);
+  font-size: 10.5px;
+}
+
+.project-header-more-popover > .project-notification-control {
+  display: block;
+}
+
+.project-header-more-popover > .project-notification-control > button {
+  height: auto;
+  font-size: 12px;
+}
+
+.project-header-more-popover > .project-notification-control > button > svg:last-child {
+  justify-self: end;
+  color: var(--weak);
+}
+
+.project-header-more-popover > .project-notification-control > button > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.project-header-more-popover > .project-notification-control .project-notification-popover {
+  top: 0;
+  right: calc(100% + 8px);
+}
+
+.project-header-more-popover > footer {
+  margin: 4px -6px -6px;
+  padding: 8px 12px;
+  background: var(--surface-soft);
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 8px 8px;
+}
+
 .project-session-path-trigger.is-open {
   color: var(--teal-accent);
   background: var(--teal-tint);
@@ -1100,6 +1214,7 @@ button:disabled {
   top: 41px;
   right: 0;
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   width: min(360px, calc(100vw - 24px));
   max-height: min(680px, calc(100vh - 92px));
   overflow: hidden;
@@ -1108,6 +1223,18 @@ button:disabled {
   border: 1px solid var(--border-strong);
   border-radius: 9px;
   box-shadow: var(--shadow);
+}
+
+.project-session-path-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.project-session-path-body:focus-visible {
+  outline: 2px solid var(--teal-border);
+  outline-offset: -2px;
 }
 
 .project-session-path-header {
@@ -1256,7 +1383,6 @@ button:disabled {
   min-height: 0;
   margin: 0;
   padding: 4px 0;
-  overflow-y: auto;
   list-style: none;
 }
 
@@ -10768,6 +10894,82 @@ h4.reader-rail-full-heading {
   gap: 6px;
 }
 
+.project-composer-add-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.project-composer-add-menu > summary {
+  list-style: none;
+}
+
+.project-composer-add-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.project-composer-add-menu[open] > summary {
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+}
+
+.project-composer-add-popover {
+  position: absolute;
+  z-index: 35;
+  bottom: 34px;
+  left: 0;
+  display: grid;
+  width: 244px;
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  box-shadow: var(--shadow);
+}
+
+.project-composer-add-popover > button {
+  display: grid;
+  min-height: 48px;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px;
+  cursor: pointer;
+  color: var(--text);
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+}
+
+.project-composer-add-popover > button:hover {
+  background: var(--surface-soft);
+}
+
+.project-composer-add-popover > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.project-composer-add-popover > button > svg {
+  color: var(--teal-accent);
+}
+
+.project-composer-add-popover > button > span {
+  display: grid;
+  gap: 2px;
+}
+
+.project-composer-add-popover strong {
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.project-composer-add-popover small {
+  color: var(--weak);
+  font-size: 10.5px;
+}
+
 .project-agent-composer > footer small {
   color: var(--weak);
   font-size: 10.5px;
@@ -11026,6 +11228,12 @@ h4.reader-rail-full-heading {
   color: #fff;
   background: var(--teal-accent);
   border-radius: 8px;
+}
+
+.project-agent-composer > footer > button.is-stop {
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+  border: 1px solid var(--teal-border);
 }
 
 .project-context-chips {
