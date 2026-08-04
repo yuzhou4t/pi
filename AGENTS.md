@@ -32,6 +32,13 @@ Pi is a local-first, project-centered Agent workbench. Review changes against th
 - New Worker tasks derive their title deterministically from the first explicit user message without another model call. Never overwrite an assigned or manually edited title.
 - Monthly candidate refresh follows the `Asia/Shanghai` Monday `00:00` natural-week boundary. Persist real scan observation evidence, retry task-level failures without advancing the week watermark, and never derive the displayed coverage window from the browser clock.
 
+### Retrospective skill and control density
+
+- Treat Better Harness as a manual or low-frequency, read-only retrospective Skill. It summarizes bounded run evidence, proposes improvements, and compares later reports; any actual prompt, Skill, settings, or code change returns to normal review and execution.
+- Keep only the artifact toggle, combined model control, and one `更多` entry in the normal-work top bar. Put per-turn capabilities, conversation paths, process detail, and local notifications behind `更多`.
+- Use one composer `添加` menu for project-file context and local materials. While work is running, replace the lower-right send action with one square stop control; do not duplicate stop in the top bar.
+- Keep the conversation-path title and actions visible while one focusable middle region scrolls through Workspace and checkpoint history.
+
 ### Journal source health and six-month recommendations
 
 - Keep all 11 registered journal and conference sources queryable through an explicit official-primary route and a declared fallback route. A fallback success is visibly degraded and the latest completed scan preserves per-route failure evidence.
