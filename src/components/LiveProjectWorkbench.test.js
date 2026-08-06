@@ -2320,7 +2320,7 @@ test("every completed turn keeps its activity collapsed beside its final answer"
 });
 
 test("the active plan stays in a fixed dock while historical plans remain visible", async () => {
-  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+  await withLiveWorkbench(({ LiveProjectWorkbench, ProjectPlanDock }) => {
     const messages = [
       {
         id: "user-plan-1",
@@ -2369,13 +2369,18 @@ test("the active plan stays in a fixed dock while historical plans remain visibl
       },
       {
         seq: 5,
+        type: "plan.cleared",
+        data: { turnId: "turn-plan-2", attempt: 1 },
+      },
+      {
+        seq: 6,
         type: "plan.updated",
         data: {
           steps: [{ id: "new-plan", text: "第二轮对应计划", status: "in_progress" }],
         },
       },
       {
-        seq: 6,
+        seq: 7,
         type: "agent.progress",
         data: { summary: "正在检查第二轮。" },
       },
@@ -2424,7 +2429,7 @@ test("the active plan stays in a fixed dock while historical plans remain visibl
           events: [
             ...events,
             {
-              seq: 7,
+              seq: 8,
               type: "message.completed",
               data: { turnId: "turn-plan-2" },
             },
@@ -2449,18 +2454,43 @@ test("the active plan stays in a fixed dock while historical plans remain visibl
           status: "running",
           turnStatus: "running",
           messages,
-          events: events.filter((event) => event.seq !== 5),
-          plan: [{
-            id: "old-plan",
-            title: "第一轮对应计划",
-            status: "completed",
-          }],
+          events: events.filter((event) => event.seq !== 6),
+          plan: null,
         }),
       },
     ));
     assert.equal((noNewPlanHtml.match(/>第一轮对应计划<\/span>/g) ?? []).length, 1);
     assert.match(noNewPlanHtml, /project-plan-dock is-running is-expanded/);
+    assert.match(noNewPlanHtml, /正在准备本轮计划/);
+    assert.doesNotMatch(noNewPlanHtml, /正在整理最终回答/);
+    assert.match(runningHtml, /正在：第二轮对应计划/);
     assert.match(runningHtml, /aria-label="进行中：第二轮对应计划"/);
+
+    const finalizingHtml = renderToStaticMarkup(React.createElement(ProjectPlanDock, {
+      running: true,
+      plan: [{ id: "done", title: "完成检查", status: "completed" }],
+    }));
+    assert.match(finalizingHtml, /正在整理最终回答/);
+    assert.match(finalizingHtml, /已完成/);
+    assert.match(finalizingHtml, /进行中/);
+    assert.match(finalizingHtml, /class="is-running"/);
+    assert.match(
+      finalizingHtml,
+      /project-plan-step-title">整理最终回答<\/span>/,
+    );
+
+    const mixedHtml = renderToStaticMarkup(React.createElement(ProjectPlanDock, {
+      running: true,
+      plan: [{ id: "done", title: "已经完成的步骤", status: "completed" }, {
+        id: "active", title: "现在正在做的步骤", status: "in_progress",
+      }, {
+        id: "pending", title: "稍后处理的步骤", status: "pending",
+      }],
+    }));
+    assert.match(mixedHtml, /已完成/);
+    assert.match(mixedHtml, /进行中/);
+    assert.match(mixedHtml, /待处理/);
+    assert.match(mixedHtml, /正在：现在正在做的步骤/);
   });
 
   const styles = await readFile(STYLES_URL, "utf8");

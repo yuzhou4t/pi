@@ -28,6 +28,7 @@ import { fetchCandidateSummaries, fetchModelProviders, mergeCandidateSummaries }
 import { projectWorkApi } from "./api/projectWork.js";
 import {
   adjacentConversationAfterRemoval,
+  beginProjectConversationSelection,
   createProjectConversationLock,
   hydrateCreatedConversation,
   insertCreatedConversation,
@@ -57,6 +58,7 @@ import {
   addPastRunPapersToWeekly,
   translateJournalRunLibrary,
   refreshJournalCandidates,
+  rotateJournalRecommendations,
   dismissJournalPaper,
   restartJournalReadingFromGuide,
   resetJournalPaperReading,
@@ -201,6 +203,16 @@ function createLiveProjectWorkState() {
     conversation: null,
     error: null,
   };
+}
+
+export async function listAllProjectConversations(
+  projects,
+  listConversations = projectWorkApi.listConversations,
+) {
+  const conversationLists = await Promise.all(
+    projects.map((projectItem) => listConversations({ projectId: projectItem.id })),
+  );
+  return conversationLists.flat();
 }
 
 function projectWorkConversationLabel(status) {
@@ -480,8 +492,16 @@ function createIdleGuideState(runId = null) {
 
 function liveRunBinding(run) {
   const candidatePaperIds = run.candidates.map((paper) => paper.id);
+  const visibleRecommendationIds = new Set(
+    run.weeklyRecommendation?.paperIds?.length
+      ? run.weeklyRecommendation.paperIds
+      : candidatePaperIds,
+  );
   const selectablePaperIds = run.candidates
-    .filter((paper) => paper.mineruStatus === "ready")
+    .filter((paper) => (
+      paper.mineruStatus === "ready"
+      && visibleRecommendationIds.has(paper.id)
+    ))
     .map((paper) => paper.id);
   const requestedPaperIds = run.guides?.requestedPaperIds ?? [];
   const preparedGuideIds = requestedPaperIds.filter(
@@ -1051,6 +1071,7 @@ export function App() {
       kind: "project_work",
       title: conversation.title,
       status: conversation.status,
+      busy: isProjectWorkConversationBusy(conversation),
       subtitle: conversation.projectId === null
         ? `未连接文件夹 · ${projectWorkConversationLabel(conversation.status)}`
         : `正常工作 · ${projectWorkConversationLabel(conversation.status)}`,
@@ -1155,9 +1176,10 @@ export function App() {
         : projects.some((item) => item.id === preferredProjectId)
           ? preferredProjectId
           : projects[0]?.id ?? "";
-      const projectConversations = projectId
-        ? await projectWorkApi.listConversations({ projectId })
-        : [];
+      const projectConversations = await listAllProjectConversations(projects);
+      const activeProjectConversations = projectConversations.filter(
+        (item) => item.projectId === projectId,
+      );
       const listedConversationIds = new Set([
         ...standaloneConversations,
         ...projectConversations,
@@ -1171,9 +1193,9 @@ export function App() {
       ];
       const conversationId = notificationConversation?.id
         ?? preferredStandalone?.id
-        ?? (projectConversations.some((item) => item.id === preferredConversationId)
+        ?? (activeProjectConversations.some((item) => item.id === preferredConversationId)
           ? preferredConversationId
-          : projectConversations[0]?.id ?? standaloneConversations[0]?.id ?? "");
+          : activeProjectConversations[0]?.id ?? standaloneConversations[0]?.id ?? "");
       const conversation = notificationConversation ?? (conversationId
         ? await projectWorkApi.fetchConversation({ conversationId })
         : null);
@@ -1214,13 +1236,7 @@ export function App() {
     setActiveConversationId("");
     selectedProjectIdRef.current = projectId;
     setSelectedProjectId(projectId);
-    setLiveProjectWork((current) => ({
-      ...current,
-      status: "loading",
-      conversations: current.conversations.filter((item) => item.projectId === null),
-      conversation: null,
-      error: null,
-    }));
+    setLiveProjectWork(beginProjectConversationSelection);
     try {
       const nextConversations = await projectWorkApi.listConversations({ projectId });
       const conversationId = nextConversations.some(
@@ -2224,7 +2240,22 @@ export function App() {
     const nextRun = await refreshJournalCandidates({ runId });
     syncJournalRun(nextRun);
     const added = nextRun?.candidateRefresh?.lastAddedCount ?? 0;
-    showToast(added > 0 ? `已刷新，新增 ${added} 篇论文` : "已刷新，暂无新发表的论文");
+    showToast(added > 0 ? `已检查，新增 ${added} 篇论文` : "已检查，暂无新发表的论文");
+  }, [journalRunState.run?.id, showToast, syncJournalRun]);
+
+  const rotateRecommendations = useCallback(async () => {
+    const runId = journalRunState.run?.id;
+    if (!runId) throw new Error("当前没有可更换的推荐");
+    const nextRun = await rotateJournalRecommendations({ runId });
+    syncJournalRun(nextRun);
+    const count = nextRun?.recommendationRotation?.lastBatchCount ?? 0;
+    const classicCount = nextRun?.recommendationRotation?.lastAddedClassicCount ?? 0;
+    const hasMore = nextRun?.recommendationRotation?.hasMore !== false;
+    showToast(count > 0
+      ? `已换一批，共 ${count} 篇${classicCount > 0 ? `，含 ${classicCount} 篇近年高引论文` : ""}`
+      : hasMore
+        ? "这一段暂时没有合适论文，可以继续点一下往后找"
+        : "已找完当前高质量论文池，暂时没有更多符合条件的论文");
   }, [journalRunState.run?.id, showToast, syncJournalRun]);
 
   // 翻译回填：当前 Run 走完整 sync；往期 Run 只更新历史，不把它切成当前。
@@ -3886,6 +3917,7 @@ export function App() {
           onResumeJournalRun={resumeCurrentJournalRun}
           onRetryPaperDocument={retryPaperDocument}
           onRefreshCandidates={refreshCandidates}
+          onRotateRecommendations={rotateRecommendations}
           onRestartFromGuide={restartCurrentReadingFromGuide}
           guideState={guideState}
           onTogglePaper={(paperId) => dispatchAction(RUN_ACTIONS.TOGGLE_PAPER, { paperId })}

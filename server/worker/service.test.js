@@ -130,6 +130,24 @@ async function createMailTask(service, content = "本周进展见正文。") {
   return { task, draft };
 }
 
+test("Worker task can be resolved from its bound Pi conversation", async (t) => {
+  const { service } = await setup(t);
+  const task = await service.createTask({
+    workerId: "agent_mail",
+    conversationId: "conversation-mail-1",
+    title: "查看邮箱",
+  });
+
+  assert.deepEqual(
+    await service.getTaskByConversation("conversation-mail-1"),
+    task,
+  );
+  await assert.rejects(
+    service.getTaskByConversation("conversation-missing"),
+    { code: "WORKER_TASK_NOT_FOUND" },
+  );
+});
+
 test("built-in definitions, tasks, and drafts persist across service instances", async (t) => {
   const context = await setup(t);
   const definitions = await context.service.listDefinitions();

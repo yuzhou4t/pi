@@ -384,6 +384,8 @@ export function applyProjectWorkEventDelta(current, event) {
       detail: step.detail ?? "",
       status: step.status ?? "pending",
     }));
+  } else if (event.type === "plan.cleared") {
+    next.plan = null;
   }
   if (event.type === "agent.status") {
     const status = value(data, "status");
@@ -517,6 +519,15 @@ export function replaceProjectConversationSlice(state, projectId, conversations)
       ...state.conversations.filter((item) => item.projectId !== projectId),
       ...conversations,
     ],
+  };
+}
+
+export function beginProjectConversationSelection(state) {
+  return {
+    ...state,
+    status: "loading",
+    conversation: null,
+    error: null,
   };
 }
 

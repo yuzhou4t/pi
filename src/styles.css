@@ -519,6 +519,11 @@ button:disabled {
   border-color: var(--border);
 }
 
+.project-row.is-running {
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+}
+
 .project-row.is-selected::before {
   position: absolute;
   top: 8px;
@@ -574,6 +579,18 @@ button:disabled {
 .project-row time {
   flex: 0 0 auto;
   white-space: nowrap;
+}
+
+.project-row-running-indicator {
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--teal-accent);
+  background: var(--surface);
+  border: 1px solid var(--teal-border);
+  border-radius: 999px;
 }
 
 .project-row > .icon-button {
@@ -804,6 +821,18 @@ button:disabled {
   color: var(--text);
   background: var(--surface);
   border-color: var(--teal-border);
+}
+
+.project-conversation-row.is-running {
+  color: var(--text);
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+  box-shadow: inset 3px 0 0 var(--teal-accent);
+}
+
+.project-conversation-row.is-running small {
+  color: var(--teal-accent);
+  font-weight: 650;
 }
 
 .project-conversation-row:disabled {
@@ -9364,14 +9393,15 @@ h4.reader-rail-full-heading {
 }
 
 .project-plan-dock.is-running {
+  background: color-mix(in srgb, var(--surface) 80%, var(--teal-tint));
   border-color: var(--teal-border);
-  box-shadow: 0 7px 18px rgba(33, 93, 83, 0.08);
+  box-shadow: 0 7px 18px rgba(33, 93, 83, 0.12), inset 3px 0 0 var(--teal-accent);
 }
 
 .project-plan-dock > button {
   display: grid;
   width: 100%;
-  min-height: 38px;
+  min-height: 46px;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
@@ -9391,14 +9421,16 @@ h4.reader-rail-full-heading {
 }
 
 .project-plan-dock > button > span {
-  display: flex;
+  display: grid;
   min-width: 0;
-  align-items: baseline;
-  gap: 8px;
+  gap: 2px;
 }
 
 .project-plan-dock > button strong {
-  font-size: 12px;
+  overflow: hidden;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .project-plan-dock > button small {
@@ -9439,21 +9471,56 @@ h4.reader-rail-full-heading {
 
 .project-plan-dock li {
   display: flex;
-  min-height: 26px;
+  min-height: 32px;
   align-items: center;
   gap: 8px;
+  padding: 3px 7px;
   color: var(--muted);
+  border-radius: 7px;
   font-size: 12px;
 }
 
 .project-plan-dock li.is-in_progress,
 .project-plan-dock li.is-running {
-  color: var(--text);
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+  box-shadow: inset 2px 0 0 var(--teal-accent);
   font-weight: 600;
 }
 
 .project-plan-dock li.is-completed {
-  color: var(--teal-accent);
+  color: var(--weak);
+}
+
+.project-plan-dock li.is-completed .project-plan-status {
+  color: var(--muted);
+  border-color: var(--border);
+}
+
+.project-plan-status-label {
+  display: inline-flex;
+  min-width: 45px;
+  flex: 0 0 auto;
+  justify-content: center;
+  padding: 2px 6px;
+  color: var(--weak);
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.project-plan-dock li.is-in_progress .project-plan-status-label,
+.project-plan-dock li.is-running .project-plan-status-label {
+  color: #fff;
+  background: var(--teal-accent);
+  border-color: var(--teal-accent);
+}
+
+.project-plan-step-title {
+  min-width: 0;
 }
 
 .project-plan-dock li.is-in_progress svg,
@@ -10042,7 +10109,7 @@ h4.reader-rail-full-heading {
 }
 
 .project-plan-card li.is-completed {
-  color: var(--teal-accent);
+  color: var(--weak);
 }
 
 .project-plan-card li.is-in_progress .project-plan-status {

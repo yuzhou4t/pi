@@ -395,6 +395,8 @@ function WorkerPlanProgress({ conversation, messages = [], running }) {
     "message.completed",
     "agent.status",
     "agent.progress",
+    "tool.started",
+    "tool.completed",
     "compaction.started",
     "compaction.completed",
   ].includes(event?.type)).slice(-3);
@@ -456,12 +458,25 @@ function WorkerPlanProgress({ conversation, messages = [], running }) {
                 <li key={event.seq || `${event.type}-${index}`}>
                   {event.data?.detail
                     || event.data?.message
+                    || event.data?.summary
                     || event.data?.status
                     || ({
                       "message.started": "Agent 开始处理",
                       "message.completed": "Agent 已形成回答",
                       "agent.status": "Agent 状态已更新",
                       "agent.progress": "正在推进当前任务",
+                      "tool.started": ({
+                        mailbox_identity: "正在确认邮箱连接",
+                        list_mail: "正在查看邮件列表",
+                        search_mail: "正在搜索邮件",
+                        read_mail: "正在读取邮件",
+                      })[event.data?.name] || "正在读取任务资料",
+                      "tool.completed": ({
+                        mailbox_identity: "邮箱连接已确认",
+                        list_mail: "邮件列表已读取",
+                        search_mail: "邮件搜索已完成",
+                        read_mail: "邮件内容已读取",
+                      })[event.data?.name] || "任务资料已读取",
                       "compaction.started": "正在压缩上下文",
                       "compaction.completed": "上下文压缩完成",
                     }[event.type] ?? "Worker 状态已更新")}
@@ -581,7 +596,9 @@ function WorkerAgentPane({
             <WorkerTypeIcon workerId={state.worker.id} size={24} />
             <div>
               <h2>从一项明确的文字工作开始</h2>
-              <p>Agent 可以读取本任务资料并整理草稿；任何外部修改或发送都会先给出精确预览。</p>
+              <p>{state.worker.id === "agent_mail"
+                ? "Agent 可以直接查询已连接邮箱并整理草稿；任何发送、回复或整理操作都会先给出精确预览。"
+                : "Agent 可以读取本任务资料并整理草稿；任何外部修改或发送都会先给出精确预览。"}</p>
             </div>
             <div className="project-agent-scope">
               <span>项目背景只读</span>
@@ -718,7 +735,9 @@ function WorkerAgentPane({
                 composerFormRef.current?.requestSubmit();
               }
             }}
-            placeholder="补充要求，或让 Agent 根据资料调整草稿"
+            placeholder={state.worker.id === "agent_mail"
+              ? "例如：查看最近的未读邮件并帮我归纳"
+              : "补充要求，或让 Agent 根据资料调整草稿"}
           />
         </label>
         <footer>
@@ -833,7 +852,9 @@ function WorkerReadSourceForm({ workerId, busy, onReadSource }) {
       <div className="worker-source-import-heading">
         <div>
           <strong>读取并加入任务资料</strong>
-          <small>只在点击读取后调用对应连接；结果会作为不受信任的只读资料保存。</small>
+          <small>{workerId === "agent_mail"
+            ? "Agent 可按你的要求直接查询邮箱；也可以在这里手动读取。结果都会作为不受信任的只读资料保存。"
+            : "只在点击读取后调用对应连接；结果会作为不受信任的只读资料保存。"}</small>
         </div>
         <select value={operation} onChange={(event) => setOperation(event.target.value)}>
           {operations.map((action) => (
@@ -1074,7 +1095,9 @@ function SourcesArtifact({ state, onReadSource, readBusy, onUseSource }) {
               ) : null}
             </article>
           )) : (
-            <p className="worker-artifact-empty-copy">还没有加入邮件、文档、IMA 笔记或附件。</p>
+            <p className="worker-artifact-empty-copy">{state.worker.id === "agent_mail"
+              ? "还没有读取邮件。可以直接在对话中让 Agent 查询，也可以使用下方表单。"
+              : "还没有加入邮件、文档、IMA 笔记或附件。"}</p>
           )}
         </div>
       </section>

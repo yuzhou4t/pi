@@ -61,7 +61,19 @@ function deriveConversationTitle(question) {
   return text || DEFAULT_CONVERSATION_TITLE;
 }
 
-// 学术索引对整段中文提问几乎必然零命中；规划失败时只用问题里可检索的英文术语兜底。
+const DETERMINISTIC_ACADEMIC_EXPANSIONS = Object.freeze([
+  {
+    matches: ["harness"],
+    queries: [
+      "agent orchestration tool use",
+      "LLM agent scaffold architecture",
+      "agent runtime environment interface",
+    ],
+  },
+]);
+
+// 学术索引对整段中文提问几乎必然零命中；规划失败时先提取英文术语，
+// 再对已知工程术语补充一组受控的学术表达，避免只做字面匹配。
 export function deterministicSearchQuery(question) {
   const text = typeof question === "string" ? question : "";
   const asciiRuns = text.match(/[A-Za-z][A-Za-z0-9+._-]{1,40}/g) ?? [];
@@ -77,6 +89,18 @@ export function deterministicSearchQuery(question) {
   const extracted = compact(terms.join(" "), 200);
   if (extracted.length >= 3) return extracted;
   return compact(text, 200);
+}
+
+export function deterministicSearchQueries(question) {
+  const primary = deterministicSearchQuery(question);
+  const normalizedQuestion = String(question ?? "").toLowerCase();
+  const queries = [primary];
+  for (const expansion of DETERMINISTIC_ACADEMIC_EXPANSIONS) {
+    if (!expansion.matches.some((term) => normalizedQuestion.includes(term))) continue;
+    queries.push(...expansion.queries);
+  }
+  return [...new Set(queries.map((query) => compact(query, 200)).filter(Boolean))]
+    .slice(0, MAX_PLAN_QUERIES);
 }
 
 function recommendInput(question, projectContext, papers, webResults = []) {
@@ -409,10 +433,10 @@ export function createVenueSearchService({
   }
 
   async function planQuery(question, projectContext, { providerId, modelId, reasoningEffort, onEvent = null }) {
-    const fallbackQuery = deterministicSearchQuery(question);
+    const fallbackQueries = deterministicSearchQueries(question);
     const fallback = {
-      search_query: fallbackQuery,
-      search_queries: [fallbackQuery],
+      search_query: fallbackQueries[0],
+      search_queries: fallbackQueries,
       from_year: null,
       source: "deterministic",
       usage: null,
@@ -770,6 +794,8 @@ export function createVenueSearchService({
         search: {
           venues: search.venues,
           venue_success_count: search.venue_success_count,
+          venue_reached_count: search.venue_reached_count,
+          venue_matched_count: search.venue_matched_count,
           venue_failed_ids: search.venue_failed_ids,
           total_found: search.total_found,
           truncated: search.truncated,

@@ -1152,11 +1152,12 @@ function normalizeActivityPlan(plan) {
 export function planFromActivityEvents(events) {
   const planEvent = [...(Array.isArray(events) ? events : [])]
     .reverse()
-    .find((event) => event?.type === "plan.updated");
+    .find((event) => ["plan.updated", "plan.cleared"].includes(event?.type));
+  if (planEvent?.type === "plan.cleared") return [];
   return normalizeActivityPlan(planEvent?.data ?? planEvent);
 }
 
-function PlanSteps({ plan }) {
+function PlanSteps({ plan, showStatusLabels = false }) {
   const statusLabels = {
     pending: "待处理",
     in_progress: "进行中",
@@ -1178,7 +1179,12 @@ function PlanSteps({ plan }) {
               <CircleNotch size={12} weight="bold" />
             ) : null}
           </span>
-          <span>{step.title}</span>
+          {showStatusLabels ? (
+            <small className="project-plan-status-label">
+              {statusLabels[step.status] ?? "待处理"}
+            </small>
+          ) : null}
+          <span className="project-plan-step-title">{step.title}</span>
         </li>
       ))}
     </ol>
@@ -1212,13 +1218,38 @@ export function ProjectPlanDock({ plan, running }) {
   const completed = normalizedPlan.filter(
     (step) => step.status === "completed",
   ).length;
+  const activeStep = normalizedPlan.find(
+    (step) => step.status === "in_progress" || step.status === "running",
+  );
+  const nextStep = normalizedPlan.find((step) => step.status === "pending");
+  const runningLabel = activeStep
+    ? `正在：${activeStep.title}`
+    : normalizedPlan.length === 0
+      ? "正在准备本轮计划"
+      : completed === normalizedPlan.length
+        ? "正在整理最终回答"
+        : nextStep
+          ? `即将：${nextStep.title}`
+          : "正在工作";
+  const visiblePlan = running
+    && normalizedPlan.length > 0
+    && completed === normalizedPlan.length
+    ? [
+        ...normalizedPlan,
+        {
+          id: "final-answer",
+          title: "整理最终回答",
+          status: "running",
+        },
+      ]
+    : normalizedPlan;
   const revision = planSignature(normalizedPlan);
 
   useEffect(() => {
     setExpanded(Boolean(running));
   }, [revision, running]);
 
-  if (normalizedPlan.length === 0) return null;
+  if (normalizedPlan.length === 0 && !running) return null;
   return (
     <aside
       className={`project-plan-dock${running ? " is-running" : " is-settled"}${expanded ? " is-expanded" : ""}`}
@@ -1235,14 +1266,22 @@ export function ProjectPlanDock({ plan, running }) {
           <CheckCircle size={14} weight="fill" aria-hidden="true" />
         )}
         <span>
-          <strong>Agent 计划</strong>
-          <small>{running ? "固定显示" : "本轮已收起"} · {completed}/{normalizedPlan.length}</small>
+          <strong aria-live="polite">{running ? runningLabel : "Agent 计划"}</strong>
+          <small>
+            {running
+              ? normalizedPlan.length > 0
+                ? `实时计划 · ${completed}/${normalizedPlan.length}`
+                : "等待 Agent 更新计划"
+              : `本轮已收起 · ${completed}/${normalizedPlan.length}`}
+          </small>
         </span>
         <CaretDown size={13} aria-hidden="true" />
       </button>
-      <div className="project-plan-dock-body" hidden={!expanded}>
-        <PlanSteps plan={normalizedPlan} />
-      </div>
+      {normalizedPlan.length > 0 ? (
+        <div className="project-plan-dock-body" hidden={!expanded}>
+          <PlanSteps plan={visiblePlan} showStatusLabels />
+        </div>
+      ) : null}
     </aside>
   );
 }

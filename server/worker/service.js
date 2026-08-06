@@ -943,6 +943,23 @@ export function createWorkerService({
     ));
   }
 
+  async function getTaskByConversation(conversationId) {
+    await readyPromise;
+    const id = assertId(conversationId, "Pi 会话标识");
+    const state = await workerStore.read();
+    const task = Object.values(state.tasks).find(
+      (candidate) => candidate.conversationId === id,
+    );
+    if (!task) {
+      throw workerError(
+        "WORKER_TASK_NOT_FOUND",
+        "Worker 任务不存在",
+        404,
+      );
+    }
+    return structuredClone(task);
+  }
+
   async function listTasks({ workerId = null } = {}) {
     await readyPromise;
     const normalizedWorkerId = workerId ? assertId(workerId, "Worker 标识") : null;
@@ -2306,6 +2323,7 @@ export function createWorkerService({
     getDefinition,
     createTask,
     getTask,
+    getTaskByConversation,
     listTasks,
     updateTaskContext,
     createTaskFile,
