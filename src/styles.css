@@ -10190,8 +10190,12 @@ h4.reader-rail-full-heading {
   color: var(--teal-accent);
 }
 
-.project-activity.is-running .project-activity-toggle > svg:first-child {
+.project-activity.is-running:not(.is-stale) .project-activity-toggle > svg:first-child {
   animation: project-spin 0.9s linear infinite;
+}
+
+.project-activity.is-stale .project-activity-toggle > svg:first-child {
+  color: #a46d20;
 }
 
 .project-activity-toggle > span {

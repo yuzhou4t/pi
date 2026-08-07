@@ -9,6 +9,8 @@ import {
   CaretDown,
   CaretRight,
   CheckCircle,
+  CircleNotch,
+  DotsThree,
   EnvelopeSimple,
   FileText,
   FloppyDisk,
@@ -22,6 +24,7 @@ import {
   SidebarSimple,
   SpinnerGap,
   StopCircle,
+  Trash,
   UploadSimple,
   WarningCircle,
   X,
@@ -105,11 +108,14 @@ export function WorkerRail({
   onQueryChange,
   onSelectTask,
   onNewTask,
+  onDeleteTask,
   creatingTask = false,
+  deletingTaskId = null,
 }) {
   const searchId = useId();
   const [internalQuery, setInternalQuery] = useState("");
   const [expandedWorkerIds, setExpandedWorkerIds] = useState([]);
+  const [openTaskMenuId, setOpenTaskMenuId] = useState(null);
   const query = controlledQuery ?? internalQuery;
   const normalizedQuery = query.trim().toLocaleLowerCase("zh-CN");
 
@@ -117,6 +123,20 @@ export function WorkerRail({
     const workerIds = new Set(workers.map((worker) => worker.id));
     setExpandedWorkerIds((current) => current.filter((id) => workerIds.has(id)));
   }, [workers]);
+
+  useEffect(() => {
+    if (!openTaskMenuId) return undefined;
+    const closeMenu = () => setOpenTaskMenuId(null);
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") closeMenu();
+    };
+    window.addEventListener("pointerdown", closeMenu);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [openTaskMenuId]);
 
   const visibleWorkers = useMemo(() => workers.flatMap((worker) => {
     const workerTasks = tasks.filter((task) => task.workerId === worker.id);
@@ -228,32 +248,85 @@ export function WorkerRail({
 
                   {workerTasks.length > 0 ? workerTasks.map((task) => {
                     const taskSelected = task.id === activeTaskId;
+                    const deleting = task.id === deletingTaskId;
                     return (
-                      <button
-                        className={`project-conversation-row worker-task-row${taskSelected ? " is-active" : ""}`}
-                        type="button"
-                        aria-current={taskSelected ? "page" : undefined}
+                      <div
+                        className={`project-conversation-item has-actions${openTaskMenuId === task.id ? " has-open-menu" : ""}`}
                         key={task.id}
-                        onClick={() => onSelectTask?.(task.id, worker.id)}
                       >
-                        <Briefcase
-                          size={15}
-                          weight={taskSelected ? "fill" : "regular"}
-                          aria-hidden="true"
-                        />
-                        <span>
-                          <strong>{task.title}</strong>
-                          <small>{task.subtitle || task.updatedLabel || "等待开始"}</small>
-                        </span>
-                        {task.unreadCount > 0 ? (
-                          <b
-                            className="project-conversation-unread-badge"
-                            aria-label={`${task.unreadCount} 条未读消息`}
-                          >
-                            {task.unreadCount > 99 ? "99+" : task.unreadCount}
-                          </b>
+                        <button
+                          className={`project-conversation-row worker-task-row${taskSelected ? " is-active" : ""}${task.busy ? " is-running" : ""}`}
+                          type="button"
+                          disabled={deleting}
+                          aria-busy={task.busy || deleting}
+                          aria-current={taskSelected ? "page" : undefined}
+                          onClick={() => onSelectTask?.(task.id, worker.id)}
+                        >
+                          {deleting || task.busy ? (
+                            <CircleNotch className="spin" size={15} weight="bold" aria-hidden="true" />
+                          ) : (
+                            <Briefcase
+                              size={15}
+                              weight={taskSelected ? "fill" : "regular"}
+                              aria-hidden="true"
+                            />
+                          )}
+                          <span>
+                            <strong>{task.title}</strong>
+                            <small>{deleting ? "正在删除…" : task.subtitle || task.updatedLabel || "等待开始"}</small>
+                          </span>
+                          {task.unreadCount > 0 ? (
+                            <b
+                              className="project-conversation-unread-badge"
+                              aria-label={`${task.unreadCount} 条未读消息`}
+                            >
+                              {task.unreadCount > 99 ? "99+" : task.unreadCount}
+                            </b>
+                          ) : null}
+                        </button>
+                        {onDeleteTask && !deleting ? (
+                          <>
+                            <button
+                              className="project-conversation-more"
+                              type="button"
+                              aria-label={`打开“${task.title}”的更多操作`}
+                              aria-haspopup="menu"
+                              aria-expanded={openTaskMenuId === task.id}
+                              onPointerDown={(event) => event.stopPropagation()}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setOpenTaskMenuId((current) => current === task.id ? null : task.id);
+                              }}
+                            >
+                              <DotsThree size={17} weight="bold" aria-hidden="true" />
+                            </button>
+                            {openTaskMenuId === task.id ? (
+                              <div
+                                className="project-conversation-menu"
+                                role="menu"
+                                aria-label={`“${task.title}”任务操作`}
+                                onPointerDown={(event) => event.stopPropagation()}
+                              >
+                                <button
+                                  className="is-danger"
+                                  type="button"
+                                  role="menuitem"
+                                  disabled={task.busy}
+                                  title={task.busy ? "请先停止当前运行，再删除任务" : undefined}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setOpenTaskMenuId(null);
+                                    onDeleteTask(task);
+                                  }}
+                                >
+                                  <Trash size={15} weight="regular" aria-hidden="true" />
+                                  删除任务
+                                </button>
+                              </div>
+                            ) : null}
+                          </>
                         ) : null}
-                      </button>
+                      </div>
                     );
                   }) : (
                     <p className="worker-task-empty">还没有任务</p>

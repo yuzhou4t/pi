@@ -672,6 +672,7 @@ export function App() {
   const [toast, setToast] = useState(null);
   const [bindProjectOpen, setBindProjectOpen] = useState(false);
   const [conversationToDelete, setConversationToDelete] = useState(null);
+  const [workerTaskToDelete, setWorkerTaskToDelete] = useState(null);
   const [conversationToRename, setConversationToRename] = useState(null);
   const [paperToReset, setPaperToReset] = useState(null);
   const [topicConversationToDelete, setTopicConversationToDelete] = useState(null);
@@ -3513,7 +3514,13 @@ export function App() {
               onSelectWorker={workerController.selectWorker}
               onSelectTask={workerController.selectTask}
               onNewTask={workerController.createTask}
+              onDeleteTask={(task) => setWorkerTaskToDelete({
+                ...task,
+                scope: "worker",
+                deleteBlocked: task.busy === true,
+              })}
               creatingTask={workerController.busyAction === "create_task"}
+              deletingTaskId={workerController.deletingTaskId}
             />
           )}
           selectedId={selectedProjectId}
@@ -4091,6 +4098,15 @@ export function App() {
         conversation={conversationToDelete}
         onClose={closeDeleteConversation}
         onConfirm={deleteWorkConversation}
+      />
+
+      <DeleteConversationDialog
+        conversation={workerTaskToDelete}
+        onClose={() => setWorkerTaskToDelete(null)}
+        onConfirm={async (task) => {
+          await workerController.deleteTask(task.id);
+          showToast("Worker 任务已删除");
+        }}
       />
 
       <ResetPaperReadingDialog

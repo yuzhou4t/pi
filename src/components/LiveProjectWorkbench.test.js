@@ -2083,7 +2083,7 @@ test("latest settled activity is coalesced and collapses above the final answer"
     assert.match(html, /4 项 · 查看过程/);
     assert.match(html, />更多</);
     assert.doesNotMatch(html, /Harness 快照/);
-    assert.match(html, /查看与检索了 1 次/);
+    assert.match(html, /查看了 1 项文件与资料/);
     assert.equal((html.match(/思考完成/g) ?? []).length, 0);
     assert.doesNotMatch(html, /agent\.thinking|37 条记录/);
     assert.ok(
@@ -2680,8 +2680,65 @@ test("repeated file inspection stays in one public activity layer", async () => 
 
     assert.equal(normalized.length, 1);
     assert.equal(normalized[0].type, "activity.research_summary");
-    assert.equal(normalized[0].title, "查看与检索了 8 次");
+    assert.equal(normalized[0].title, "查看了 8 项文件与资料");
     assert.equal(normalized[0].detail, "项目资料 8 次");
+  });
+});
+
+test("activity liveness reports elapsed time and warns when progress is stale", async () => {
+  await withLiveWorkbench(({ activityLiveness }) => {
+    const events = [
+      {
+        seq: 1,
+        type: "message.created",
+        at: "2026-08-07T08:00:00.000Z",
+      },
+      {
+        seq: 2,
+        type: "agent.progress",
+        at: "2026-08-07T08:54:00.000Z",
+      },
+    ];
+    const liveness = activityLiveness(
+      events,
+      true,
+      Date.parse("2026-08-07T09:00:00.000Z"),
+    );
+
+    assert.deepEqual(liveness, {
+      elapsed: "1 小时",
+      progress: "6 分钟没有新进展",
+      stale: true,
+    });
+  });
+});
+
+test("successful file changes collapse into one counted activity", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "tool.completed",
+        toolName: "edit",
+        toolCallId: "edit-1",
+        path: "src/a.js",
+        status: "completed",
+      },
+      {
+        seq: 3,
+        type: "tool.completed",
+        toolName: "write",
+        toolCallId: "write-1",
+        path: "src/b.js",
+        status: "completed",
+      },
+    ], false);
+
+    assert.equal(normalized.length, 1);
+    assert.equal(normalized[0].type, "activity.file_change_summary");
+    assert.equal(normalized[0].title, "处理了 2 个文件");
+    assert.equal(normalized[0].artifactId, "changes");
   });
 });
 
@@ -2813,7 +2870,7 @@ test("non-final assistant narration is interleaved with tools as public progress
 
     assert.deepEqual(
       normalized.map((event) => event.type),
-      ["activity.research_summary", "agent.progress", "tool.completed"],
+      ["activity.research_summary", "agent.progress", "activity.file_change_summary"],
     );
     assert.equal(normalized[1].data.summary, "已经确认入口，接下来写入修复。");
     assert.deepEqual(
@@ -2966,7 +3023,7 @@ test("reasoning cycles stay interleaved with their real tool batches", async () 
         "agent.thinking",
         "activity.research_summary",
         "agent.thinking",
-        "tool.completed",
+        "activity.file_change_summary",
         "agent.thinking",
       ],
     );
@@ -3061,7 +3118,7 @@ test("activity timeline adds bounded provider-neutral narration around real tool
 
     assert.match(html, /我先确认任务范围，再按需查看相关资料/);
     assert.match(html, /关键资料已经核对，正在整理结论与适用边界/);
-    assert.match(html, /查看与检索了 2 次/);
+    assert.match(html, /查看了 2 项文件与资料/);
     assert.doesNotMatch(html, /思考完成/);
     assert.equal((html.match(/<article class="project-activity-progress/g) ?? []).length, 2);
   });
@@ -3546,7 +3603,7 @@ test("activity normalization collapses tool lifecycles into counted public summa
     assert.equal(normalized[0].type, "agent.thinking");
     assert.equal(normalized[0].status, "finished");
     assert.equal(normalized[1].type, "activity.research_summary");
-    assert.equal(normalized[1].title, "查看与检索了 3 次");
+    assert.equal(normalized[1].title, "查看了 3 项文件与资料");
     assert.equal(normalized[1].detail, "项目资料 2 次 · 会话资料 1 次");
     assert.deepEqual(normalized[1].counts, {
       project: 2,
@@ -3585,7 +3642,7 @@ test("activity normalization hides bookkeeping events without dropping public wo
 
     assert.deepEqual(
       normalized.map((event) => event.type),
-      ["agent.thinking", "tool.completed", "change_set.ready"],
+      ["agent.thinking", "activity.file_change_summary", "change_set.ready"],
     );
     assert.doesNotMatch(
       JSON.stringify(normalized),
@@ -3795,11 +3852,71 @@ test("activity normalization distinguishes prepared and actually run verificatio
 
     assert.equal(normalized.length, 2);
     assert.equal(normalized[0].type, "activity.command_summary");
-    assert.equal(normalized[0].title, "运行了 1 条验证命令");
+    assert.equal(normalized[0].title, "运行了 1 条命令");
     assert.equal(normalized[0].detail, "已准备 1 条 · 已运行 1 条");
     assert.equal(normalized[1].type, "verification.completed");
     assert.equal(normalized[1].status, "failed");
     assert.doesNotMatch(JSON.stringify(normalized), /request_verification/);
+  });
+});
+
+test("native workspace and bash lifecycles collapse into one command count", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "tool.started",
+        toolName: "bash",
+        toolCallId: "bash-1",
+      },
+      {
+        seq: 3,
+        type: "workspace_run.started",
+        toolCallId: "bash-1",
+        runId: "run-1",
+        status: "running",
+      },
+      {
+        seq: 4,
+        type: "tool.completed",
+        toolName: "bash",
+        toolCallId: "bash-1",
+        status: "completed",
+      },
+      {
+        seq: 5,
+        type: "workspace_run.completed",
+        toolCallId: "bash-1",
+        runId: "run-1",
+        status: "succeeded",
+      },
+    ], false);
+
+    assert.equal(normalized.length, 1);
+    assert.equal(normalized[0].type, "activity.command_summary");
+    assert.equal(normalized[0].title, "运行了 1 条命令");
+    assert.equal(normalized[0].detail, "已运行 1 条");
+    assert.doesNotMatch(JSON.stringify(normalized), /workspace_run\.|bash完成/);
+  });
+});
+
+test("failed workspace commands remain individually visible", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "workspace_run.completed",
+        toolCallId: "bash-failed",
+        runId: "run-failed",
+        status: "failed",
+      },
+    ], false);
+
+    assert.equal(normalized.length, 1);
+    assert.equal(normalized[0].type, "workspace_run.completed");
+    assert.equal(normalized[0].status, "failed");
   });
 });
 
@@ -4332,10 +4449,10 @@ test("native reasoning remains interleaved with public progress without repeated
     }));
     assert.match(html, /先核对入口/);
     assert.match(html, /已完成这一步分析/);
-    assert.match(html, /查看与检索了 1 次/);
+    assert.match(html, /查看了 1 项文件与资料/);
     assert.match(html, /入口已核对/);
     assert.doesNotMatch(html, /思考完成/);
-    assert.ok(html.indexOf("先核对入口") < html.indexOf("查看与检索了 1 次"));
+    assert.ok(html.indexOf("先核对入口") < html.indexOf("查看了 1 项文件与资料"));
   });
 });
 

@@ -180,6 +180,7 @@ const AUTO_REVIEW_REASON_LABELS = {
 };
 
 const TOOL_LABELS = {
+  bash: "运行命令",
   read: "读取文件",
   edit: "修改文件",
   write: "写入文件",
@@ -231,6 +232,19 @@ const RESEARCH_TOOL_GROUPS = {
   resolve_library_id: "retrieval",
   query_docs: "retrieval",
 };
+
+const FILE_CHANGE_TOOLS = new Set([
+  "edit",
+  "write",
+  "write_word_document",
+  "write_excel_workbook",
+]);
+
+const SUCCESSFUL_COMMAND_STATUSES = new Set([
+  "completed",
+  "passed",
+  "succeeded",
+]);
 
 const HIDDEN_TOOL_ACTIVITY = new Set([
   "update_plan",
@@ -1601,28 +1615,73 @@ function updateResearchSummary(event, toolEvent, running) {
     event.counts.retrieval ? `外部检索 ${event.counts.retrieval} 次` : "",
   ].filter(Boolean);
   event.title = event.status === "active" && running
-    ? "正在查看与检索"
-    : `查看与检索了 ${total} 次`;
+    ? "正在查看文件与资料"
+    : `查看了 ${total} 项文件与资料`;
   event.detail = parts.join(" · ");
 }
 
+function commandActivityKey(commandEvent) {
+  return commandEvent.toolCallId
+    ?? commandEvent.runId
+    ?? commandEvent.data?.toolCallId
+    ?? commandEvent.data?.runId
+    ?? commandEvent.eventId
+    ?? `seq-${commandEvent.firstSeq ?? commandEvent.seq}`;
+}
+
 function updateCommandSummary(event, commandEvent, running) {
-  if (commandEvent.type === "verification.requested") {
-    event.prepared += 1;
-  } else {
-    event.ran += 1;
-    if (commandEvent.type === "verification.started") event.active += 1;
+  const key = commandActivityKey(commandEvent);
+  const previous = event.commandStates.get(key);
+  const status = commandEvent.type === "verification.requested"
+    ? "prepared"
+    : (
+        commandEvent.type === "verification.started"
+        || commandEvent.type === "workspace_run.queued"
+        || commandEvent.type === "workspace_run.started"
+        || commandEvent.status === "active"
+        || commandEvent.status === "running"
+      )
+      ? "active"
+      : SUCCESSFUL_COMMAND_STATUSES.has(commandEvent.status)
+        ? "completed"
+        : previous ?? "completed";
+  if (
+    previous !== "completed"
+    || status === "completed"
+  ) {
+    event.commandStates.set(key, status);
   }
   event.lastSeq = Math.max(event.lastSeq, commandEvent.lastSeq ?? commandEvent.seq);
+  const states = [...event.commandStates.values()];
+  event.prepared = states.filter((value) => value === "prepared").length;
+  event.active = states.filter((value) => value === "active").length;
+  event.ran = states.filter((value) => value !== "prepared").length;
   event.title = event.active > 0 && running
-    ? "正在运行验证命令"
+    ? `正在运行 ${event.active} 条命令`
     : event.ran > 0
-      ? `运行了 ${event.ran} 条验证命令`
-      : `准备了 ${event.prepared} 条验证命令`;
+      ? `运行了 ${event.ran} 条命令`
+      : `准备了 ${event.prepared} 条命令`;
   event.detail = [
     event.prepared ? `已准备 ${event.prepared} 条` : "",
     event.ran ? `已运行 ${event.ran} 条` : "",
+    event.active && running ? `${event.active} 条仍在运行` : "",
   ].filter(Boolean).join(" · ");
+}
+
+function updateFileChangeSummary(event, toolEvent, running) {
+  const key = toolEvent.path
+    ?? toolEvent.data?.path
+    ?? toolEvent.toolCallId
+    ?? `seq-${toolEvent.firstSeq ?? toolEvent.seq}`;
+  event.files.add(key);
+  event.lastSeq = Math.max(event.lastSeq, toolEvent.lastSeq ?? toolEvent.seq);
+  event.status = event.status === "active" || toolEvent.status === "active"
+    ? "active"
+    : "completed";
+  event.title = event.status === "active" && running
+    ? `正在处理 ${event.files.size} 个文件`
+    : `处理了 ${event.files.size} 个文件`;
+  event.detail = "文件操作已合并；可在更改工件中查看具体内容";
 }
 
 function currentTurnActivityEvents(events) {
@@ -1885,7 +1944,58 @@ function formatTraceDuration(milliseconds) {
   if (seconds < 60) return `${seconds} 秒`;
   const minutes = Math.floor(seconds / 60);
   const remaining = Math.round(seconds - minutes * 60);
+  if (minutes >= 60) {
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return remainingMinutes > 0
+      ? `${hours} 小时 ${remainingMinutes} 分`
+      : `${hours} 小时`;
+  }
   return remaining > 0 ? `${minutes} 分 ${remaining} 秒` : `${minutes} 分`;
+}
+
+function activityEventTime(event) {
+  const timestamp = Date.parse(event?.createdAt ?? event?.at ?? "");
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+export function activityLiveness(events, running, now = Date.now()) {
+  if (!running) return null;
+  const currentTurn = currentTurnActivityEvents(events).events;
+  const startedAt = currentTurn
+    .map(activityEventTime)
+    .find((value) => Number.isFinite(value));
+  const latestAt = [...currentTurn]
+    .reverse()
+    .map(activityEventTime)
+    .find((value) => Number.isFinite(value));
+  const elapsed = Number.isFinite(startedAt)
+    ? formatTraceDuration(Math.max(0, now - startedAt))
+    : null;
+  if (!Number.isFinite(latestAt)) {
+    return {
+      elapsed,
+      progress: "等待第一条运行进展",
+      stale: false,
+    };
+  }
+  const silenceMs = Math.max(0, now - latestAt);
+  if (silenceMs < 60_000) {
+    return { elapsed, progress: "刚有新进展", stale: false };
+  }
+  const silenceMinutes = Math.max(1, Math.floor(silenceMs / 60_000));
+  if (silenceMs >= 5 * 60_000) {
+    return {
+      elapsed,
+      progress: `${silenceMinutes} 分钟没有新进展`,
+      stale: true,
+    };
+  }
+  return {
+    elapsed,
+    progress: `最近进展 ${silenceMinutes} 分钟前`,
+    stale: false,
+  };
 }
 
 function formatTraceTokens(value) {
@@ -2001,6 +2111,7 @@ export function normalizeActivityEvents(
   let latestThinkingEvent = null;
   let latestPhaseEvent = null;
   let researchEvent = null;
+  let fileChangeEvent = null;
   let commandEvent = null;
   let previousActivityKind = null;
   let activeTurnStartSeq = null;
@@ -2008,6 +2119,7 @@ export function normalizeActivityEvents(
 
   const closeVisibleBatches = () => {
     researchEvent = null;
+    fileChangeEvent = null;
     commandEvent = null;
   };
 
@@ -2126,6 +2238,7 @@ export function normalizeActivityEvents(
       && RESEARCH_TOOL_GROUPS[event.toolName]
       && event.status !== "failed"
     ) {
+      fileChangeEvent = null;
       commandEvent = null;
       if (!researchEvent) {
         const firstSeq = event.firstSeq ?? event.seq;
@@ -2147,6 +2260,32 @@ export function normalizeActivityEvents(
       continue;
     }
     if (
+      TOOL_ACTIVITY_TYPES.has(event.type)
+      && FILE_CHANGE_TOOLS.has(event.toolName)
+      && !["failed", "aborted", "stopped"].includes(event.status)
+    ) {
+      researchEvent = null;
+      commandEvent = null;
+      if (!fileChangeEvent) {
+        const firstSeq = event.firstSeq ?? event.seq;
+        fileChangeEvent = {
+          type: "activity.file_change_summary",
+          seq: firstSeq,
+          firstSeq,
+          lastSeq: event.lastSeq ?? event.seq,
+          activityKey: `file-changes-${firstSeq}`,
+          artifactId: "changes",
+          hideSequence: true,
+          files: new Set(),
+          status: "completed",
+        };
+        normalized.push(fileChangeEvent);
+      }
+      updateFileChangeSummary(fileChangeEvent, event, running);
+      previousActivityKind = "action";
+      continue;
+    }
+    if (
       event.type === "verification.started"
       && event.eventId
       && completedVerificationIds.has(event.eventId)
@@ -2158,10 +2297,27 @@ export function normalizeActivityEvents(
       || event.type === "verification.started"
       || (
         event.type === "verification.completed"
-        && ["passed", "succeeded", "completed"].includes(event.status)
+        && SUCCESSFUL_COMMAND_STATUSES.has(event.status)
+      )
+      || (
+        [
+          "workspace_run.queued",
+          "workspace_run.started",
+          "workspace_run.completed",
+        ].includes(event.type)
+        && (
+          event.type !== "workspace_run.completed"
+          || SUCCESSFUL_COMMAND_STATUSES.has(event.status)
+        )
+      )
+      || (
+        TOOL_ACTIVITY_TYPES.has(event.type)
+        && event.toolName === "bash"
+        && !["failed", "aborted", "stopped"].includes(event.status)
       )
     ) {
       researchEvent = null;
+      fileChangeEvent = null;
       if (!commandEvent) {
         const firstSeq = event.firstSeq ?? event.seq;
         commandEvent = {
@@ -2175,6 +2331,7 @@ export function normalizeActivityEvents(
           prepared: 0,
           ran: 0,
           active: 0,
+          commandStates: new Map(),
         };
         normalized.push(commandEvent);
       }
@@ -2464,6 +2621,7 @@ export function ActivityTimeline({
   onOpenArtifact,
 }) {
   const [expanded, setExpanded] = useState(!compact);
+  const [livenessNow, setLivenessNow] = useState(() => Date.now());
   const normalizedEvents = normalizeActivityEvents(
     withRuntimeProgressFallback(events, running),
     running,
@@ -2483,10 +2641,23 @@ export function ActivityTimeline({
   const latestProgressSummary = latestProgressEvent
     ? progressNarration(latestProgressEvent).summary
     : "";
+  const liveness = activityLiveness(events, running, livenessNow);
+  const runningSummary = [
+    liveness?.elapsed ? `已运行 ${liveness.elapsed}` : "",
+    liveness?.progress ?? "",
+    latestProgressSummary || `${visibleEvents.length} 项实时进展`,
+  ].filter(Boolean).join(" · ");
 
   useEffect(() => {
     setExpanded(!compact);
   }, [compact]);
+
+  useEffect(() => {
+    if (!running) return undefined;
+    setLivenessNow(Date.now());
+    const timer = window.setInterval(() => setLivenessNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [running]);
 
   if (
     visibleEvents.length === 0
@@ -2499,6 +2670,7 @@ export function ActivityTimeline({
       className={[
         "project-activity",
         running ? "is-running" : "is-settled",
+        liveness?.stale ? "is-stale" : "",
         running ? "" : `is-${terminalState.key}`,
         compact ? "is-compact" : "",
         expanded ? "is-expanded" : "",
@@ -2512,7 +2684,9 @@ export function ActivityTimeline({
         aria-expanded={expanded}
         onClick={() => setExpanded((current) => !current)}
       >
-        {running ? (
+        {running && liveness?.stale ? (
+          <WarningCircle size={15} weight="fill" aria-hidden="true" />
+        ) : running ? (
           <CircleNotch size={15} weight="bold" aria-hidden="true" />
         ) : terminalState.key === "stopped" ? (
           <StopCircle size={15} weight="fill" aria-hidden="true" />
@@ -2525,17 +2699,23 @@ export function ActivityTimeline({
           <strong>
             {transparentMode
               ? running
-                ? "Agent 透视 · 正在工作"
+                ? liveness?.stale
+                  ? "Agent 透视 · 运行中但暂无新进展"
+                  : "Agent 透视 · 正在工作"
                 : `Agent 透视 · ${terminalState.label}`
               : running
-                ? "Agent 正在工作"
+                ? liveness?.stale
+                  ? "Agent 仍在运行，暂时没有新进展"
+                  : "Agent 正在工作"
                 : terminalState.label}
           </strong>
           <small>
             {transparentMode
-              ? traceSummary || `${visibleEvents.length} 项过程`
+              ? running
+                ? [runningSummary, traceSummary].filter(Boolean).join(" · ")
+                : traceSummary || `${visibleEvents.length} 项过程`
               : running
-                ? latestProgressSummary || `${visibleEvents.length} 项实时进展`
+                ? runningSummary || `${visibleEvents.length} 项实时进展`
                 : `${visibleEvents.length} 项 · 查看过程`}
           </small>
         </span>

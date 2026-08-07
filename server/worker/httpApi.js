@@ -153,6 +153,25 @@ export function createWorkerHttpApi({
       }, origin);
       return true;
     }
+    if (taskMatch && request.method === "DELETE") {
+      requireMutationOrigin(origin);
+      const taskId = segment(taskMatch[1], "Worker 任务标识");
+      const task = await workerService.getTask(taskId);
+      await projectWorkService.removeWorkerConversation(task.conversationId);
+      let result;
+      try {
+        result = await workerService.removeTask(task.id);
+      } catch {
+        throw workerError(
+          "WORKER_TASK_DELETE_INCONSISTENT",
+          "会话已删除，但 Worker 任务索引清理失败；请刷新后重试",
+          500,
+          { retryable: true },
+        );
+      }
+      sendJson(response, 200, { schema_version: 1, result }, origin);
+      return true;
+    }
     if (taskMatch && request.method === "PATCH") {
       requireMutationOrigin(origin);
       const taskId = segment(taskMatch[1], "Worker 任务标识");
