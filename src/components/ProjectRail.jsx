@@ -27,6 +27,19 @@ export function getProjectRailConversationGroupKey(workspaceMode, scope, scopeId
   return `${workspaceMode}:${scope}:${scopeId}`;
 }
 
+export function setProjectRailProjectExpanded(projectIds, projectId, expanded) {
+  const normalizedIds = Array.from(new Set(
+    (Array.isArray(projectIds) ? projectIds : []).filter(Boolean),
+  ));
+  if (!projectId) return normalizedIds;
+  if (expanded) {
+    return normalizedIds.includes(projectId)
+      ? normalizedIds
+      : [...normalizedIds, projectId];
+  }
+  return normalizedIds.filter((id) => id !== projectId);
+}
+
 export function visibleProjectRailConversations(
   conversations,
   selectedConversationId,
@@ -80,6 +93,7 @@ export function ConversationList({
       {visibleConversations.map((conversation) => {
         const conversationSelected = conversation.id === selectedConversationId;
         const deletingConversation = conversation.id === deletingConversationId;
+        const conversationBusy = conversation.busy === true;
         const deletionBlocked = conversation.deleteBlocked === true;
         const ConversationIcon = conversation.projectId === null
           ? ChatText
@@ -101,13 +115,14 @@ export function ConversationList({
             data-delete-blocked={deletionBlocked || undefined}
           >
             <button
-              className={`project-conversation-row${conversationSelected ? " is-active" : ""}`}
+              className={`project-conversation-row${conversationSelected ? " is-active" : ""}${conversationBusy ? " is-running" : ""}`}
               type="button"
               disabled={deletingConversation}
+              aria-busy={conversationBusy || deletingConversation}
               aria-current={conversationSelected ? "page" : undefined}
               onClick={() => onSelectConversation?.(conversation.id)}
             >
-              {deletingConversation ? (
+              {deletingConversation || conversationBusy ? (
                 <CircleNotch className="spin" size={16} weight="bold" aria-hidden="true" />
               ) : (
                 <ConversationIcon
@@ -282,20 +297,20 @@ export function ProjectRail({
     "pi-agent-topic-list-open-v1",
     true,
   );
-  // 项目行再次点击可收起/展开子入口；收起状态持久化。
-  const [collapsedProjectIds, setCollapsedProjectIds] = usePersistentState(
-    "pi-agent-collapsed-projects-v1",
-    [],
+  // 每个项目独立展开；切换项目不会收起其他已经打开的文件夹。
+  const [expandedProjectIds, setExpandedProjectIds] = usePersistentState(
+    "pi-agent-expanded-projects-v2",
+    selectedId ? [selectedId] : [],
   );
   const [paperListOpen, setPaperListOpen] = usePersistentState(
     "pi-agent-paper-conversations-open-v1",
     true,
   );
-  const toggleProjectCollapsed = (projectId) => {
-    setCollapsedProjectIds((current) => (
-      current.includes(projectId)
-        ? current.filter((id) => id !== projectId)
-        : [...current, projectId]
+  const toggleProjectExpanded = (projectId) => {
+    setExpandedProjectIds((current) => setProjectRailProjectExpanded(
+      current,
+      projectId,
+      !current.includes(projectId),
     ));
   };
   const conversationGroupExpanded = (groupKey) => expandedConversationGroups[groupKey] === true;
@@ -333,6 +348,15 @@ export function ProjectRail({
       && matchesQuery(`${activeRun?.name} ${activeRun?.title} ${activeRun?.statusLabel}`);
     return projectMatches || conversationMatches || runMatches;
   });
+
+  useEffect(() => {
+    if (!selectedId) return;
+    setExpandedProjectIds((current) => setProjectRailProjectExpanded(
+      current,
+      selectedId,
+      true,
+    ));
+  }, [selectedId, setExpandedProjectIds]);
 
   useEffect(() => {
     if (!openConversationMenuId) return undefined;
@@ -416,7 +440,9 @@ export function ProjectRail({
         </div>
         {filteredProjects.map((project) => {
           const selected = project.id === selectedId;
-          const collapsed = collapsedProjectIds.includes(project.id);
+          const expanded = Boolean(
+            normalizedQuery || expandedProjectIds.includes(project.id),
+          );
           const creatingConversation = creatingProjectIds.has(project.id);
           const projectMatches = matchesQuery(`${project.name} ${project.state} ${project.rootLabel}`);
           const projectConversations = conversations.filter((conversation) => (
@@ -425,6 +451,9 @@ export function ProjectRail({
               `${conversation.title} ${conversation.subtitle} ${conversation.kind}`,
             ))
           ));
+          const projectBusy = projectConversations.some(
+            (conversation) => conversation.busy === true,
+          );
           const topicConversationGroupKey = getProjectRailConversationGroupKey(
             workspaceMode,
             "topic",
@@ -445,29 +474,41 @@ export function ProjectRail({
           return (
             <Fragment key={project.id}>
               <div
-                className={`project-row${selected ? " is-selected" : ""}`}
+                className={`project-row${selected ? " is-selected" : ""}${projectBusy ? " is-running" : ""}`}
               >
                 <button
                   className="project-row-copy"
                   type="button"
                   aria-current={selected ? "page" : undefined}
-                  aria-expanded={selected && !collapsed}
+                  aria-expanded={expanded}
                   onClick={() => {
                     if (selected) {
-                      toggleProjectCollapsed(project.id);
+                      toggleProjectExpanded(project.id);
                       return;
                     }
-                    if (collapsed) toggleProjectCollapsed(project.id);
+                    setExpandedProjectIds((current) => setProjectRailProjectExpanded(
+                      current,
+                      project.id,
+                      true,
+                    ));
                     onSelect(project.id);
                   }}
                 >
-                  {selected && !collapsed
+                  {expanded
                     ? <CaretDown className="project-row-caret" size={12} weight="bold" aria-hidden="true" />
                     : <CaretRight className="project-row-caret" size={12} weight="bold" aria-hidden="true" />}
                   <strong>{project.name}</strong>
                   <small>{project.state}</small>
                 </button>
-                <time>{project.updated}</time>
+                {projectBusy ? (
+                  <span
+                    className="project-row-running-indicator"
+                    aria-label={`${project.name} 中有会话正在工作`}
+                    title="有会话正在工作"
+                  >
+                    <CircleNotch className="spin" size={14} weight="bold" aria-hidden="true" />
+                  </span>
+                ) : <time>{project.updated}</time>}
                 {onRemoveProject && project.removable ? (
                   <button
                     className="icon-button project-remove-button"
@@ -495,7 +536,7 @@ export function ProjectRail({
                   </button>
                 ) : null}
               </div>
-              {selected && !collapsed ? (
+              {expanded ? (
                 <div className="project-children">
                   {workspaceMode === "paper_reading" && activeRun ? (
                     <button

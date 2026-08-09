@@ -20,14 +20,23 @@ const SOURCES = [
   },
 ];
 
-function work({ id, title, cites, sourceId = "S4306420609", date = "2024-05-01" }) {
+function work({
+  id,
+  title,
+  cites,
+  sourceId = "S4306420609",
+  date = "2024-05-01",
+  abstractTerms = ["LLM", "agent", "planning"],
+}) {
   return {
     id: `https://openalex.org/${id}`,
     title,
     publication_date: date,
     doi: `https://doi.org/10.1000/${id}`,
     cited_by_count: cites,
-    abstract_inverted_index: { "LLM": [0], "agent": [1], "planning": [2] },
+    abstract_inverted_index: Object.fromEntries(
+      abstractTerms.map((term, index) => [term, [index]]),
+    ),
     authorships: [{ author: { display_name: "A. Author" } }],
     primary_location: {
       source: { id: `https://openalex.org/sources/${sourceId}` },
@@ -62,6 +71,7 @@ test("fetchRecentClassics returns topic-relevant high-citation papers with hones
   assert.ok(requestedUrl.searchParams.get("filter").includes("S4306420609"));
   assert.ok(requestedUrl.searchParams.get("filter").includes("from_publication_date:2022-01-01"));
   assert.equal(requestedUrl.searchParams.get("sort"), "cited_by_count:desc");
+  assert.equal(requestedUrl.searchParams.get("cursor"), "*");
   assert.equal(result.papers.length, 2);
   assert.equal(result.papers[0].cited_by_count, 900);
   assert.equal(result.papers[0].display_label, RECENT_CLASSIC_LABEL);
@@ -69,6 +79,55 @@ test("fetchRecentClassics returns topic-relevant high-citation papers with hones
   assert.equal(result.papers[0].published_this_month, false);
   assert.deepEqual(result.covered_source_ids, ["conference-neurips"]);
   assert.deepEqual(result.uncovered_source_ids, ["conference-cvpr"]);
+});
+
+test("fetchRecentClassics follows the cursor and fills with broader AI/ML papers", async () => {
+  const requestedCursors = [];
+  const result = await fetchRecentClassics({
+    sources: SOURCES,
+    observedAt: "2026-07-30T08:00:00.000Z",
+    limit: 3,
+    fetchImpl: async (url) => {
+      const cursor = new URL(url).searchParams.get("cursor");
+      requestedCursors.push(cursor);
+      return {
+        ok: true,
+        json: async () => cursor === "*"
+          ? {
+              results: [work({
+                id: "W1",
+                title: "LLM Agent Planning Benchmarks",
+                cites: 900,
+              })],
+              meta: { next_cursor: "cursor-2" },
+            }
+          : {
+              results: [
+                work({
+                  id: "W2",
+                  title: "Robust Reinforcement Learning",
+                  cites: 800,
+                  abstractTerms: ["reinforcement learning", "robustness"],
+                }),
+                work({
+                  id: "W3",
+                  title: "Multimodal Representation Learning",
+                  cites: 700,
+                  abstractTerms: ["multimodal", "representation learning"],
+                }),
+              ],
+              meta: { next_cursor: null },
+            },
+      };
+    },
+  });
+  assert.deepEqual(requestedCursors, ["*", "cursor-2"]);
+  assert.equal(result.papers.length, 3);
+  assert.equal(result.papers[0].title, "LLM Agent Planning Benchmarks");
+  assert.equal(result.papers[0].candidate_scope, undefined);
+  assert.equal(result.papers[1].candidate_scope, "field");
+  assert.equal(result.next_cursor, null);
+  assert.equal(result.pages_fetched, 2);
 });
 
 test("fetchRecentClassics excludes read, collected, and dismissed identities", async () => {

@@ -26,6 +26,7 @@ export function DeleteConversationDialog({
   }, [busy, conversation, onClose]);
 
   if (!conversation) return null;
+  const workerTask = conversation.scope === "worker";
   const pendingChangeFileCount = Number(conversation.pendingChangeFileCount) || 0;
   const standalone = conversation.projectId === null
     || conversation.scope === "standalone"
@@ -68,10 +69,12 @@ export function DeleteConversationDialog({
           </span>
           <div>
             <h2 id="conversation-delete-title">
-              {standalone ? "删除独立对话？" : "删除工作会话？"}
+              {workerTask ? "删除 Worker 任务？" : standalone ? "删除独立对话？" : "删除工作会话？"}
             </h2>
             <p id="conversation-delete-description">
-              “{conversation.title || "未命名会话"}”的对话、计划、运行记录和未应用修改草稿将被删除。
+              {workerTask
+                ? `“${conversation.title || "未命名任务"}”的对话、任务资料、草稿和未交付预览将被删除。`
+                : `“${conversation.title || "未命名会话"}”的对话、计划、运行记录和未应用修改草稿将被删除。`}
             </p>
           </div>
         </header>
@@ -83,7 +86,9 @@ export function DeleteConversationDialog({
               <br />
             </>
           ) : null}
-          {standalone
+          {workerTask
+            ? "此操作不可恢复，不会撤回已经完成的外部交付。"
+            : standalone
             ? "此操作不可恢复，不会影响任何已绑定项目。"
             : "此操作不可恢复，不会删除项目文件夹，也不会回滚已确认写入的修改。"}
         </p>
@@ -95,7 +100,9 @@ export function DeleteConversationDialog({
         ) : null}
         {conversation.deleteBlocked && !conversation.checkError ? (
           <p className="conversation-delete-error" role="alert">
-            这个会话仍在运行。请先停止当前运行，再删除会话。
+            {workerTask
+              ? "这个任务仍在运行。请先停止当前运行，再删除任务。"
+              : "这个会话仍在运行。请先停止当前运行，再删除会话。"}
           </p>
         ) : null}
         {conversation.checkError ? (
@@ -122,7 +129,7 @@ export function DeleteConversationDialog({
             ) : conversation.checkError ? "无法核对状态" : conversation.deleteBlocked ? "请先停止运行" : (
               <>
                 <Trash size={15} weight="regular" aria-hidden="true" />
-                删除会话
+                {workerTask ? "删除任务" : "删除会话"}
               </>
             )}
           </button>

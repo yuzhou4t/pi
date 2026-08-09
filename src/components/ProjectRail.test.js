@@ -71,6 +71,38 @@ test("conversation list keeps the existing first five and exposes one compact re
   assert.match(selectedTailHtml, /展开其余 2 个/);
 });
 
+test("project folders keep independent expanded state and running conversations stay prominent", async () => {
+  const {
+    ConversationList,
+    setProjectRailProjectExpanded,
+  } = await vite.ssrLoadModule("/src/components/ProjectRail.jsx");
+  const firstOpen = setProjectRailProjectExpanded([], "project-1", true);
+  const bothOpen = setProjectRailProjectExpanded(firstOpen, "project-2", true);
+  assert.deepEqual(bothOpen, ["project-1", "project-2"]);
+  assert.deepEqual(
+    setProjectRailProjectExpanded(bothOpen, "project-1", false),
+    ["project-2"],
+  );
+
+  const html = renderToStaticMarkup(React.createElement(ConversationList, {
+    conversations: [{
+      id: "conversation-running",
+      projectId: "project-1",
+      kind: "project_work",
+      title: "排查实时计划",
+      subtitle: "正常工作 · 正在工作",
+      busy: true,
+    }],
+    selectedConversationId: "conversation-running",
+    openConversationMenuId: null,
+    setOpenConversationMenuId() {},
+  }));
+  assert.match(html, /project-conversation-row is-active is-running/);
+  assert.match(html, /aria-busy="true"/);
+  assert.match(html, /class="spin"/);
+  assert.match(html, /正常工作 · 正在工作/);
+});
+
 test("normal work places the collapsed standalone group after projects and expands it for search", async () => {
   const { ProjectRail } = await vite.ssrLoadModule("/src/components/ProjectRail.jsx");
   const standalone = conversations({ projectId: null, prefix: "独立" });

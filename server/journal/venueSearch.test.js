@@ -42,7 +42,7 @@ test("empty query is rejected before any network call", () => {
   assert.equal(normalizeSearchQuery("  llm   agent  "), "llm agent");
 });
 
-test("registered venue search restricts journals to OpenAlex source filter and conferences to DBLP stream", async () => {
+test("registered venue search batches DBLP history once and classifies hits by venue key", async () => {
   const calls = [];
   const fetchImpl = async (url) => {
     const target = new URL(url);
@@ -88,10 +88,13 @@ test("registered venue search restricts journals to OpenAlex source filter and c
   assert.ok(openAlexCall.searchParams.get("filter").includes("primary_location.source.id:S196139623"));
   assert.equal(openAlexCall.searchParams.get("search"), "llm agent");
   const dblpCall = calls.find((call) => call.hostname === "dblp.org");
-  assert.match(dblpCall.searchParams.get("q"), /streamid:conf\/iclr:/);
+  assert.equal(dblpCall.searchParams.get("q"), "llm agent");
+  assert.equal(calls.filter((call) => call.pathname === "/search/publ/api").length, 1);
 
   assert.equal(result.papers.length, 2);
   assert.equal(result.venue_success_count, 2);
+  assert.equal(result.venue_reached_count, 2);
+  assert.equal(result.venue_matched_count, 2);
   assert.deepEqual(result.venue_failed_ids, []);
   // OpenAlex relevance ranks the journal hit ahead of the zero-relevance DBLP hit.
   assert.equal(result.papers[0].discovery_channel, "openalex-search");
@@ -102,7 +105,7 @@ test("registered venue search restricts journals to OpenAlex source filter and c
   assert.equal(iclr.pdf_url, "https://openreview.net/pdf?id=abc");
 });
 
-test("a failed venue stays visible without discarding other venues' results", async () => {
+test("a successful shared DBLP query marks unmatched venues reachable", async () => {
   const fetchImpl = async (url) => {
     const target = new URL(url);
     if (target.hostname === "api.openalex.org") {
@@ -129,12 +132,73 @@ test("a failed venue stays visible without discarding other venues' results", as
   });
 
   const journalStatus = result.venues.find((venue) => venue.source_id === "journal-ai");
-  assert.equal(journalStatus.status, "failed");
-  assert.equal(journalStatus.error.code, "OPENALEX_HTTP_503");
-  assert.equal(journalStatus.error.retryable, true);
-  assert.deepEqual(result.venue_failed_ids, ["journal-ai"]);
+  assert.equal(journalStatus.status, "empty");
+  assert.equal(journalStatus.error, null);
+  assert.deepEqual(result.venue_failed_ids, []);
+  assert.equal(result.venue_reached_count, 2);
   assert.equal(result.papers.length, 1);
   assert.equal(result.papers[0].source_id, "conference-iclr");
+});
+
+test("a failed OpenAlex journal search falls back to its historical DBLP stream", async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    const target = new URL(url);
+    calls.push(target);
+    if (target.hostname === "api.openalex.org") {
+      return new Response("rate limited", { status: 429 });
+    }
+    return dblpResponse([{
+      info: {
+        title: "Architectures for Tool-Using Agents.",
+        year: "2022",
+        venue: "Artificial Intelligence",
+        key: "journals/ai/tool-agents22",
+        doi: "10.1000/tool-agents",
+        ee: "https://doi.org/10.1000/tool-agents",
+        authors: { author: { text: "Historical Author" } },
+      },
+    }]);
+  };
+
+  const result = await searchRegisteredVenues({
+    query: "agent scaffold",
+    sources: [journal],
+    fetchImpl,
+    enrich: false,
+    observedAt: "2026-08-04T08:00:00.000Z",
+  });
+
+  const dblpCalls = calls.filter((call) => call.pathname === "/search/publ/api");
+  assert.equal(dblpCalls.length, 1);
+  assert.equal(dblpCalls[0].searchParams.get("q"), "agent scaffold");
+  assert.equal(result.venue_reached_count, 1);
+  assert.equal(result.venue_matched_count, 1);
+  assert.deepEqual(result.venue_failed_ids, []);
+  assert.equal(result.papers[0].published_at, "2022");
+  assert.equal(result.papers[0].discovery_channel, "dblp-search");
+  assert.equal(result.papers[0].paper_type, "journal-article");
+});
+
+test("a reachable source with no historical match is not reported as failed", async () => {
+  const fetchImpl = async (url) => {
+    const target = new URL(url);
+    if (target.hostname === "api.openalex.org") return openAlexResponse([]);
+    return dblpResponse([]);
+  };
+
+  const result = await searchRegisteredVenues({
+    query: "no matching topic",
+    sources: [journal],
+    fetchImpl,
+    enrich: false,
+    observedAt: "2026-08-04T08:00:00.000Z",
+  });
+
+  assert.equal(result.venues[0].status, "empty");
+  assert.equal(result.venue_reached_count, 1);
+  assert.equal(result.venue_matched_count, 0);
+  assert.deepEqual(result.venue_failed_ids, []);
 });
 
 test("multi-query expansion merges hits, dedupes by identity, and unions venue success", async () => {

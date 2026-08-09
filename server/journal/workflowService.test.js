@@ -396,6 +396,159 @@ test("refreshRunCandidates appends this-month papers and records refresh state",
   assert.equal(commitCalls, 1);
 });
 
+test("rotateRunRecommendations replaces the visible batch with unseen translated classics", async () => {
+  const { dataDir, runStore, runId, papers } = await createReadyGuideRun("pi-agent-rotate-");
+  const classics = Array.from({ length: 6 }, (_, index) => ({
+    paper_id: `classic-${index + 1}`,
+    dedupe_key: `classic-key-${index + 1}`,
+    title: `Classic ${index + 1}`,
+    title_zh: `经典论文 ${index + 1}`,
+    authors: ["C. Author"],
+    venue: "JMLR",
+    published_at: "2024-01-01",
+    abstract: `Classic abstract ${index + 1}.`,
+    abstract_zh: `经典摘要 ${index + 1}。`,
+    project_impact: `项目作用 ${index + 1}。`,
+    cited_by_count: 100 - index,
+    display_label: "近年高引 · 未读经典",
+    pdf_url: `https://papers.example/classic-${index + 1}.pdf`,
+  }));
+  await runStore.updateRun(runId, {
+    weekly_recommendation: {
+      schema_version: 1,
+      week_key: "2026-08-03",
+      observed_at: "2026-08-04T00:00:00.000Z",
+      paper_ids: papers.map((paper) => paper.paper_id),
+      selections: [{
+        week_key: "2026-08-03",
+        observed_at: "2026-08-04T00:00:00.000Z",
+        paper_ids: papers.map((paper) => paper.paper_id),
+      }],
+    },
+    recent_classics: {
+      schema_version: 1,
+      status: "success",
+      papers: classics,
+    },
+  });
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "fixture" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+  });
+
+  const rotated = await service.rotateRunRecommendations(runId);
+  assert.deepEqual(
+    rotated.weekly_recommendation.paper_ids,
+    classics.slice(0, 5).map((paper) => paper.paper_id),
+  );
+  assert.equal(rotated.recommendation_rotation.cycle, 1);
+  assert.equal(rotated.recommendation_rotation.last_batch_count, 5);
+  assert.equal(rotated.recommendation_rotation.last_added_classic_count, 5);
+  assert.deepEqual(
+    new Set(rotated.recommendation_rotation.retired_paper_ids),
+    new Set(papers.map((paper) => paper.paper_id)),
+  );
+  assert.equal(rotated.recent_classics.papers.length, 1);
+  assert.equal(rotated.mineru.papers["classic-1"].status, "pdf_not_prepared");
+  assert.equal(
+    rotated.candidates.find((paper) => paper.paper_id === "classic-1").title_zh,
+    "经典论文 1",
+  );
+});
+
+test("rotateRunRecommendations refills the classic pool and translates the next batch", async () => {
+  const { dataDir, runStore, runId, papers } = await createReadyGuideRun("pi-agent-rotate-refill-");
+  const remainingClassic = {
+    paper_id: "classic-remaining",
+    dedupe_key: "classic-key-remaining",
+    title: "Remaining Classic",
+    title_zh: "剩余经典",
+    authors: ["C. Author"],
+    venue: "JMLR",
+    published_at: "2024-01-01",
+    abstract: "Remaining abstract.",
+    abstract_zh: "剩余摘要。",
+    display_label: "近年高引 · 未读经典",
+  };
+  const fetchedClassics = Array.from({ length: 5 }, (_, index) => ({
+    paper_id: `fetched-classic-${index + 1}`,
+    dedupe_key: `fetched-classic-key-${index + 1}`,
+    title: `Fetched Classic ${index + 1}`,
+    authors: ["F. Author"],
+    venue: "TPAMI",
+    published_at: "2023-01-01",
+    abstract: `Fetched abstract ${index + 1}.`,
+    cited_by_count: 80 - index,
+    display_label: "近年高引 · 未读经典",
+  }));
+  await runStore.updateRun(runId, {
+    weekly_recommendation: {
+      schema_version: 1,
+      week_key: "2026-08-03",
+      observed_at: "2026-08-04T00:00:00.000Z",
+      paper_ids: papers.map((paper) => paper.paper_id),
+      selections: [],
+    },
+    recent_classics: { schema_version: 1, status: "success", papers: [remainingClassic] },
+  });
+  let fetchCalls = 0;
+  const service = createJournalWorkflowService({
+    env: { PI_DATA_DIR: dataDir, PI_MODEL_MODE: "live" },
+    dataDir,
+    runStore,
+    sourceStateStore: createSourceStateStore({ dataDir }),
+    modelProviders: {
+      completeStructured: async ({ input }) => ({
+        value: Array.isArray(input?.items)
+          ? {
+              translations: input.items.map((item) => ({
+                id: item.id,
+                zh: `中文:${item.text}`,
+              })),
+            }
+          : {
+              impacts: (input?.papers ?? []).map((paper) => ({
+                request_id: paper.request_id,
+                project_impact: `项目相关:${paper.title}`,
+              })),
+            },
+      }),
+    },
+    recentClassicsFetcher: async ({ cursor }) => {
+      fetchCalls += 1;
+      assert.equal(cursor, "*");
+      return {
+        schema_version: 1,
+        status: "success",
+        papers: fetchedClassics,
+        next_cursor: "cursor-after-first-refill",
+        pages_fetched: 2,
+      };
+    },
+  });
+
+  const rotated = await service.rotateRunRecommendations(runId);
+  assert.equal(fetchCalls, 1);
+  assert.equal(rotated.weekly_recommendation.paper_ids.length, 5);
+  assert.equal(rotated.weekly_recommendation.paper_ids[0], "classic-remaining");
+  assert.ok(rotated.weekly_recommendation.paper_ids.includes("fetched-classic-1"));
+  assert.ok(
+    rotated.candidates.find((paper) => paper.paper_id === "fetched-classic-1").title_zh,
+  );
+  assert.equal(
+    rotated.recommendation_rotation.language_artifact.translation.provenance.model_id,
+    "gpt-5.3-codex-spark",
+  );
+  assert.equal(
+    rotated.recommendation_rotation.recent_classics_cursor,
+    "cursor-after-first-refill",
+  );
+  assert.equal(rotated.recommendation_rotation.recent_classics_exhausted, false);
+  assert.equal(rotated.recommendation_rotation.last_refill_pages_fetched, 2);
+});
+
 test("getRun hydrates latest scan evidence for runs created before summary projection", async () => {
   const { dataDir, runStore, runId } = await createReadyGuideRun("pi-agent-refresh-hydrate-");
   const scanKey = "refresh-2026-08-03";
