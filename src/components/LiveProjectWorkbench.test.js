@@ -152,7 +152,8 @@ test("live project workbench renders the honest empty states without starting wo
     assert.match(emptyConversationHtml, /修改先审阅/);
     assert.match(emptyConversationHtml, /命令显式运行/);
     assert.match(emptyConversationHtml, /只有显式发送才开始工作/);
-    assert.match(emptyConversationHtml, /添加项目文件/);
+    assert.match(emptyConversationHtml, />添加</);
+    assert.match(emptyConversationHtml, /引用项目文件/);
     assert.match(emptyConversationHtml, /添加本地资料/);
     assert.match(emptyConversationHtml, /aria-label="选择要添加的本地资料"/);
     assert.match(emptyConversationHtml, /type="file" multiple=""/);
@@ -414,10 +415,7 @@ test("execution policy control offers only confirmation and safe auto-review mod
         onChange: () => {},
       },
     ));
-    assert.match(nativeHtml, /Pi 原生/);
-    assert.match(nativeHtml, /可信 Workspace/);
-    assert.match(nativeHtml, /disabled=""/);
-    assert.doesNotMatch(nativeHtml, /role="dialog"/);
+    assert.equal(nativeHtml, "");
   });
 });
 
@@ -648,7 +646,7 @@ test("composer thinking control exposes only model-supported Chinese levels", as
   });
 });
 
-test("a pending model selection locks both thinking-strength entry points", async () => {
+test("a pending model selection locks the combined model control and message submit", async () => {
   const source = await readFile(COMPONENT_URL, "utf8");
   assert.match(
     source,
@@ -659,7 +657,7 @@ test("a pending model selection locks both thinking-strength entry points", asyn
     /conversationRunning\s*\|\| modelSelectionDisabled\s*\|\| !snapshot\?\.id/,
   );
   assert.match(source, /thinkingDisabled=\{thinkingBusy \|\| thinkingSaving\}/);
-  assert.match(source, /<ProjectThinkingLevelControl[\s\S]*?running=\{thinkingBusy\}/);
+  assert.doesNotMatch(source, /thinkingLevelControl=\{/);
   assert.match(source, /&& !modelSelectionDisabled\s*&& uploadingAttachments/);
   assert.match(
     source,
@@ -789,8 +787,6 @@ test("message payload controls stay frozen until image serialization and HTTP fi
       onOpenArtifact: () => {},
       action: "message",
       error: null,
-      modelLabel: "vision-model",
-      thinkingLevelControl: null,
       contextUsageControl: null,
       uploadingPdf: null,
       onRetryDocument: () => {},
@@ -821,7 +817,7 @@ test("message payload controls stay frozen until image serialization and HTTP fi
     assert.match(html, /AI 按需读取 · 不预载全文/);
     assert.match(
       html,
-      /project-composer-attachment" type="button" disabled="" title="从电脑选择资料；未知后缀会按实际内容检查/,
+      /role="menuitem" disabled="" title="从电脑选择资料；未知后缀会按实际内容检查/,
     );
     assert.match(
       html,
@@ -1026,14 +1022,15 @@ test("running composer keeps steer separate from the durable follow-up queue", a
     assert.match(html, /当前工作结束后处理/);
     assert.match(html, /aria-pressed="true"/);
     assert.match(html, /发送会加入持久后续队列/);
-    assert.match(html, /aria-label="加入后续队列"/);
+    assert.match(html, /aria-label="停止当前 Agent"/);
+    assert.match(html, /class="is-stop" type="button"/);
 
     const workbenchHtml = renderToStaticMarkup(React.createElement(
       LiveProjectWorkbench,
       { project, conversation: runningConversation },
     ));
-    assert.match(workbenchHtml, /停止并清空队列/);
-    assert.match(workbenchHtml, /停止会同时取消尚未处理的后续消息/);
+    assert.equal((workbenchHtml.match(/aria-label="停止当前 Agent"/g) ?? []).length, 1);
+    assert.doesNotMatch(workbenchHtml, /停止并清空队列/);
   });
 });
 
@@ -1355,7 +1352,7 @@ test("completed Word and Excel outputs stay in Files with verified previews and 
   }, { exposeArtifact: true });
 });
 
-test("normal-work keeps context usage beside the composer model and out of the header", async () => {
+test("normal-work keeps one combined model entry and moves low-frequency controls behind more", async () => {
   const source = await readFile(COMPONENT_URL, "utf8");
   const headerStart = source.indexOf("const headerActions");
   const headerEnd = source.indexOf("if (!snapshot)", headerStart);
@@ -1365,16 +1362,15 @@ test("normal-work keeps context usage beside the composer model and out of the h
   const composerImplementation = source.slice(composerStart, composerEnd);
 
   const providerIndex = headerImplementation.indexOf("<ProviderMenu");
-  const capabilitiesIndex = headerImplementation.indexOf("<ProjectCapabilityMenu");
+  const moreIndex = headerImplementation.indexOf("<ProjectHeaderMoreMenu");
   const policyIndex = composerImplementation.indexOf("{executionPolicyControl}");
-  const modelIndex = composerImplementation.indexOf("project-composer-model");
-  const thinkingIndex = composerImplementation.indexOf("{thinkingLevelControl}");
   const contextIndex = composerImplementation.indexOf("{contextUsageControl}");
-  assert.ok(providerIndex >= 0 && providerIndex < capabilitiesIndex);
+  assert.ok(providerIndex >= 0 && providerIndex < moreIndex);
   assert.doesNotMatch(headerImplementation, /ProjectContextUsageMenu/);
-  assert.ok(policyIndex >= 0 && policyIndex < modelIndex);
-  assert.ok(modelIndex < thinkingIndex);
-  assert.ok(thinkingIndex < contextIndex);
+  assert.ok(policyIndex >= 0 && policyIndex < contextIndex);
+  assert.doesNotMatch(composerImplementation, /project-composer-model|thinkingLevelControl/);
+  assert.match(headerImplementation, /<ProjectCapabilityMenu[\s\S]*?hideTrigger/);
+  assert.match(headerImplementation, /<ProjectSessionPathMenu[\s\S]*?hideTrigger/);
   assert.doesNotMatch(source, />\s*整理上下文\s*</);
 });
 
@@ -1792,18 +1788,14 @@ test("settled turns expose paged history, unread state, one path entry, and one 
 
     assert.match(html, /加载更早记录/);
     assert.match(html, /2 条未读/);
-    assert.match(html, />路径</);
+    assert.match(html, />更多</);
     assert.doesNotMatch(html, /重试上一轮/);
     assert.doesNotMatch(html, /这是较早的 DeepSeek 方案/);
     assert.match(html, /已经修复并复测通过/);
     assert.doesNotMatch(html, /class="project-agent-header"/);
     assert.ok(
-      html.indexOf("透明模式") < html.indexOf('class="project-agent-stream"'),
-      "transparent mode should live in the shared top bar",
-    );
-    assert.ok(
-      html.indexOf(">路径<") < html.indexOf('class="project-agent-stream"'),
-      "the compact path entry should live in the shared top bar",
+      html.indexOf(">更多<") < html.indexOf('class="project-agent-stream"'),
+      "low-frequency controls should live behind the shared more entry",
     );
     assert.match(html, /openai-codex · gpt-5\.3-codex/);
     assert.match(html, /1,536 tokens/);
@@ -2089,9 +2081,9 @@ test("latest settled activity is coalesced and collapses above the final answer"
     assert.match(html, /class="project-activity-body" hidden=""/);
     assert.match(html, /已完成/);
     assert.match(html, /4 项 · 查看过程/);
-    assert.match(html, /透明模式/);
+    assert.match(html, />更多</);
     assert.doesNotMatch(html, /Harness 快照/);
-    assert.match(html, /查看与检索了 1 次/);
+    assert.match(html, /查看了 1 项文件与资料/);
     assert.equal((html.match(/思考完成/g) ?? []).length, 0);
     assert.doesNotMatch(html, /agent\.thinking|37 条记录/);
     assert.ok(
@@ -2328,7 +2320,7 @@ test("every completed turn keeps its activity collapsed beside its final answer"
 });
 
 test("the active plan stays in a fixed dock while historical plans remain visible", async () => {
-  await withLiveWorkbench(({ LiveProjectWorkbench }) => {
+  await withLiveWorkbench(({ LiveProjectWorkbench, ProjectPlanDock }) => {
     const messages = [
       {
         id: "user-plan-1",
@@ -2377,13 +2369,18 @@ test("the active plan stays in a fixed dock while historical plans remain visibl
       },
       {
         seq: 5,
+        type: "plan.cleared",
+        data: { turnId: "turn-plan-2", attempt: 1 },
+      },
+      {
+        seq: 6,
         type: "plan.updated",
         data: {
           steps: [{ id: "new-plan", text: "第二轮对应计划", status: "in_progress" }],
         },
       },
       {
-        seq: 6,
+        seq: 7,
         type: "agent.progress",
         data: { summary: "正在检查第二轮。" },
       },
@@ -2432,7 +2429,7 @@ test("the active plan stays in a fixed dock while historical plans remain visibl
           events: [
             ...events,
             {
-              seq: 7,
+              seq: 8,
               type: "message.completed",
               data: { turnId: "turn-plan-2" },
             },
@@ -2457,18 +2454,43 @@ test("the active plan stays in a fixed dock while historical plans remain visibl
           status: "running",
           turnStatus: "running",
           messages,
-          events: events.filter((event) => event.seq !== 5),
-          plan: [{
-            id: "old-plan",
-            title: "第一轮对应计划",
-            status: "completed",
-          }],
+          events: events.filter((event) => event.seq !== 6),
+          plan: null,
         }),
       },
     ));
     assert.equal((noNewPlanHtml.match(/>第一轮对应计划<\/span>/g) ?? []).length, 1);
     assert.match(noNewPlanHtml, /project-plan-dock is-running is-expanded/);
+    assert.match(noNewPlanHtml, /正在准备本轮计划/);
+    assert.doesNotMatch(noNewPlanHtml, /正在整理最终回答/);
+    assert.match(runningHtml, /正在：第二轮对应计划/);
     assert.match(runningHtml, /aria-label="进行中：第二轮对应计划"/);
+
+    const finalizingHtml = renderToStaticMarkup(React.createElement(ProjectPlanDock, {
+      running: true,
+      plan: [{ id: "done", title: "完成检查", status: "completed" }],
+    }));
+    assert.match(finalizingHtml, /正在整理最终回答/);
+    assert.match(finalizingHtml, /已完成/);
+    assert.match(finalizingHtml, /进行中/);
+    assert.match(finalizingHtml, /class="is-running"/);
+    assert.match(
+      finalizingHtml,
+      /project-plan-step-title">整理最终回答<\/span>/,
+    );
+
+    const mixedHtml = renderToStaticMarkup(React.createElement(ProjectPlanDock, {
+      running: true,
+      plan: [{ id: "done", title: "已经完成的步骤", status: "completed" }, {
+        id: "active", title: "现在正在做的步骤", status: "in_progress",
+      }, {
+        id: "pending", title: "稍后处理的步骤", status: "pending",
+      }],
+    }));
+    assert.match(mixedHtml, /已完成/);
+    assert.match(mixedHtml, /进行中/);
+    assert.match(mixedHtml, /待处理/);
+    assert.match(mixedHtml, /正在：现在正在做的步骤/);
   });
 
   const styles = await readFile(STYLES_URL, "utf8");
@@ -2658,8 +2680,65 @@ test("repeated file inspection stays in one public activity layer", async () => 
 
     assert.equal(normalized.length, 1);
     assert.equal(normalized[0].type, "activity.research_summary");
-    assert.equal(normalized[0].title, "查看与检索了 8 次");
+    assert.equal(normalized[0].title, "查看了 8 项文件与资料");
     assert.equal(normalized[0].detail, "项目资料 8 次");
+  });
+});
+
+test("activity liveness reports elapsed time and warns when progress is stale", async () => {
+  await withLiveWorkbench(({ activityLiveness }) => {
+    const events = [
+      {
+        seq: 1,
+        type: "message.created",
+        at: "2026-08-07T08:00:00.000Z",
+      },
+      {
+        seq: 2,
+        type: "agent.progress",
+        at: "2026-08-07T08:54:00.000Z",
+      },
+    ];
+    const liveness = activityLiveness(
+      events,
+      true,
+      Date.parse("2026-08-07T09:00:00.000Z"),
+    );
+
+    assert.deepEqual(liveness, {
+      elapsed: "1 小时",
+      progress: "6 分钟没有新进展",
+      stale: true,
+    });
+  });
+});
+
+test("successful file changes collapse into one counted activity", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "tool.completed",
+        toolName: "edit",
+        toolCallId: "edit-1",
+        path: "src/a.js",
+        status: "completed",
+      },
+      {
+        seq: 3,
+        type: "tool.completed",
+        toolName: "write",
+        toolCallId: "write-1",
+        path: "src/b.js",
+        status: "completed",
+      },
+    ], false);
+
+    assert.equal(normalized.length, 1);
+    assert.equal(normalized[0].type, "activity.file_change_summary");
+    assert.equal(normalized[0].title, "处理了 2 个文件");
+    assert.equal(normalized[0].artifactId, "changes");
   });
 });
 
@@ -2791,7 +2870,7 @@ test("non-final assistant narration is interleaved with tools as public progress
 
     assert.deepEqual(
       normalized.map((event) => event.type),
-      ["activity.research_summary", "agent.progress", "tool.completed"],
+      ["activity.research_summary", "agent.progress", "activity.file_change_summary"],
     );
     assert.equal(normalized[1].data.summary, "已经确认入口，接下来写入修复。");
     assert.deepEqual(
@@ -2944,7 +3023,7 @@ test("reasoning cycles stay interleaved with their real tool batches", async () 
         "agent.thinking",
         "activity.research_summary",
         "agent.thinking",
-        "tool.completed",
+        "activity.file_change_summary",
         "agent.thinking",
       ],
     );
@@ -3039,7 +3118,7 @@ test("activity timeline adds bounded provider-neutral narration around real tool
 
     assert.match(html, /我先确认任务范围，再按需查看相关资料/);
     assert.match(html, /关键资料已经核对，正在整理结论与适用边界/);
-    assert.match(html, /查看与检索了 2 次/);
+    assert.match(html, /查看了 2 项文件与资料/);
     assert.doesNotMatch(html, /思考完成/);
     assert.equal((html.match(/<article class="project-activity-progress/g) ?? []).length, 2);
   });
@@ -3524,7 +3603,7 @@ test("activity normalization collapses tool lifecycles into counted public summa
     assert.equal(normalized[0].type, "agent.thinking");
     assert.equal(normalized[0].status, "finished");
     assert.equal(normalized[1].type, "activity.research_summary");
-    assert.equal(normalized[1].title, "查看与检索了 3 次");
+    assert.equal(normalized[1].title, "查看了 3 项文件与资料");
     assert.equal(normalized[1].detail, "项目资料 2 次 · 会话资料 1 次");
     assert.deepEqual(normalized[1].counts, {
       project: 2,
@@ -3563,7 +3642,7 @@ test("activity normalization hides bookkeeping events without dropping public wo
 
     assert.deepEqual(
       normalized.map((event) => event.type),
-      ["agent.thinking", "tool.completed", "change_set.ready"],
+      ["agent.thinking", "activity.file_change_summary", "change_set.ready"],
     );
     assert.doesNotMatch(
       JSON.stringify(normalized),
@@ -3773,11 +3852,71 @@ test("activity normalization distinguishes prepared and actually run verificatio
 
     assert.equal(normalized.length, 2);
     assert.equal(normalized[0].type, "activity.command_summary");
-    assert.equal(normalized[0].title, "运行了 1 条验证命令");
+    assert.equal(normalized[0].title, "运行了 1 条命令");
     assert.equal(normalized[0].detail, "已准备 1 条 · 已运行 1 条");
     assert.equal(normalized[1].type, "verification.completed");
     assert.equal(normalized[1].status, "failed");
     assert.doesNotMatch(JSON.stringify(normalized), /request_verification/);
+  });
+});
+
+test("native workspace and bash lifecycles collapse into one command count", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "tool.started",
+        toolName: "bash",
+        toolCallId: "bash-1",
+      },
+      {
+        seq: 3,
+        type: "workspace_run.started",
+        toolCallId: "bash-1",
+        runId: "run-1",
+        status: "running",
+      },
+      {
+        seq: 4,
+        type: "tool.completed",
+        toolName: "bash",
+        toolCallId: "bash-1",
+        status: "completed",
+      },
+      {
+        seq: 5,
+        type: "workspace_run.completed",
+        toolCallId: "bash-1",
+        runId: "run-1",
+        status: "succeeded",
+      },
+    ], false);
+
+    assert.equal(normalized.length, 1);
+    assert.equal(normalized[0].type, "activity.command_summary");
+    assert.equal(normalized[0].title, "运行了 1 条命令");
+    assert.equal(normalized[0].detail, "已运行 1 条");
+    assert.doesNotMatch(JSON.stringify(normalized), /workspace_run\.|bash完成/);
+  });
+});
+
+test("failed workspace commands remain individually visible", async () => {
+  await withLiveWorkbench(({ normalizeActivityEvents }) => {
+    const normalized = normalizeActivityEvents([
+      { seq: 1, type: "message.created", status: "accepted" },
+      {
+        seq: 2,
+        type: "workspace_run.completed",
+        toolCallId: "bash-failed",
+        runId: "run-failed",
+        status: "failed",
+      },
+    ], false);
+
+    assert.equal(normalized.length, 1);
+    assert.equal(normalized[0].type, "workspace_run.completed");
+    assert.equal(normalized[0].status, "failed");
   });
 });
 
@@ -4310,10 +4449,10 @@ test("native reasoning remains interleaved with public progress without repeated
     }));
     assert.match(html, /先核对入口/);
     assert.match(html, /已完成这一步分析/);
-    assert.match(html, /查看与检索了 1 次/);
+    assert.match(html, /查看了 1 项文件与资料/);
     assert.match(html, /入口已核对/);
     assert.doesNotMatch(html, /思考完成/);
-    assert.ok(html.indexOf("先核对入口") < html.indexOf("查看与检索了 1 次"));
+    assert.ok(html.indexOf("先核对入口") < html.indexOf("查看了 1 项文件与资料"));
   });
 });
 

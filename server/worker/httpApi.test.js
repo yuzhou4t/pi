@@ -225,6 +225,47 @@ test("Worker messages receive persisted reference context and Lark drafts defaul
   assert.equal(saved[0].format, "xml");
 });
 
+test("Worker task deletion removes its Pi conversation before the Worker index", async () => {
+  const calls = [];
+  const context = harness({
+    worker: {
+      async getTask(taskId) {
+        calls.push(["get", taskId]);
+        return {
+          id: taskId,
+          conversationId: "conversation_1",
+          workerId: "agent_mail",
+        };
+      },
+      async removeTask(taskId) {
+        calls.push(["remove-task", taskId]);
+        return { id: taskId, conversationId: "conversation_1", removed: true };
+      },
+    },
+    project: {
+      async removeWorkerConversation(conversationId) {
+        calls.push(["remove-conversation", conversationId]);
+        return { id: conversationId, removed: true };
+      },
+    },
+  });
+  const handled = await context.api.handle(
+    request("DELETE"),
+    {},
+    new URL("http://localhost/api/v1/worker/tasks/worker_task_1"),
+    "http://127.0.0.1:5173",
+  );
+  assert.equal(handled, true);
+  assert.deepEqual(calls, [
+    ["get", "worker_task_1"],
+    ["remove-conversation", "conversation_1"],
+    ["remove-task", "worker_task_1"],
+  ]);
+  assert.equal(context.responses[0].status, 200);
+  assert.equal(context.responses[0].body.result.removed, true);
+  assert.deepEqual(context.origins, ["http://127.0.0.1:5173"]);
+});
+
 test("Worker context update rolls the conversation back if task persistence fails", async () => {
   const projectUpdates = [];
   const worker = {

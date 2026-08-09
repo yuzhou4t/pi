@@ -52,6 +52,10 @@ import {
   probeVercelReadHealth,
   VERCEL_READ_TOOL_NAMES,
 } from "./vercelReadConnector.js";
+import {
+  createWorkerMailTools,
+  WORKER_MAIL_TOOL_NAMES,
+} from "./workerMailTools.js";
 import { VERIFICATION_RECIPE_IDS } from "./verificationRecipes.js";
 import {
   isFilteredProjectPath,
@@ -119,6 +123,7 @@ const TOOL_NAMES = [
   ...EXTERNAL_RETRIEVAL_TOOL_NAMES,
   ...GITHUB_READ_TOOL_NAMES,
   ...VERCEL_READ_TOOL_NAMES,
+  ...WORKER_MAIL_TOOL_NAMES,
 ];
 const PI_NATIVE_BUILTIN_TOOL_NAMES = new Set([
   "read",
@@ -1958,6 +1963,7 @@ export async function createProjectWorkTools({
   externalRetrievalOptions,
   githubReadOptions,
   vercelReadOptions,
+  workerMailAccess,
   onPlan,
   onAskUserRequest,
   onVerificationRequest,
@@ -2549,6 +2555,9 @@ export async function createProjectWorkTools({
     ...vercelReadOptions,
     enabledForTurn: true,
   });
+  const workerMailTools = createWorkerMailTools({
+    mailAccess: workerMailAccess,
+  });
 
   return [
     createReadTool(roots, skillResources),
@@ -2570,6 +2579,7 @@ export async function createProjectWorkTools({
     ...externalRetrievalTools,
     ...githubReadTools,
     ...vercelReadTools,
+    ...workerMailTools,
     reportProgress,
     updatePlan,
     askUser,
@@ -3031,6 +3041,7 @@ export function createPiSessionFactory({
     documentAccess,
     attachmentAccess,
     officeArtifactAccess,
+    workerMailAccess,
     onPlan,
     onAskUserRequest,
     onVerificationRequest,
@@ -3172,6 +3183,7 @@ export function createPiSessionFactory({
       documentAccess,
       attachmentAccess,
       officeArtifactAccess,
+      workerMailAccess,
       externalRetrievalOptions,
       githubReadOptions,
       vercelReadOptions,

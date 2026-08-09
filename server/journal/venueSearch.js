@@ -225,7 +225,7 @@ function mapDblpHit(hit, source) {
       title,
       authors: dblpAuthors(info),
       venue: compact(info?.venue) || source.short_name,
-      paper_type: "conference-paper",
+      paper_type: source.source_type === "journal" ? "journal-article" : "conference-paper",
       published_at: /^\d{4}$/.test(year) ? year : null,
       publication_date_precision: /^\d{4}$/.test(year) ? "year" : "unknown",
       doi,
@@ -242,24 +242,33 @@ function mapDblpHit(hit, source) {
   };
 }
 
-async function searchConferenceViaDblp(source, {
+function sourceForDblpHit(hit, sources) {
+  const key = compact(hit?.info?.key);
+  if (!key) return null;
+  return sources.find((source) => key.startsWith(`${source.dblp_path}/`)) ?? null;
+}
+
+async function searchSourcesViaDblp(sources, {
   query,
   fetchImpl,
   perVenue,
+  fromYear,
   timeoutMs,
 }) {
-  const status = {
+  const statuses = new Map(sources.map((source) => [source.source_id, {
     source_id: source.source_id,
     short_name: source.short_name,
     channel: "dblp-search",
     status: "empty",
     count: 0,
     error: null,
-  };
+  }]));
   const search = new URLSearchParams({
-    q: `${query} streamid:${source.dblp_path}:`,
+    // One global publication query is classified by DBLP key locally. This
+    // keeps historical coverage without issuing one rate-limited request per venue.
+    q: query,
     format: "json",
-    h: String(perVenue),
+    h: String(Math.min(1_000, Math.max(perVenue, perVenue * sources.length))),
   });
   const records = [];
   let lastError = null;
@@ -275,47 +284,30 @@ async function searchConferenceViaDblp(source, {
       const hits = body?.result?.hits?.hit;
       const list = Array.isArray(hits) ? hits : hits ? [hits] : [];
       for (const hit of list) {
+        const source = sourceForDblpHit(hit, sources);
+        if (!source) continue;
         const mapped = mapDblpHit(hit, source);
         if (!mapped) continue;
+        const year = Number.parseInt(compact(mapped.raw.published_at), 10);
+        if (Number.isInteger(fromYear) && (!Number.isInteger(year) || year < fromYear)) continue;
+        const status = statuses.get(source.source_id);
         status.status = "success";
         status.count += 1;
         records.push({ ...mapped, sourceId: source.source_id });
       }
-      return { records, status };
+      return { records, statuses: [...statuses.values()] };
     } catch (error) {
       lastError = error;
     }
   }
-  status.status = "failed";
-  status.error = {
-    code: lastError?.code ?? "DBLP_SEARCH_FAILED",
-    retryable: Boolean(lastError?.retryable),
-  };
-  return { records, status };
-}
-
-async function searchConferencesViaDblp(conferences, {
-  query,
-  fetchImpl,
-  perVenue,
-  timeoutMs,
-  requestDelayMs,
-  sleep,
-}) {
-  // DBLP rate-limits bursts (HTTP 429), so conference streams are searched
-  // sequentially with a short pause between requests, mirroring the paced
-  // weekly scan rather than firing every stream at once.
-  const results = [];
-  for (const [index, source] of conferences.entries()) {
-    if (index > 0 && requestDelayMs > 0) await sleep(requestDelayMs);
-    results.push(await searchConferenceViaDblp(source, {
-      query,
-      fetchImpl,
-      perVenue,
-      timeoutMs,
-    }));
+  for (const status of statuses.values()) {
+    status.status = "failed";
+    status.error = {
+      code: lastError?.code ?? "DBLP_SEARCH_FAILED",
+      retryable: Boolean(lastError?.retryable),
+    };
   }
-  return results;
+  return { records, statuses: [...statuses.values()] };
 }
 
 function rankScore(paper) {
@@ -338,8 +330,6 @@ export async function searchRegisteredVenues({
   enrich = true,
   observedAt = new Date().toISOString(),
   timeoutMs = DEFAULT_TIMEOUT_MS,
-  requestDelayMs = 700,
-  sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 } = {}) {
   // 多查询扩展：同一个主题用若干互补检索式分别命中，在原始记录层合并，
   // 再统一去重/补全/排序，提高召回而不破坏 venue 约束。
@@ -356,10 +346,8 @@ export async function searchRegisteredVenues({
     normalizedQueries.push(normalized);
     if (normalizedQueries.length >= MAX_QUERIES) break;
   }
-  const journals = sources.filter((source) => compact(source.openalex_source_id));
-  const conferences = sources.filter(
-    (source) => source.source_type === "conference" && compact(source.dblp_path),
-  );
+  const openAlexSources = sources.filter((source) => compact(source.openalex_source_id));
+  const dblpSources = sources.filter((source) => compact(source.dblp_path));
 
   const rawRecords = [];
   // source_id -> 合并后的状态：任一查询成功即视为成功，全部失败才算失败。
@@ -372,18 +360,22 @@ export async function searchRegisteredVenues({
       return;
     }
     const merged = { ...previous };
-    if (status.status === "success") merged.status = "success";
+    const rank = { failed: 0, empty: 1, success: 2 };
+    if ((rank[status.status] ?? -1) > (rank[previous.status] ?? -1)) {
+      merged.status = status.status;
+      merged.channel = status.channel;
+    }
     merged.count = (Number(previous.count) || 0) + (Number(status.count) || 0);
-    if (previous.status !== "success" && status.error) merged.error = status.error;
-    if (status.status === "success") merged.error = null;
+    if (merged.status === "failed" && status.error) merged.error = status.error;
+    if (merged.status !== "failed") merged.error = null;
     statusById.set(status.source_id, merged);
   };
 
   // 查询之间串行，避免对 DBLP 等来源瞬时压力过大；单查询与旧行为完全一致。
   for (const normalizedQuery of normalizedQueries) {
-    const [journalResult, conferenceResults] = await Promise.all([
-      journals.length > 0
-        ? searchJournalsViaOpenAlex(journals, {
+    const [openAlexResult, dblpResult] = await Promise.all([
+      openAlexSources.length > 0
+        ? searchJournalsViaOpenAlex(openAlexSources, {
             query: normalizedQuery,
             fetchImpl,
             perVenue,
@@ -392,23 +384,24 @@ export async function searchRegisteredVenues({
             timeoutMs,
           })
         : Promise.resolve({ records: [], statuses: [] }),
-      searchConferencesViaDblp(conferences, {
+      searchSourcesViaDblp(dblpSources, {
         query: normalizedQuery,
         fetchImpl,
         perVenue,
+        fromYear,
         timeoutMs,
-        requestDelayMs,
-        sleep,
       }),
     ]);
-    for (const status of journalResult.statuses) mergeStatus(status);
-    for (const result of conferenceResults) mergeStatus(result.status);
-    rawRecords.push(...journalResult.records);
-    rawRecords.push(...conferenceResults.flatMap((result) => result.records));
+    for (const status of openAlexResult.statuses) mergeStatus(status);
+    for (const status of dblpResult.statuses) mergeStatus(status);
+    rawRecords.push(...openAlexResult.records);
+    rawRecords.push(...dblpResult.records);
   }
 
   const normalizedQuery = normalizedQueries[0] ?? "";
   const venueStatuses = [...statusById.values()];
+  const venueReachedCount = venueStatuses.filter((status) => status.status !== "failed").length;
+  const venueMatchedCount = venueStatuses.filter((status) => status.status === "success").length;
 
   const normalized = [];
   for (const record of rawRecords) {
@@ -458,7 +451,10 @@ export async function searchRegisteredVenues({
     observed_at: observedAt,
     from_year: Number.isInteger(fromYear) ? fromYear : null,
     venues: venueStatuses,
-    venue_success_count: venueStatuses.filter((status) => status.status === "success").length,
+    // 兼容旧客户端：success 仍表示“有命中”；新客户端使用 reached/matched 拆分状态。
+    venue_success_count: venueMatchedCount,
+    venue_reached_count: venueReachedCount,
+    venue_matched_count: venueMatchedCount,
     venue_failed_ids: venueStatuses
       .filter((status) => status.status === "failed")
       .map((status) => status.source_id),

@@ -120,6 +120,7 @@ export function useWorkerController({
   const [state, setState] = useState(null);
   const [status, setStatus] = useState("idle");
   const [busyAction, setBusyAction] = useState(null);
+  const [deletingTaskId, setDeletingTaskId] = useState(null);
   const [error, setError] = useState(null);
   const draftInvalidationCoordinatorRef = useRef(null);
   if (!draftInvalidationCoordinatorRef.current) {
@@ -443,7 +444,7 @@ export function useWorkerController({
     async (taskId) => {
       const attachments = pendingAttachmentsRef.current.get(taskId) ?? [];
       const current = state;
-      await workerRequest(`/api/v1/worker/tasks/${encodeURIComponent(taskId)}/messages`, {
+      const accepted = await workerRequest(`/api/v1/worker/tasks/${encodeURIComponent(taskId)}/messages`, {
         body: {
           schema_version: 1,
           client_request_id: requestId("worker-message"),
@@ -456,9 +457,71 @@ export function useWorkerController({
         },
       });
       pendingAttachmentsRef.current.set(taskId, []);
+      if (accepted?.conversation && activeTaskIdRef.current === taskId) {
+        renderBundle({
+          ...bundleRef.current,
+          conversation: accepted.conversation,
+        });
+        if (
+          subscribedTaskIdRef.current === taskId
+          && isWorkerConversationBusy(accepted.conversation)
+        ) {
+          pollTask(taskId, epochRef.current).catch(reportError);
+        }
+      }
     },
     { poll: true },
-  ), [defaultModelId, defaultProviderId, runTaskMutation, state]);
+  ), [
+    defaultModelId,
+    defaultProviderId,
+    pollTask,
+    renderBundle,
+    reportError,
+    runTaskMutation,
+    state,
+  ]);
+
+  const deleteTask = useCallback(async (taskId) => {
+    if (!taskId || deletingTaskId) return false;
+    const target = tasks.find((task) => task.id === taskId);
+    if (!target) return false;
+    setDeletingTaskId(taskId);
+    setError(null);
+    try {
+      const payload = await workerApi.deleteTask(taskId);
+      if (payload?.result?.removed !== true) {
+        throw new Error("服务未确认删除，请稍后重试");
+      }
+      importedSourcesRef.current.delete(taskId);
+      pendingAttachmentsRef.current.delete(taskId);
+      const nextTasks = await workerApi.listTasks();
+      setTasks(nextTasks);
+      if (activeTaskIdRef.current !== taskId) return true;
+      const fallback = nextTasks.find((task) => task.workerId === target.workerId)
+        ?? nextTasks[0]
+        ?? null;
+      if (fallback) return selectTask(fallback.id, fallback.workerId);
+      draftInvalidationCoordinatorRef.current.reset();
+      epochRef.current += 1;
+      unsubscribeRef.current?.();
+      unsubscribeRef.current = null;
+      subscribedTaskIdRef.current = null;
+      activeTaskIdRef.current = null;
+      bundleRef.current = null;
+      setActiveTaskId(null);
+      setActiveWorkerId(target.workerId);
+      setBundle(null);
+      setState(null);
+      setStatus("ready");
+      onSelectionChangeRef.current?.({ taskId: null, workerId: target.workerId });
+      return true;
+    } catch (nextError) {
+      reportError(nextError);
+      throw nextError;
+    } finally {
+      setDeletingTaskId(null);
+    }
+  }, [deletingTaskId, reportError, selectTask, tasks]);
 
   const invalidateDraftOnEdit = useCallback((input) => {
     const taskId = activeTaskIdRef.current;
@@ -720,6 +783,7 @@ export function useWorkerController({
   return {
     status,
     busyAction,
+    deletingTaskId,
     error,
     definitions,
     tasks: displayTasks,
@@ -733,6 +797,7 @@ export function useWorkerController({
     selectWorker,
     selectTask,
     createTask,
+    deleteTask,
     sendMessage,
     invalidateDraftOnEdit,
     saveDraft,

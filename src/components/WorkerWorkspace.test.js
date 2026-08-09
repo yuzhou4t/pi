@@ -72,6 +72,28 @@ test("WorkerRail search contract filters groups and tasks without changing task 
   });
 });
 
+test("WorkerRail gives each task the same overflow deletion entry as coding conversations", async () => {
+  await withViteModule("/src/components/WorkerWorkspace.jsx", ({ WorkerRail }) => {
+    const html = renderToStaticMarkup(React.createElement(WorkerRail, {
+      workers: [{
+        id: WORKER_IDS.AGENT_MAIL,
+        name: "Agent 邮箱 Worker",
+        description: "读取邮箱",
+      }],
+      tasks: [{
+        id: "mail-task-1",
+        workerId: WORKER_IDS.AGENT_MAIL,
+        title: "查看邮箱",
+        subtitle: "等待任务",
+      }],
+      query: "查看邮箱",
+      onDeleteTask() {},
+    }));
+    assert.match(html, /打开“查看邮箱”的更多操作/);
+    assert.match(html, /project-conversation-more/);
+  });
+});
+
 test("IMA Worker exposes explicit note reads, Markdown drafts, and no external delivery form", async () => {
   await withViteModule("/src/components/WorkerWorkspace.jsx", ({ WorkerWorkspace }) => {
     const sourcesHtml = renderToStaticMarkup(React.createElement(WorkerWorkspace, {

@@ -47,6 +47,25 @@ const providers = [{
   models: ["deepseek-v4-flash", "deepseek-v4-pro"],
 }];
 
+test("initial project-work loading keeps conversation summaries for every folder", async () => {
+  await withAppModule(async ({ listAllProjectConversations }) => {
+    const requestedProjectIds = [];
+    const conversations = await listAllProjectConversations([
+      { id: "project-1" },
+      { id: "project-2" },
+    ], async ({ projectId }) => {
+      requestedProjectIds.push(projectId);
+      return [{ id: `${projectId}-conversation`, projectId }];
+    });
+
+    assert.deepEqual(requestedProjectIds.sort(), ["project-1", "project-2"]);
+    assert.deepEqual(
+      conversations.map((conversation) => conversation.id).sort(),
+      ["project-1-conversation", "project-2-conversation"],
+    );
+  });
+});
+
 test("project-work model preference migrates v1 and remembers a model per provider", async () => {
   await withAppModule(({
     DEFAULT_PROJECT_WORK_EXECUTION_POLICY_MODE,

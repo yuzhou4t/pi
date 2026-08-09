@@ -728,6 +728,7 @@ export function normalizeWorkerTasks(tasks, activeState = null) {
       subtitle,
       updatedLabel: createdAtLabel(task.updatedAt),
       unreadCount: active ? activeState.conversation?.unreadCount ?? 0 : 0,
+      busy: active && isWorkerConversationBusy(activeState.conversation),
     };
   });
 }
