@@ -26,8 +26,13 @@ import {
   safeProjectWorkError,
 } from "./project-work/errors.js";
 import { createProjectWorkService } from "./project-work/projectWorkService.js";
+import { createSearchUsageService } from "./project-work/externalRetrieval.js";
 import { createLegacyWorkspaceArchiveService } from "./project-work/legacyWorkspaceArchive.js";
-import { resolveProjectWorkStorageRoot } from "./project-work/projectWorkPaths.js";
+import {
+  resolveProjectWorkDoubaoQuotaFilePath,
+  resolveProjectWorkStorageRoot,
+  resolveProjectWorkTavilyQuotaFilePath,
+} from "./project-work/projectWorkPaths.js";
 import {
   normalizeProjectWorkRuntimeUrl,
   probeProjectWorkRuntime,
@@ -64,6 +69,10 @@ const candidateSummaries = createCandidateSummaryService({
 const journalWorkflow = createJournalWorkflowService({
   dataDir: piDataDir,
   usageLedger: paperUsageLedger,
+});
+const searchUsage = createSearchUsageService({
+  doubaoQuotaFilePath: resolveProjectWorkDoubaoQuotaFilePath(),
+  tavilyQuotaFilePath: resolveProjectWorkTavilyQuotaFilePath(),
 });
 const projectWorkRuntimeOnly = process.env.PI_PROJECT_WORK_RUNTIME_ONLY === "1";
 const configuredProjectWorkRuntimeUrl = normalizeProjectWorkRuntimeUrl(
@@ -1309,6 +1318,7 @@ export function createApiServer({
   legacyWorkspaceArchiveService = legacyWorkspaceArchives,
   workerService = worker,
   notificationSubscriptionService = notificationService,
+  searchUsageService = searchUsage,
   projectWorkRuntimeUrl = configuredProjectWorkRuntimeUrl,
   projectWorkRuntimeHealthProbe = probeProjectWorkRuntime,
   runtimeOnly = projectWorkRuntimeOnly,
@@ -1474,6 +1484,21 @@ export function createApiServer({
       workflow,
       accessIssues,
     }), origin);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/v1/search-usage") {
+    try {
+      sendJson(response, 200, await searchUsageService.getUsage(), origin);
+    } catch {
+      sendJson(response, 503, {
+        error: {
+          code: "SEARCH_USAGE_UNAVAILABLE",
+          message: "搜索额度暂时无法读取",
+          retryable: true,
+        },
+      }, origin);
+    }
     return;
   }
 

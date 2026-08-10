@@ -2686,6 +2686,82 @@ export async function fetchModelUsage({
   return mapProjectWorkUsage(payload);
 }
 
+export function mapSearchUsage(raw) {
+  const source = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? raw
+    : {};
+  return {
+    period: pick(source, "period", "period"),
+    generatedAt: pick(source, "generated_at", "generatedAt"),
+    warnings: asArray(source.warnings).map((warning) => ({
+      code: pick(warning, "code", "code", "SEARCH_USAGE_PARTIAL"),
+      message: pick(warning, "message", "message", "搜索额度数据不完整"),
+    })),
+    providers: asArray(source.providers).flatMap((provider) => {
+      const providerId = pick(provider, "provider_id", "providerId");
+      if (!providerId) return [];
+      const limit = nullableNumber(provider, "limit", "limit") ?? 0;
+      const used = nullableNumber(provider, "used", "used") ?? 0;
+      const issue = provider.issue
+        && typeof provider.issue === "object"
+        && !Array.isArray(provider.issue)
+        ? {
+            code: pick(provider.issue, "code", "code", "SEARCH_USAGE_PARTIAL"),
+            message: pick(
+              provider.issue,
+              "message",
+              "message",
+              "搜索额度数据不完整",
+            ),
+          }
+        : null;
+      return [{
+        providerId,
+        providerName: pick(
+          provider,
+          "provider_name",
+          "providerName",
+          providerId,
+        ),
+        configured: pick(provider, "configured", "configured", false) === true,
+        hardLimit: pick(provider, "hard_limit", "hardLimit", false) === true,
+        source: pick(provider, "source", "source", "local_hard_ledger"),
+        period: pick(provider, "period", "period", source.period),
+        limit,
+        used,
+        remaining: nullableNumber(provider, "remaining", "remaining")
+          ?? Math.max(0, limit - used),
+        officialUsageAvailable: pick(
+          provider,
+          "official_usage_available",
+          "officialUsageAvailable",
+          false,
+        ) === true,
+        providerPlanLimit: nullableNumber(
+          provider,
+          "provider_plan_limit",
+          "providerPlanLimit",
+        ),
+        sharedRepository: pick(
+          provider,
+          "shared_repository",
+          "sharedRepository",
+        ),
+        sharedBranch: pick(provider, "shared_branch", "sharedBranch"),
+        issue,
+      }];
+    }),
+  };
+}
+
+export async function fetchSearchUsage({ signal, fetchImpl } = {}) {
+  const payload = await requestJson("/api/v1/search-usage", {
+    signal,
+    fetchImpl,
+  });
+  return mapSearchUsage(payload);
+}
+
 export async function fetchProjectWorkUsage({
   period = "30d",
   signal,
@@ -4461,6 +4537,7 @@ export const projectWorkApi = {
   installSkillPackage: installProjectWorkSkillPackage,
   setSkillEnabled: setProjectWorkSkillEnabled,
   getUsage: fetchModelUsage,
+  getSearchUsage: fetchSearchUsage,
   getProjectUsage: fetchProjectWorkUsage,
   fetchLegacyWorkspaceArchives,
   cleanupLegacyWorkspaceArchives,

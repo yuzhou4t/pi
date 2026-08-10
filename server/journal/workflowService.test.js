@@ -7,7 +7,7 @@ import test from "node:test";
 import { promptRegistry } from "../promptRegistry.js";
 import { createRunStore } from "./runStore.js";
 import { createSourceStateStore } from "./sourceStateStore.js";
-import { createJournalWorkflowService } from "./workflowService.js";
+import { createJournalWorkflowService, resolveOpenPaperPdf } from "./workflowService.js";
 import { __test as zoteroArchivalTest } from "./zoteroArchival.js";
 
 function candidates() {
@@ -26,6 +26,30 @@ function candidates() {
     pdf_url: `https://papers.example/${index + 1}.pdf`,
   }));
 }
+
+test("missing candidate PDF resolves only an exact arXiv title match", async () => {
+  const xml = `<?xml version="1.0"?><feed><entry>
+    <title>Lifelong Learning of Large Language Model based Agents: A Roadmap</title>
+    <link href="https://arxiv.org/abs/2501.07278v2" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2501.07278v2" rel="related" type="application/pdf"/>
+  </entry></feed>`;
+  const calls = [];
+  const resolved = await resolveOpenPaperPdf({
+    title: "Lifelong Learning of Large Language Model Based Agents: A Roadmap",
+  }, {
+    fetchImpl: async (url) => {
+      calls.push(String(url));
+      return new Response(xml, { status: 200 });
+    },
+  });
+
+  assert.equal(resolved, "https://arxiv.org/pdf/2501.07278v2");
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /^https:\/\/export\.arxiv\.org\/api\/query\?/);
+  assert.equal(await resolveOpenPaperPdf({ title: "A different paper" }, {
+    fetchImpl: async () => new Response(xml, { status: 200 }),
+  }), null);
+});
 
 async function createReadyGuideRun(prefix = "pi-agent-guides-") {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), prefix));

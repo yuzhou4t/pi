@@ -45,6 +45,12 @@ Pi Agent 是一个本地 Agent 工作空间：长期项目保存持续状态，�
 http://127.0.0.1:4173/
 ```
 
+搜索额度的固定直达地址是：
+
+```text
+http://127.0.0.1:4173/?settings=usage
+```
+
 启动器终端窗口就是当前阶段的开关：关闭该窗口或按 `Control+C`，会同时停止它拥有的网页与 API 进程并释放端口。内部 API 会在 `47880–47919` 中选择空闲端口，不会占用“灵感记录”使用的 `8787`；如果公开端口 `4173` 已属于其他服务，启动器会停止启动并明确报错，不会打开错站或按端口误杀进程。
 
 需要临时手动开发或排障时，仍可使用两个终端：
@@ -63,6 +69,8 @@ npm run dev -- --host 127.0.0.1 --port 4173
 ```
 
 `npm run dev:api` 使用 Pi Agent 专用的开发端口 `8788`，默认 Vite 代理也指向该端口。它读取 `.env.local`，并在服务端代码变化后自动重启，避免前端命中旧版接口。论文语义步骤的 GPT 通道继续使用已登录的 Codex 订阅，DeepSeek 读取 `PI_DEEPSEEK_API_KEY`；项目工作会话直接读取 Pi 本机已配置且可用的模型目录，不读取或复制 Pi/Codex 凭据。MinerU Cloud 读取 `PI_MINERU_API_TOKEN`。GitHub 只读 Connector 优先使用服务端专用 `PI_GITHUB_TOKEN`；缺少该配置时，可通过固定、无 Shell 的 `gh api` 只读适配器复用 GitHub CLI Keychain，且仍需用户为本轮显式启用。Vercel 只读 Connector 复用已登录的本机 Vercel CLI。Pi 不读取或复制这两个 CLI 的 Token，也不会把任何凭据返回浏览器。Zotero Desktop 默认只通过 `http://127.0.0.1:23119` 连接本机，必要时可用 `PI_ZOTERO_BASE_URL` 覆盖。所有独立密钥只放在未跟踪的 `.env.local`，不要写入前端、聊天或 Git。
+
+搜索额度可通过 GitHub 的独立 `quota-state` 分支跨设备共享。两台设备配置同一个 `PI_SEARCH_QUOTA_GITHUB_REPOSITORY` 与 `PI_SEARCH_QUOTA_GITHUB_BRANCH`，再分别设置不同的 `PI_SEARCH_QUOTA_PROJECT_ID`；每次搜索只提交月份、次数和项目标识，不提交搜索词或任何密钥。未配置专用 Token 时，服务使用已登录的 `gh` CLI 发起固定 GitHub API 请求，不读取或复制 CLI Token。
 
 正常工作会话数据默认保存在 macOS `Application Support/Pi Agent/project-work`，可通过服务端环境变量 `PI_PROJECT_WORK_STORAGE_ROOT` 覆盖。该目录保存安全项目与 Workspace 注册、会话状态、事件流、`PendingWorkspaceWrite` 私有 before/after 载荷、`WorkspaceChangeSet`、`WorkspaceRun` 日志、独立对话私有草稿与 Pi JSONL session；不会把绝对路径或私有存储目录返回浏览器，也不会进入 Git。创建空会话只写轻量元数据，不扫描或复制项目，也不会启动 Pi。
 

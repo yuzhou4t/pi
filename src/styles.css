@@ -35,6 +35,103 @@
   --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
+.search-quota-section {
+  display: grid;
+  gap: 9px;
+  margin-bottom: 16px;
+}
+
+.search-quota-heading,
+.search-quota-card header,
+.search-quota-values {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.search-quota-heading > div {
+  display: grid;
+  gap: 2px;
+}
+
+.search-quota-heading h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.search-quota-heading > span {
+  color: var(--weak);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.search-quota-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.search-quota-card {
+  display: grid;
+  gap: 9px;
+  padding: 12px 13px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.search-quota-card header strong {
+  font-size: 13px;
+}
+
+.search-quota-card header span {
+  padding: 2px 6px;
+  color: var(--teal-accent);
+  background: var(--accent-pale);
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+.search-quota-card header span.is-muted {
+  color: var(--weak);
+  background: var(--surface-soft);
+}
+
+.search-quota-values strong {
+  font-family: var(--font-mono);
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+.search-quota-values span,
+.search-quota-card small,
+.search-quota-card p {
+  color: var(--weak);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.search-quota-card p {
+  margin: 0;
+  color: var(--risk);
+}
+
+.search-quota-progress {
+  height: 6px;
+  overflow: hidden;
+  background: var(--surface-soft);
+  border-radius: 999px;
+}
+
+.search-quota-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--teal-accent);
+  border-radius: inherit;
+  transition: width 160ms ease;
+}
+
 * {
   box-sizing: border-box;
 }

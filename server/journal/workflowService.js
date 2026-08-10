@@ -117,6 +117,82 @@ function publicError(error) {
   };
 }
 
+function documentSourceUnavailable() {
+  const error = new Error("暂未找到可用的公开全文来源");
+  error.code = "PDF_SOURCE_UNAVAILABLE";
+  error.retryable = false;
+  return error;
+}
+
+function decodedXmlText(value) {
+  return String(value ?? "")
+    .replaceAll("&amp;", "&")
+    .replaceAll("&quot;", "\"")
+    .replaceAll("&apos;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">");
+}
+
+function comparablePaperTitle(value) {
+  return decodedXmlText(value)
+    .normalize("NFKC")
+    .toLowerCase()
+    .replaceAll(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+export async function resolveOpenPaperPdf(paper, {
+  fetchImpl = globalThis.fetch,
+  timeoutMs = 15000,
+} = {}) {
+  const direct = paper?.pdf_url || paper?.pdf_candidates?.[0];
+  if (direct) return direct;
+  const title = typeof paper?.title === "string" ? paper.title.trim() : "";
+  if (!title || typeof fetchImpl !== "function") return null;
+
+  const query = new URL("https://export.arxiv.org/api/query");
+  query.searchParams.set("search_query", `ti:\"${title.replaceAll(/\s+/g, " ").replaceAll("\"", "")}\"`);
+  query.searchParams.set("start", "0");
+  query.searchParams.set("max_results", "3");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(query, {
+      headers: {
+        accept: "application/atom+xml",
+        "user-agent": "Pi-Agent-PDF-Resolver/0.1",
+      },
+      signal: controller.signal,
+    });
+    if (!response?.ok) return null;
+    const xml = await response.text();
+    if (xml.length > 512 * 1024) return null;
+    const expectedTitle = comparablePaperTitle(title);
+    const entries = xml.match(/<entry>[\s\S]*?<\/entry>/g) ?? [];
+    for (const entry of entries) {
+      const resultTitle = entry.match(/<title>([\s\S]*?)<\/title>/)?.[1];
+      if (comparablePaperTitle(resultTitle) !== expectedTitle) continue;
+      const links = entry.match(/<link\s+[^>]*>/g) ?? [];
+      const pdfLink = links.find((link) => /type=["']application\/pdf["']/i.test(link));
+      const href = decodedXmlText(pdfLink?.match(/href=["']([^"']+)["']/i)?.[1]);
+      if (!href) continue;
+      try {
+        const url = new URL(href);
+        if (url.protocol === "https:" && url.hostname === "arxiv.org" && url.pathname.startsWith("/pdf/")) {
+          return url.toString();
+        }
+      } catch {
+        // Ignore malformed discovery results and keep looking.
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const SOURCE_META_BY_ID = new Map(
   SOURCE_REGISTRY.map((source) => [source.source_id, source]),
 );
@@ -141,6 +217,44 @@ function sourceStatusSnapshot(sourceScans = []) {
       error_code: scan.error?.code ?? null,
     };
   });
+}
+
+function appendCurrentRecommendation(current, candidates, paperIds, observedAt) {
+  const prior = current.weekly_recommendation ?? {};
+  const existingIds = prior.paper_ids?.length
+    ? prior.paper_ids
+    : candidates.slice(0, 5).map((paper) => paper.paper_id);
+  const candidateIds = new Set(candidates.map((paper) => paper.paper_id));
+  const nextIds = [...new Set([
+    ...existingIds,
+    ...paperIds.filter((paperId) => candidateIds.has(paperId)),
+  ])];
+  if (
+    prior.paper_ids
+    && nextIds.length === prior.paper_ids.length
+    && nextIds.every((paperId, index) => paperId === prior.paper_ids[index])
+  ) {
+    return prior;
+  }
+  const weekKey = prior.week_key ?? shanghaiNaturalWeekWindow(observedAt).weekKey;
+  const selection = {
+    week_key: weekKey,
+    observed_at: observedAt,
+    paper_ids: nextIds,
+  };
+  const selections = [...(prior.selections ?? [])];
+  if (selections.at(-1)?.week_key === weekKey) {
+    selections[selections.length - 1] = selection;
+  } else {
+    selections.push(selection);
+  }
+  return {
+    schema_version: 1,
+    week_key: weekKey,
+    observed_at: observedAt,
+    paper_ids: nextIds,
+    selections: selections.slice(-26),
+  };
 }
 
 function artifactError(code, message, status = 409) {
@@ -271,6 +385,7 @@ export function createJournalWorkflowService({
     usageRecorder: usageLedger.capture,
   }),
   pdfDownloader = downloadPdf,
+  pdfSourceResolver = resolveOpenPaperPdf,
   mineruAdapter = env.PI_MINERU_API_TOKEN
     ? createMineruCloudAdapter({
         apiToken: env.PI_MINERU_API_TOKEN,
@@ -367,8 +482,8 @@ export function createJournalWorkflowService({
     if (cachedManifest && await fileExists(candidatePath)) {
       return { ...cachedManifest, file_path: candidatePath, cache_hit: true };
     }
-    const pdfUrl = paper.pdf_url || paper.pdf_candidates?.[0];
-    if (!pdfUrl) throw new Error("PDF_URL_UNAVAILABLE");
+    const pdfUrl = await pdfSourceResolver(paper, { fetchImpl });
+    if (!pdfUrl) throw documentSourceUnavailable();
     return {
       ...await pdfDownloader({
         paperId: paper.paper_id,
@@ -401,6 +516,7 @@ export function createJournalWorkflowService({
               pdf_sha256: pdf.sha256,
               pdf_bytes: pdf.byte_length,
               pdf_cache_hit: pdf.cache_hit,
+              pdf_source_url: pdf.source_url ?? null,
               error: null,
             },
           };
@@ -1031,14 +1147,25 @@ export function createJournalWorkflowService({
       const existingKeys = new Set(
         (current.candidates ?? []).map((paper) => paper.dedupe_key).filter(Boolean),
       );
+      const existingByKey = new Map(
+        (current.candidates ?? [])
+          .filter((paper) => paper.dedupe_key)
+          .map((paper) => [paper.dedupe_key, paper.paper_id]),
+      );
       let nextRank = (current.candidates ?? []).reduce(
         (max, paper) => Math.max(max, Number(paper.rank) || 0),
         0,
       );
       const added = [];
+      const acceptedCandidateIds = [];
       for (const paperId of paperIds) {
         const paper = byId.get(paperId);
-        if (existingIds.has(paperId) || (paper.dedupe_key && existingKeys.has(paper.dedupe_key))) {
+        if (existingIds.has(paperId)) {
+          acceptedCandidateIds.push(paperId);
+          continue;
+        }
+        if (paper.dedupe_key && existingKeys.has(paper.dedupe_key)) {
+          acceptedCandidateIds.push(existingByKey.get(paper.dedupe_key));
           continue;
         }
         nextRank += 1;
@@ -1055,12 +1182,25 @@ export function createJournalWorkflowService({
               : `${paper.title}：来自主题检索，价值待全文核验。`),
           project_impact: recommendation?.project_impact ?? PROJECT_IMPACT_FALLBACK,
         });
+        acceptedCandidateIds.push(paperId);
         existingIds.add(paperId);
-        if (paper.dedupe_key) existingKeys.add(paper.dedupe_key);
+        if (paper.dedupe_key) {
+          existingKeys.add(paper.dedupe_key);
+          existingByKey.set(paper.dedupe_key, paperId);
+        }
       }
-      if (added.length === 0) return {};
+      const candidates = [...(current.candidates ?? []), ...added];
+      const observedAt = new Date().toISOString();
+      const weeklyRecommendation = appendCurrentRecommendation(
+        current,
+        candidates,
+        acceptedCandidateIds,
+        observedAt,
+      );
+      if (added.length === 0 && weeklyRecommendation === current.weekly_recommendation) return {};
       return {
-        candidates: [...(current.candidates ?? []), ...added],
+        candidates,
+        weekly_recommendation: weeklyRecommendation,
         mineru: {
           ...current.mineru,
           papers: {
@@ -2237,6 +2377,7 @@ export function createJournalWorkflowService({
             pdf_sha256: pdf.sha256,
             pdf_bytes: pdf.byte_length,
             pdf_cache_hit: pdf.cache_hit,
+            pdf_source_url: pdf.source_url ?? null,
             error: null,
           },
         };

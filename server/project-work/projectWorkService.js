@@ -57,6 +57,7 @@ import { normalizeProjectWorkImages } from "./projectWorkImages.js";
 import {
   resolveProjectWorkDoubaoQuotaFilePath,
   resolveProjectWorkStorageRoot,
+  resolveProjectWorkTavilyQuotaFilePath,
 } from "./projectWorkPaths.js";
 import {
   bindProjectWorkMessageAttachments,
@@ -2785,6 +2786,9 @@ function createProjectWorkServiceRuntime({
   const effectiveSessionFactory = sessionFactory ?? createPiSessionFactory({
     externalRetrievalOptions: {
       doubaoQuotaFilePath: resolveProjectWorkDoubaoQuotaFilePath({
+        storageRoot: configuredStorageRoot,
+      }),
+      tavilyQuotaFilePath: resolveProjectWorkTavilyQuotaFilePath({
         storageRoot: configuredStorageRoot,
       }),
       now,

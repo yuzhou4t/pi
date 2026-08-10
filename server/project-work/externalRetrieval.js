@@ -13,6 +13,7 @@ import path from "node:path";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { projectWorkError } from "./errors.js";
+import { createGitHubSearchQuotaStoreFromEnv } from "./githubSearchQuotaStore.js";
 
 export const EXTERNAL_RETRIEVAL_TOOL_NAMES = [
   "search_web",
@@ -28,9 +29,11 @@ const EXTERNAL_TOOL_GUIDELINES = [
 ];
 
 const TAVILY_SEARCH_URL = "https://api.tavily.com/search";
+const TAVILY_USAGE_URL = "https://api.tavily.com/usage";
 const DOUBAO_RESPONSES_URL = "https://ark.cn-beijing.volces.com/api/v3/responses";
 const DEFAULT_DOUBAO_SEARCH_MODEL = "doubao-seed-2-0-lite-260215";
 const DOUBAO_MONTHLY_SEARCH_LIMIT = 500;
+const TAVILY_MONTHLY_CREDIT_LIMIT = 1_000;
 const CONTEXT7_LIBRARY_SEARCH_URL = "https://context7.com/api/v2/libs/search";
 const CONTEXT7_QUERY_DOCS_URL = "https://context7.com/api/v2/context";
 const DEFAULT_TIMEOUT_MS = 8_000;
@@ -226,14 +229,33 @@ function retrievalLabel(provider) {
   return provider === "CONTEXT7" ? "技术文档检索" : "网页检索";
 }
 
-function currentMonth(now) {
+const DOUBAO_QUOTA_POLICY = Object.freeze({
+  codePrefix: "PROJECT_WORK_DOUBAO",
+  label: "豆包",
+  limit: DOUBAO_MONTHLY_SEARCH_LIMIT,
+});
+const TAVILY_QUOTA_POLICY = Object.freeze({
+  codePrefix: "PROJECT_WORK_TAVILY",
+  label: "Tavily",
+  limit: TAVILY_MONTHLY_CREDIT_LIMIT,
+});
+
+function quotaStateError(policy, kind, message, retryable = true) {
+  return projectWorkError(
+    `${policy.codePrefix}_QUOTA_STATE_${kind}`,
+    message,
+    503,
+    retryable,
+  );
+}
+
+function currentMonth(now, policy = DOUBAO_QUOTA_POLICY) {
   const date = typeof now === "function" ? now() : new Date();
   if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
-    throw projectWorkError(
-      "PROJECT_WORK_DOUBAO_QUOTA_STATE_INVALID",
-      "豆包月度搜索额度状态不可用",
-      503,
-      true,
+    throw quotaStateError(
+      policy,
+      "INVALID",
+      `${policy.label}月度搜索额度状态不可用`,
     );
   }
   const year = date.getFullYear();
@@ -252,7 +274,7 @@ function enqueueQuotaFile(filePath, operation) {
   });
 }
 
-async function readQuotaState(filePath) {
+async function readQuotaState(filePath, policy = DOUBAO_QUOTA_POLICY) {
   try {
     const parsed = JSON.parse(await readFile(filePath, "utf8"));
     if (
@@ -266,11 +288,10 @@ async function readQuotaState(filePath) {
     return parsed;
   } catch (error) {
     if (error?.code === "ENOENT") return null;
-    throw projectWorkError(
-      "PROJECT_WORK_DOUBAO_QUOTA_STATE_INVALID",
-      "豆包月度搜索额度状态不可用",
-      503,
-      true,
+    throw quotaStateError(
+      policy,
+      "INVALID",
+      `${policy.label}月度搜索额度状态不可用`,
     );
   }
 }
@@ -280,7 +301,11 @@ function quotaReservationDirectory(filePath, period) {
   return path.join(`${filePath}.reservations`, period);
 }
 
-async function readQuotaBaseline(filePath, period) {
+async function readQuotaBaseline(
+  filePath,
+  period,
+  policy = DOUBAO_QUOTA_POLICY,
+) {
   try {
     const parsed = JSON.parse(await readFile(filePath, "utf8"));
     if (
@@ -288,18 +313,17 @@ async function readQuotaBaseline(filePath, period) {
       || parsed.period !== period
       || !Number.isSafeInteger(parsed.baseline_used)
       || parsed.baseline_used < 0
-      || parsed.baseline_used > DOUBAO_MONTHLY_SEARCH_LIMIT
+      || parsed.baseline_used > policy.limit
     ) {
       throw new Error("invalid quota baseline");
     }
     return parsed.baseline_used;
   } catch (error) {
     if (error?.code === "ENOENT") return null;
-    throw projectWorkError(
-      "PROJECT_WORK_DOUBAO_QUOTA_STATE_INVALID",
-      "豆包月度搜索额度状态不可用",
-      503,
-      true,
+    throw quotaStateError(
+      policy,
+      "INVALID",
+      `${policy.label}月度搜索额度状态不可用`,
     );
   }
 }
@@ -309,25 +333,30 @@ async function ensureQuotaBaseline({
   period,
   existing,
   now,
+  policy = DOUBAO_QUOTA_POLICY,
+  minimumUsed = 0,
 }) {
   const directory = quotaReservationDirectory(filePath, period);
   const baselinePath = path.join(directory, "baseline.json");
   try {
     await mkdir(directory, { recursive: true });
   } catch {
-    throw projectWorkError(
-      "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE",
-      "无法初始化豆包月度搜索额度",
-      503,
-      true,
+    throw quotaStateError(
+      policy,
+      "UNAVAILABLE",
+      `无法初始化${policy.label}月度搜索额度`,
     );
   }
-  const current = await readQuotaBaseline(baselinePath, period);
+  const current = await readQuotaBaseline(baselinePath, period, policy);
   if (current !== null) return { baseline: current, directory };
 
-  const baseline = existing?.period === period
-    ? Math.min(existing.used, DOUBAO_MONTHLY_SEARCH_LIMIT)
-    : 0;
+  const baseline = Math.min(
+    policy.limit,
+    Math.max(
+      Number.isSafeInteger(minimumUsed) ? minimumUsed : 0,
+      existing?.period === period ? existing.used : 0,
+    ),
+  );
   const temporaryPath = path.join(
     directory,
     `.baseline.${process.pid}.${randomUUID()}.tmp`,
@@ -349,59 +378,67 @@ async function ensureQuotaBaseline({
       if (error?.code !== "EEXIST") throw error;
     }
   } catch {
-    throw projectWorkError(
-      "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE",
-      "无法初始化豆包月度搜索额度",
-      503,
-      true,
+    throw quotaStateError(
+      policy,
+      "UNAVAILABLE",
+      `无法初始化${policy.label}月度搜索额度`,
     );
   } finally {
     await unlink(temporaryPath).catch(() => undefined);
   }
-  const durableBaseline = await readQuotaBaseline(baselinePath, period);
+  const durableBaseline = await readQuotaBaseline(baselinePath, period, policy);
   if (durableBaseline === null) {
-    throw projectWorkError(
-      "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE",
-      "无法初始化豆包月度搜索额度",
-      503,
-      true,
+    throw quotaStateError(
+      policy,
+      "UNAVAILABLE",
+      `无法初始化${policy.label}月度搜索额度`,
     );
   }
   return { baseline: durableBaseline, directory };
 }
 
-async function readHighestQuotaReservation(directory, baseline) {
+async function readHighestQuotaReservation(
+  directory,
+  baseline,
+  policy = DOUBAO_QUOTA_POLICY,
+) {
   try {
     const entries = await readdir(directory, { withFileTypes: true });
     let highest = baseline;
     for (const entry of entries) {
       if (!entry.isFile()) continue;
-      const match = /^slot-(\d{3})\.json$/.exec(entry.name);
+      const match = /^slot-(\d{3,4})\.json$/.exec(entry.name);
       if (!match) continue;
       const slot = Number(match[1]);
       if (
         Number.isSafeInteger(slot)
         && slot > highest
-        && slot <= DOUBAO_MONTHLY_SEARCH_LIMIT
+        && slot <= policy.limit
       ) {
         highest = slot;
       }
     }
     return highest;
-  } catch {
-    throw projectWorkError(
-      "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE",
-      "无法读取豆包月度搜索额度",
-      503,
-      true,
+  } catch (error) {
+    if (error?.code === "ENOENT") return baseline;
+    throw quotaStateError(
+      policy,
+      "UNAVAILABLE",
+      `无法读取${policy.label}月度搜索额度`,
     );
   }
 }
 
-async function claimQuotaReservation(directory, firstSlot, now) {
+async function claimQuotaReservation({
+  directory,
+  firstSlot,
+  now,
+  policy = DOUBAO_QUOTA_POLICY,
+  projectId = "pi-agent",
+}) {
   for (
     let slot = firstSlot;
-    slot <= DOUBAO_MONTHLY_SEARCH_LIMIT;
+    slot <= policy.limit;
     slot += 1
   ) {
     const slotPath = path.join(
@@ -413,11 +450,10 @@ async function claimQuotaReservation(directory, firstSlot, now) {
       handle = await open(slotPath, "wx", 0o600);
     } catch (error) {
       if (error?.code === "EEXIST") continue;
-      throw projectWorkError(
-        "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE",
-        "无法占用豆包月度搜索额度",
-        503,
-        true,
+      throw quotaStateError(
+        policy,
+        "UNAVAILABLE",
+        `无法占用${policy.label}月度搜索额度`,
       );
     }
     try {
@@ -426,6 +462,7 @@ async function claimQuotaReservation(directory, firstSlot, now) {
         period_slot: slot,
         reserved_at: (typeof now === "function" ? now() : new Date()).toISOString(),
         pid: process.pid,
+        project_id: projectId,
       })}\n`);
     } catch {
       // The exclusive slot file itself is the durable reservation.
@@ -443,31 +480,41 @@ async function refreshQuotaSummary({
   baseline,
   directory,
   now,
+  policy = DOUBAO_QUOTA_POLICY,
+  minimumUsed = 0,
 }) {
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const current = await readQuotaState(filePath);
+    const current = await readQuotaState(filePath, policy);
     const persisted = current?.period === period
-      ? Math.min(current.used, DOUBAO_MONTHLY_SEARCH_LIMIT)
+      ? Math.min(current.used, policy.limit)
       : 0;
-    const highest = await readHighestQuotaReservation(directory, baseline);
-    const used = Math.max(baseline, persisted, highest);
+    const highest = await readHighestQuotaReservation(directory, baseline, policy);
+    const used = Math.min(
+      policy.limit,
+      Math.max(baseline, persisted, highest, minimumUsed),
+    );
     if (current?.period === period && current.used >= used) return;
     await writeQuotaState(filePath, {
       version: 1,
       period,
       used,
       updated_at: (typeof now === "function" ? now() : new Date()).toISOString(),
-    });
-    const confirmed = await readQuotaState(filePath);
+    }, policy);
+    const confirmed = await readQuotaState(filePath, policy);
     const required = Math.max(
       baseline,
-      await readHighestQuotaReservation(directory, baseline),
+      minimumUsed,
+      await readHighestQuotaReservation(directory, baseline, policy),
     );
     if (confirmed?.period === period && confirmed.used >= required) return;
   }
 }
 
-async function writeQuotaState(filePath, state) {
+async function writeQuotaState(
+  filePath,
+  state,
+  policy = DOUBAO_QUOTA_POLICY,
+) {
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   try {
     await mkdir(path.dirname(filePath), { recursive: true });
@@ -478,31 +525,36 @@ async function writeQuotaState(filePath, state) {
     );
     await rename(temporaryPath, filePath);
   } catch {
-    throw projectWorkError(
-      "PROJECT_WORK_DOUBAO_QUOTA_STATE_UNAVAILABLE",
-      "无法保存豆包月度搜索额度",
-      503,
-      true,
+    throw quotaStateError(
+      policy,
+      "UNAVAILABLE",
+      `无法保存${policy.label}月度搜索额度`,
     );
   } finally {
     await unlink(temporaryPath).catch(() => undefined);
   }
 }
 
-async function reserveDoubaoSearch({
+async function reserveMonthlySearch({
   filePath,
   inMemoryState,
   now,
+  policy = DOUBAO_QUOTA_POLICY,
+  minimumUsed = 0,
+  projectId = "pi-agent",
 }) {
-  const period = currentMonth(now);
+  const period = currentMonth(now, policy);
   const reserve = async (existing) => {
-    const used = existing?.period === period ? existing.used : 0;
-    if (used >= DOUBAO_MONTHLY_SEARCH_LIMIT) {
+    const used = Math.max(
+      existing?.period === period ? existing.used : 0,
+      minimumUsed,
+    );
+    if (used >= policy.limit) {
       return {
         granted: false,
         period,
-        limit: DOUBAO_MONTHLY_SEARCH_LIMIT,
-        used,
+        limit: policy.limit,
+        used: policy.limit,
         remaining: 0,
       };
     }
@@ -515,9 +567,9 @@ async function reserveDoubaoSearch({
     return {
       granted: true,
       period,
-      limit: DOUBAO_MONTHLY_SEARCH_LIMIT,
+      limit: policy.limit,
       used: next.used,
-      remaining: DOUBAO_MONTHLY_SEARCH_LIMIT - next.used,
+      remaining: policy.limit - next.used,
       state: next,
     };
   };
@@ -530,35 +582,48 @@ async function reserveDoubaoSearch({
 
   const resolvedPath = path.resolve(filePath);
   return enqueueQuotaFile(resolvedPath, async () => {
-    const existing = await readQuotaState(resolvedPath);
+    const existing = await readQuotaState(resolvedPath, policy);
     const { baseline, directory } = await ensureQuotaBaseline({
       filePath: resolvedPath,
       period,
       existing,
       now,
+      policy,
+      minimumUsed,
     });
     const persisted = existing?.period === period
-      ? Math.min(existing.used, DOUBAO_MONTHLY_SEARCH_LIMIT)
+      ? Math.min(existing.used, policy.limit)
       : 0;
-    const highest = await readHighestQuotaReservation(directory, baseline);
-    const used = Math.max(baseline, persisted, highest);
-    if (used >= DOUBAO_MONTHLY_SEARCH_LIMIT) {
+    const highest = await readHighestQuotaReservation(directory, baseline, policy);
+    const used = Math.min(
+      policy.limit,
+      Math.max(baseline, persisted, highest, minimumUsed),
+    );
+    if (used >= policy.limit) {
       await refreshQuotaSummary({
         filePath: resolvedPath,
         period,
         baseline,
         directory,
         now,
+        policy,
+        minimumUsed,
       }).catch(() => undefined);
       return {
         granted: false,
         period,
-        limit: DOUBAO_MONTHLY_SEARCH_LIMIT,
-        used: DOUBAO_MONTHLY_SEARCH_LIMIT,
+        limit: policy.limit,
+        used: policy.limit,
         remaining: 0,
       };
     }
-    const claimed = await claimQuotaReservation(directory, used + 1, now);
+    const claimed = await claimQuotaReservation({
+      directory,
+      firstSlot: used + 1,
+      now,
+      policy,
+      projectId,
+    });
     if (claimed === null) {
       await refreshQuotaSummary({
         filePath: resolvedPath,
@@ -566,21 +631,23 @@ async function reserveDoubaoSearch({
         baseline,
         directory,
         now,
+        policy,
+        minimumUsed,
       }).catch(() => undefined);
       return {
         granted: false,
         period,
-        limit: DOUBAO_MONTHLY_SEARCH_LIMIT,
-        used: DOUBAO_MONTHLY_SEARCH_LIMIT,
+        limit: policy.limit,
+        used: policy.limit,
         remaining: 0,
       };
     }
     const reservation = {
       granted: true,
       period,
-      limit: DOUBAO_MONTHLY_SEARCH_LIMIT,
+      limit: policy.limit,
       used: claimed,
-      remaining: DOUBAO_MONTHLY_SEARCH_LIMIT - claimed,
+      remaining: policy.limit - claimed,
     };
     await refreshQuotaSummary({
       filePath: resolvedPath,
@@ -588,8 +655,66 @@ async function reserveDoubaoSearch({
       baseline,
       directory,
       now,
+      policy,
+      minimumUsed,
     }).catch(() => undefined);
     return reservation;
+  });
+}
+
+async function readMonthlySearchQuota({
+  filePath,
+  now,
+  policy = DOUBAO_QUOTA_POLICY,
+  minimumUsed = 0,
+}) {
+  const period = currentMonth(now, policy);
+  if (!filePath) {
+    const used = Math.min(policy.limit, Math.max(0, minimumUsed));
+    return { period, limit: policy.limit, used, remaining: policy.limit - used };
+  }
+  const resolvedPath = path.resolve(filePath);
+  const existing = await readQuotaState(resolvedPath, policy);
+  const persisted = existing?.period === period
+    ? Math.min(existing.used, policy.limit)
+    : 0;
+  const directory = quotaReservationDirectory(resolvedPath, period);
+  const highest = await readHighestQuotaReservation(directory, 0, policy);
+  const used = Math.min(
+    policy.limit,
+    Math.max(persisted, highest, minimumUsed),
+  );
+  return { period, limit: policy.limit, used, remaining: policy.limit - used };
+}
+
+async function synchronizeMonthlySearchQuota({
+  filePath,
+  now,
+  policy = DOUBAO_QUOTA_POLICY,
+  minimumUsed = 0,
+}) {
+  if (!filePath) return;
+  const period = currentMonth(now, policy);
+  const resolvedPath = path.resolve(filePath);
+  await enqueueQuotaFile(resolvedPath, async () => {
+    const existing = await readQuotaState(resolvedPath, policy);
+    const { baseline, directory } = await ensureQuotaBaseline({
+      filePath: resolvedPath,
+      period,
+      existing,
+      now,
+      policy,
+      minimumUsed,
+    });
+    await refreshQuotaSummary({
+      filePath: resolvedPath,
+      period,
+      baseline,
+      directory,
+      now,
+      policy,
+      minimumUsed,
+    });
   });
 }
 
@@ -721,6 +846,7 @@ async function requestJson({
   timeoutMs,
   method = "GET",
   body,
+  headers = {},
 }) {
   if (typeof fetchImpl !== "function") {
     throw unavailable(
@@ -751,6 +877,7 @@ async function requestJson({
             accept: "application/json",
             authorization: `Bearer ${apiKey}`,
             ...(body ? { "content-type": "application/json" } : {}),
+            ...headers,
           },
           signal: controller.signal,
           ...(body ? { body: JSON.stringify(body) } : {}),
@@ -979,6 +1106,54 @@ function normalizeDocumentation(data) {
     .slice(0, MAX_DOC_SNIPPETS);
 }
 
+function normalizeTavilyAccountUsage(data) {
+  const account = data?.account;
+  const used = Number(account?.plan_usage);
+  const providerLimit = Number(account?.plan_limit);
+  if (
+    !account
+    || !Number.isSafeInteger(used)
+    || used < 0
+    || !Number.isSafeInteger(providerLimit)
+    || providerLimit <= 0
+  ) {
+    throw projectWorkError(
+      "PROJECT_WORK_TAVILY_USAGE_RESPONSE_INVALID",
+      "Tavily 返回了无效的额度数据",
+      502,
+      false,
+    );
+  }
+  return {
+    used,
+    providerLimit,
+    plan: boundedString(account.current_plan, 80) || null,
+  };
+}
+
+async function fetchTavilyAccountUsage({
+  apiKey,
+  fetchImpl,
+  timeoutMs,
+}) {
+  return normalizeTavilyAccountUsage(await requestJson({
+    provider: "TAVILY",
+    url: TAVILY_USAGE_URL,
+    apiKey,
+    fetchImpl,
+    timeoutMs,
+  }));
+}
+
+function publicMonthlyQuota(quota) {
+  return {
+    period: quota.period,
+    limit: quota.limit,
+    used: quota.used,
+    remaining: quota.remaining,
+  };
+}
+
 // 豆包（优先）+ Tavily（回退）联网检索核心。抽成可复用 runner，供写代码的
 // search_web 工具与论文主题检索的「联网发现」通道共用同一实现和同一月度额度台账。
 export function createWebSearchRunner({
@@ -986,7 +1161,10 @@ export function createWebSearchRunner({
   fetchImpl = globalThis.fetch,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   doubaoQuotaFilePath,
+  tavilyQuotaFilePath,
+  projectId = "pi-agent",
   now = () => new Date(),
+  searchQuotaStore,
 } = {}) {
   const doubaoApiKey = envSecret(env, [
     "PI_DOUBAO_API_KEY",
@@ -999,12 +1177,52 @@ export function createWebSearchRunner({
     "TAVILY_API_KEY",
   ]);
   const inMemoryDoubaoQuota = { value: null };
+  const inMemoryTavilyQuota = { value: null };
+  const sharedQuotaStore = searchQuotaStore === undefined
+    ? createGitHubSearchQuotaStoreFromEnv({ env, fetchImpl, now })
+    : searchQuotaStore;
+  const quotaProjectId = envSecret(env, ["PI_SEARCH_QUOTA_PROJECT_ID"])
+    || projectId;
+
+  async function reserveQuota({
+    providerId,
+    filePath,
+    inMemoryState,
+    policy,
+    minimumUsed = 0,
+  }) {
+    if (!sharedQuotaStore) {
+      return reserveMonthlySearch({
+        filePath,
+        inMemoryState,
+        now,
+        policy,
+        minimumUsed,
+        projectId: quotaProjectId,
+      });
+    }
+    const quota = await sharedQuotaStore.reserve({
+      providerId,
+      limit: policy.limit,
+      period: currentMonth(now, policy),
+      projectId: quotaProjectId,
+      minimumUsed,
+    });
+    await synchronizeMonthlySearchQuota({
+      filePath,
+      now,
+      policy,
+      minimumUsed: quota.used,
+    });
+    return quota;
+  }
 
   async function searchDoubao(normalizedQuery, limit) {
-    const quota = await reserveDoubaoSearch({
+    const quota = await reserveQuota({
+      providerId: "doubao",
       filePath: doubaoQuotaFilePath,
       inMemoryState: inMemoryDoubaoQuota,
-      now,
+      policy: DOUBAO_QUOTA_POLICY,
     });
     if (!quota.granted) {
       return { quota, exhausted: true };
@@ -1054,17 +1272,33 @@ export function createWebSearchRunner({
         results,
         result_count: results.length,
         truncated: normalized.truncated,
-        monthly_quota: {
-          period: quota.period,
-          limit: quota.limit,
-          used: quota.used,
-          remaining: quota.remaining,
-        },
+        monthly_quota: publicMonthlyQuota(quota),
       },
     };
   }
 
   async function searchTavily(normalizedQuery, limit, fallbackReason) {
+    let quota = null;
+    if (tavilyQuotaFilePath) {
+      const official = await fetchTavilyAccountUsage({
+        apiKey: tavilyApiKey,
+        fetchImpl,
+        timeoutMs,
+      });
+      quota = await reserveQuota({
+        providerId: "tavily",
+        filePath: tavilyQuotaFilePath,
+        inMemoryState: inMemoryTavilyQuota,
+        policy: TAVILY_QUOTA_POLICY,
+        minimumUsed: official.used,
+      });
+      if (!quota.granted) {
+        throw unavailable(
+          "PROJECT_WORK_TAVILY_MONTHLY_LIMIT_REACHED",
+          "Tavily 本月 1,000 credits 免费额度已用完",
+        );
+      }
+    }
     const data = await requestJson({
       provider: "TAVILY",
       url: TAVILY_SEARCH_URL,
@@ -1079,7 +1313,9 @@ export function createWebSearchRunner({
         include_answer: false,
         include_raw_content: false,
         include_images: false,
+        include_usage: true,
       },
+      headers: { "x-project-id": quotaProjectId },
     });
     const results = normalizeWebResults(data, limit);
     return {
@@ -1088,6 +1324,7 @@ export function createWebSearchRunner({
       results,
       result_count: results.length,
       truncated: Array.isArray(data?.results) && data.results.length > results.length,
+      ...(quota ? { monthly_quota: publicMonthlyQuota(quota) } : {}),
       ...(fallbackReason ? { fallback_reason: fallbackReason } : {}),
     };
   }
@@ -1133,12 +1370,143 @@ export function createWebSearchRunner({
   };
 }
 
+export function createSearchUsageService({
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  doubaoQuotaFilePath,
+  tavilyQuotaFilePath,
+  now = () => new Date(),
+  searchQuotaStore,
+} = {}) {
+  const doubaoApiKey = envSecret(env, ["PI_DOUBAO_API_KEY"]);
+  const tavilyApiKey = envSecret(env, ["PI_TAVILY_API_KEY", "TAVILY_API_KEY"]);
+  const sharedQuotaStore = searchQuotaStore === undefined
+    ? createGitHubSearchQuotaStoreFromEnv({ env, fetchImpl, now })
+    : searchQuotaStore;
+
+  async function getUsage() {
+    const generatedAt = (typeof now === "function" ? now() : new Date());
+    const warnings = [];
+    const localDoubao = await readMonthlySearchQuota({
+      filePath: doubaoQuotaFilePath,
+      now,
+      policy: DOUBAO_QUOTA_POLICY,
+    });
+
+    let tavilyOfficial = null;
+    let tavilyIssue = null;
+    if (tavilyApiKey) {
+      try {
+        tavilyOfficial = await fetchTavilyAccountUsage({
+          apiKey: tavilyApiKey,
+          fetchImpl,
+          timeoutMs,
+        });
+      } catch (error) {
+        tavilyIssue = {
+          code: error?.code || "PROJECT_WORK_TAVILY_USAGE_UNAVAILABLE",
+          message: "Tavily 官方用量暂时无法同步，当前显示本机硬账本",
+        };
+      }
+    }
+    const localTavily = await readMonthlySearchQuota({
+      filePath: tavilyQuotaFilePath,
+      now,
+      policy: TAVILY_QUOTA_POLICY,
+      minimumUsed: tavilyOfficial?.used ?? 0,
+    });
+    let sharedDoubao = null;
+    let sharedTavily = null;
+    if (sharedQuotaStore) {
+      try {
+        [sharedDoubao, sharedTavily] = await Promise.all([
+          sharedQuotaStore.read({
+            providerId: "doubao",
+            limit: DOUBAO_QUOTA_POLICY.limit,
+            period: localDoubao.period,
+          }),
+          sharedQuotaStore.read({
+            providerId: "tavily",
+            limit: TAVILY_QUOTA_POLICY.limit,
+            period: localTavily.period,
+          }),
+        ]);
+      } catch (error) {
+        warnings.push({
+          code: error?.code || "PROJECT_WORK_SEARCH_QUOTA_SYNC_FAILED",
+          message: "GitHub 共享额度暂时无法读取，当前显示可核验的本机或官方用量",
+        });
+      }
+    }
+    const doubaoUsed = Math.max(localDoubao.used, sharedDoubao?.used ?? 0);
+    const tavilyUsed = Math.max(
+      localTavily.used,
+      sharedTavily?.used ?? 0,
+      tavilyOfficial?.used ?? 0,
+    );
+    const doubao = {
+      ...localDoubao,
+      used: doubaoUsed,
+      remaining: Math.max(0, localDoubao.limit - doubaoUsed),
+    };
+    const tavily = {
+      ...localTavily,
+      used: tavilyUsed,
+      remaining: Math.max(0, localTavily.limit - tavilyUsed),
+    };
+
+    return {
+      schema_version: 1,
+      period: doubao.period,
+      generated_at: generatedAt.toISOString(),
+      providers: [
+        {
+          provider_id: "doubao",
+          provider_name: "豆包",
+          configured: Boolean(doubaoApiKey),
+          hard_limit: true,
+          source: sharedQuotaStore ? "github_shared_ledger" : "local_hard_ledger",
+          ...publicMonthlyQuota(doubao),
+          ...(sharedQuotaStore ? {
+            shared_repository: sharedQuotaStore.repository,
+            shared_branch: sharedQuotaStore.branch,
+          } : {}),
+        },
+        {
+          provider_id: "tavily",
+          provider_name: "Tavily",
+          configured: Boolean(tavilyApiKey),
+          hard_limit: true,
+          source: sharedQuotaStore
+            ? "provider_github_and_local_ledger"
+            : (tavilyOfficial ? "provider_and_local_ledger" : "local_hard_ledger"),
+          ...publicMonthlyQuota(tavily),
+          official_usage_available: Boolean(tavilyOfficial),
+          provider_plan_limit: tavilyOfficial?.providerLimit ?? null,
+          ...(tavilyIssue ? { issue: tavilyIssue } : {}),
+          ...(sharedQuotaStore ? {
+            shared_repository: sharedQuotaStore.repository,
+            shared_branch: sharedQuotaStore.branch,
+          } : {}),
+        },
+      ],
+      ...(warnings.length > 0 ? { warnings } : {}),
+    };
+  }
+
+  return { getUsage };
+}
+
 export function createExternalRetrievalTools({
   env = process.env,
   fetchImpl = globalThis.fetch,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   doubaoQuotaFilePath,
+  tavilyQuotaFilePath,
+  projectId = "pi-agent",
   now = () => new Date(),
+  searchQuotaStore,
 } = {}) {
   const context7ApiKey = envSecret(env, [
     "PI_CONTEXT7_API_KEY",
@@ -1149,7 +1517,10 @@ export function createExternalRetrievalTools({
     fetchImpl,
     timeoutMs,
     doubaoQuotaFilePath,
+    tavilyQuotaFilePath,
+    projectId,
     now,
+    searchQuotaStore,
   });
 
   const searchWeb = defineTool({

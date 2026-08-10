@@ -23,6 +23,7 @@ import {
   fetchProjectWorkTree,
   fetchProjectWorkConversationTurns,
   fetchModelUsage,
+  fetchSearchUsage,
   fetchProjectWorkUsage,
   fetchProjectWorkWorkspace,
   forkProjectWorkCheckpoint,
@@ -33,6 +34,7 @@ import {
   markProjectWorkConversationRead,
   mapProjectWorkConversation,
   mapProjectWorkUsage,
+  mapSearchUsage,
   projectWorkGeneratedImageUrl,
   projectWorkGeneratedOfficeDownloadUrl,
   projectWorkBrowserQaScreenshotUrl,
@@ -1837,6 +1839,46 @@ test("unified model usage requests the selected workflow and maps paper coverage
     fetchModelUsage({ workflow: "invalid", fetchImpl }),
     /工作类型无效/,
   );
+});
+
+test("search usage maps provider hard limits and requests the shared endpoint", async () => {
+  const calls = [];
+  const usage = await fetchSearchUsage({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return jsonResponse({
+        schema_version: 1,
+        period: "2026-08",
+        generated_at: "2026-08-11T00:00:00.000Z",
+        providers: [{
+          provider_id: "tavily",
+          provider_name: "Tavily",
+          configured: true,
+          hard_limit: true,
+          source: "provider_github_and_local_ledger",
+          period: "2026-08",
+          limit: 1000,
+          used: 42,
+          remaining: 958,
+          official_usage_available: true,
+          provider_plan_limit: 1000,
+          shared_repository: "yuzhou4t/pi",
+          shared_branch: "quota-state",
+        }],
+        warnings: [{ code: "PARTIAL", message: "部分数据延迟" }],
+      });
+    },
+  });
+
+  assert.deepEqual(calls, ["/api/v1/search-usage"]);
+  assert.equal(usage.providers[0].used, 42);
+  assert.equal(usage.providers[0].remaining, 958);
+  assert.equal(usage.providers[0].hardLimit, true);
+  assert.equal(usage.providers[0].officialUsageAvailable, true);
+  assert.equal(usage.providers[0].sharedRepository, "yuzhou4t/pi");
+  assert.equal(usage.providers[0].sharedBranch, "quota-state");
+  assert.equal(usage.warnings[0].message, "部分数据延迟");
+  assert.deepEqual(mapSearchUsage(null).providers, []);
 });
 
 test("thinking level maps in conversation messages and uses snake-case mutation payloads", async () => {

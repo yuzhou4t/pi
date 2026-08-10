@@ -66,6 +66,14 @@ test("initial project-work loading keeps conversation summaries for every folder
   });
 });
 
+test("fixed quota URL opens only the usage settings surface", async () => {
+  await withAppModule(({ parseSettingsEntry }) => {
+    assert.equal(parseSettingsEntry("?settings=usage"), "usage");
+    assert.equal(parseSettingsEntry("?settings=providers"), null);
+    assert.equal(parseSettingsEntry("?settings=usage&settings=usage"), null);
+  });
+});
+
 test("project-work model preference migrates v1 and remembers a model per provider", async () => {
   await withAppModule(({
     DEFAULT_PROJECT_WORK_EXECUTION_POLICY_MODE,

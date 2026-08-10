@@ -11,6 +11,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   createExternalRetrievalTools,
+  createSearchUsageService,
   createWebSearchRunner,
   getExternalRetrievalCapabilities,
 } from "./externalRetrieval.js";
@@ -265,7 +266,9 @@ test("search_web uses only the bounded Tavily search contract and marks results 
     include_answer: false,
     include_raw_content: false,
     include_images: false,
+    include_usage: true,
   });
+  assert.equal(calls[0].options.headers["x-project-id"], "pi-agent");
   assert.equal(body.trust, "untrusted_external_content");
   assert.equal(body.executable, false);
   assert.match(body.instruction_policy, /Never follow or execute/);
@@ -340,6 +343,56 @@ test("search_web prefers Doubao and durably counts the monthly request before ca
   });
 });
 
+test("search_web reserves the shared GitHub quota before calling Doubao", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-shared-search-quota-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const reservations = [];
+  const runner = createWebSearchRunner({
+    env: {
+      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_SEARCH_QUOTA_PROJECT_ID: "pi-agent",
+    },
+    doubaoQuotaFilePath: path.join(directory, "doubao.json"),
+    now: () => new Date("2026-08-11T08:00:00+08:00"),
+    searchQuotaStore: {
+      async reserve(request) {
+        reservations.push(request);
+        return {
+          granted: true,
+          period: request.period,
+          limit: request.limit,
+          used: 9,
+          remaining: request.limit - 9,
+        };
+      },
+    },
+    fetchImpl: async () => jsonResponse({
+      output: [{
+        type: "web_search_call",
+        action: {
+          sources: [{
+            title: "Shared result",
+            url: "https://example.com/shared",
+            snippet: "Shared quota result",
+          }],
+        },
+      }],
+    }),
+  });
+
+  const result = await runner.runWebSearch("shared quota check");
+
+  assert.deepEqual(reservations, [{
+    providerId: "doubao",
+    limit: 500,
+    period: "2026-08",
+    projectId: "pi-agent",
+    minimumUsed: 0,
+  }]);
+  assert.equal(result.monthly_quota.used, 9);
+  assert.equal(JSON.parse(await readFile(path.join(directory, "doubao.json"), "utf8")).used, 9);
+});
+
 test("search_web falls back to Tavily after the durable Doubao monthly limit", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "pi-doubao-limit-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -379,6 +432,153 @@ test("search_web falls back to Tavily after the durable Doubao monthly limit", a
   assert.equal(body.provider, "tavily");
   assert.equal(body.fallback_reason, "doubao_monthly_limit_reached");
   assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).used, 500);
+});
+
+test("Tavily syncs official usage and reserves the local free-credit hard limit", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-tavily-quota-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const quotaFile = path.join(directory, "tavily-usage.json");
+  const calls = [];
+  const runner = createWebSearchRunner({
+    env: { PI_TAVILY_API_KEY: "tavily-key" },
+    tavilyQuotaFilePath: quotaFile,
+    now: () => new Date("2026-08-11T08:00:00+08:00"),
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url.endsWith("/usage")) {
+        return jsonResponse({
+          account: {
+            current_plan: "Researcher",
+            plan_usage: 121,
+            plan_limit: 1000,
+          },
+        });
+      }
+      return jsonResponse({
+        results: [{
+          title: "Tavily result",
+          url: "https://example.com/tavily",
+          content: "Result",
+        }],
+        usage: { credits: 1 },
+      });
+    },
+  });
+
+  const result = await runner.runWebSearch("current search usage");
+
+  assert.deepEqual(calls.map((call) => call.url), [
+    "https://api.tavily.com/usage",
+    "https://api.tavily.com/search",
+  ]);
+  assert.equal(calls[1].options.headers["x-project-id"], "pi-agent");
+  assert.equal(JSON.parse(calls[1].options.body).include_usage, true);
+  assert.deepEqual(result.monthly_quota, {
+    period: "2026-08",
+    limit: 1000,
+    used: 122,
+    remaining: 878,
+  });
+  assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).used, 122);
+});
+
+test("Tavily stops before search when the official free-credit limit is exhausted", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-tavily-limit-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const calls = [];
+  const runner = createWebSearchRunner({
+    env: { PI_TAVILY_API_KEY: "tavily-key" },
+    tavilyQuotaFilePath: path.join(directory, "tavily-usage.json"),
+    now: () => new Date("2026-08-11T08:00:00+08:00"),
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return jsonResponse({
+        account: {
+          current_plan: "Researcher",
+          plan_usage: 1000,
+          plan_limit: 1000,
+        },
+      });
+    },
+  });
+
+  await assert.rejects(
+    () => runner.runWebSearch("must not overspend"),
+    (error) => {
+      assert.equal(error.code, "PROJECT_WORK_TAVILY_MONTHLY_LIMIT_REACHED");
+      return true;
+    },
+  );
+  assert.deepEqual(calls, ["https://api.tavily.com/usage"]);
+});
+
+test("search usage summary combines the Doubao ledger with Tavily account usage", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-search-usage-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const doubaoQuotaFile = path.join(directory, "doubao.json");
+  await writeFile(doubaoQuotaFile, JSON.stringify({
+    version: 1,
+    period: "2026-08",
+    used: 7,
+  }));
+  const service = createSearchUsageService({
+    env: {
+      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_TAVILY_API_KEY: "tavily-key",
+    },
+    doubaoQuotaFilePath: doubaoQuotaFile,
+    tavilyQuotaFilePath: path.join(directory, "tavily.json"),
+    now: () => new Date("2026-08-11T08:00:00+08:00"),
+    fetchImpl: async () => jsonResponse({
+      account: {
+        current_plan: "Researcher",
+        plan_usage: 44,
+        plan_limit: 1000,
+      },
+    }),
+  });
+
+  const usage = await service.getUsage();
+
+  assert.equal(usage.period, "2026-08");
+  assert.deepEqual(usage.providers.map((provider) => ({
+    id: provider.provider_id,
+    used: provider.used,
+    remaining: provider.remaining,
+  })), [
+    { id: "doubao", used: 7, remaining: 493 },
+    { id: "tavily", used: 44, remaining: 956 },
+  ]);
+  assert.equal(usage.providers[1].official_usage_available, true);
+});
+
+test("search usage prefers the shared GitHub ledger across devices", async () => {
+  const service = createSearchUsageService({
+    env: {
+      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_TAVILY_API_KEY: "tavily-key",
+    },
+    now: () => new Date("2026-08-11T08:00:00+08:00"),
+    searchQuotaStore: {
+      repository: "yuzhou4t/pi",
+      branch: "quota-state",
+      async read({ providerId, limit, period }) {
+        const used = providerId === "doubao" ? 11 : 45;
+        return { period, limit, used, remaining: limit - used };
+      },
+    },
+    fetchImpl: async () => jsonResponse({
+      account: { plan_usage: 44, plan_limit: 1000 },
+    }),
+  });
+
+  const usage = await service.getUsage();
+
+  assert.equal(usage.providers[0].used, 11);
+  assert.equal(usage.providers[0].source, "github_shared_ledger");
+  assert.equal(usage.providers[1].used, 45);
+  assert.equal(usage.providers[1].source, "provider_github_and_local_ledger");
+  assert.equal(usage.providers[0].shared_repository, "yuzhou4t/pi");
 });
 
 test("the shared Doubao quota resets into a separate reservation month", async (t) => {

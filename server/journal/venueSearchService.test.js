@@ -27,10 +27,12 @@ function searchResult(papers) {
     observed_at: "2026-07-29T08:00:00.000Z",
     from_year: null,
     venues: [
-      { source_id: "journal-ai", short_name: "AI", channel: "openalex-search", status: "success", count: papers.length, error: null },
+      { source_id: "journal-ai", short_name: "AI", channel: "openalex-search", status: papers.length > 0 ? "success" : "empty", count: papers.length, error: null },
       { source_id: "journal-jmlr", short_name: "JMLR", channel: "openalex-search", status: "failed", count: 0, error: { code: "OPENALEX_HTTP_503", retryable: true } },
     ],
-    venue_success_count: 1,
+    venue_success_count: papers.length > 0 ? 1 : 0,
+    venue_reached_count: 1,
+    venue_matched_count: papers.length > 0 ? 1 : 0,
     venue_failed_ids: ["journal-jmlr"],
     total_found: papers.length,
     truncated: false,
@@ -175,6 +177,15 @@ test("project work and venue search share one 500-request Doubao ledger", async 
         }],
       }), { headers: { "content-type": "application/json" } });
     }
+    if (url.endsWith("/usage")) {
+      return new Response(JSON.stringify({
+        account: {
+          current_plan: "Researcher",
+          plan_usage: 0,
+          plan_limit: 1000,
+        },
+      }), { headers: { "content-type": "application/json" } });
+    }
     return new Response(JSON.stringify({
       results: [{
         title: "Tavily result",
@@ -208,7 +219,8 @@ test("project work and venue search share one 500-request Doubao ledger", async 
 
   assert.equal(conversation.turns[0].web.provider, "tavily");
   assert.equal(calls.filter((url) => url.includes("volces.com")).length, 1);
-  assert.equal(calls.filter((url) => url.includes("tavily.com")).length, 1);
+  assert.equal(calls.filter((url) => url.endsWith("/usage")).length, 1);
+  assert.equal(calls.filter((url) => url.endsWith("/search")).length, 1);
   assert.equal(JSON.parse(await readFile(quotaFilePath, "utf8")).used, 500);
   await assert.rejects(
     () => readFile(path.join(dataDir, "venue-search", "web-usage.json"), "utf8"),
@@ -236,6 +248,63 @@ test("a failing web lane never breaks the turn and empty academic hits still sta
   assert.equal(turn.papers.length, 0);
   assert.equal(turn.recommendations.length, 0);
   assert.ok(turn.answer.includes("没有检索到"));
+});
+
+test("zero-hit memory search automatically retries academic expansions and one web query", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-venue-adaptive-"));
+  const venueCalls = [];
+  const webCalls = [];
+  const service = createVenueSearchService({
+    dataDir,
+    modelMode: "fixture",
+    venueSearcher: async ({ queries }) => {
+      venueCalls.push(queries);
+      return venueCalls.length === 1
+        ? searchResult([])
+        : searchResult([searchPaper("memory-1", "Generative Agents Memory")]);
+    },
+    webSearcher: async (query) => {
+      webCalls.push(query);
+      if (webCalls.length === 1) {
+        const error = new Error("temporary timeout");
+        error.retryable = true;
+        throw error;
+      }
+      return {
+        provider: "tavily",
+        results: [{
+          title: "Long-term memory for language agents",
+          url: "https://example.com/agent-memory",
+          excerpt: "A survey of memory retrieval for language agents.",
+        }],
+      };
+    },
+  });
+
+  const conversation = await service.submitTurn({
+    question: "Agent memory、long-term memory、context management、episodic/semantic memory、memory retrieval、context compression、session segmentation",
+    clientRequestId: "vs-adaptive-1",
+  });
+  const [turn] = conversation.turns;
+  assert.deepEqual(venueCalls, [
+    ["LLM agent long-term memory"],
+    [
+      "memory retrieval language agents",
+      "episodic semantic memory agents",
+      "context compression session management LLM agents",
+    ],
+  ]);
+  assert.deepEqual(webCalls, [
+    "LLM agent long-term memory",
+    "memory retrieval language agents",
+  ]);
+  assert.equal(turn.plan.adaptive_expansion, true);
+  assert.deepEqual(turn.plan.search_queries, deterministicSearchQueries(turn.question));
+  assert.equal(turn.search.total_found, 1);
+  assert.equal(turn.papers[0].paper_id, "memory-1");
+  assert.equal(turn.web.status, "success");
+  assert.deepEqual(turn.web.queries, webCalls);
+  assert.equal(turn.web.results[0].url, "https://example.com/agent-memory");
 });
 
 test("conversations can be created, switched, and deleted with isolated turns", async () => {
@@ -497,6 +566,17 @@ test("accepted search papers join the current weekly run once with retrieval lab
       candidate_origin: "weekly_scan",
       display_label: "本月新论文",
     }],
+    weekly_recommendation: {
+      schema_version: 1,
+      week_key: "2026-08-03",
+      observed_at: "2026-08-03T00:00:00.000Z",
+      paper_ids: ["weekly-1"],
+      selections: [{
+        week_key: "2026-08-03",
+        observed_at: "2026-08-03T00:00:00.000Z",
+        paper_ids: ["weekly-1"],
+      }],
+    },
     mineru: { status: "ready", batch_id: null, papers: { "weekly-1": { status: "ready" } } },
   });
   const service = createJournalWorkflowService({
@@ -539,6 +619,11 @@ test("accepted search papers join the current weekly run once with retrieval lab
   const weekly = result.run.candidates.find((paper) => paper.paper_id === "weekly-1");
   assert.equal(weekly.candidate_origin, "weekly_scan");
   assert.equal(result.run.candidates.length, 2);
+  assert.deepEqual(result.run.weekly_recommendation.paper_ids, ["weekly-1", "search-1"]);
+  assert.deepEqual(
+    result.run.weekly_recommendation.selections.at(-1).paper_ids,
+    ["weekly-1", "search-1"],
+  );
 
   // Replaying the same accept adds nothing more.
   const replay = await service.addVenueSearchPapersToWeekly({
@@ -546,6 +631,7 @@ test("accepted search papers join the current weekly run once with retrieval lab
     paperIds: target.papers.map((paper) => paper.paper_id),
   });
   assert.equal(replay.run.candidates.length, 2);
+  assert.deepEqual(replay.run.weekly_recommendation.paper_ids, ["weekly-1", "search-1"]);
   assert.deepEqual(
     replay.conversation.turns.at(-1).added_paper_ids.sort(),
     target.papers.map((paper) => paper.paper_id).sort(),
@@ -575,7 +661,12 @@ test("deterministicSearchQueries expands Harness into bounded academic terminolo
   );
   assert.deepEqual(
     deterministicSearchQueries("帮我找 LLM Agent 长期记忆论文"),
-    ["LLM Agent"],
+    [
+      "LLM agent long-term memory",
+      "memory retrieval language agents",
+      "episodic semantic memory agents",
+      "context compression session management LLM agents",
+    ],
   );
 });
 

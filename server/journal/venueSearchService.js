@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createWebSearchRunner } from "../project-work/externalRetrieval.js";
-import { resolveProjectWorkDoubaoQuotaFilePath } from "../project-work/projectWorkPaths.js";
+import {
+  resolveProjectWorkDoubaoQuotaFilePath,
+  resolveProjectWorkTavilyQuotaFilePath,
+} from "../project-work/projectWorkPaths.js";
 import { promptRegistry } from "../promptRegistry.js";
 import {
   PROJECT_IMPACT_FALLBACK,
@@ -63,6 +66,28 @@ function deriveConversationTitle(question) {
 
 const DETERMINISTIC_ACADEMIC_EXPANSIONS = Object.freeze([
   {
+    matches: [
+      "memory",
+      "long-term",
+      "episodic",
+      "semantic",
+      "context",
+      "compression",
+      "session",
+      "记忆",
+      "上下文",
+      "会话",
+      "窗口",
+    ],
+    prioritize: true,
+    queries: [
+      "LLM agent long-term memory",
+      "memory retrieval language agents",
+      "episodic semantic memory agents",
+      "context compression session management LLM agents",
+    ],
+  },
+  {
     matches: ["harness"],
     queries: [
       "agent orchestration tool use",
@@ -94,13 +119,85 @@ export function deterministicSearchQuery(question) {
 export function deterministicSearchQueries(question) {
   const primary = deterministicSearchQuery(question);
   const normalizedQuestion = String(question ?? "").toLowerCase();
-  const queries = [primary];
+  const prioritized = [];
+  const complementary = [];
   for (const expansion of DETERMINISTIC_ACADEMIC_EXPANSIONS) {
     if (!expansion.matches.some((term) => normalizedQuestion.includes(term))) continue;
-    queries.push(...expansion.queries);
+    (expansion.prioritize ? prioritized : complementary).push(...expansion.queries);
   }
+  const queries = [...prioritized, primary, ...complementary];
   return [...new Set(queries.map((query) => compact(query, 200)).filter(Boolean))]
     .slice(0, MAX_PLAN_QUERIES);
+}
+
+function mergeVenueSearchAttempts(initial, expansion, queries) {
+  const statusRank = { failed: 0, empty: 1, success: 2 };
+  const statuses = new Map();
+  for (const status of [...(initial?.venues ?? []), ...(expansion?.venues ?? [])]) {
+    const previous = statuses.get(status.source_id);
+    if (!previous) {
+      statuses.set(status.source_id, { ...status });
+      continue;
+    }
+    const next = { ...previous };
+    if ((statusRank[status.status] ?? -1) > (statusRank[previous.status] ?? -1)) {
+      next.status = status.status;
+      next.channel = status.channel;
+      next.error = status.error ?? null;
+    }
+    next.count = (Number(previous.count) || 0) + (Number(status.count) || 0);
+    if (next.status !== "failed") next.error = null;
+    statuses.set(status.source_id, next);
+  }
+  const venues = [...statuses.values()];
+  const papersById = new Map();
+  for (const paper of [...(initial?.papers ?? []), ...(expansion?.papers ?? [])]) {
+    const key = paper.dedupe_key || paper.paper_id;
+    if (!papersById.has(key)) papersById.set(key, paper);
+  }
+  const papers = [...papersById.values()].slice(0, SEARCH_RESULT_LIMIT)
+    .map((paper, index) => ({ ...paper, search_rank: index + 1 }));
+  const totalFound = (Number(initial?.total_found) || 0)
+    + (Number(expansion?.total_found) || 0);
+  const matched = venues.filter((status) => status.status === "success").length;
+  const reached = venues.filter((status) => status.status !== "failed").length;
+  return {
+    ...expansion,
+    query: queries[0],
+    queries,
+    venues,
+    venue_success_count: matched,
+    venue_reached_count: reached,
+    venue_matched_count: matched,
+    venue_failed_ids: venues
+      .filter((status) => status.status === "failed")
+      .map((status) => status.source_id),
+    total_found: totalFound,
+    truncated: Boolean(initial?.truncated || expansion?.truncated || totalFound > papers.length),
+    papers,
+  };
+}
+
+function mergeWebDiscoveries(initial, expansion) {
+  const results = [];
+  const seen = new Set();
+  // 零命中后的学术扩展更贴近用户意图，展示时优先于首轮宽泛网页结果。
+  for (const item of [...(expansion?.results ?? []), ...(initial?.results ?? [])]) {
+    if (seen.has(item.url)) continue;
+    seen.add(item.url);
+    results.push(item);
+    if (results.length >= MAX_WEB_RESULTS) break;
+  }
+  const successful = expansion?.status === "success"
+    ? expansion
+    : (initial?.status === "success" ? initial : null);
+  return {
+    status: successful ? "success" : "failed",
+    provider: successful?.provider ?? null,
+    results,
+    queries: [initial?.query, expansion?.query].filter(Boolean),
+    error: successful ? null : (expansion?.error ?? initial?.error ?? null),
+  };
 }
 
 function recommendInput(question, projectContext, papers, webResults = []) {
@@ -196,6 +293,7 @@ export function createVenueSearchService({
   dataDir,
   env = {},
   doubaoQuotaFilePath = resolveProjectWorkDoubaoQuotaFilePath({ env }),
+  tavilyQuotaFilePath = resolveProjectWorkTavilyQuotaFilePath({ env }),
   fetchImpl = globalThis.fetch,
   modelProviders = null,
   modelMode = "fixture",
@@ -224,6 +322,7 @@ export function createVenueSearchService({
         env,
         fetchImpl,
         doubaoQuotaFilePath,
+        tavilyQuotaFilePath,
         now,
       }).runWebSearch;
   let inFlight = null;
@@ -436,7 +535,8 @@ export function createVenueSearchService({
     const fallbackQueries = deterministicSearchQueries(question);
     const fallback = {
       search_query: fallbackQueries[0],
-      search_queries: fallbackQueries,
+      search_queries: fallbackQueries.slice(0, 1),
+      expansion_queries: fallbackQueries.slice(1),
       from_year: null,
       source: "deterministic",
       usage: null,
@@ -474,9 +574,14 @@ export function createVenueSearchService({
           if (searchQueries.length >= MAX_PLAN_QUERIES) break;
         }
         if (searchQueries.length === 0) throw new Error("VENUE_SEARCH_PLAN_INVALID");
+        const seenQueries = new Set(searchQueries.map((item) => item.toLowerCase()));
+        const expansionQueries = deterministicSearchQueries(question)
+          .filter((item) => !seenQueries.has(item.toLowerCase()))
+          .slice(0, Math.max(0, MAX_PLAN_QUERIES - searchQueries.length));
         return {
           search_query: searchQueries[0],
           search_queries: searchQueries,
+          expansion_queries: expansionQueries,
           from_year: Number.isInteger(generated.value?.from_year)
             ? generated.value.from_year
             : null,
@@ -506,9 +611,21 @@ export function createVenueSearchService({
           published_date: compact(item?.published_date, 40) || null,
         }))
         .filter((item) => item.url && item.title);
-      return { status: "success", provider: result?.provider ?? null, results, error: null };
+      return {
+        status: "success",
+        provider: result?.provider ?? null,
+        query,
+        results,
+        error: null,
+      };
     } catch (error) {
-      return { status: "failed", provider: null, results: [], error: publicError(error) };
+      return {
+        status: "failed",
+        provider: null,
+        query,
+        results: [],
+        error: publicError(error),
+      };
     }
   }
 
@@ -672,10 +789,11 @@ export function createVenueSearchService({
         query: plan.search_query,
         thinking: null,
       });
-      const [search, web] = await Promise.all([
+      let searchQueries = plan.search_queries ?? [plan.search_query];
+      let [search, web] = await Promise.all([
         venueSearcher({
           query: plan.search_query,
-          queries: plan.search_queries ?? [plan.search_query],
+          queries: searchQueries,
           fromYear: plan.from_year ?? null,
           limit: SEARCH_RESULT_LIMIT,
           fetchImpl,
@@ -683,6 +801,34 @@ export function createVenueSearchService({
         }),
         webDiscovery(plan.search_query),
       ]);
+      let adaptiveExpansion = false;
+      const expansionQueries = (plan.expansion_queries ?? [])
+        .filter((item) => !searchQueries.some(
+          (existingQuery) => existingQuery.toLowerCase() === item.toLowerCase(),
+        ))
+        .slice(0, Math.max(0, MAX_PLAN_QUERIES - searchQueries.length));
+      if (search.total_found === 0 && expansionQueries.length > 0) {
+        adaptiveExpansion = true;
+        setTurnProgress(clientRequestId, {
+          phase: "expanding",
+          query: expansionQueries.join(" · "),
+          thinking: null,
+        });
+        const [expandedSearch, expandedWeb] = await Promise.all([
+          venueSearcher({
+            query: expansionQueries[0],
+            queries: expansionQueries,
+            fromYear: plan.from_year ?? null,
+            limit: SEARCH_RESULT_LIMIT,
+            fetchImpl,
+            mailto,
+          }),
+          webDiscovery(expansionQueries[0]),
+        ]);
+        searchQueries = [...searchQueries, ...expansionQueries];
+        search = mergeVenueSearchAttempts(search, expandedSearch, searchQueries);
+        web = mergeWebDiscoveries(web, expandedWeb);
+      }
       setTurnProgress(clientRequestId, { phase: "recommending" });
       const recommendation = await recommend(
         normalizedQuestion,
@@ -783,7 +929,8 @@ export function createVenueSearchService({
         completed_at: now().toISOString(),
         plan: {
           search_query: plan.search_query,
-          search_queries: plan.search_queries ?? [plan.search_query],
+          search_queries: searchQueries,
+          adaptive_expansion: adaptiveExpansion,
           from_year: plan.from_year ?? null,
           source: plan.source,
           provider_id: plan.provider_id ?? null,
@@ -804,6 +951,7 @@ export function createVenueSearchService({
         web: {
           status: web.status,
           provider: web.provider,
+          queries: web.queries ?? [web.query].filter(Boolean),
           results: translatedWeb,
           error: web.error,
         },

@@ -126,12 +126,53 @@ test("settings navigation exposes the local model usage surface", async () => {
     }));
 
     assert.match(html, /模型用量/);
-    assert.match(html, /统一查看正常工作与论文精读/);
+    assert.match(html, /先确认搜索免费额度/);
+    assert.match(html, /正在同步搜索额度/);
     assert.match(html, /全部消耗/);
     assert.match(html, /论文精读/);
     assert.match(html, /今日/);
     assert.match(html, /30 天/);
     assert.match(html, /正在读取本机用量记录/);
+  });
+});
+
+test("search quota cards show used and remaining hard limits", async () => {
+  await withSettingsPanel(({ SearchQuotaSummary }) => {
+    const html = renderToStaticMarkup(React.createElement(SearchQuotaSummary, {
+      data: {
+        period: "2026-08",
+        providers: [
+          {
+            providerId: "doubao",
+            providerName: "豆包",
+            configured: true,
+            limit: 500,
+            used: 17,
+            remaining: 483,
+            officialUsageAvailable: false,
+            source: "github_shared_ledger",
+          },
+          {
+            providerId: "tavily",
+            providerName: "Tavily",
+            configured: true,
+            limit: 1000,
+            used: 42,
+            remaining: 958,
+            officialUsageAvailable: true,
+            source: "provider_github_and_local_ledger",
+          },
+        ],
+      },
+    }));
+
+    assert.match(html, /搜索额度/);
+    assert.match(html, /17 \/ 500/);
+    assert.match(html, /剩余 483 次/);
+    assert.match(html, /42 \/ 1,000/);
+    assert.match(html, /两台设备共用 GitHub 硬账本/);
+    assert.match(html, /官方账户、GitHub 与本机账本已同步/);
+    assert.match(html, /role="progressbar"/);
   });
 });
 

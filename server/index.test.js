@@ -450,6 +450,7 @@ async function startTestServer(
     projectWorkRuntimeUrl,
     projectWorkRuntimeHealthProbe,
     legacyWorkspaceArchiveService,
+    searchUsageService,
   } = {},
 ) {
   const server = createApiServer({
@@ -460,6 +461,7 @@ async function startTestServer(
     projectWorkRuntimeUrl,
     projectWorkRuntimeHealthProbe,
     legacyWorkspaceArchiveService,
+    searchUsageService,
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -605,6 +607,44 @@ test("model usage all merges normal work and paper reading", async (t) => {
     { workflow: "project_work", options: { period: "7d" } },
     { workflow: "paper_reading", options: { period: "7d" } },
   ]);
+});
+
+test("search usage route returns provider hard-limit evidence", async (t) => {
+  const server = await startTestServer(
+    {},
+    candidateSummaryService,
+    {},
+    {
+      searchUsageService: {
+        async getUsage() {
+          return {
+            schema_version: 1,
+            period: "2026-08",
+            generated_at: "2026-08-11T00:00:00.000Z",
+            providers: [{
+              provider_id: "doubao",
+              provider_name: "豆包",
+              configured: true,
+              hard_limit: true,
+              source: "local_hard_ledger",
+              period: "2026-08",
+              limit: 500,
+              used: 8,
+              remaining: 492,
+            }],
+          };
+        },
+      },
+    },
+  );
+  t.after(server.close);
+
+  const response = await fetch(`${server.baseUrl}/api/v1/search-usage`);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.providers[0].used, 8);
+  assert.equal(body.providers[0].remaining, 492);
+  assert.equal(body.providers[0].hard_limit, true);
 });
 
 test("legacy workspace archive routes expose safe totals and require a local exact cleanup", async (t) => {

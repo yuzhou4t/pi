@@ -18,3 +18,13 @@ export function resolveProjectWorkDoubaoQuotaFilePath({
     : resolveProjectWorkStorageRoot(env);
   return path.join(root, "external-retrieval-usage.json");
 }
+
+export function resolveProjectWorkTavilyQuotaFilePath({
+  env = process.env,
+  storageRoot = null,
+} = {}) {
+  const root = storageRoot
+    ? path.resolve(storageRoot)
+    : resolveProjectWorkStorageRoot(env);
+  return path.join(root, "external-retrieval-tavily-usage.json");
+}

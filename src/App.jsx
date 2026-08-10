@@ -115,6 +115,19 @@ const WORKFLOW_FIXTURES_ENABLED = import.meta.env.VITE_ENABLE_WORKFLOW_FIXTURES 
 export const DEFAULT_PROJECT_WORK_EXECUTION_POLICY_MODE = "auto_review";
 const NOTIFICATION_CONVERSATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u;
 
+export function parseSettingsEntry(search = "") {
+  const parameters = new URLSearchParams(typeof search === "string" ? search : "");
+  const values = parameters.getAll("settings");
+  return values.length === 1 && values[0] === "usage" ? "usage" : null;
+}
+
+function clearSettingsEntryFromUrl() {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has("settings")) return;
+  url.searchParams.delete("settings");
+  window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
 export function parseProjectWorkNotificationEntry(search = "") {
   const parameters = new URLSearchParams(typeof search === "string" ? search : "");
   const workTypes = parameters.getAll("work_type");
@@ -666,8 +679,12 @@ export function App() {
   const [providerOpen, setProviderOpen] = useState(false);
   const [skillCenterOpen, setSkillCenterOpen] = useState(false);
   const [installedPackageSkillCount, setInstalledPackageSkillCount] = useState(0);
-  const [settingsView, setSettingsView] = useState(null);
-  const [settingsSection, setSettingsSection] = useState("general");
+  const [settingsView, setSettingsView] = useState(() => (
+    parseSettingsEntry(window.location.search) ? "full" : null
+  ));
+  const [settingsSection, setSettingsSection] = useState(() => (
+    parseSettingsEntry(window.location.search) ?? "general"
+  ));
   const [mobileView, setMobileView] = useState("agent");
   const [toast, setToast] = useState(null);
   const [bindProjectOpen, setBindProjectOpen] = useState(false);
@@ -3050,6 +3067,7 @@ export function App() {
 
   const closeSettings = () => {
     setSettingsView(null);
+    clearSettingsEntryFromUrl();
     window.requestAnimationFrame(() => document.getElementById("settings-trigger")?.focus());
   };
 

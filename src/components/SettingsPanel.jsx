@@ -32,7 +32,7 @@ const sections = [
   { id: "general", label: "常规", icon: GearSix },
   { id: "providers", label: "模型服务商", icon: Cpu },
   { id: "connections", label: "互联", icon: PlugsConnected },
-  { id: "usage", label: "模型用量", icon: ChartBar },
+  { id: "usage", label: "额度与用量", icon: ChartBar },
   { id: "skills", label: "技能中心", icon: Package },
   { id: "appearance", label: "外观", icon: Palette },
   { id: "data", label: "项目与数据", icon: Database },
@@ -70,7 +70,7 @@ export function SettingsQuickPanel({ providerName, model, onOpenFull, onOpenSkil
 
         <div className="quick-setting-list">
           <QuickSetting icon={Cpu} label="模型与服务商" detail={`${providerName} · ${model}`} onClick={() => onOpenFull("providers")} />
-          <QuickSetting icon={ChartBar} label="模型用量" detail="正常工作 + Worker + 论文精读" onClick={() => onOpenFull("usage")} />
+          <QuickSetting icon={ChartBar} label="搜索额度与模型用量" detail="豆包 + Tavily + 三类工作" onClick={() => onOpenFull("usage")} />
           <QuickSetting icon={PlugsConnected} label="互联" detail="Worker 连接与飞书提醒" onClick={() => onOpenFull("connections")} />
           <QuickSetting icon={Package} label="技能中心" onClick={onOpenSkills ?? (() => onOpenFull("skills"))} />
           <QuickSetting icon={Palette} label="外观" detail="浅色 · 紧凑界面" onClick={() => onOpenFull("appearance")} />
@@ -188,6 +188,67 @@ function formatRate(value) {
     minimumFractionDigits: 0,
     maximumFractionDigits: 4,
   })}`;
+}
+
+export function SearchQuotaSummary({ data }) {
+  const providers = Array.isArray(data?.providers) ? data.providers : [];
+  return (
+    <section className="search-quota-section" aria-labelledby="search-quota-title">
+      <div className="search-quota-heading">
+        <div>
+          <span className="eyebrow">自然月硬限额</span>
+          <h3 id="search-quota-title">搜索额度</h3>
+        </div>
+        <span>{data?.period || "本月"}</span>
+      </div>
+      <div className="search-quota-grid">
+        {providers.map((provider) => {
+          const percent = provider.limit > 0
+            ? Math.min(100, Math.round((provider.used / provider.limit) * 100))
+            : 0;
+          return (
+            <article className="search-quota-card" key={provider.providerId}>
+              <header>
+                <strong>{provider.providerName}</strong>
+                <span className={provider.configured ? "is-ready" : "is-muted"}>
+                  {provider.configured ? "已配置" : "未配置"}
+                </span>
+              </header>
+              <div className="search-quota-values">
+                <strong>{formatInteger(provider.used)} / {formatInteger(provider.limit)}</strong>
+                <span>剩余 {formatInteger(provider.remaining)} 次</span>
+              </div>
+              <div
+                className="search-quota-progress"
+                role="progressbar"
+                aria-label={`${provider.providerName} 本月搜索额度`}
+                aria-valuemin="0"
+                aria-valuemax={provider.limit}
+                aria-valuenow={provider.used}
+              >
+                <span style={{ width: `${percent}%` }} />
+              </div>
+              <small>
+                {provider.source === "github_shared_ledger"
+                  ? "两台设备共用 GitHub 硬账本"
+                  : provider.source === "provider_github_and_local_ledger"
+                    ? "官方账户、GitHub 与本机账本已同步"
+                    : provider.providerId === "tavily" && provider.officialUsageAvailable
+                      ? "官方账户用量与本机硬账本已同步"
+                      : "本机硬账本，达到上限后停止调用"}
+              </small>
+              {provider.issue ? <p role="status">{provider.issue.message}</p> : null}
+            </article>
+          );
+        })}
+      </div>
+      {data?.warnings?.map((warning) => (
+        <p className="usage-refresh-error" role="status" key={warning.code}>
+          {warning.message}
+        </p>
+      ))}
+    </section>
+  );
 }
 
 export function UsageSummary({ values, costNote = "基于调用时保存的费用证据" }) {
@@ -364,6 +425,11 @@ function UsageSettingsContent() {
     loadedPeriod: null,
     loadedWorkflow: null,
   });
+  const [searchState, setSearchState] = useState({
+    status: "loading",
+    data: null,
+    error: null,
+  });
   const reload = useCallback(() => {
     setReloadVersion((current) => current + 1);
   }, []);
@@ -419,6 +485,26 @@ function UsageSettingsContent() {
     });
     return () => controller.abort();
   }, [period, reloadVersion, workflow]);
+  useEffect(() => {
+    const controller = new AbortController();
+    setSearchState((current) => ({
+      status: current.data ? "refreshing" : "loading",
+      data: current.data,
+      error: null,
+    }));
+    projectWorkApi.getSearchUsage({ signal: controller.signal }).then((data) => {
+      if (controller.signal.aborted) return;
+      setSearchState({ status: "ready", data, error: null });
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      setSearchState((current) => ({
+        status: "error",
+        data: current.data,
+        error: error.message,
+      }));
+    });
+    return () => controller.abort();
+  }, [reloadVersion]);
 
   const filteredModels = useMemo(() => {
     if (!state.data) return [];
@@ -448,10 +534,22 @@ function UsageSettingsContent() {
   return (
     <>
       <div className="settings-section-heading usage-heading">
-        <span className="eyebrow">本机记录</span>
-        <h2>模型用量</h2>
-        <p>统一查看正常工作与论文精读中已持久化的调用、Token 分项与 API 等价估算。</p>
+        <span className="eyebrow">额度与本机记录</span>
+        <h2>搜索额度与模型用量</h2>
+        <p>先确认搜索免费额度，再查看正常工作与论文精读中已持久化的模型消耗。</p>
       </div>
+
+      {searchState.status === "loading" ? (
+        <div className="settings-card usage-status" role="status">
+          正在同步搜索额度…
+        </div>
+      ) : null}
+      {searchState.data ? <SearchQuotaSummary data={searchState.data} /> : null}
+      {searchState.status === "error" ? (
+        <div className="usage-refresh-error" role="alert">
+          搜索额度刷新失败{searchState.data ? "，仍显示上一次记录" : ""}。{searchState.error}
+        </div>
+      ) : null}
 
       <div className="usage-workflow-control" aria-label="统计工作类型">
         {usageWorkflows.map((item) => (
@@ -551,7 +649,7 @@ function UsageSettingsContent() {
           <div className="usage-scope-note">
             <Info size={16} aria-hidden="true" />
             <span>
-              统一统计本机正常工作与论文精读中已有调用证据的模型消耗；账户真实剩余额度不可获取。
+              模型部分统计正常工作与论文精读中已有的调用证据；模型订阅余额仍无法统一读取。
             </span>
           </div>
 
