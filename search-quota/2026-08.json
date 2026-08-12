@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "period": "2026-08",
-  "updated_at": "2026-08-12T12:51:19.678Z",
+  "updated_at": "2026-08-12T12:51:25.633Z",
   "providers": {
     "doubao": {
       "limit": 500,
@@ -59,9 +59,9 @@
     },
     "tavily": {
       "limit": 1000,
-      "used": 12,
+      "used": 13,
       "projects": {
-        "pi-agent": 12
+        "pi-agent": 13
       },
       "leases": {
         "590dd7df-c4ac-495f-b90a-5c6966a6016c": {
@@ -103,11 +103,11 @@
         "a385617d-f10b-4725-aec7-300ce231cbac": {
           "project_id": "pi-agent",
           "granted": 10,
-          "consumed": 0,
+          "consumed": 1,
           "returned": 0,
           "state": "active",
           "created_at": "2026-08-12T12:51:15.379Z",
-          "updated_at": "2026-08-12T12:51:15.379Z"
+          "updated_at": "2026-08-12T12:51:25.633Z"
         }
       }
     }
