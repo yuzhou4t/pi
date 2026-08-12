@@ -5,13 +5,18 @@ import {
   createGitHubSearchQuotaStoreFromEnv,
 } from "./githubSearchQuotaStore.js";
 
-function encodedState(used) {
+function encodedState(used, { schemaVersion = 1, leases } = {}) {
   return Buffer.from(JSON.stringify({
-    schema_version: 1,
+    schema_version: schemaVersion,
     period: "2026-08",
     updated_at: "2026-08-11T00:00:00.000Z",
     providers: {
-      doubao: { limit: 500, used, projects: { "pi-agent": used } },
+      doubao: {
+        limit: 500,
+        used,
+        projects: { "pi-agent": used },
+        ...(leases ? { leases } : {}),
+      },
     },
   })).toString("base64");
 }
@@ -74,6 +79,64 @@ test("GitHub quota store atomically advances the shared branch", async () => {
   const refCall = calls.at(-1);
   assert.equal(refCall.method, "PATCH");
   assert.deepEqual(refCall.body, { sha: "commit-1", force: false });
+});
+
+test("GitHub quota store preserves compatible v2 lease metadata", async () => {
+  const calls = [];
+  const leases = {
+    "windows-lease": {
+      project_id: "windows-assistant",
+      state: "returned",
+      granted: 10,
+      consumed: 1,
+      returned: 9,
+    },
+  };
+  const client = {
+    async request(request) {
+      calls.push(request);
+      const { method = "GET", endpoint } = request;
+      if (endpoint.includes("/git/ref/heads/")) {
+        return { status: 200, data: { object: { sha: "head-v2" } } };
+      }
+      if (endpoint.includes("/git/commits/head-v2")) {
+        return { status: 200, data: { tree: { sha: "tree-v2" } } };
+      }
+      if (endpoint.includes("/contents/search-quota/")) {
+        return {
+          status: 200,
+          data: { content: encodedState(8, { schemaVersion: 2, leases }) },
+        };
+      }
+      if (method === "POST" && endpoint.endsWith("/git/blobs")) {
+        return { status: 201, data: { sha: "blob-v2" } };
+      }
+      if (method === "POST" && endpoint.endsWith("/git/trees")) {
+        return { status: 201, data: { sha: "tree-next" } };
+      }
+      if (method === "POST" && endpoint.endsWith("/git/commits")) {
+        return { status: 201, data: { sha: "commit-next" } };
+      }
+      if (method === "PATCH" && endpoint.includes("/git/refs/heads/")) {
+        return { status: 200, data: {} };
+      }
+      throw new Error(`unexpected request: ${method} ${endpoint}`);
+    },
+  };
+  const store = createGitHubSearchQuotaStore({ repository: "yuzhou4t/pi", client });
+
+  const quota = await store.reserve({
+    providerId: "doubao",
+    projectId: "pi-agent",
+    period: "2026-08",
+    limit: 500,
+  });
+
+  assert.equal(quota.used, 9);
+  const blobCall = calls.find((call) => call.endpoint.endsWith("/git/blobs"));
+  const nextState = JSON.parse(Buffer.from(blobCall.body.content, "base64").toString("utf8"));
+  assert.equal(nextState.schema_version, 2);
+  assert.deepEqual(nextState.providers.doubao.leases, leases);
 });
 
 test("GitHub quota store refuses an exhausted shared quota without writing", async () => {

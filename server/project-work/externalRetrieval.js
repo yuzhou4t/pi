@@ -30,8 +30,7 @@ const EXTERNAL_TOOL_GUIDELINES = [
 
 const TAVILY_SEARCH_URL = "https://api.tavily.com/search";
 const TAVILY_USAGE_URL = "https://api.tavily.com/usage";
-const DOUBAO_RESPONSES_URL = "https://ark.cn-beijing.volces.com/api/v3/responses";
-const DEFAULT_DOUBAO_SEARCH_MODEL = "doubao-seed-2-0-lite-260215";
+const DOUBAO_SEARCH_URL = "https://open.feedcoopapi.com/search_api/web_search";
 const DOUBAO_MONTHLY_SEARCH_LIMIT = 500;
 const TAVILY_MONTHLY_CREDIT_LIMIT = 1_000;
 const CONTEXT7_LIBRARY_SEARCH_URL = "https://context7.com/api/v2/libs/search";
@@ -41,6 +40,7 @@ const MAX_TIMEOUT_MS = 20_000;
 const MAX_UPSTREAM_BYTES = 1024 * 1024;
 const MAX_TOOL_OUTPUT_CHARS = 20_000;
 const MAX_QUERY_CHARS = 500;
+const DOUBAO_MAX_QUERY_CHARS = 100;
 const MAX_LIBRARY_NAME_CHARS = 160;
 const MAX_LIBRARY_ID_CHARS = 240;
 const MAX_WEB_RESULTS = 5;
@@ -722,7 +722,7 @@ export function getExternalRetrievalCapabilities({
   env = process.env,
 } = {}) {
   const doubaoAvailable = Boolean(envSecret(env, [
-    "PI_DOUBAO_API_KEY",
+    "PI_DOUBAO_SEARCH_API_KEY",
   ]));
   const tavilyAvailable = Boolean(envSecret(env, [
     "PI_TAVILY_API_KEY",
@@ -980,52 +980,25 @@ function normalizeWebResults(data, limit) {
   });
 }
 
-function doubaoText(data) {
-  return (Array.isArray(data?.output) ? data.output : [])
-    .flatMap((item) => (Array.isArray(item?.content) ? item.content : []))
-    .map((item) => boundedString(item?.text ?? item?.output_text, MAX_WEB_CONTENT_CHARS))
-    .filter(Boolean)
-    .join("\n")
-    .slice(0, MAX_WEB_CONTENT_CHARS);
-}
-
 function normalizeDoubaoResults(data, limit) {
-  const candidates = [];
-  for (const output of Array.isArray(data?.output) ? data.output : []) {
-    for (const source of Array.isArray(output?.action?.sources)
-      ? output.action.sources
-      : []) {
-      candidates.push(source);
-    }
-    for (const result of Array.isArray(output?.results) ? output.results : []) {
-      candidates.push(result);
-    }
-    for (const content of Array.isArray(output?.content) ? output.content : []) {
-      for (const annotation of Array.isArray(content?.annotations)
-        ? content.annotations
-        : []) {
-        candidates.push(annotation?.url_citation ?? annotation);
-      }
-    }
-  }
+  const candidates = Array.isArray(data?.Result?.WebResults)
+    ? data.Result.WebResults
+    : [];
 
   const seen = new Set();
   const normalized = candidates.flatMap((item) => {
-    const url = safeHttpsUrl(item?.url ?? item?.source_url);
+    const url = safeHttpsUrl(item?.Url);
     if (!url || seen.has(url)) return [];
     seen.add(url);
     return [{
-      title: boundedString(item?.title, 240) || url,
+      title: boundedString(item?.Title, 240) || url,
       url,
       excerpt: boundedString(
-        item?.snippet ?? item?.content ?? item?.text,
+        item?.Summary ?? item?.Snippet ?? item?.Content,
         MAX_WEB_CONTENT_CHARS,
       ),
-      score: Number.isFinite(item?.score) ? item.score : null,
-      published_date: boundedString(
-        item?.published_date ?? item?.published_at,
-        80,
-      ) || null,
+      score: Number.isFinite(item?.RankScore) ? item.RankScore : null,
+      published_date: boundedString(item?.PublishTime, 80) || null,
     }];
   });
   return {
@@ -1167,11 +1140,8 @@ export function createWebSearchRunner({
   searchQuotaStore,
 } = {}) {
   const doubaoApiKey = envSecret(env, [
-    "PI_DOUBAO_API_KEY",
+    "PI_DOUBAO_SEARCH_API_KEY",
   ]);
-  const doubaoModel = envSecret(env, [
-    "PI_DOUBAO_SEARCH_MODEL",
-  ]) || DEFAULT_DOUBAO_SEARCH_MODEL;
   const tavilyApiKey = envSecret(env, [
     "PI_TAVILY_API_KEY",
     "TAVILY_API_KEY",
@@ -1229,32 +1199,31 @@ export function createWebSearchRunner({
     }
     const data = await requestJson({
       provider: "DOUBAO",
-      url: DOUBAO_RESPONSES_URL,
+      url: DOUBAO_SEARCH_URL,
       apiKey: doubaoApiKey,
       fetchImpl,
       timeoutMs,
       method: "POST",
       body: {
-        model: doubaoModel,
-        input: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text: `请使用联网搜索查找以下内容，给出简洁摘要并保留来源链接：${normalizedQuery}`,
-              },
-            ],
-          },
-        ],
-        tools: [{ type: "web_search" }],
-        stream: false,
-        store: false,
+        Query: normalizedQuery.slice(0, DOUBAO_MAX_QUERY_CHARS),
+        SearchType: "web",
+        Count: limit,
+        Filter: {
+          NeedContent: false,
+          NeedUrl: true,
+        },
       },
     });
+    if (data?.ResponseMetadata?.Error) {
+      throw projectWorkError(
+        "PROJECT_WORK_DOUBAO_SEARCH_FAILED",
+        "豆包搜索请求失败",
+        502,
+        true,
+      );
+    }
     const normalized = normalizeDoubaoResults(data, limit);
     const results = normalized.results;
-    const answer = doubaoText(data);
     if (results.length === 0) {
       throw projectWorkError(
         "PROJECT_WORK_DOUBAO_RESPONSE_INVALID",
@@ -1268,7 +1237,6 @@ export function createWebSearchRunner({
       data: {
         provider: "doubao",
         query: normalizedQuery,
-        answer,
         results,
         result_count: results.length,
         truncated: normalized.truncated,
@@ -1379,7 +1347,7 @@ export function createSearchUsageService({
   now = () => new Date(),
   searchQuotaStore,
 } = {}) {
-  const doubaoApiKey = envSecret(env, ["PI_DOUBAO_API_KEY"]);
+  const doubaoApiKey = envSecret(env, ["PI_DOUBAO_SEARCH_API_KEY"]);
   const tavilyApiKey = envSecret(env, ["PI_TAVILY_API_KEY", "TAVILY_API_KEY"]);
   const sharedQuotaStore = searchQuotaStore === undefined
     ? createGitHubSearchQuotaStoreFromEnv({ env, fetchImpl, now })

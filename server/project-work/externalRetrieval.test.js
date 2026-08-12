@@ -32,6 +32,16 @@ function jsonResponse(value, init = {}) {
   });
 }
 
+function doubaoSearchResponse(results) {
+  return {
+    ResponseMetadata: { RequestId: "test-request" },
+    Result: {
+      ResultCount: results.length,
+      WebResults: results,
+    },
+  };
+}
+
 test("external capability status is safe and depends only on dedicated keys", () => {
   assert.deepEqual(getExternalRetrievalCapabilities({
     env: {
@@ -52,7 +62,7 @@ test("external capability status is safe and depends only on dedicated keys", ()
 
   assert.deepEqual(getExternalRetrievalCapabilities({
     env: {
-      PI_DOUBAO_API_KEY: "doubao-secret",
+      PI_DOUBAO_SEARCH_API_KEY: "doubao-secret",
       PI_TAVILY_API_KEY: "tavily-secret",
     },
   }).web_search, {
@@ -277,42 +287,27 @@ test("search_web uses only the bounded Tavily search contract and marks results 
   assert.doesNotMatch(result.content[0].text, /user:secret/);
 });
 
-test("search_web prefers Doubao and durably counts the monthly request before calling it", async (t) => {
+test("search_web uses standalone Doubao results without a Doubao model answer", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "pi-doubao-quota-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const quotaFile = path.join(directory, "usage.json");
   const calls = [];
   const tools = createExternalRetrievalTools({
     env: {
-      PI_DOUBAO_API_KEY: "doubao-key",
-      PI_DOUBAO_SEARCH_MODEL: "doubao-search-model",
+      PI_DOUBAO_SEARCH_API_KEY: "doubao-key",
       PI_TAVILY_API_KEY: "tavily-key",
     },
     doubaoQuotaFilePath: quotaFile,
     now: () => new Date("2026-07-29T08:00:00+08:00"),
     fetchImpl: async (url, options) => {
       calls.push({ url, options });
-      return jsonResponse({
-        output: [
-          {
-            type: "web_search_call",
-            action: {
-              sources: [{
-                title: "Node.js documentation",
-                url: "https://nodejs.org/api/globals.html#fetch",
-                snippet: "The current fetch API.",
-              }],
-            },
-          },
-          {
-            type: "message",
-            content: [{
-              type: "output_text",
-              text: "Node.js provides a browser-compatible fetch implementation.",
-            }],
-          },
-        ],
-      });
+      return jsonResponse(doubaoSearchResponse([{
+        Title: "Node.js documentation",
+        Url: "https://nodejs.org/api/globals.html#fetch",
+        Summary: "The current fetch API.",
+        RankScore: 0.98,
+        PublishTime: "2026-07-28",
+      }]));
     },
   });
 
@@ -325,14 +320,20 @@ test("search_web prefers Doubao and durably counts the monthly request before ca
   const quota = JSON.parse(await readFile(quotaFile, "utf8"));
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, "https://ark.cn-beijing.volces.com/api/v3/responses");
+  assert.equal(calls[0].url, "https://open.feedcoopapi.com/search_api/web_search");
   assert.equal(calls[0].options.headers.authorization, "Bearer doubao-key");
-  assert.equal(requestBody.model, "doubao-search-model");
-  assert.deepEqual(requestBody.tools, [{ type: "web_search" }]);
-  assert.equal(requestBody.stream, false);
-  assert.equal(requestBody.store, false);
+  assert.deepEqual(requestBody, {
+    Query: "current Node.js fetch API",
+    SearchType: "web",
+    Count: 2,
+    Filter: { NeedContent: false, NeedUrl: true },
+  });
   assert.equal(body.provider, "doubao");
+  assert.equal(body.answer, undefined);
   assert.equal(body.results[0].url, "https://nodejs.org/api/globals.html#fetch");
+  assert.equal(body.results[0].excerpt, "The current fetch API.");
+  assert.equal(body.results[0].score, 0.98);
+  assert.equal(body.results[0].published_date, "2026-07-28");
   assert.equal(body.monthly_quota.limit, 500);
   assert.equal(body.monthly_quota.used, 1);
   assert.deepEqual(quota, {
@@ -349,7 +350,7 @@ test("search_web reserves the shared GitHub quota before calling Doubao", async 
   const reservations = [];
   const runner = createWebSearchRunner({
     env: {
-      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_DOUBAO_SEARCH_API_KEY: "doubao-key",
       PI_SEARCH_QUOTA_PROJECT_ID: "pi-agent",
     },
     doubaoQuotaFilePath: path.join(directory, "doubao.json"),
@@ -366,18 +367,11 @@ test("search_web reserves the shared GitHub quota before calling Doubao", async 
         };
       },
     },
-    fetchImpl: async () => jsonResponse({
-      output: [{
-        type: "web_search_call",
-        action: {
-          sources: [{
-            title: "Shared result",
-            url: "https://example.com/shared",
-            snippet: "Shared quota result",
-          }],
-        },
-      }],
-    }),
+    fetchImpl: async () => jsonResponse(doubaoSearchResponse([{
+      Title: "Shared result",
+      Url: "https://example.com/shared",
+      Summary: "Shared quota result",
+    }])),
   });
 
   const result = await runner.runWebSearch("shared quota check");
@@ -405,7 +399,7 @@ test("search_web falls back to Tavily after the durable Doubao monthly limit", a
   const calls = [];
   const tools = createExternalRetrievalTools({
     env: {
-      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_DOUBAO_SEARCH_API_KEY: "doubao-key",
       PI_TAVILY_API_KEY: "tavily-key",
     },
     doubaoQuotaFilePath: quotaFile,
@@ -523,7 +517,7 @@ test("search usage summary combines the Doubao ledger with Tavily account usage"
   }));
   const service = createSearchUsageService({
     env: {
-      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_DOUBAO_SEARCH_API_KEY: "doubao-key",
       PI_TAVILY_API_KEY: "tavily-key",
     },
     doubaoQuotaFilePath: doubaoQuotaFile,
@@ -555,7 +549,7 @@ test("search usage summary combines the Doubao ledger with Tavily account usage"
 test("search usage prefers the shared GitHub ledger across devices", async () => {
   const service = createSearchUsageService({
     env: {
-      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_DOUBAO_SEARCH_API_KEY: "doubao-key",
       PI_TAVILY_API_KEY: "tavily-key",
     },
     now: () => new Date("2026-08-11T08:00:00+08:00"),
@@ -594,7 +588,7 @@ test("the shared Doubao quota resets into a separate reservation month", async (
   const calls = [];
   const runner = createWebSearchRunner({
     env: {
-      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_DOUBAO_SEARCH_API_KEY: "doubao-key",
       PI_TAVILY_API_KEY: "tavily-key",
     },
     doubaoQuotaFilePath: quotaFile,
@@ -602,18 +596,11 @@ test("the shared Doubao quota resets into a separate reservation month", async (
     fetchImpl: async (url) => {
       calls.push(url);
       return jsonResponse(
-        url.includes("volces.com")
-          ? {
-              output: [{
-                type: "web_search_call",
-                action: {
-                  sources: [{
-                    title: "August Doubao result",
-                    url: "https://example.com/august-doubao",
-                  }],
-                },
-              }],
-            }
+        url.includes("feedcoopapi.com")
+          ? doubaoSearchResponse([{
+              Title: "August Doubao result",
+              Url: "https://example.com/august-doubao",
+            }])
           : {
               results: [{
                 title: "July Tavily result",
@@ -632,7 +619,7 @@ test("the shared Doubao quota resets into a separate reservation month", async (
   assert.equal(july.provider, "tavily");
   assert.equal(august.provider, "doubao");
   assert.equal(august.monthly_quota.used, 1);
-  assert.equal(calls.filter((url) => url.includes("volces.com")).length, 1);
+  assert.equal(calls.filter((url) => url.includes("feedcoopapi.com")).length, 1);
   assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).period, "2026-08");
   await readFile(
     path.join(`${quotaFile}.reservations`, "2026-08", "slot-001.json"),
@@ -652,25 +639,18 @@ test("concurrent searches cannot reserve more than the final Doubao monthly slot
   const calls = [];
   const tools = createExternalRetrievalTools({
     env: {
-      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_DOUBAO_SEARCH_API_KEY: "doubao-key",
       PI_TAVILY_API_KEY: "tavily-key",
     },
     doubaoQuotaFilePath: quotaFile,
     now: () => new Date("2026-07-29T08:00:00+08:00"),
     fetchImpl: async (url) => {
       calls.push(url);
-      if (url.includes("volces.com")) {
-        return jsonResponse({
-          output: [{
-            type: "web_search_call",
-            action: {
-              sources: [{
-                title: "Doubao result",
-                url: "https://example.com/doubao",
-              }],
-            },
-          }],
-        });
+      if (url.includes("feedcoopapi.com")) {
+        return jsonResponse(doubaoSearchResponse([{
+          Title: "Doubao result",
+          Url: "https://example.com/doubao",
+        }]));
       }
       return jsonResponse({
         results: [{
@@ -692,7 +672,7 @@ test("concurrent searches cannot reserve more than the final Doubao monthly slot
     .sort();
 
   assert.deepEqual(providers, ["doubao", "tavily"]);
-  assert.equal(calls.filter((url) => url.includes("volces.com")).length, 1);
+  assert.equal(calls.filter((url) => url.includes("feedcoopapi.com")).length, 1);
   assert.equal(calls.filter((url) => url.includes("tavily.com")).length, 1);
   assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).used, 500);
 });
@@ -708,24 +688,17 @@ test("an exhausted reservation repairs a stale quota summary before fallback", a
   }));
   const runner = createWebSearchRunner({
     env: {
-      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_DOUBAO_SEARCH_API_KEY: "doubao-key",
       PI_TAVILY_API_KEY: "tavily-key",
     },
     doubaoQuotaFilePath: quotaFile,
     now: () => new Date("2026-07-29T08:00:00+08:00"),
     fetchImpl: async (url) => jsonResponse(
-      url.includes("volces.com")
-        ? {
-            output: [{
-              type: "web_search_call",
-              action: {
-                sources: [{
-                  title: "Doubao result",
-                  url: "https://example.com/doubao",
-                }],
-              },
-            }],
-          }
+      url.includes("feedcoopapi.com")
+        ? doubaoSearchResponse([{
+            Title: "Doubao result",
+            Url: "https://example.com/doubao",
+          }])
         : {
             results: [{
               title: "Tavily result",
@@ -767,23 +740,22 @@ test("separate processes cannot reserve more than the final Doubao monthly slot"
     await new Promise((resolve) => process.stdin.once("data", resolve));
     const runner = createWebSearchRunner({
       env: {
-        PI_DOUBAO_API_KEY: "doubao-key",
+        PI_DOUBAO_SEARCH_API_KEY: "doubao-key",
         PI_TAVILY_API_KEY: "tavily-key",
       },
       doubaoQuotaFilePath: quotaFilePath,
       now: () => new Date("2026-07-29T08:00:00+08:00"),
       fetchImpl: async (url) => new Response(JSON.stringify(
-        url.includes("volces.com")
+        url.includes("feedcoopapi.com")
           ? {
-              output: [{
-                type: "web_search_call",
-                action: {
-                  sources: [{
-                    title: "Doubao result",
-                    url: "https://example.com/doubao-" + workerId,
-                  }],
-                },
-              }],
+              ResponseMetadata: { RequestId: "test-request" },
+              Result: {
+                ResultCount: 1,
+                WebResults: [{
+                  Title: "Doubao result",
+                  Url: "https://example.com/doubao-" + workerId,
+                }],
+              },
             }
           : {
               results: [{
@@ -870,7 +842,7 @@ test("a process crash after claiming the final slot cannot reopen it", async (t)
     import { createWebSearchRunner } from ${JSON.stringify(moduleUrl)};
     const quotaFilePath = process.argv[1];
     const runner = createWebSearchRunner({
-      env: { PI_DOUBAO_API_KEY: "doubao-key" },
+      env: { PI_DOUBAO_SEARCH_API_KEY: "doubao-key" },
       doubaoQuotaFilePath: quotaFilePath,
       now: () => new Date("2026-07-29T08:00:00+08:00"),
       fetchImpl: async () => process.exit(0),
@@ -901,7 +873,7 @@ test("a process crash after claiming the final slot cannot reopen it", async (t)
   const calls = [];
   const runner = createWebSearchRunner({
     env: {
-      PI_DOUBAO_API_KEY: "doubao-key",
+      PI_DOUBAO_SEARCH_API_KEY: "doubao-key",
       PI_TAVILY_API_KEY: "tavily-key",
     },
     doubaoQuotaFilePath: quotaFile,
@@ -920,7 +892,7 @@ test("a process crash after claiming the final slot cannot reopen it", async (t)
   const result = await runner.runWebSearch("after crash");
 
   assert.equal(result.provider, "tavily");
-  assert.equal(calls.filter((url) => url.includes("volces.com")).length, 0);
+  assert.equal(calls.filter((url) => url.includes("feedcoopapi.com")).length, 0);
   assert.equal(calls.filter((url) => url.includes("tavily.com")).length, 1);
   assert.equal(JSON.parse(await readFile(quotaFile, "utf8")).used, 500);
 });
@@ -937,7 +909,7 @@ test("quota reservation directory failures stay safe and never call Doubao", asy
   await writeFile(`${quotaFile}.reservations`, "not a directory");
   let fetchCalls = 0;
   const runner = createWebSearchRunner({
-    env: { PI_DOUBAO_API_KEY: "doubao-key" },
+    env: { PI_DOUBAO_SEARCH_API_KEY: "doubao-key" },
     doubaoQuotaFilePath: quotaFile,
     now: () => new Date("2026-07-29T08:00:00+08:00"),
     fetchImpl: async () => {

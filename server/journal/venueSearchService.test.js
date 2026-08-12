@@ -150,7 +150,7 @@ test("project work and venue search share one 500-request Doubao ledger", async 
   const storageRoot = path.join(dataDir, "project-work");
   const env = {
     PI_PROJECT_WORK_STORAGE_ROOT: storageRoot,
-    PI_DOUBAO_API_KEY: "doubao-key",
+    PI_DOUBAO_SEARCH_API_KEY: "doubao-key",
     PI_TAVILY_API_KEY: "tavily-key",
   };
   const quotaFilePath = resolveProjectWorkDoubaoQuotaFilePath({ env });
@@ -164,17 +164,16 @@ test("project work and venue search share one 500-request Doubao ledger", async 
   const calls = [];
   const fetchImpl = async (url) => {
     calls.push(url);
-    if (url.includes("volces.com")) {
+    if (url.includes("feedcoopapi.com")) {
       return new Response(JSON.stringify({
-        output: [{
-          type: "web_search_call",
-          action: {
-            sources: [{
-              title: "Doubao result",
-              url: "https://example.com/doubao",
-            }],
-          },
-        }],
+        ResponseMetadata: { RequestId: "test-request" },
+        Result: {
+          ResultCount: 1,
+          WebResults: [{
+            Title: "Doubao result",
+            Url: "https://example.com/doubao",
+          }],
+        },
       }), { headers: { "content-type": "application/json" } });
     }
     if (url.endsWith("/usage")) {
@@ -218,7 +217,7 @@ test("project work and venue search share one 500-request Doubao ledger", async 
   });
 
   assert.equal(conversation.turns[0].web.provider, "tavily");
-  assert.equal(calls.filter((url) => url.includes("volces.com")).length, 1);
+  assert.equal(calls.filter((url) => url.includes("feedcoopapi.com")).length, 1);
   assert.equal(calls.filter((url) => url.endsWith("/usage")).length, 1);
   assert.equal(calls.filter((url) => url.endsWith("/search")).length, 1);
   assert.equal(JSON.parse(await readFile(quotaFilePath, "utf8")).used, 500);

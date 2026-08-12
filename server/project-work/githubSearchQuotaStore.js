@@ -178,7 +178,9 @@ function decodeState(data, period) {
   if (data?.status === 404 || data == null) return null;
   try {
     const parsed = JSON.parse(Buffer.from(String(data.content ?? ""), "base64").toString("utf8"));
-    if (parsed?.schema_version !== 1 || parsed.period !== period || typeof parsed.providers !== "object") {
+    if (![1, 2].includes(parsed?.schema_version)
+      || parsed.period !== period
+      || typeof parsed.providers !== "object") {
       throw new Error("invalid quota state");
     }
     return parsed;
@@ -266,6 +268,7 @@ export function createGitHubSearchQuotaStore({
           providers: {
             ...state.providers,
             [id]: {
+              ...providerState,
               limit,
               used: nextUsed,
               projects: {
