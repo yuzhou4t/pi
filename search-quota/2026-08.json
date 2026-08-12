@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "period": "2026-08",
-  "updated_at": "2026-08-12T12:51:37.085Z",
+  "updated_at": "2026-08-12T12:52:11.922Z",
   "providers": {
     "doubao": {
       "limit": 500,
@@ -54,6 +54,15 @@
           "state": "returned",
           "created_at": "2026-08-12T12:51:09.410Z",
           "updated_at": "2026-08-12T12:51:29.771Z"
+        },
+        "d6bdc676-f922-400e-903a-078b84ac8428": {
+          "project_id": "pi-agent",
+          "granted": 10,
+          "consumed": 0,
+          "returned": 0,
+          "state": "active",
+          "created_at": "2026-08-12T12:52:11.922Z",
+          "updated_at": "2026-08-12T12:52:11.922Z"
         }
       }
     },
