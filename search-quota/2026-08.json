@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
   "period": "2026-08",
-  "updated_at": "2026-08-14T10:35:29.326Z",
+  "updated_at": "2026-08-14T10:41:43.621Z",
   "providers": {
     "doubao": {
       "limit": 500,
-      "used": 15,
+      "used": 16,
       "projects": {
-        "pi-agent": 15
+        "pi-agent": 16
       },
       "leases": {
         "18d0df06-56b4-4d73-bd73-bcbccc398554": {
