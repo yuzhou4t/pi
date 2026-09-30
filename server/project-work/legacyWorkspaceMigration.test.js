@@ -507,3 +507,121 @@ test("legacy migration can export or hash-bound abandon without deleting its arc
     "// changed\n",
   );
 });
+
+test("retired verification repairs preserve provenance without reopening or resuming", async (t) => {
+  for (const alreadySuperseded of [false, true]) {
+    const fixture = await createNativeLegacyVerificationFixture();
+    t.after(() => rm(fixture.temporaryRoot, { recursive: true, force: true }));
+    const state = JSON.parse(await readFile(fixture.statePath, "utf8"));
+    if (alreadySuperseded) {
+      state.status = "idle";
+      state.lastError = null;
+      state.verifications = state.verifications.map((verification) => ({
+        ...verification,
+        status: "legacy_superseded",
+        blockedReason: "legacy_workspace_migration",
+      }));
+    }
+    const operation = {
+      id: "repair-legacy", type: "verification_repair", status: "interrupted",
+      phase: "verifying", commandId: "legacy-swift-request-1",
+      repairAttemptCount: 1, maxRepairAttempts: 2,
+      validationAttemptIds: ["legacy-swift-attempt-1"],
+      lastFailedAttemptId: "legacy-swift-attempt-1",
+      startedAt: "2026-08-01T01:00:00.000Z", completedAt: null,
+      error: { code: "INTERRUPTED", message: "Interrupted repair", retryable: true },
+    };
+    state.operations = [operation];
+    await writeFile(fixture.statePath, JSON.stringify(state));
+    const createService = () => createProjectWorkService({
+      storageRoot: fixture.storageRoot, sessionFactory: sessionFactory(),
+      picker: async () => ({ rootPath: fixture.projectRoot }),
+      idFactory: incrementalId("repair-normalize"),
+    });
+    const service = createService();
+    const result = await service.getConversation(fixture.conversation.id);
+    assert.equal(result.conversation.status, "idle");
+    const retired = result.conversation.operations[0];
+    assert.equal(retired.status, "legacy_superseded");
+    assert.equal(retired.legacyStatus, "interrupted");
+    assert.equal(retired.blockedReason, "legacy_workspace_migration");
+    assert.ok(retired.supersededAt);
+    assert.deepEqual(retired.validationAttemptIds, operation.validationAttemptIds);
+    assert.deepEqual(retired.error, operation.error);
+    const persisted = JSON.parse(await readFile(fixture.statePath, "utf8"));
+    assert.deepEqual(persisted.operations[0], {
+      ...operation, status: "legacy_superseded", legacyStatus: "interrupted",
+      blockedReason: "legacy_workspace_migration",
+      supersededAt: retired.supersededAt, completedAt: retired.completedAt,
+    });
+    await assert.rejects(service.resumeVerificationRepair(fixture.conversation.id, {
+      operationId: operation.id, clientRequestId: "resume-retired-repair",
+    }), (error) => error?.code === "PROJECT_WORK_VERIFICATION_REPAIR_NOT_RECOVERABLE");
+    await service.dispose();
+    const secondService = createService();
+    t.after(() => secondService.dispose());
+    const second = await secondService.getConversation(fixture.conversation.id);
+    assert.deepEqual(second.conversation.operations[0], retired);
+    const events = (await readFile(path.join(fixture.conversationDirectory, "events.jsonl"), "utf8"))
+      .trim().split("\n").map(JSON.parse);
+    const normalizationEvents = events.filter((event) => event.type === "workspace.legacy_verifications_superseded");
+    assert.equal(normalizationEvents.length, 1);
+    assert.equal(normalizationEvents[0].data.supersededOperationCount, 1);
+  }
+});
+
+test("legacy repair retirement leaves current failures and unrelated repairs intact", async (t) => {
+  const fixture = await createNativeLegacyVerificationFixture();
+  t.after(() => rm(fixture.temporaryRoot, { recursive: true, force: true }));
+  const state = JSON.parse(await readFile(fixture.statePath, "utf8"));
+  state.verifications.push(
+    { id: "current-request", status: "requested" },
+    { id: "current-attempt", commandId: "current-request", status: "failed" },
+  );
+  const currentRepair = {
+    id: "repair-current", type: "verification_repair", status: "interrupted",
+    commandId: "current-request", phase: "verifying",
+  };
+  const otherOperation = {
+    id: "other-operation", type: "settlement", status: "interrupted",
+    commandId: "legacy-swift-request-1",
+  };
+  state.operations = [currentRepair, otherOperation, {
+    id: "repair-legacy", type: "verification_repair", status: "running",
+    commandId: "legacy-swift-request-1",
+  }];
+  await writeFile(fixture.statePath, JSON.stringify(state));
+  const service = createProjectWorkService({
+    storageRoot: fixture.storageRoot, sessionFactory: sessionFactory(),
+    picker: async () => ({ rootPath: fixture.projectRoot }),
+    idFactory: incrementalId("repair-current"),
+  });
+  t.after(() => service.dispose());
+  const result = await service.getConversation(fixture.conversation.id);
+  assert.equal(result.conversation.status, "verification_failed");
+  const persisted = JSON.parse(await readFile(fixture.statePath, "utf8"));
+  assert.deepEqual(persisted.operations[0], currentRepair);
+  assert.deepEqual(persisted.operations[1], otherOperation);
+  assert.equal(persisted.operations[2].status, "legacy_superseded");
+  assert.equal(persisted.verifications.find((item) => item.id === "current-attempt").status, "failed");
+});
+
+test("first legacy Workspace migration retires linked interrupted repairs", async (t) => {
+  const fixture = await createLegacyFixture();
+  t.after(() => rm(fixture.temporaryRoot, { recursive: true, force: true }));
+  const state = JSON.parse(await readFile(fixture.statePath, "utf8"));
+  state.operations = [{
+    id: "legacy-repair", type: "verification_repair", status: "interrupted",
+    commandId: "legacy-swift-test-1",
+  }];
+  await writeFile(fixture.statePath, JSON.stringify(state));
+  const service = createProjectWorkService({
+    storageRoot: fixture.storageRoot, sessionFactory: sessionFactory(),
+    picker: async () => ({ rootPath: fixture.projectRoot }),
+    idFactory: incrementalId("migrate-repair"),
+  });
+  t.after(() => service.dispose());
+  const result = await service.getConversation(fixture.conversation.id);
+  assert.equal(result.conversation.operations[0].status, "legacy_superseded");
+  assert.equal(result.conversation.operations[0].legacyStatus, "interrupted");
+});
