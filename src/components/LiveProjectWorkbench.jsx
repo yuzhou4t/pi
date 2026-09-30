@@ -18,6 +18,7 @@ import {
   Cloud,
   Code,
   DownloadSimple,
+  DotsThree,
   ArrowClockwise,
   Brain,
   FileCode,
@@ -39,6 +40,7 @@ import {
   Play,
   ShieldCheck,
   SidebarSimple,
+  Stop,
   StopCircle,
   TestTube,
   UploadSimple,
@@ -178,6 +180,7 @@ const AUTO_REVIEW_REASON_LABELS = {
 };
 
 const TOOL_LABELS = {
+  bash: "运行命令",
   read: "读取文件",
   edit: "修改文件",
   write: "写入文件",
@@ -229,6 +232,19 @@ const RESEARCH_TOOL_GROUPS = {
   resolve_library_id: "retrieval",
   query_docs: "retrieval",
 };
+
+const FILE_CHANGE_TOOLS = new Set([
+  "edit",
+  "write",
+  "write_word_document",
+  "write_excel_workbook",
+]);
+
+const SUCCESSFUL_COMMAND_STATUSES = new Set([
+  "completed",
+  "passed",
+  "succeeded",
+]);
 
 const HIDDEN_TOOL_ACTIVITY = new Set([
   "update_plan",
@@ -1150,11 +1166,12 @@ function normalizeActivityPlan(plan) {
 export function planFromActivityEvents(events) {
   const planEvent = [...(Array.isArray(events) ? events : [])]
     .reverse()
-    .find((event) => event?.type === "plan.updated");
+    .find((event) => ["plan.updated", "plan.cleared"].includes(event?.type));
+  if (planEvent?.type === "plan.cleared") return [];
   return normalizeActivityPlan(planEvent?.data ?? planEvent);
 }
 
-function PlanSteps({ plan }) {
+function PlanSteps({ plan, showStatusLabels = false }) {
   const statusLabels = {
     pending: "待处理",
     in_progress: "进行中",
@@ -1176,7 +1193,12 @@ function PlanSteps({ plan }) {
               <CircleNotch size={12} weight="bold" />
             ) : null}
           </span>
-          <span>{step.title}</span>
+          {showStatusLabels ? (
+            <small className="project-plan-status-label">
+              {statusLabels[step.status] ?? "待处理"}
+            </small>
+          ) : null}
+          <span className="project-plan-step-title">{step.title}</span>
         </li>
       ))}
     </ol>
@@ -1210,13 +1232,38 @@ export function ProjectPlanDock({ plan, running }) {
   const completed = normalizedPlan.filter(
     (step) => step.status === "completed",
   ).length;
+  const activeStep = normalizedPlan.find(
+    (step) => step.status === "in_progress" || step.status === "running",
+  );
+  const nextStep = normalizedPlan.find((step) => step.status === "pending");
+  const runningLabel = activeStep
+    ? `正在：${activeStep.title}`
+    : normalizedPlan.length === 0
+      ? "正在准备本轮计划"
+      : completed === normalizedPlan.length
+        ? "正在整理最终回答"
+        : nextStep
+          ? `即将：${nextStep.title}`
+          : "正在工作";
+  const visiblePlan = running
+    && normalizedPlan.length > 0
+    && completed === normalizedPlan.length
+    ? [
+        ...normalizedPlan,
+        {
+          id: "final-answer",
+          title: "整理最终回答",
+          status: "running",
+        },
+      ]
+    : normalizedPlan;
   const revision = planSignature(normalizedPlan);
 
   useEffect(() => {
     setExpanded(Boolean(running));
   }, [revision, running]);
 
-  if (normalizedPlan.length === 0) return null;
+  if (normalizedPlan.length === 0 && !running) return null;
   return (
     <aside
       className={`project-plan-dock${running ? " is-running" : " is-settled"}${expanded ? " is-expanded" : ""}`}
@@ -1233,14 +1280,22 @@ export function ProjectPlanDock({ plan, running }) {
           <CheckCircle size={14} weight="fill" aria-hidden="true" />
         )}
         <span>
-          <strong>Agent 计划</strong>
-          <small>{running ? "固定显示" : "本轮已收起"} · {completed}/{normalizedPlan.length}</small>
+          <strong aria-live="polite">{running ? runningLabel : "Agent 计划"}</strong>
+          <small>
+            {running
+              ? normalizedPlan.length > 0
+                ? `实时计划 · ${completed}/${normalizedPlan.length}`
+                : "等待 Agent 更新计划"
+              : `本轮已收起 · ${completed}/${normalizedPlan.length}`}
+          </small>
         </span>
         <CaretDown size={13} aria-hidden="true" />
       </button>
-      <div className="project-plan-dock-body" hidden={!expanded}>
-        <PlanSteps plan={normalizedPlan} />
-      </div>
+      {normalizedPlan.length > 0 ? (
+        <div className="project-plan-dock-body" hidden={!expanded}>
+          <PlanSteps plan={visiblePlan} showStatusLabels />
+        </div>
+      ) : null}
     </aside>
   );
 }
@@ -1560,28 +1615,73 @@ function updateResearchSummary(event, toolEvent, running) {
     event.counts.retrieval ? `外部检索 ${event.counts.retrieval} 次` : "",
   ].filter(Boolean);
   event.title = event.status === "active" && running
-    ? "正在查看与检索"
-    : `查看与检索了 ${total} 次`;
+    ? "正在查看文件与资料"
+    : `查看了 ${total} 项文件与资料`;
   event.detail = parts.join(" · ");
 }
 
+function commandActivityKey(commandEvent) {
+  return commandEvent.toolCallId
+    ?? commandEvent.runId
+    ?? commandEvent.data?.toolCallId
+    ?? commandEvent.data?.runId
+    ?? commandEvent.eventId
+    ?? `seq-${commandEvent.firstSeq ?? commandEvent.seq}`;
+}
+
 function updateCommandSummary(event, commandEvent, running) {
-  if (commandEvent.type === "verification.requested") {
-    event.prepared += 1;
-  } else {
-    event.ran += 1;
-    if (commandEvent.type === "verification.started") event.active += 1;
+  const key = commandActivityKey(commandEvent);
+  const previous = event.commandStates.get(key);
+  const status = commandEvent.type === "verification.requested"
+    ? "prepared"
+    : (
+        commandEvent.type === "verification.started"
+        || commandEvent.type === "workspace_run.queued"
+        || commandEvent.type === "workspace_run.started"
+        || commandEvent.status === "active"
+        || commandEvent.status === "running"
+      )
+      ? "active"
+      : SUCCESSFUL_COMMAND_STATUSES.has(commandEvent.status)
+        ? "completed"
+        : previous ?? "completed";
+  if (
+    previous !== "completed"
+    || status === "completed"
+  ) {
+    event.commandStates.set(key, status);
   }
   event.lastSeq = Math.max(event.lastSeq, commandEvent.lastSeq ?? commandEvent.seq);
+  const states = [...event.commandStates.values()];
+  event.prepared = states.filter((value) => value === "prepared").length;
+  event.active = states.filter((value) => value === "active").length;
+  event.ran = states.filter((value) => value !== "prepared").length;
   event.title = event.active > 0 && running
-    ? "正在运行验证命令"
+    ? `正在运行 ${event.active} 条命令`
     : event.ran > 0
-      ? `运行了 ${event.ran} 条验证命令`
-      : `准备了 ${event.prepared} 条验证命令`;
+      ? `运行了 ${event.ran} 条命令`
+      : `准备了 ${event.prepared} 条命令`;
   event.detail = [
     event.prepared ? `已准备 ${event.prepared} 条` : "",
     event.ran ? `已运行 ${event.ran} 条` : "",
+    event.active && running ? `${event.active} 条仍在运行` : "",
   ].filter(Boolean).join(" · ");
+}
+
+function updateFileChangeSummary(event, toolEvent, running) {
+  const key = toolEvent.path
+    ?? toolEvent.data?.path
+    ?? toolEvent.toolCallId
+    ?? `seq-${toolEvent.firstSeq ?? toolEvent.seq}`;
+  event.files.add(key);
+  event.lastSeq = Math.max(event.lastSeq, toolEvent.lastSeq ?? toolEvent.seq);
+  event.status = event.status === "active" || toolEvent.status === "active"
+    ? "active"
+    : "completed";
+  event.title = event.status === "active" && running
+    ? `正在处理 ${event.files.size} 个文件`
+    : `处理了 ${event.files.size} 个文件`;
+  event.detail = "文件操作已合并；可在更改工件中查看具体内容";
 }
 
 function currentTurnActivityEvents(events) {
@@ -1844,7 +1944,58 @@ function formatTraceDuration(milliseconds) {
   if (seconds < 60) return `${seconds} 秒`;
   const minutes = Math.floor(seconds / 60);
   const remaining = Math.round(seconds - minutes * 60);
+  if (minutes >= 60) {
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return remainingMinutes > 0
+      ? `${hours} 小时 ${remainingMinutes} 分`
+      : `${hours} 小时`;
+  }
   return remaining > 0 ? `${minutes} 分 ${remaining} 秒` : `${minutes} 分`;
+}
+
+function activityEventTime(event) {
+  const timestamp = Date.parse(event?.createdAt ?? event?.at ?? "");
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+export function activityLiveness(events, running, now = Date.now()) {
+  if (!running) return null;
+  const currentTurn = currentTurnActivityEvents(events).events;
+  const startedAt = currentTurn
+    .map(activityEventTime)
+    .find((value) => Number.isFinite(value));
+  const latestAt = [...currentTurn]
+    .reverse()
+    .map(activityEventTime)
+    .find((value) => Number.isFinite(value));
+  const elapsed = Number.isFinite(startedAt)
+    ? formatTraceDuration(Math.max(0, now - startedAt))
+    : null;
+  if (!Number.isFinite(latestAt)) {
+    return {
+      elapsed,
+      progress: "等待第一条运行进展",
+      stale: false,
+    };
+  }
+  const silenceMs = Math.max(0, now - latestAt);
+  if (silenceMs < 60_000) {
+    return { elapsed, progress: "刚有新进展", stale: false };
+  }
+  const silenceMinutes = Math.max(1, Math.floor(silenceMs / 60_000));
+  if (silenceMs >= 5 * 60_000) {
+    return {
+      elapsed,
+      progress: `${silenceMinutes} 分钟没有新进展`,
+      stale: true,
+    };
+  }
+  return {
+    elapsed,
+    progress: `最近进展 ${silenceMinutes} 分钟前`,
+    stale: false,
+  };
 }
 
 function formatTraceTokens(value) {
@@ -1960,6 +2111,7 @@ export function normalizeActivityEvents(
   let latestThinkingEvent = null;
   let latestPhaseEvent = null;
   let researchEvent = null;
+  let fileChangeEvent = null;
   let commandEvent = null;
   let previousActivityKind = null;
   let activeTurnStartSeq = null;
@@ -1967,6 +2119,7 @@ export function normalizeActivityEvents(
 
   const closeVisibleBatches = () => {
     researchEvent = null;
+    fileChangeEvent = null;
     commandEvent = null;
   };
 
@@ -2085,6 +2238,7 @@ export function normalizeActivityEvents(
       && RESEARCH_TOOL_GROUPS[event.toolName]
       && event.status !== "failed"
     ) {
+      fileChangeEvent = null;
       commandEvent = null;
       if (!researchEvent) {
         const firstSeq = event.firstSeq ?? event.seq;
@@ -2106,6 +2260,32 @@ export function normalizeActivityEvents(
       continue;
     }
     if (
+      TOOL_ACTIVITY_TYPES.has(event.type)
+      && FILE_CHANGE_TOOLS.has(event.toolName)
+      && !["failed", "aborted", "stopped"].includes(event.status)
+    ) {
+      researchEvent = null;
+      commandEvent = null;
+      if (!fileChangeEvent) {
+        const firstSeq = event.firstSeq ?? event.seq;
+        fileChangeEvent = {
+          type: "activity.file_change_summary",
+          seq: firstSeq,
+          firstSeq,
+          lastSeq: event.lastSeq ?? event.seq,
+          activityKey: `file-changes-${firstSeq}`,
+          artifactId: "changes",
+          hideSequence: true,
+          files: new Set(),
+          status: "completed",
+        };
+        normalized.push(fileChangeEvent);
+      }
+      updateFileChangeSummary(fileChangeEvent, event, running);
+      previousActivityKind = "action";
+      continue;
+    }
+    if (
       event.type === "verification.started"
       && event.eventId
       && completedVerificationIds.has(event.eventId)
@@ -2117,10 +2297,27 @@ export function normalizeActivityEvents(
       || event.type === "verification.started"
       || (
         event.type === "verification.completed"
-        && ["passed", "succeeded", "completed"].includes(event.status)
+        && SUCCESSFUL_COMMAND_STATUSES.has(event.status)
+      )
+      || (
+        [
+          "workspace_run.queued",
+          "workspace_run.started",
+          "workspace_run.completed",
+        ].includes(event.type)
+        && (
+          event.type !== "workspace_run.completed"
+          || SUCCESSFUL_COMMAND_STATUSES.has(event.status)
+        )
+      )
+      || (
+        TOOL_ACTIVITY_TYPES.has(event.type)
+        && event.toolName === "bash"
+        && !["failed", "aborted", "stopped"].includes(event.status)
       )
     ) {
       researchEvent = null;
+      fileChangeEvent = null;
       if (!commandEvent) {
         const firstSeq = event.firstSeq ?? event.seq;
         commandEvent = {
@@ -2134,6 +2331,7 @@ export function normalizeActivityEvents(
           prepared: 0,
           ran: 0,
           active: 0,
+          commandStates: new Map(),
         };
         normalized.push(commandEvent);
       }
@@ -2423,6 +2621,7 @@ export function ActivityTimeline({
   onOpenArtifact,
 }) {
   const [expanded, setExpanded] = useState(!compact);
+  const [livenessNow, setLivenessNow] = useState(() => Date.now());
   const normalizedEvents = normalizeActivityEvents(
     withRuntimeProgressFallback(events, running),
     running,
@@ -2442,10 +2641,23 @@ export function ActivityTimeline({
   const latestProgressSummary = latestProgressEvent
     ? progressNarration(latestProgressEvent).summary
     : "";
+  const liveness = activityLiveness(events, running, livenessNow);
+  const runningSummary = [
+    liveness?.elapsed ? `已运行 ${liveness.elapsed}` : "",
+    liveness?.progress ?? "",
+    latestProgressSummary || `${visibleEvents.length} 项实时进展`,
+  ].filter(Boolean).join(" · ");
 
   useEffect(() => {
     setExpanded(!compact);
   }, [compact]);
+
+  useEffect(() => {
+    if (!running) return undefined;
+    setLivenessNow(Date.now());
+    const timer = window.setInterval(() => setLivenessNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [running]);
 
   if (
     visibleEvents.length === 0
@@ -2458,6 +2670,7 @@ export function ActivityTimeline({
       className={[
         "project-activity",
         running ? "is-running" : "is-settled",
+        liveness?.stale ? "is-stale" : "",
         running ? "" : `is-${terminalState.key}`,
         compact ? "is-compact" : "",
         expanded ? "is-expanded" : "",
@@ -2471,7 +2684,9 @@ export function ActivityTimeline({
         aria-expanded={expanded}
         onClick={() => setExpanded((current) => !current)}
       >
-        {running ? (
+        {running && liveness?.stale ? (
+          <WarningCircle size={15} weight="fill" aria-hidden="true" />
+        ) : running ? (
           <CircleNotch size={15} weight="bold" aria-hidden="true" />
         ) : terminalState.key === "stopped" ? (
           <StopCircle size={15} weight="fill" aria-hidden="true" />
@@ -2484,17 +2699,23 @@ export function ActivityTimeline({
           <strong>
             {transparentMode
               ? running
-                ? "Agent 透视 · 正在工作"
+                ? liveness?.stale
+                  ? "Agent 透视 · 运行中但暂无新进展"
+                  : "Agent 透视 · 正在工作"
                 : `Agent 透视 · ${terminalState.label}`
               : running
-                ? "Agent 正在工作"
+                ? liveness?.stale
+                  ? "Agent 仍在运行，暂时没有新进展"
+                  : "Agent 正在工作"
                 : terminalState.label}
           </strong>
           <small>
             {transparentMode
-              ? traceSummary || `${visibleEvents.length} 项过程`
+              ? running
+                ? [runningSummary, traceSummary].filter(Boolean).join(" · ")
+                : traceSummary || `${visibleEvents.length} 项过程`
               : running
-                ? latestProgressSummary || `${visibleEvents.length} 项实时进展`
+                ? runningSummary || `${visibleEvents.length} 项实时进展`
                 : `${visibleEvents.length} 项 · 查看过程`}
           </small>
         </span>
@@ -2733,6 +2954,8 @@ export function ProjectExecutionPolicyControl({
       ? "替我审批"
       : "需确认";
 
+  if (native) return null;
+
   return (
     <div className="provider-menu-wrap project-execution-policy-menu">
       {open && !disabled ? (
@@ -2883,6 +3106,7 @@ function capabilityAvailability(capabilityStatus, capabilityId) {
 export function ProjectCapabilityMenu({
   open,
   onOpenChange,
+  hideTrigger = false,
   capabilityStatus = {},
   selectedCapabilityIds = [],
   onToggleCapability,
@@ -2907,18 +3131,20 @@ export function ProjectCapabilityMenu({
 
   return (
     <div className="project-capability-menu">
-      <button
-        className={`header-meta-pill header-skill-pill${open ? " is-open" : ""}`}
-        type="button"
-        disabled={running}
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        onClick={() => onOpenChange(!open)}
-      >
-        <Package size={13} weight="regular" aria-hidden="true" />
-        <span>{selectedCount > 0 ? `能力 · ${selectedCount}` : "能力"}</span>
-        <CaretDown size={11} weight="bold" aria-hidden="true" />
-      </button>
+      {!hideTrigger ? (
+        <button
+          className={`header-meta-pill header-skill-pill${open ? " is-open" : ""}`}
+          type="button"
+          disabled={running}
+          aria-expanded={open}
+          aria-haspopup="dialog"
+          onClick={() => onOpenChange(!open)}
+        >
+          <Package size={13} weight="regular" aria-hidden="true" />
+          <span>{selectedCount > 0 ? `能力 · ${selectedCount}` : "能力"}</span>
+          <CaretDown size={11} weight="bold" aria-hidden="true" />
+        </button>
+      ) : null}
       {open ? (
         <>
           <button
@@ -3060,6 +3286,91 @@ export function ProjectCapabilityMenu({
             </footer>
           </section>
         </>
+      ) : null}
+    </div>
+  );
+}
+
+function ProjectHeaderMoreMenu({
+  open,
+  onOpenChange,
+  selectedCapabilityCount = 0,
+  onOpenCapabilities,
+  onOpenPath,
+  transparentMode = false,
+  onToggleTransparentMode,
+  notificationControl,
+}) {
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") onOpenChange(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onOpenChange, open]);
+
+  const runAction = (callback) => {
+    onOpenChange(false);
+    callback?.();
+  };
+
+  return (
+    <div className="project-header-more-menu">
+      {open ? (
+        <button
+          className="popover-scrim"
+          type="button"
+          aria-label="关闭更多选项"
+          onClick={() => onOpenChange(false)}
+        />
+      ) : null}
+      <button
+        className={`header-meta-pill project-header-more-trigger${open ? " is-open" : ""}`}
+        type="button"
+        aria-expanded={open}
+        aria-haspopup="menu"
+        onClick={() => onOpenChange(!open)}
+      >
+        <DotsThree size={15} weight="bold" aria-hidden="true" />
+        <span>更多</span>
+        <CaretDown size={11} weight="bold" aria-hidden="true" />
+      </button>
+      {open ? (
+        <section className="project-header-more-popover" role="menu" aria-label="更多会话选项">
+          <button type="button" role="menuitem" onClick={() => runAction(onOpenCapabilities)}>
+            <Package size={15} aria-hidden="true" />
+            <span>
+              <strong>本轮能力</strong>
+              <small>{selectedCapabilityCount > 0 ? `已选择 ${selectedCapabilityCount} 项` : "按需为下一条消息启用"}</small>
+            </span>
+            <CaretRight size={12} aria-hidden="true" />
+          </button>
+          <button type="button" role="menuitem" onClick={() => runAction(onOpenPath)}>
+            <GitBranch size={15} aria-hidden="true" />
+            <span>
+              <strong>会话路径</strong>
+              <small>查看检查点、分支与工作区</small>
+            </span>
+            <CaretRight size={12} aria-hidden="true" />
+          </button>
+          <button
+            className={transparentMode ? "is-active" : ""}
+            type="button"
+            role="menuitemcheckbox"
+            aria-checked={transparentMode}
+            onClick={() => onToggleTransparentMode?.()}
+          >
+            <Gauge size={15} weight={transparentMode ? "fill" : "regular"} aria-hidden="true" />
+            <span>
+              <strong>透明模式</strong>
+              <small>{transparentMode ? "正在显示过程细节" : "需要时查看 Harness 与用量"}</small>
+            </span>
+            <span className="project-header-more-state">{transparentMode ? "开" : "关"}</span>
+          </button>
+          {notificationControl}
+          <footer>飞书提醒等全局偏好可在左下角“设置”中管理。</footer>
+        </section>
       ) : null}
     </div>
   );
@@ -3439,6 +3750,7 @@ export function ProjectAgentPane({
   localFileInputRef,
   supportsImages,
   onSubmit,
+  onAbort,
   onLoadEarlier,
   loadingEarlier = false,
   canLoadEarlier = false,
@@ -3453,10 +3765,8 @@ export function ProjectAgentPane({
   generatedImageUrl,
   action,
   error,
-  modelLabel,
   modelSelectionDisabled = false,
   executionPolicyControl,
-  thinkingLevelControl,
   contextUsageControl,
   transparentMode = false,
   uploadingPdf,
@@ -3483,6 +3793,7 @@ export function ProjectAgentPane({
   const autoReview = conversation.executionPolicy?.mode === "auto_review";
   const nativeExecution = conversation.executionPolicy?.mode === "native";
   const streamRef = useRef(null);
+  const attachmentMenuRef = useRef(null);
   const dragDepthRef = useRef(0);
   const followLatestRef = useRef(true);
   const [dropActive, setDropActive] = useState(false);
@@ -4205,33 +4516,54 @@ export function ProjectAgentPane({
         <footer>
           <div className="project-composer-meta">
             <div className="project-composer-tools">
-              <button
-                className="project-composer-tool project-composer-attachment"
-                type="button"
-                onClick={() => onOpenArtifact("files")}
-              >
-                <Paperclip size={13} aria-hidden="true" />
-                添加项目文件
-              </button>
-              <button
-                className="project-composer-tool project-composer-attachment"
-                type="button"
-                disabled={
-                  running
-                  || turnPayloadLocked
-                  || Boolean(uploadingPdf)
-                  || uploadingAttachments.length > 0
-                }
-                onClick={() => localFileInputRef.current?.click()}
-                title="从电脑选择资料；未知后缀会按实际内容检查，也可用 ⌘⇧G 粘贴路径"
-              >
-                {uploadingPdf || uploadingAttachments.length > 0 ? (
-                  <CircleNotch className="spin" size={13} aria-hidden="true" />
-                ) : (
-                  <UploadSimple size={13} aria-hidden="true" />
-                )}
-                添加本地资料
-              </button>
+              <details className="project-composer-add-menu" ref={attachmentMenuRef}>
+                <summary className="project-composer-tool project-composer-attachment">
+                  {uploadingPdf || uploadingAttachments.length > 0 ? (
+                    <CircleNotch className="spin" size={13} aria-hidden="true" />
+                  ) : (
+                    <Paperclip size={13} aria-hidden="true" />
+                  )}
+                  添加
+                  <CaretUp size={11} weight="bold" aria-hidden="true" />
+                </summary>
+                <div className="project-composer-add-popover" role="menu" aria-label="添加内容">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      if (attachmentMenuRef.current) attachmentMenuRef.current.open = false;
+                      onOpenArtifact("files");
+                    }}
+                  >
+                    <Files size={15} aria-hidden="true" />
+                    <span>
+                      <strong>引用项目文件</strong>
+                      <small>从项目中选择上下文</small>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={
+                      running
+                      || turnPayloadLocked
+                      || Boolean(uploadingPdf)
+                      || uploadingAttachments.length > 0
+                    }
+                    onClick={() => {
+                      if (attachmentMenuRef.current) attachmentMenuRef.current.open = false;
+                      localFileInputRef.current?.click();
+                    }}
+                    title="从电脑选择资料；未知后缀会按实际内容检查，也可用 ⌘⇧G 粘贴路径"
+                  >
+                    <UploadSimple size={15} aria-hidden="true" />
+                    <span>
+                      <strong>添加本地资料</strong>
+                      <small>PDF、Word、Excel、图片或文本</small>
+                    </span>
+                  </button>
+                </div>
+              </details>
               <input
                 className="sr-only"
                 ref={localFileInputRef}
@@ -4246,10 +4578,6 @@ export function ProjectAgentPane({
                 }}
               />
               {executionPolicyControl}
-              <span className="project-composer-model">
-                {modelLabel || (standalone ? "跟随默认模型" : "跟随项目默认模型")}
-              </span>
-              {thinkingLevelControl}
               {contextUsageControl}
             </div>
             <small>
@@ -4264,20 +4592,18 @@ export function ProjectAgentPane({
             </small>
           </div>
           <button
-            type="submit"
-            disabled={!canSubmit}
-            aria-label={runningMessageMode === "follow_up" && running
-              ? "加入后续队列"
-              : running
-                ? "调整当前 Agent"
-                : "发送任务"}
-            title={runningMessageMode === "follow_up" && running
-              ? "加入后续队列"
-              : running
-                ? "调整当前 Agent"
-                : "发送任务"}
+            className={running ? "is-stop" : undefined}
+            type={running ? "button" : "submit"}
+            disabled={running ? Boolean(action) : !canSubmit}
+            aria-label={running ? "停止当前 Agent" : "发送任务"}
+            title={running ? "停止当前 Agent" : "发送任务"}
+            onClick={running ? onAbort : undefined}
           >
-            {action === "message" ? (
+            {running && action === "abort" ? (
+              <CircleNotch className="spin" size={16} weight="bold" aria-hidden="true" />
+            ) : running ? (
+              <Stop size={16} weight="fill" aria-hidden="true" />
+            ) : action === "message" ? (
               <CircleNotch size={16} weight="bold" aria-hidden="true" />
             ) : (
               <PaperPlaneTilt size={16} weight="fill" aria-hidden="true" />
@@ -6573,6 +6899,7 @@ export function LiveProjectWorkbench({
   const [executionPolicyOpen, setExecutionPolicyOpen] = useState(false);
   const [capabilityOpen, setCapabilityOpen] = useState(false);
   const [pathOpen, setPathOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
   const [selectedCheckpointId, setSelectedCheckpointId] = useState(null);
   const [branchTarget, setBranchTarget] = useState(null);
   const [transparentMode, setTransparentMode] = useState(readTransparentMode);
@@ -6719,6 +7046,7 @@ export function LiveProjectWorkbench({
     setExecutionPolicyOpen(false);
     setCapabilityOpen(false);
     setPathOpen(false);
+    setMoreOpen(false);
     setSelectedCheckpointId(null);
     setBranchTarget(null);
     setSelectedCapabilityIds([]);
@@ -7823,9 +8151,6 @@ export function LiveProjectWorkbench({
   const conversationRunning = snapshot ? isConversationRunning(snapshot) : false;
   const headerStatus = activeStatus(snapshot);
   const headerStatusLabel = STATUS_LABELS[headerStatus] ?? headerStatus;
-  const queuedHeaderFollowUps = (snapshot?.followUpQueue ?? []).filter(
-    (item) => item.status === "queued",
-  );
 
   useEffect(() => {
     if (!conversationRunning) setRunningMessageMode("steer");
@@ -8111,7 +8436,10 @@ export function LiveProjectWorkbench({
   }, [action, conversationRunning]);
 
   useEffect(() => {
-    if (providerOpen) setPathOpen(false);
+    if (providerOpen) {
+      setPathOpen(false);
+      setMoreOpen(false);
+    }
   }, [providerOpen]);
   const turnPayloadLocked = action === "message";
   const retryingDocumentId = action?.startsWith("document-retry:")
@@ -8249,6 +8577,7 @@ export function LiveProjectWorkbench({
               setExecutionPolicyOpen(false);
               setCapabilityOpen(false);
               setPathOpen(false);
+              setMoreOpen(false);
             }
             onProviderOpenChange?.(open);
           }}
@@ -8270,6 +8599,7 @@ export function LiveProjectWorkbench({
       ) : null}
       <ProjectCapabilityMenu
         open={capabilityOpen}
+        hideTrigger
         onOpenChange={(open) => {
           if (turnPayloadLocked && open) return;
           setCapabilityOpen(open);
@@ -8277,6 +8607,7 @@ export function LiveProjectWorkbench({
             setContextUsageOpen(false);
             setExecutionPolicyOpen(false);
             setPathOpen(false);
+            setMoreOpen(false);
             onProviderOpenChange?.(false);
           }
         }}
@@ -8303,12 +8634,14 @@ export function LiveProjectWorkbench({
         <>
           <ProjectSessionPathMenu
             open={pathOpen}
+            hideTrigger
             onOpenChange={(open) => {
               setPathOpen(open);
               if (open) {
                 setContextUsageOpen(false);
                 setExecutionPolicyOpen(false);
                 setCapabilityOpen(false);
+                setMoreOpen(false);
                 onProviderOpenChange?.(false);
               }
             }}
@@ -8330,36 +8663,25 @@ export function LiveProjectWorkbench({
             busy={conversationRunning || Boolean(action)}
             standalone={standalone}
           />
-          <ProjectLoopNotificationControl conversation={snapshot} />
-          <button
-            className={`header-meta-pill project-insight-toggle${transparentMode ? " is-active" : ""}`}
-            type="button"
-            aria-pressed={transparentMode}
-            title={transparentMode
-              ? "关闭后恢复精简的默认过程"
-              : "显示 Harness、模型轮次、工具与用量详情"}
-            onClick={() => setTransparentMode(!transparentMode)}
-          >
-            <Gauge size={13} weight={transparentMode ? "fill" : "regular"} aria-hidden="true" />
-            {transparentMode ? "透明模式 · 开" : "透明模式"}
-          </button>
-          {conversationRunning ? (
-            <button
-              className="header-meta-pill"
-              type="button"
-              onClick={abortConversation}
-              disabled={Boolean(action)}
-              aria-label={queuedHeaderFollowUps.length > 0
-                ? `停止 Agent 并取消 ${queuedHeaderFollowUps.length} 条后续消息`
-                : "停止 Agent"}
-              title={queuedHeaderFollowUps.length > 0
-                ? "停止会同时取消尚未处理的后续消息"
-                : "停止当前 Agent"}
-            >
-              <StopCircle size={13} aria-hidden="true" />
-              {queuedHeaderFollowUps.length > 0 ? "停止并清空队列" : "停止"}
-            </button>
-          ) : null}
+          <ProjectHeaderMoreMenu
+            open={moreOpen}
+            onOpenChange={(open) => {
+              setMoreOpen(open);
+              if (open) {
+                setContextUsageOpen(false);
+                setExecutionPolicyOpen(false);
+                setCapabilityOpen(false);
+                setPathOpen(false);
+                onProviderOpenChange?.(false);
+              }
+            }}
+            selectedCapabilityCount={selectedCapabilityIds.length + (selectedWorkflowId ? 1 : 0)}
+            onOpenCapabilities={() => setCapabilityOpen(true)}
+            onOpenPath={() => setPathOpen(true)}
+            transparentMode={transparentMode}
+            onToggleTransparentMode={() => setTransparentMode(!transparentMode)}
+            notificationControl={<ProjectLoopNotificationControl conversation={snapshot} menuItem />}
+          />
           {snapshot.unreadCount > 0 ? (
             <span className="project-agent-unread" role="status">
               {snapshot.unreadCount} 条未读
@@ -8460,6 +8782,7 @@ export function LiveProjectWorkbench({
           localFileInputRef={localFileInputRef}
           supportsImages={supportsImages}
           onSubmit={submitMessage}
+          onAbort={abortConversation}
           onLoadEarlier={loadEarlierTurns}
           loadingEarlier={loadingEarlier}
           canLoadEarlier={Boolean(historyCursor)}
@@ -8474,7 +8797,6 @@ export function LiveProjectWorkbench({
           generatedImageUrl={api.generatedImageUrl}
           action={action}
           error={actionError}
-          modelLabel={activeModelId}
           modelSelectionDisabled={modelSelectionDisabled}
           executionPolicyControl={(
             <ProjectExecutionPolicyControl
@@ -8493,16 +8815,6 @@ export function LiveProjectWorkbench({
               running={conversationRunning}
               saving={executionPolicySaving}
               onChange={changeExecutionPolicy}
-            />
-          )}
-          thinkingLevelControl={(
-            <ProjectThinkingLevelControl
-              thinkingLevels={availableThinkingLevels}
-              thinkingLevel={activeThinkingLevel}
-              supportsThinking={activeModelInfo?.supportsThinking === true}
-              running={thinkingBusy}
-              saving={thinkingSaving}
-              onChange={changeThinkingLevel}
             />
           )}
           contextUsageControl={(

@@ -412,6 +412,9 @@ function mapConversationOperation(raw) {
     clientRequestId: pick(raw, "client_request_id", "clientRequestId"),
     type: pick(raw, "type", "type", "settlement"),
     status: pick(raw, "status", "status", "failed"),
+    legacyStatus: pick(raw, "legacy_status", "legacyStatus"),
+    blockedReason: pick(raw, "blocked_reason", "blockedReason"),
+    supersededAt: pick(raw, "superseded_at", "supersededAt"),
     turnId: pick(raw, "turn_id", "turnId"),
     targetAssistantMessageId: pick(
       raw,

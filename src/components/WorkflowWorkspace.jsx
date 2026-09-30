@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
+  ArrowsClockwise,
   BookOpen,
   BookmarkSimple,
   Check,
@@ -693,9 +694,9 @@ function CandidateReview({
   journalRunState,
   onOpenPaper,
   onStartJournalRun,
-  onResumeJournalRun,
   onRetryPaperDocument,
   onRefreshCandidates,
+  onRotateRecommendations,
   readOnly = false,
   readOnlyQuiet = false,
 }) {
@@ -705,6 +706,8 @@ function CandidateReview({
   const [expandedEvidenceId, setExpandedEvidenceId] = useState(null);
   const [refreshBusy, setRefreshBusy] = useState(false);
   const [refreshError, setRefreshError] = useState(null);
+  const [rotationBusy, setRotationBusy] = useState(false);
+  const [rotationError, setRotationError] = useState(null);
   const [documentRetryState, setDocumentRetryState] = useState({
     paperId: null,
     errors: {},
@@ -740,12 +743,6 @@ function CandidateReview({
   const failedSourceStatuses = sourceStatuses.filter((source) => source.status === "failed");
   const completedSourceCount = scanSummary?.source_count
     ?? sourceProgress?.completed_source_ids?.length;
-  const canResumeMineru = hasLiveCandidates && [
-    "not_configured",
-    "quota_deferred",
-    "failed",
-    "unavailable",
-  ].includes(liveRun?.mineru?.status);
   const failedGuidePaperIds = new Set(
     (liveRun?.guides?.requestedPaperIds ?? []).filter(
       (paperId) => liveRun?.guides?.papers?.[paperId]?.status === "failed",
@@ -844,7 +841,7 @@ function CandidateReview({
                     }
                   }}
                 >
-                  {refreshBusy ? "正在刷新新论文…" : "刷新本月推荐"}
+                  {refreshBusy ? "正在检查新论文…" : "检查本月新发表"}
                 </button>
                 {liveRun?.candidateRefresh?.lastScanObservedAt
                   || liveRun?.candidateRefresh?.lastRefreshedAt ? (
@@ -855,9 +852,9 @@ function CandidateReview({
                     )}
                   </small>
                 ) : null}
-                {refreshError || durableRefreshError ? (
+                {refreshError || rotationError || durableRefreshError ? (
                   <small className="workflow-recent-classics-error" role="alert">
-                    {refreshError || durableRefreshError}
+                    {refreshError || rotationError || durableRefreshError}
                   </small>
                 ) : null}
               </div>
@@ -914,11 +911,30 @@ function CandidateReview({
             <button
               className="workflow-secondary-action workflow-scan-action"
               type="button"
-              disabled={scanInProgress}
-              onClick={canResumeMineru ? onResumeJournalRun : onStartJournalRun}
+              disabled={scanInProgress || rotationBusy}
+              title={hasLiveCandidates ? "保留当前记录，换一批尚未展示的优质论文" : undefined}
+              onClick={hasLiveCandidates && onRotateRecommendations
+                ? async () => {
+                    if (rotationBusy) return;
+                    setRotationBusy(true);
+                    setRotationError(null);
+                    try {
+                      await onRotateRecommendations();
+                      setExpandedEvidenceId(null);
+                    } catch (error) {
+                      setRotationError(error?.message ?? "更换推荐未完成，可稍后重试");
+                    } finally {
+                      setRotationBusy(false);
+                    }
+                  }
+                : onStartJournalRun}
             >
-              {scanInProgress ? <CircleNotch className="spin" size={15} weight="bold" aria-hidden="true" /> : null}
-              {scanInProgress ? "扫描中" : canResumeMineru ? "重新准备全文" : "扫描全部来源"}
+              {scanInProgress || rotationBusy
+                ? <CircleNotch className="spin" size={15} weight="bold" aria-hidden="true" />
+                : hasLiveCandidates
+                  ? <ArrowsClockwise size={15} weight="bold" aria-hidden="true" />
+                  : null}
+              {scanInProgress ? "扫描中" : rotationBusy ? "正在换一批…" : hasLiveCandidates ? "换一批推荐" : "扫描全部来源"}
             </button>
           ) : null}
         </header>
@@ -2125,6 +2141,7 @@ export function WorkflowWorkspace({
   onResumeJournalRun,
   onRetryPaperDocument,
   onRefreshCandidates,
+  onRotateRecommendations,
   onRestartFromGuide,
   onTogglePaper,
   onPrepareGuides,
@@ -2279,7 +2296,7 @@ export function WorkflowWorkspace({
         : JOURNAL_PHASE_LABELS[journalRunState?.run?.phase];
 
   let content = null;
-  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onResumeJournalRun={onResumeJournalRun} onRetryPaperDocument={onRetryPaperDocument} onRefreshCandidates={onRefreshCandidates} />;
+  if (status === "review_ready") content = <CandidateReview run={run} papers={reviewPapers} candidateSummaryState={candidateSummaryState} onGenerateCandidateSummaries={onGenerateCandidateSummaries} onTogglePaper={onTogglePaper} onPrepareGuides={onPrepareGuides} onSkipRun={onSkipRun} journalRunState={journalRunState} onOpenPaper={onOpenPaper} onStartJournalRun={onStartJournalRun} onRetryPaperDocument={onRetryPaperDocument} onRefreshCandidates={onRefreshCandidates} onRotateRecommendations={onRotateRecommendations} />;
   if (status === "preparing_guides") {
     content = <PreparingGuides run={run} selectedPapers={selectedPapers} journalRunState={journalRunState} />;
   }

@@ -519,6 +519,11 @@ button:disabled {
   border-color: var(--border);
 }
 
+.project-row.is-running {
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+}
+
 .project-row.is-selected::before {
   position: absolute;
   top: 8px;
@@ -574,6 +579,18 @@ button:disabled {
 .project-row time {
   flex: 0 0 auto;
   white-space: nowrap;
+}
+
+.project-row-running-indicator {
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--teal-accent);
+  background: var(--surface);
+  border: 1px solid var(--teal-border);
+  border-radius: 999px;
 }
 
 .project-row > .icon-button {
@@ -804,6 +821,18 @@ button:disabled {
   color: var(--text);
   background: var(--surface);
   border-color: var(--teal-border);
+}
+
+.project-conversation-row.is-running {
+  color: var(--text);
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+  box-shadow: inset 3px 0 0 var(--teal-accent);
+}
+
+.project-conversation-row.is-running small {
+  color: var(--teal-accent);
+  font-weight: 650;
 }
 
 .project-conversation-row:disabled {
@@ -1079,6 +1108,120 @@ button:disabled {
   z-index: 32;
 }
 
+.project-header-more-menu {
+  position: relative;
+  z-index: 32;
+}
+
+.project-header-more-trigger.is-open {
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+}
+
+.project-header-more-popover {
+  position: absolute;
+  z-index: 34;
+  top: 38px;
+  right: 0;
+  display: grid;
+  width: 278px;
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  box-shadow: var(--shadow);
+}
+
+.project-header-more-popover > button,
+.project-header-more-popover > .project-notification-control > button {
+  display: grid;
+  width: 100%;
+  min-height: 48px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px;
+  cursor: pointer;
+  color: var(--text);
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+}
+
+.project-header-more-popover > button:hover,
+.project-header-more-popover > .project-notification-control > button:hover {
+  background: var(--surface-soft);
+}
+
+.project-header-more-popover > button > svg,
+.project-header-more-popover > .project-notification-control > button > svg:first-child {
+  color: var(--teal-accent);
+}
+
+.project-header-more-popover > button > span:not(.project-header-more-state) {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.project-header-more-popover strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.project-header-more-popover small,
+.project-header-more-popover > footer {
+  color: var(--weak);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.project-header-more-popover > button.is-active,
+.project-header-more-popover > .project-notification-control > button.is-active {
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+}
+
+.project-header-more-state {
+  color: var(--weak);
+  font-size: 10.5px;
+}
+
+.project-header-more-popover > .project-notification-control {
+  display: block;
+}
+
+.project-header-more-popover > .project-notification-control > button {
+  height: auto;
+  font-size: 12px;
+}
+
+.project-header-more-popover > .project-notification-control > button > svg:last-child {
+  justify-self: end;
+  color: var(--weak);
+}
+
+.project-header-more-popover > .project-notification-control > button > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.project-header-more-popover > .project-notification-control .project-notification-popover {
+  top: 0;
+  right: calc(100% + 8px);
+}
+
+.project-header-more-popover > footer {
+  margin: 4px -6px -6px;
+  padding: 8px 12px;
+  background: var(--surface-soft);
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 8px 8px;
+}
+
 .project-session-path-trigger.is-open {
   color: var(--teal-accent);
   background: var(--teal-tint);
@@ -1100,6 +1243,7 @@ button:disabled {
   top: 41px;
   right: 0;
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   width: min(360px, calc(100vw - 24px));
   max-height: min(680px, calc(100vh - 92px));
   overflow: hidden;
@@ -1108,6 +1252,18 @@ button:disabled {
   border: 1px solid var(--border-strong);
   border-radius: 9px;
   box-shadow: var(--shadow);
+}
+
+.project-session-path-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.project-session-path-body:focus-visible {
+  outline: 2px solid var(--teal-border);
+  outline-offset: -2px;
 }
 
 .project-session-path-header {
@@ -1256,7 +1412,6 @@ button:disabled {
   min-height: 0;
   margin: 0;
   padding: 4px 0;
-  overflow-y: auto;
   list-style: none;
 }
 
@@ -9238,14 +9393,15 @@ h4.reader-rail-full-heading {
 }
 
 .project-plan-dock.is-running {
+  background: color-mix(in srgb, var(--surface) 80%, var(--teal-tint));
   border-color: var(--teal-border);
-  box-shadow: 0 7px 18px rgba(33, 93, 83, 0.08);
+  box-shadow: 0 7px 18px rgba(33, 93, 83, 0.12), inset 3px 0 0 var(--teal-accent);
 }
 
 .project-plan-dock > button {
   display: grid;
   width: 100%;
-  min-height: 38px;
+  min-height: 46px;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
@@ -9265,14 +9421,16 @@ h4.reader-rail-full-heading {
 }
 
 .project-plan-dock > button > span {
-  display: flex;
+  display: grid;
   min-width: 0;
-  align-items: baseline;
-  gap: 8px;
+  gap: 2px;
 }
 
 .project-plan-dock > button strong {
-  font-size: 12px;
+  overflow: hidden;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .project-plan-dock > button small {
@@ -9313,21 +9471,56 @@ h4.reader-rail-full-heading {
 
 .project-plan-dock li {
   display: flex;
-  min-height: 26px;
+  min-height: 32px;
   align-items: center;
   gap: 8px;
+  padding: 3px 7px;
   color: var(--muted);
+  border-radius: 7px;
   font-size: 12px;
 }
 
 .project-plan-dock li.is-in_progress,
 .project-plan-dock li.is-running {
-  color: var(--text);
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+  box-shadow: inset 2px 0 0 var(--teal-accent);
   font-weight: 600;
 }
 
 .project-plan-dock li.is-completed {
-  color: var(--teal-accent);
+  color: var(--weak);
+}
+
+.project-plan-dock li.is-completed .project-plan-status {
+  color: var(--muted);
+  border-color: var(--border);
+}
+
+.project-plan-status-label {
+  display: inline-flex;
+  min-width: 45px;
+  flex: 0 0 auto;
+  justify-content: center;
+  padding: 2px 6px;
+  color: var(--weak);
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.project-plan-dock li.is-in_progress .project-plan-status-label,
+.project-plan-dock li.is-running .project-plan-status-label {
+  color: #fff;
+  background: var(--teal-accent);
+  border-color: var(--teal-accent);
+}
+
+.project-plan-step-title {
+  min-width: 0;
 }
 
 .project-plan-dock li.is-in_progress svg,
@@ -9916,7 +10109,7 @@ h4.reader-rail-full-heading {
 }
 
 .project-plan-card li.is-completed {
-  color: var(--teal-accent);
+  color: var(--weak);
 }
 
 .project-plan-card li.is-in_progress .project-plan-status {
@@ -9997,8 +10190,12 @@ h4.reader-rail-full-heading {
   color: var(--teal-accent);
 }
 
-.project-activity.is-running .project-activity-toggle > svg:first-child {
+.project-activity.is-running:not(.is-stale) .project-activity-toggle > svg:first-child {
   animation: project-spin 0.9s linear infinite;
+}
+
+.project-activity.is-stale .project-activity-toggle > svg:first-child {
+  color: #a46d20;
 }
 
 .project-activity-toggle > span {
@@ -10768,6 +10965,82 @@ h4.reader-rail-full-heading {
   gap: 6px;
 }
 
+.project-composer-add-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.project-composer-add-menu > summary {
+  list-style: none;
+}
+
+.project-composer-add-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.project-composer-add-menu[open] > summary {
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+  border-color: var(--teal-border);
+}
+
+.project-composer-add-popover {
+  position: absolute;
+  z-index: 35;
+  bottom: 34px;
+  left: 0;
+  display: grid;
+  width: 244px;
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  box-shadow: var(--shadow);
+}
+
+.project-composer-add-popover > button {
+  display: grid;
+  min-height: 48px;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px;
+  cursor: pointer;
+  color: var(--text);
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+}
+
+.project-composer-add-popover > button:hover {
+  background: var(--surface-soft);
+}
+
+.project-composer-add-popover > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.project-composer-add-popover > button > svg {
+  color: var(--teal-accent);
+}
+
+.project-composer-add-popover > button > span {
+  display: grid;
+  gap: 2px;
+}
+
+.project-composer-add-popover strong {
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.project-composer-add-popover small {
+  color: var(--weak);
+  font-size: 10.5px;
+}
+
 .project-agent-composer > footer small {
   color: var(--weak);
   font-size: 10.5px;
@@ -11026,6 +11299,12 @@ h4.reader-rail-full-heading {
   color: #fff;
   background: var(--teal-accent);
   border-radius: 8px;
+}
+
+.project-agent-composer > footer > button.is-stop {
+  color: var(--teal-accent);
+  background: var(--teal-tint);
+  border: 1px solid var(--teal-border);
 }
 
 .project-context-chips {

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent 运行复盘"
+  short_description: "低频回顾历史运行证据，归纳改进，并用后续报告比较闭环变化"
+  default_prompt: "使用 $review-agent-runs 回顾最近一段 Agent 运行，生成只读改进报告。"

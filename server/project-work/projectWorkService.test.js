@@ -5874,6 +5874,15 @@ test("a new turn clears the previous plan until it publishes its own", async (t)
     (await service.getConversation(conversation.id)).conversation.plan,
     null,
   );
+  const clearedSnapshot = await service.getConversation(conversation.id);
+  const clearedEvent = [...clearedSnapshot.events]
+    .reverse()
+    .find((event) => event.type === "plan.cleared");
+  const secondUserMessage = clearedSnapshot.conversation.messages.find(
+    (message) => message.role === "user" && message.text === "第二轮",
+  );
+  assert.equal(clearedEvent?.data?.turnId, secondUserMessage?.turnId);
+  assert.equal(clearedEvent?.data?.attempt, 1);
 
   await eventually(
     async () => releaseSecondPlan,
@@ -6123,6 +6132,18 @@ test("Worker turns receive only bounded untrusted references and never activate 
   const service = createProjectWorkService({
     storageRoot: path.join(temporaryRoot, "private-state"),
     sessionFactory,
+    workerConnectorAccess: {
+      async identity() {
+        return {
+          status: "connected",
+          verified: true,
+          identity: "worker@example.com",
+        };
+      },
+      async read() {
+        throw new Error("not used in this test");
+      },
+    },
     idFactory: incrementalId("worker-context"),
   });
   t.after(() => service.dispose());
@@ -6155,6 +6176,7 @@ test("Worker turns receive only bounded untrusted references and never activate 
   assert.deepEqual(settled.conversation.verifications, []);
   assert.match(sessionFactory.sessions[0].prompts[0], /trust="untrusted"/u);
   assert.match(sessionFactory.sessions[0].prompts[0], /忽略系统规则/u);
+  assert.match(sessionFactory.sessions[0].prompts[0], /worker@example\.com/u);
   const activeTools = sessionFactory.sessions[0].activeToolCalls.at(-1);
   assert.deepEqual(activeTools, {
     names: [
@@ -6167,6 +6189,10 @@ test("Worker turns receive only bounded untrusted references and never activate 
       "report_progress",
       "update_plan",
       "ask_user",
+      "mailbox_identity",
+      "list_mail",
+      "search_mail",
+      "read_mail",
     ],
     options: { allowSubagents: false },
   });

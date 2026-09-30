@@ -130,6 +130,52 @@ async function createMailTask(service, content = "本周进展见正文。") {
   return { task, draft };
 }
 
+test("Worker task can be resolved from its bound Pi conversation", async (t) => {
+  const { service } = await setup(t);
+  const task = await service.createTask({
+    workerId: "agent_mail",
+    conversationId: "conversation-mail-1",
+    title: "查看邮箱",
+  });
+
+  assert.deepEqual(
+    await service.getTaskByConversation("conversation-mail-1"),
+    task,
+  );
+  await assert.rejects(
+    service.getTaskByConversation("conversation-missing"),
+    { code: "WORKER_TASK_NOT_FOUND" },
+  );
+});
+
+test("removing a Worker task clears its private task records and staged files", async (t) => {
+  const { service, storageRoot } = await setup(t);
+  const { task } = await createMailTask(service);
+  await service.readExternal(task.id, {
+    operation: "read",
+    parameters: { messageId: "mail-1" },
+  });
+  await stageAttachment(service, task, "notes.txt", "private notes");
+
+  assert.deepEqual(await service.removeTask(task.id), {
+    id: task.id,
+    conversationId: task.conversationId,
+    removed: true,
+  });
+  await assert.rejects(service.getTask(task.id), { code: "WORKER_TASK_NOT_FOUND" });
+  const state = JSON.parse(await readFile(
+    path.join(storageRoot, "worker", "state.json"),
+    "utf8",
+  ));
+  for (const collection of ["drafts", "sources", "files", "proposals", "receipts"]) {
+    assert.equal(
+      Object.values(state[collection]).some((item) => item.taskId === task.id),
+      false,
+      `${collection} should not retain deleted task records`,
+    );
+  }
+});
+
 test("built-in definitions, tasks, and drafts persist across service instances", async (t) => {
   const context = await setup(t);
   const definitions = await context.service.listDefinitions();

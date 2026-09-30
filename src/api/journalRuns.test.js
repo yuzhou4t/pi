@@ -134,6 +134,18 @@ const runBody = {
       error_code: "SOURCE_ROUTES_EXHAUSTED",
     }],
   },
+  recommendation_rotation: {
+    schema_version: 1,
+    cycle: 2,
+    retired_paper_ids: ["paper-old"],
+    last_batch_paper_ids: ["paper-1"],
+    last_batch_count: 1,
+    last_added_classic_count: 1,
+    last_rotated_at: "2026-07-23T07:28:00.000Z",
+    recent_classics_exhausted: false,
+    last_refill_pages_fetched: 2,
+    last_error: null,
+  },
   weekly_recommendation: {
     week_key: "2026-07-20",
     observed_at: "2026-07-23T07:25:00.000Z",
@@ -167,6 +179,12 @@ test("journal runs keep classic origin and MinerU state visible", () => {
   assert.equal(run.candidateRefresh.lastScanSummary.successful_source_count, 10);
   assert.equal(run.candidateRefresh.sourceStatuses[0].shortName, "ICCV");
   assert.equal(run.candidateRefresh.sourceStatuses[0].attempts[0].errorCode, "OFFICIAL_HTTP_406");
+  assert.equal(run.recommendationRotation.cycle, 2);
+  assert.deepEqual(run.recommendationRotation.retiredPaperIds, ["paper-old"]);
+  assert.deepEqual(run.recommendationRotation.lastBatchPaperIds, ["paper-1"]);
+  assert.equal(run.recommendationRotation.lastAddedClassicCount, 1);
+  assert.equal(run.recommendationRotation.hasMore, true);
+  assert.equal(run.recommendationRotation.lastRefillPagesFetched, 2);
   assert.equal(run.sourceStatuses[0].shortName, "JMLR");
   assert.deepEqual(run.weeklyRecommendation.paperIds, ["paper-1"]);
 });

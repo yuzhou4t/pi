@@ -295,6 +295,7 @@ function ProjectSessionPathAction({
 export function ProjectSessionPathMenu({
   open,
   onOpenChange,
+  hideTrigger = false,
   sessionPath,
   messages,
   selectedCheckpointId,
@@ -360,28 +361,30 @@ export function ProjectSessionPathMenu({
         />
       ) : null}
 
-      <button
-        ref={triggerRef}
-        className={`header-meta-pill project-session-path-trigger${open ? " is-open" : ""}`}
-        type="button"
-        aria-expanded={Boolean(open)}
-        aria-haspopup="dialog"
-        aria-controls={open ? dialogId : undefined}
-        onClick={() => {
-          if (open) {
-            closeProjectSessionPathMenu({
-              onOpenChange,
-              trigger: triggerRef.current,
-            });
-          } else {
-            onOpenChange?.(true);
-          }
-        }}
-      >
-        <TreeStructure size={13} weight="regular" aria-hidden="true" />
-        <span>路径</span>
-        <CaretDown size={11} weight="bold" aria-hidden="true" />
-      </button>
+      {!hideTrigger ? (
+        <button
+          ref={triggerRef}
+          className={`header-meta-pill project-session-path-trigger${open ? " is-open" : ""}`}
+          type="button"
+          aria-expanded={Boolean(open)}
+          aria-haspopup="dialog"
+          aria-controls={open ? dialogId : undefined}
+          onClick={() => {
+            if (open) {
+              closeProjectSessionPathMenu({
+                onOpenChange,
+                trigger: triggerRef.current,
+              });
+            } else {
+              onOpenChange?.(true);
+            }
+          }}
+        >
+          <TreeStructure size={13} weight="regular" aria-hidden="true" />
+          <span>路径</span>
+          <CaretDown size={11} weight="bold" aria-hidden="true" />
+        </button>
+      ) : null}
 
       {open ? (
         <section
@@ -397,139 +400,146 @@ export function ProjectSessionPathMenu({
             </div>
           </header>
 
-          {!standalone ? (
-            <section className="project-session-workspaces" aria-label="项目 Workspace">
-              <header>
-                <strong>Workspace</strong>
-                <small>{workspacesLoading ? "正在刷新…" : `${workspaces.length} 个可用位置`}</small>
-              </header>
-              {workspaces.length > 0 ? (
-                <ul>
-                  {workspaces.map((workspace) => {
-                    const state = projectWorkspaceActionState(workspace, {
-                      currentWorkspaceId,
-                      busy: busy || Boolean(workspaceAction),
-                      loading: workspacesLoading,
-                    });
-                    return (
-                      <li key={workspace.id}>
-                        <div>
-                          <strong>{workspace.label || "Workspace"}</strong>
-                          <small>
-                            {workspace.branch || (workspace.isGit ? "分离 HEAD" : "本地文件夹")}
-                            {workspace.head ? ` · ${workspace.head.slice(0, 8)}` : ""}
-                          </small>
-                          <span>
-                            {state.current ? "当前会话" : `${workspace.conversationCount ?? 0} 个会话`}
-                            {workspace.dirty ? " · 有未提交修改" : ""}
-                          </span>
-                        </div>
-                        {!state.current ? (
-                          <button
-                            type="button"
-                            disabled={state.open.disabled}
-                            title={state.open.reason ?? undefined}
-                            onClick={() => onCreateConversationInWorkspace?.(workspace)}
-                          >
-                            {workspaceAction === `conversation:${workspace.id}` ? "正在创建" : "在此新建会话"}
-                          </button>
-                        ) : null}
-                        {!workspace.isMain && workspace.kind === "git_worktree" ? (
-                          <button
-                            className="is-danger"
-                            type="button"
-                            disabled={state.remove.disabled}
-                            title={state.remove.reason ?? undefined}
-                            aria-label={`删除 Workspace ${workspace.label || workspace.branch || ""}`}
-                            onClick={() => onRemoveWorkspace?.(workspace)}
-                          >
-                            <Trash size={13} aria-hidden="true" />
-                          </button>
-                        ) : null}
-                      </li>
-                    );
-                  })}
-                </ul>
-              ) : (
-                <p>{workspacesLoading ? "正在读取 Workspace…" : "当前没有可显示的 Workspace。"}</p>
-              )}
-              {workspaceError ? <p className="is-error">{workspaceError}</p> : null}
-              {workspaces.find((workspace) => workspace.id === currentWorkspaceId)?.isGit ? (
-                <button
-                  className="project-session-workspace-create"
-                  type="button"
-                  disabled={busy || workspacesLoading || Boolean(workspaceAction)}
-                  onClick={() => onCreateWorktreeConversation?.(
-                    workspaces.find((workspace) => workspace.id === currentWorkspaceId),
-                  )}
-                >
-                  <Plus size={14} aria-hidden="true" />
-                  {workspaceAction === "create" ? "正在创建" : "从当前 HEAD 新建 Workspace 会话"}
-                </button>
-              ) : null}
-            </section>
-          ) : null}
-
-          {groups.length > 0 ? (
-            <ol className="project-session-path-turns">
-              {groups.map((group, groupIndex) => (
-                <li className="project-session-path-turn" key={group.id}>
-                  <header>
-                    <span>
-                      {Number.isSafeInteger(group.turnSeq)
-                        ? `第 ${group.turnSeq} 轮`
-                        : `检查点 ${groupIndex + 1}`}
-                    </span>
-                    <p>{group.prompt}</p>
-                  </header>
-                  <div
-                    className="project-session-path-attempts"
-                    role="radiogroup"
-                    aria-label={`${Number.isSafeInteger(group.turnSeq)
-                      ? `第 ${group.turnSeq} 轮`
-                      : `检查点 ${groupIndex + 1}`}的回答方案`}
-                  >
-                    {group.checkpoints.map((checkpoint, attemptIndex) => {
-                      const selected = checkpoint.id === selectedCheckpoint?.id;
-                      const active = checkpoint.id
-                        === sessionPath?.activeLeafCheckpointId;
+          <div
+            className="project-session-path-body"
+            role="region"
+            aria-label="会话路径内容"
+            tabIndex={0}
+          >
+            {!standalone ? (
+              <section className="project-session-workspaces" aria-label="项目 Workspace">
+                <header>
+                  <strong>Workspace</strong>
+                  <small>{workspacesLoading ? "正在刷新…" : `${workspaces.length} 个可用位置`}</small>
+                </header>
+                {workspaces.length > 0 ? (
+                  <ul>
+                    {workspaces.map((workspace) => {
+                      const state = projectWorkspaceActionState(workspace, {
+                        currentWorkspaceId,
+                        busy: busy || Boolean(workspaceAction),
+                        loading: workspacesLoading,
+                      });
                       return (
-                        <button
-                          className={[
-                            "project-session-path-attempt",
-                            selected ? "is-selected" : "",
-                            active ? "is-active-path" : "",
-                          ].filter(Boolean).join(" ")}
-                          type="button"
-                          role="radio"
-                          aria-checked={selected}
-                          key={checkpoint.id}
-                          onClick={() => selectProjectSessionCheckpoint(
-                            checkpoint.id,
-                            { onSelectCheckpoint },
-                          )}
-                        >
-                          <GitBranch size={14} weight="regular" aria-hidden="true" />
-                          <span>
-                            <strong>
-                              方案 {checkpoint.attempt ?? attemptIndex + 1}
-                            </strong>
-                            <small>{checkpoint.modelLabel}</small>
-                          </span>
-                          {active ? <em>当前路径</em> : null}
-                          {checkpoint.status === "failed" ? <em>未完成</em> : null}
-                        </button>
+                        <li key={workspace.id}>
+                          <div>
+                            <strong>{workspace.label || "Workspace"}</strong>
+                            <small>
+                              {workspace.branch || (workspace.isGit ? "分离 HEAD" : "本地文件夹")}
+                              {workspace.head ? ` · ${workspace.head.slice(0, 8)}` : ""}
+                            </small>
+                            <span>
+                              {state.current ? "当前会话" : `${workspace.conversationCount ?? 0} 个会话`}
+                              {workspace.dirty ? " · 有未提交修改" : ""}
+                            </span>
+                          </div>
+                          {!state.current ? (
+                            <button
+                              type="button"
+                              disabled={state.open.disabled}
+                              title={state.open.reason ?? undefined}
+                              onClick={() => onCreateConversationInWorkspace?.(workspace)}
+                            >
+                              {workspaceAction === `conversation:${workspace.id}` ? "正在创建" : "在此新建会话"}
+                            </button>
+                          ) : null}
+                          {!workspace.isMain && workspace.kind === "git_worktree" ? (
+                            <button
+                              className="is-danger"
+                              type="button"
+                              disabled={state.remove.disabled}
+                              title={state.remove.reason ?? undefined}
+                              aria-label={`删除 Workspace ${workspace.label || workspace.branch || ""}`}
+                              onClick={() => onRemoveWorkspace?.(workspace)}
+                            >
+                              <Trash size={13} aria-hidden="true" />
+                            </button>
+                          ) : null}
+                        </li>
                       );
                     })}
-                  </div>
-                </li>
-              ))}
-            </ol>
-          ) : (
-            <p className="project-session-path-empty">
-              完成一次回答后，这里会出现可继续的检查点。
-            </p>
-          )}
+                  </ul>
+                ) : (
+                  <p>{workspacesLoading ? "正在读取 Workspace…" : "当前没有可显示的 Workspace。"}</p>
+                )}
+                {workspaceError ? <p className="is-error">{workspaceError}</p> : null}
+                {workspaces.find((workspace) => workspace.id === currentWorkspaceId)?.isGit ? (
+                  <button
+                    className="project-session-workspace-create"
+                    type="button"
+                    disabled={busy || workspacesLoading || Boolean(workspaceAction)}
+                    onClick={() => onCreateWorktreeConversation?.(
+                      workspaces.find((workspace) => workspace.id === currentWorkspaceId),
+                    )}
+                  >
+                    <Plus size={14} aria-hidden="true" />
+                    {workspaceAction === "create" ? "正在创建" : "从当前 HEAD 新建 Workspace 会话"}
+                  </button>
+                ) : null}
+              </section>
+            ) : null}
+
+            {groups.length > 0 ? (
+              <ol className="project-session-path-turns">
+                {groups.map((group, groupIndex) => (
+                  <li className="project-session-path-turn" key={group.id}>
+                    <header>
+                      <span>
+                        {Number.isSafeInteger(group.turnSeq)
+                          ? `第 ${group.turnSeq} 轮`
+                          : `检查点 ${groupIndex + 1}`}
+                      </span>
+                      <p>{group.prompt}</p>
+                    </header>
+                    <div
+                      className="project-session-path-attempts"
+                      role="radiogroup"
+                      aria-label={`${Number.isSafeInteger(group.turnSeq)
+                        ? `第 ${group.turnSeq} 轮`
+                        : `检查点 ${groupIndex + 1}`}的回答方案`}
+                    >
+                      {group.checkpoints.map((checkpoint, attemptIndex) => {
+                        const selected = checkpoint.id === selectedCheckpoint?.id;
+                        const active = checkpoint.id
+                          === sessionPath?.activeLeafCheckpointId;
+                        return (
+                          <button
+                            className={[
+                              "project-session-path-attempt",
+                              selected ? "is-selected" : "",
+                              active ? "is-active-path" : "",
+                            ].filter(Boolean).join(" ")}
+                            type="button"
+                            role="radio"
+                            aria-checked={selected}
+                            key={checkpoint.id}
+                            onClick={() => selectProjectSessionCheckpoint(
+                              checkpoint.id,
+                              { onSelectCheckpoint },
+                            )}
+                          >
+                            <GitBranch size={14} weight="regular" aria-hidden="true" />
+                            <span>
+                              <strong>
+                                方案 {checkpoint.attempt ?? attemptIndex + 1}
+                              </strong>
+                              <small>{checkpoint.modelLabel}</small>
+                            </span>
+                            {active ? <em>当前路径</em> : null}
+                            {checkpoint.status === "failed" ? <em>未完成</em> : null}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <p className="project-session-path-empty">
+                完成一次回答后，这里会出现可继续的检查点。
+              </p>
+            )}
+          </div>
 
           <footer className="project-session-path-actions">
             <ProjectSessionPathAction

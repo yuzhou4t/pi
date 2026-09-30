@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   applyProjectWorkEventDelta,
   adjacentConversationAfterRemoval,
+  beginProjectConversationSelection,
   createProjectConversationLock,
   hydrateCreatedConversation,
   insertCreatedConversation,
@@ -70,6 +71,34 @@ test("incremental project events update visible state without a full snapshot", 
   assert.equal(completed.lastEventSeq, 3);
   assert.equal(completed.deliveredEventSeq, 3);
   assert.equal(applyProjectWorkEventDelta(completed, completed.events[2]), completed);
+});
+
+test("a new turn clears the previous live plan before its replacement arrives", () => {
+  const initial = {
+    id: "conversation-next-turn",
+    status: "running",
+    turnStatus: "running",
+    plan: [{ id: "old", title: "上一轮任务", status: "completed" }],
+    messages: [],
+    events: [],
+    lastEventSeq: 0,
+  };
+  const cleared = applyProjectWorkEventDelta(initial, {
+    seq: 1,
+    type: "plan.cleared",
+    data: { turnId: "turn-2", attempt: 1 },
+  });
+  assert.equal(cleared.plan, null);
+
+  const replaced = applyProjectWorkEventDelta(cleared, {
+    seq: 2,
+    type: "plan.updated",
+    data: {
+      steps: [{ id: "current", text: "排查第二轮问题", status: "in_progress" }],
+    },
+  });
+  assert.equal(replaced.plan[0].title, "排查第二轮问题");
+  assert.equal(replaced.plan[0].status, "in_progress");
 });
 
 test("incremental user and final message events use the renderer's canonical content field", () => {
@@ -417,6 +446,28 @@ test("reloading one project keeps standalone conversations and replaces only tha
     "other-project",
     "project-new",
   ]);
+});
+
+test("selecting another project keeps every already loaded folder conversation visible", () => {
+  const current = state({
+    status: "ready",
+    conversation: { id: "project-1-conversation", projectId: "project-1" },
+    conversations: [{
+      id: "project-1-conversation",
+      projectId: "project-1",
+    }, {
+      id: "project-2-conversation",
+      projectId: "project-2",
+    }],
+  });
+
+  const loading = beginProjectConversationSelection(current);
+  assert.equal(loading.status, "loading");
+  assert.equal(loading.conversation, null);
+  assert.deepEqual(
+    loading.conversations.map((conversation) => conversation.id),
+    ["project-1-conversation", "project-2-conversation"],
+  );
 });
 
 test("standalone creation and removal do not change any project conversation count", () => {

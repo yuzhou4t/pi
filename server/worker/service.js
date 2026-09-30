@@ -943,6 +943,23 @@ export function createWorkerService({
     ));
   }
 
+  async function getTaskByConversation(conversationId) {
+    await readyPromise;
+    const id = assertId(conversationId, "Pi 会话标识");
+    const state = await workerStore.read();
+    const task = Object.values(state.tasks).find(
+      (candidate) => candidate.conversationId === id,
+    );
+    if (!task) {
+      throw workerError(
+        "WORKER_TASK_NOT_FOUND",
+        "Worker 任务不存在",
+        404,
+      );
+    }
+    return structuredClone(task);
+  }
+
   async function listTasks({ workerId = null } = {}) {
     await readyPromise;
     const normalizedWorkerId = workerId ? assertId(workerId, "Worker 标识") : null;
@@ -951,6 +968,56 @@ export function createWorkerService({
       .filter((task) => !normalizedWorkerId || task.workerId === normalizedWorkerId)
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
       .map((value) => structuredClone(value));
+  }
+
+  async function removeTask(taskId) {
+    await readyPromise;
+    const id = assertId(taskId, "Worker 任务标识");
+    const cleanupTargets = [];
+    const proposalIds = [];
+    const removed = await workerStore.transaction((state) => {
+      const task = requireRecord(
+        state.tasks,
+        id,
+        "WORKER_TASK_NOT_FOUND",
+        "Worker 任务不存在",
+      );
+      for (const file of Object.values(state.files)) {
+        if (file.taskId !== id) continue;
+        const resolved = controlledWorkerPath(filesRoot, file.relativePath);
+        if (resolved) {
+          cleanupTargets.push(
+            file.status === "downloading" ? resolved : path.dirname(resolved),
+          );
+        }
+        delete state.files[file.id];
+      }
+      for (const [draftId, draft] of Object.entries(state.drafts)) {
+        if (draft.taskId === id) delete state.drafts[draftId];
+      }
+      for (const [sourceId, source] of Object.entries(state.sources)) {
+        if (source.taskId === id) delete state.sources[sourceId];
+      }
+      for (const [proposalId, proposal] of Object.entries(state.proposals)) {
+        if (proposal.taskId !== id) continue;
+        proposalIds.push(proposalId);
+        delete state.proposals[proposalId];
+      }
+      for (const [receiptId, receipt] of Object.entries(state.receipts)) {
+        if (receipt.taskId === id) delete state.receipts[receiptId];
+      }
+      delete state.tasks[id];
+      return { id, conversationId: task.conversationId, removed: true };
+    });
+    for (const proposalId of proposalIds) {
+      executionSecrets.delete(proposalId);
+      queuedResumeClaims.delete(proposalId);
+    }
+    await Promise.all([...new Set(cleanupTargets)].map((target) => rm(target, {
+      recursive: true,
+      force: true,
+    })));
+    return removed;
   }
 
   async function updateTaskContext(taskId, { sourceProjectId = null } = {}) {
@@ -2306,7 +2373,9 @@ export function createWorkerService({
     getDefinition,
     createTask,
     getTask,
+    getTaskByConversation,
     listTasks,
+    removeTask,
     updateTaskContext,
     createTaskFile,
     stageTaskFile,

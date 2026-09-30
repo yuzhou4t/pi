@@ -291,6 +291,8 @@ export function createJournalWorkflowService({
   const inFlight = new Map();
   // 候选刷新的并发护栏：同一个 Run 同时只跑一次刷新扫描。
   const refreshInFlight = new Map();
+  // 推荐轮换会读取并补充同一批候选，按 Run 串行，避免连续点击重复推荐。
+  const recommendationRotationInFlight = new Map();
   // 只有候选审阅阶段仍能安全追加论文；进入导读后候选视图只读。
   const CANDIDATE_MUTABLE_RUN_STATUSES = ["review_ready"];
   const guideInFlight = new Map();
@@ -1363,6 +1365,231 @@ export function createJournalWorkflowService({
         }
       });
     libraryTranslationInFlight.set(runId, task);
+    return task;
+  }
+
+  // 换一批推荐：先使用当期尚未展示的候选，不足时从注册刊物的
+  // 近年高引池补齐。这里只补充题录与中文展示，不自动准备全文。
+  async function rotateRunRecommendations(runId) {
+    const existing = recommendationRotationInFlight.get(runId);
+    if (existing) return existing;
+    const task = (async () => {
+      const run = await runStore.getRun(runId);
+      if (!run) throw artifactError("RUN_NOT_FOUND", "运行不存在", 404);
+      if (!CANDIDATE_MUTABLE_RUN_STATUSES.includes(run.status)) {
+        throw artifactError(
+          "WEEKLY_RUN_NOT_READY",
+          "本月候选已进入下一阶段，不能再更换推荐",
+          409,
+        );
+      }
+
+      const currentBatchIds = run.weekly_recommendation?.paper_ids?.length
+        ? run.weekly_recommendation.paper_ids
+        : (run.candidates ?? []).slice(0, 5).map((paper) => paper.paper_id);
+      const retiredIds = new Set([
+        ...(run.recommendation_rotation?.retired_paper_ids ?? []),
+        ...currentBatchIds,
+      ]);
+      const handled = new Set(
+        Object.entries(run.paper_decisions ?? {})
+          .filter(([, decision]) => ["read", "collect"].includes(decision))
+          .map(([paperId]) => paperId),
+      );
+      const candidateIds = new Set((run.candidates ?? []).map((paper) => paper.paper_id));
+      const eligibleCandidatePapers = (run.candidates ?? [])
+        .filter((paper) => !retiredIds.has(paper.paper_id) && !handled.has(paper.paper_id))
+        .sort((left, right) => (Number(left.rank) || 9999) - (Number(right.rank) || 9999));
+
+      let classicPool = [...(run.recent_classics?.papers ?? [])];
+      const eligibleClassics = () => classicPool.filter((paper) => (
+        !candidateIds.has(paper.paper_id)
+        && !retiredIds.has(paper.paper_id)
+        && !handled.has(paper.paper_id)
+      ));
+      const classicsNeeded = Math.max(0, 5 - eligibleCandidatePapers.length);
+      let refillError = null;
+      let refillLanguageArtifact = null;
+      const existingRotation = run.recommendation_rotation ?? {};
+      let refillCursor = Object.prototype.hasOwnProperty.call(
+        existingRotation,
+        "recent_classics_cursor",
+      )
+        ? existingRotation.recent_classics_cursor
+        : Object.prototype.hasOwnProperty.call(run.recent_classics ?? {}, "next_cursor")
+          ? run.recent_classics.next_cursor
+          : "*";
+      let refillPagesFetched = 0;
+      let refillExhausted = refillCursor === null;
+      if (eligibleClassics().length < classicsNeeded && !refillExhausted) {
+        try {
+          const [previousRuns, dismissedKeys] = await Promise.all([
+            runStore.listRuns(),
+            dismissedPapersStore.listKeys(),
+          ]);
+          const fetched = await recentClassicsFetcher({
+            fetchImpl,
+            mailto: env.PI_OPENALEX_MAILTO || "",
+            excludeKeys: collectExclusionKeys({
+              previousRuns,
+              currentCandidates: [...(run.candidates ?? []), ...classicPool],
+              dismissedKeys,
+            }),
+            cursor: refillCursor,
+          });
+          if (fetched?.status === "success") {
+            refillCursor = fetched.next_cursor ?? null;
+            refillPagesFetched = fetched.pages_fetched ?? 0;
+            refillExhausted = refillCursor === null;
+            let currentProjectContext = null;
+            try {
+              currentProjectContext = await projectContext.read();
+            } catch {
+              // 题录轮换仍可继续；项目作用保留为待核验。
+            }
+            const enriched = await enrichRecentClassics(
+              fetched,
+              currentProjectContext?.state ?? null,
+            );
+            refillLanguageArtifact = enriched.language_artifact ?? null;
+            const poolIds = new Set(classicPool.map((paper) => paper.paper_id));
+            const poolKeys = new Set(classicPool.map((paper) => paper.dedupe_key).filter(Boolean));
+            classicPool = [
+              ...classicPool,
+              ...(enriched.papers ?? []).filter((paper) => (
+                !poolIds.has(paper.paper_id)
+                && (!paper.dedupe_key || !poolKeys.has(paper.dedupe_key))
+              )),
+            ];
+          } else {
+            refillError = fetched?.error ?? null;
+          }
+        } catch (error) {
+          refillError = publicError(error);
+        }
+      }
+
+      const promotedClassics = eligibleClassics().slice(0, classicsNeeded);
+      const selectedExisting = eligibleCandidatePapers.slice(0, 5);
+      const selectedPapers = [
+        ...selectedExisting,
+        ...promotedClassics.slice(0, Math.max(0, 5 - selectedExisting.length)),
+      ];
+      const rotatedAt = new Date().toISOString();
+      if (selectedPapers.length === 0) {
+        return update(runId, (current) => ({
+          recommendation_rotation: {
+            schema_version: 1,
+            cycle: current.recommendation_rotation?.cycle ?? 0,
+            retired_paper_ids: current.recommendation_rotation?.retired_paper_ids ?? [],
+            last_batch_paper_ids: current.weekly_recommendation?.paper_ids ?? [],
+            last_batch_count: 0,
+            last_added_classic_count: 0,
+            last_rotated_at: rotatedAt,
+            recent_classics_cursor: refillCursor,
+            recent_classics_exhausted: refillExhausted,
+            last_refill_pages_fetched: refillPagesFetched,
+            language_artifact: current.recommendation_rotation?.language_artifact ?? null,
+            last_error: refillError,
+          },
+        }), { type: "recommendation_rotation_exhausted" });
+      }
+
+      return update(runId, (current) => {
+        if (!CANDIDATE_MUTABLE_RUN_STATUSES.includes(current.status)) {
+          throw artifactError(
+            "WEEKLY_RUN_NOT_READY",
+            "本月候选已进入下一阶段，不能再更换推荐",
+            409,
+          );
+        }
+        const currentIds = new Set((current.candidates ?? []).map((paper) => paper.paper_id));
+        const currentKeys = new Set(
+          (current.candidates ?? []).map((paper) => paper.dedupe_key).filter(Boolean),
+        );
+        let nextRank = (current.candidates ?? []).reduce(
+          (max, paper) => Math.max(max, Number(paper.rank) || 0),
+          0,
+        );
+        const added = [];
+        for (const paper of promotedClassics) {
+          if (currentIds.has(paper.paper_id) || (paper.dedupe_key && currentKeys.has(paper.dedupe_key))) {
+            continue;
+          }
+          nextRank += 1;
+          added.push({
+            ...paper,
+            rank: nextRank,
+            candidate_origin: "recent_classic",
+            display_label: paper.display_label ?? "近年高引 · 未读经典",
+            selection_summary: paper.selection_summary
+              ?? (paper.abstract_zh || paper.abstract
+                ? (paper.abstract_zh || paper.abstract).slice(0, 220)
+                : `${paper.title}：近年高引经典，价值待全文核验。`),
+            project_impact: paper.project_impact ?? PROJECT_IMPACT_FALLBACK,
+          });
+          currentIds.add(paper.paper_id);
+          if (paper.dedupe_key) currentKeys.add(paper.dedupe_key);
+        }
+        const selectedIds = selectedPapers
+          .map((paper) => paper.paper_id)
+          .filter((paperId) => currentIds.has(paperId));
+        const priorRecommendation = current.weekly_recommendation ?? {};
+        const weekKey = priorRecommendation.week_key
+          ?? shanghaiNaturalWeekWindow(rotatedAt).weekKey;
+        const selection = {
+          week_key: weekKey,
+          observed_at: rotatedAt,
+          paper_ids: selectedIds,
+        };
+        const promotedIds = new Set(added.map((paper) => paper.paper_id));
+        return {
+          candidates: [...(current.candidates ?? []), ...added],
+          recent_classics: {
+            ...(current.recent_classics ?? { schema_version: 1, status: "success" }),
+            status: "success",
+            papers: classicPool.filter((paper) => !promotedIds.has(paper.paper_id)),
+          },
+          weekly_recommendation: {
+            schema_version: 1,
+            week_key: weekKey,
+            observed_at: rotatedAt,
+            paper_ids: selectedIds,
+            selections: [...(priorRecommendation.selections ?? []), selection].slice(-26),
+          },
+          recommendation_rotation: {
+            schema_version: 1,
+            cycle: (current.recommendation_rotation?.cycle ?? 0) + 1,
+            retired_paper_ids: [...retiredIds],
+            last_batch_paper_ids: selectedIds,
+            last_batch_count: selectedIds.length,
+            last_added_classic_count: added.length,
+            last_rotated_at: rotatedAt,
+            recent_classics_cursor: refillCursor,
+            recent_classics_exhausted: refillExhausted,
+            last_refill_pages_fetched: refillPagesFetched,
+            language_artifact: refillLanguageArtifact
+              ?? current.recommendation_rotation?.language_artifact
+              ?? null,
+            last_error: refillError,
+          },
+          mineru: {
+            ...current.mineru,
+            papers: {
+              ...(current.mineru?.papers ?? {}),
+              ...Object.fromEntries(added.map((paper) => [
+                paper.paper_id,
+                { status: "pdf_not_prepared", error: null },
+              ])),
+            },
+          },
+        };
+      }, {
+        type: "recommendations_rotated",
+        paper_ids: selectedPapers.map((paper) => paper.paper_id),
+      });
+    })().finally(() => recommendationRotationInFlight.delete(runId));
+    recommendationRotationInFlight.set(runId, task);
     return task;
   }
 
@@ -3717,6 +3944,7 @@ export function createJournalWorkflowService({
     addRecentClassicsToWeekly,
     addPastRunPapersToWeekly,
     translateJournalRunLibrary,
+    rotateRunRecommendations,
     refreshRunCandidates,
     refreshCurrentMonthCandidates,
     dismissJournalPaper,

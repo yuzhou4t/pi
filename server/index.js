@@ -103,6 +103,22 @@ const projectWork = configuredProjectWorkRuntimeUrl
   ? null
   : createProjectWorkService({
       onLifecycleEvent: notificationDispatcher?.dispatch,
+      workerConnectorAccess: worker ? {
+        async identity({ conversationId, workerId }) {
+          const task = await worker.getTaskByConversation(conversationId);
+          if (task.workerId !== workerId || workerId !== "agent_mail") {
+            throw new Error("Worker 邮箱会话绑定不一致");
+          }
+          return worker.getConnectionHealth(workerId);
+        },
+        async read({ conversationId, workerId, operation, parameters }) {
+          const task = await worker.getTaskByConversation(conversationId);
+          if (task.workerId !== workerId || workerId !== "agent_mail") {
+            throw new Error("Worker 邮箱会话绑定不一致");
+          }
+          return worker.readExternal(task.id, { operation, parameters });
+        },
+      } : null,
     });
 const legacyWorkspaceArchives = configuredProjectWorkRuntimeUrl
   ? null
@@ -3865,6 +3881,32 @@ export function createApiServer({
       sendJson(response, 200, publicRun(run), origin);
     } catch (error) {
       sendWorkflowError(response, error, origin, "无法刷新本月推荐");
+    }
+    return;
+  }
+
+  const journalRotateRecommendationsMatch = url.pathname.match(
+    /^\/api\/v1\/journal-runs\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,159})\/rotate-recommendations$/,
+  );
+  if (request.method === "POST" && journalRotateRecommendationsMatch) {
+    try {
+      requireJournalMutationOrigin(origin);
+      if (!String(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        throw new CandidateSummaryError("UNSUPPORTED_MEDIA_TYPE", "请求必须使用 application/json", 415);
+      }
+      const body = await readJson(request);
+      if (
+        body?.schema_version !== 1
+        || Object.keys(body).some((key) => key !== "schema_version")
+      ) {
+        throw new CandidateSummaryError("INVALID_REQUEST", "更换推荐的请求无效", 400);
+      }
+      const run = await journalWorkflowService.rotateRunRecommendations(
+        journalRotateRecommendationsMatch[1],
+      );
+      sendJson(response, 200, publicRun(run), origin);
+    } catch (error) {
+      sendWorkflowError(response, error, origin, "无法更换推荐");
     }
     return;
   }

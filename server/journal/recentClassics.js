@@ -1,6 +1,7 @@
 import { restoreOpenAlexAbstract } from "./openAlexEnricher.js";
 import {
   deduplicatePapers,
+  filterFieldCandidates,
   filterTopicCandidates,
   normalizePaper,
 } from "./monitorCore.js";
@@ -11,7 +12,8 @@ export const RECENT_CLASSIC_LABEL = "近年高引 · 未读经典";
 const DEFAULT_YEARS_BACK = 4;
 const DEFAULT_LIMIT = 8;
 const MIN_CITED_BY = 25;
-const PER_PAGE = 60;
+const PER_PAGE = 100;
+const MAX_PAGES_PER_REFILL = 3;
 const OPENALEX_TIMEOUT_MS = 20_000;
 const SELECT_FIELDS = [
   "id",
@@ -100,6 +102,8 @@ export async function fetchRecentClassics({
   observedAt = new Date().toISOString(),
   excludeKeys = new Set(),
   timeoutMs = OPENALEX_TIMEOUT_MS,
+  cursor = "*",
+  maxPages = MAX_PAGES_PER_REFILL,
 } = {}) {
   const covered = sources.filter((source) => compact(source.openalex_source_id));
   const uncovered = sources
@@ -126,34 +130,92 @@ export async function fetchRecentClassics({
     `from_publication_date:${fromYear}-01-01`,
     `cited_by_count:>${MIN_CITED_BY}`,
   ].join(",");
-  const url = new URL("https://api.openalex.org/works");
-  url.searchParams.set("filter", filter);
-  url.searchParams.set("sort", "cited_by_count:desc");
-  url.searchParams.set("per-page", String(PER_PAGE));
-  url.searchParams.set("select", SELECT_FIELDS);
-  if (compact(mailto)) url.searchParams.set("mailto", compact(mailto));
-
-  let works;
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const normalized = [];
+  let nextCursor = compact(cursor) || "*";
+  let pagesFetched = 0;
+  let fetchError = null;
+  while (nextCursor && pagesFetched < maxPages) {
+    const url = new URL("https://api.openalex.org/works");
+    url.searchParams.set("filter", filter);
+    url.searchParams.set("sort", "cited_by_count:desc");
+    url.searchParams.set("per-page", String(PER_PAGE));
+    url.searchParams.set("select", SELECT_FIELDS);
+    url.searchParams.set("cursor", nextCursor);
+    if (compact(mailto)) url.searchParams.set("mailto", compact(mailto));
+    let body;
     try {
-      const response = await fetchImpl(url.toString(), {
-        headers: { accept: "application/json" },
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        throw Object.assign(
-          new Error(`OpenAlex 返回 HTTP ${response.status}`),
-          { code: `OPENALEX_HTTP_${response.status}` },
-        );
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetchImpl(url.toString(), {
+          headers: { accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw Object.assign(
+            new Error(`OpenAlex 返回 HTTP ${response.status}`),
+            { code: `OPENALEX_HTTP_${response.status}` },
+          );
+        }
+        body = await response.json();
+      } finally {
+        clearTimeout(timer);
       }
-      const body = await response.json();
-      works = Array.isArray(body?.results) ? body.results : [];
-    } finally {
-      clearTimeout(timer);
+    } catch (error) {
+      fetchError = error;
+      break;
     }
-  } catch (error) {
+    pagesFetched += 1;
+    const works = Array.isArray(body?.results) ? body.results : [];
+    for (const work of works) {
+      const title = compact(work?.title);
+      if (!title) continue;
+      const shortId = openAlexShortId(work?.primary_location?.source?.id);
+      const registered = shortId ? sourceById.get(shortId) : null;
+      if (!registered) continue;
+      const doi = normalizeDoi(work?.doi);
+      const doiUrl = doi ? `https://doi.org/${encodeURI(doi)}` : null;
+      const landingUrl = compact(work?.primary_location?.landing_page_url) || null;
+      const citedByCount = Number.isInteger(work?.cited_by_count) ? work.cited_by_count : 0;
+      try {
+        const paper = normalizePaper({
+          title,
+          authors: (Array.isArray(work?.authorships) ? work.authorships : [])
+            .map((authorship) => compact(authorship?.author?.display_name))
+            .filter(Boolean),
+          venue: registered.venue,
+          paper_type: registered.source_type === "journal" ? "journal-article" : "conference-paper",
+          published_at: compact(work?.publication_date) || null,
+          doi,
+          official_id: doi || compact(work?.id) || title,
+          official_url: landingUrl || doiUrl || compact(work?.id),
+          canonical_url: doiUrl || landingUrl || null,
+          pdf_url: openAlexPdfUrl(work),
+          abstract: restoreOpenAlexAbstract(work?.abstract_inverted_index),
+          evidence_scope: "OpenAlex 高引题录；摘要与全文尚待核验",
+          heat_signals: [`OpenAlex 引用记录：${citedByCount}`],
+          candidate_origin: "recent_classic",
+          is_new: false,
+        }, { sourceId: registered.source_id, observedAt });
+        normalized.push({ ...paper, cited_by_count: citedByCount });
+      } catch {
+        // 无法建立稳定身份的记录跳过，不阻断整批结果。
+      }
+    }
+    nextCursor = compact(body?.meta?.next_cursor) || null;
+    if (works.length === 0) break;
+    const deduplicated = deduplicatePapers(normalized);
+    const eligibleIds = new Set([
+      ...filterTopicCandidates(deduplicated),
+      ...filterFieldCandidates(deduplicated),
+    ].filter((paper) => (
+      !identityKeys(paper).some((key) => excludeKeys.has(key))
+    )).map((paper) => paper.paper_id));
+    const eligibleCount = eligibleIds.size;
+    if (eligibleCount >= limit) break;
+  }
+
+  if (fetchError && normalized.length === 0) {
     return {
       schema_version: 1,
       status: "failed",
@@ -162,54 +224,36 @@ export async function fetchRecentClassics({
       uncovered_source_ids: uncovered,
       from_year: fromYear,
       observed_at: observedAt,
+      next_cursor: nextCursor,
+      pages_fetched: pagesFetched,
       error: {
-        code: typeof error?.code === "string" ? error.code : "OPENALEX_FETCH_FAILED",
-        message: compact(error?.message).slice(0, 200) || "OpenAlex 请求失败",
+        code: typeof fetchError?.code === "string" ? fetchError.code : "OPENALEX_FETCH_FAILED",
+        message: compact(fetchError?.message).slice(0, 200) || "OpenAlex 请求失败",
       },
     };
   }
 
-  const normalized = [];
-  for (const work of works) {
-    const title = compact(work?.title);
-    if (!title) continue;
-    const shortId = openAlexShortId(work?.primary_location?.source?.id);
-    const registered = shortId ? sourceById.get(shortId) : null;
-    if (!registered) continue;
-    const doi = normalizeDoi(work?.doi);
-    const doiUrl = doi ? `https://doi.org/${encodeURI(doi)}` : null;
-    const landingUrl = compact(work?.primary_location?.landing_page_url) || null;
-    const citedByCount = Number.isInteger(work?.cited_by_count) ? work.cited_by_count : 0;
-    try {
-      const paper = normalizePaper({
-        title,
-        authors: (Array.isArray(work?.authorships) ? work.authorships : [])
-          .map((authorship) => compact(authorship?.author?.display_name))
-          .filter(Boolean),
-        venue: registered.venue,
-        paper_type: registered.source_type === "journal" ? "journal-article" : "conference-paper",
-        published_at: compact(work?.publication_date) || null,
-        doi,
-        official_id: doi || compact(work?.id) || title,
-        official_url: landingUrl || doiUrl || compact(work?.id),
-        canonical_url: doiUrl || landingUrl || null,
-        pdf_url: openAlexPdfUrl(work),
-        abstract: restoreOpenAlexAbstract(work?.abstract_inverted_index),
-        evidence_scope: "OpenAlex 高引题录；摘要与全文尚待核验",
-        heat_signals: [`OpenAlex 引用记录：${citedByCount}`],
-        candidate_origin: "recent_classic",
-        is_new: false,
-      }, { sourceId: registered.source_id, observedAt });
-      normalized.push({ ...paper, cited_by_count: citedByCount });
-    } catch {
-      // 无法建立稳定身份的记录跳过，不阻断整批结果。
-    }
-  }
-
-  const topicRelevant = filterTopicCandidates(deduplicatePapers(normalized));
-  const papers = topicRelevant
-    .filter((paper) => !identityKeys(paper).some((key) => excludeKeys.has(key)))
-    .sort((left, right) => (right.cited_by_count ?? 0) - (left.cited_by_count ?? 0))
+  const deduplicated = deduplicatePapers(normalized);
+  const topicRelevant = filterTopicCandidates(deduplicated);
+  const topicIds = new Set(topicRelevant.map((paper) => paper.paper_id));
+  const fieldRelevant = filterFieldCandidates(deduplicated)
+    .filter((paper) => !topicIds.has(paper.paper_id))
+    .map((paper) => ({
+      ...paper,
+      topic_matches: paper.field_matches ?? [],
+      candidate_scope: "field",
+    }));
+  const byCitations = (left, right) => (
+    (right.cited_by_count ?? 0) - (left.cited_by_count ?? 0)
+  );
+  const papers = [
+    ...topicRelevant
+      .filter((paper) => !identityKeys(paper).some((key) => excludeKeys.has(key)))
+      .sort(byCitations),
+    ...fieldRelevant
+      .filter((paper) => !identityKeys(paper).some((key) => excludeKeys.has(key)))
+      .sort(byCitations),
+  ]
     .slice(0, limit)
     .map((paper) => ({
       ...paper,
@@ -225,6 +269,8 @@ export async function fetchRecentClassics({
     uncovered_source_ids: uncovered,
     from_year: fromYear,
     observed_at: observedAt,
+    next_cursor: nextCursor,
+    pages_fetched: pagesFetched,
     error: null,
   };
 }

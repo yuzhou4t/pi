@@ -520,7 +520,11 @@ export function LarkNotificationSettings({
   );
 }
 
-export function ProjectLoopNotificationControl({ conversation, defaultOpen = false }) {
+export function ProjectLoopNotificationControl({
+  conversation,
+  defaultOpen = false,
+  menuItem = false,
+}) {
   const [enabled, setEnabled] = useState(readEnabled);
   const [permission, setPermission] = useState(
     () => browserNotificationApi()?.permission ?? "unsupported",
@@ -621,8 +625,17 @@ export function ProjectLoopNotificationControl({ conversation, defaultOpen = fal
         ) : (
           <BellSlash size={13} aria-hidden="true" />
         )}
-        通知
-        <CaretDown size={11} aria-hidden="true" />
+        {menuItem ? (
+          <span>
+            <strong>通知</strong>
+            <small>本机与飞书提醒</small>
+          </span>
+        ) : "通知"}
+        {menuItem ? (
+          <CaretRight size={12} aria-hidden="true" />
+        ) : (
+          <CaretDown size={11} aria-hidden="true" />
+        )}
       </button>
       {open ? (
         <section className="project-notification-popover" role="dialog" aria-label="通知设置">

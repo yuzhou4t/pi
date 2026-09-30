@@ -14,6 +14,7 @@ import {
   createVenueSearchService,
   deterministicRecommendation,
   deterministicSearchQuery,
+  deterministicSearchQueries,
 } from "./venueSearchService.js";
 import { createWebSearchRunner } from "../project-work/externalRetrieval.js";
 import { resolveProjectWorkDoubaoQuotaFilePath } from "../project-work/projectWorkPaths.js";
@@ -560,6 +561,22 @@ test("deterministicSearchQuery extracts English terms from a Chinese question", 
   assert.equal(deterministicSearchQuery("RAG rag RAG retrieval"), "RAG retrieval");
   // 没有英文术语时回退到原文。
   assert.equal(deterministicSearchQuery("帮我找一些论文"), "帮我找一些论文");
+});
+
+test("deterministicSearchQueries expands Harness into bounded academic terminology", () => {
+  assert.deepEqual(
+    deterministicSearchQueries("这些期刊有 Harness Agent 相关内容吗？"),
+    [
+      "Harness Agent",
+      "agent orchestration tool use",
+      "LLM agent scaffold architecture",
+      "agent runtime environment interface",
+    ],
+  );
+  assert.deepEqual(
+    deterministicSearchQueries("帮我找 LLM Agent 长期记忆论文"),
+    ["LLM Agent"],
+  );
 });
 
 test("submitTurn records phased progress that finishes complete", async () => {

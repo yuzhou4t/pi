@@ -183,6 +183,21 @@ test("reviewed Skill contracts expose exact effects and missing runtime capabili
   );
   assert.match(incompatible.compatibilityReason, /Git 收尾事务/);
 
+  const retrospective = describeSkillRuntimeContract(
+    "@pi-agent/review-agent-runs",
+    ["project_read"],
+  );
+  assert.equal(retrospective.reviewed, true);
+  assert.equal(retrospective.runtimeCompatible, true);
+  assert.deepEqual(
+    retrospective.effectScopes.map((item) => item.id),
+    ["agent_run_history_review", "conversation_retrospective_report"],
+  );
+  assert.equal(
+    retrospective.effectScopes.some((item) => item.confirmationRequired),
+    false,
+  );
+
   const unreviewed = describeSkillRuntimeContract("unknown-skill", []);
   assert.equal(unreviewed.reviewed, false);
   assert.equal(unreviewed.runtimeCompatible, false);

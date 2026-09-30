@@ -61,6 +61,12 @@ export const workerApi = Object.freeze({
       body: { schema_version: 1, source_project_id: sourceProjectId || null },
     });
   },
+  async deleteTask(taskId, options = {}) {
+    return requestJson(`${WORKER_API_ROOT}/tasks/${encodeURIComponent(taskId)}`, {
+      ...options,
+      method: "DELETE",
+    });
+  },
   async sendMessage(taskId, { text, providerId, modelId, thinkingLevel } = {}, options = {}) {
     return requestJson(`${WORKER_API_ROOT}/tasks/${encodeURIComponent(taskId)}/messages`, {
       ...options,

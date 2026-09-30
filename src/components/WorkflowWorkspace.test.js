@@ -105,6 +105,7 @@ test("live candidate review shows appended papers and a durable refresh failure"
       },
       candidateSummaryState: { items: [] },
       onRefreshCandidates() {},
+      onRotateRecommendations() {},
     }));
 
     assert.match(html, /Newly appended sixth paper/);
@@ -116,6 +117,9 @@ test("live candidate review shows appended papers and a durable refresh failure"
     assert.match(html, /失败来源：JMLR（OFFICIAL_SOURCE_EMPTY \/ SOURCE_ROUTE_EMPTY）/);
     assert.doesNotMatch(html, /来源成功 9\/11/);
     assert.match(html, /is-classic[^>]*>本月补发现 · 非本月新论文/);
+    assert.match(html, /检查本月新发表/);
+    assert.match(html, /换一批推荐/);
+    assert.doesNotMatch(html, /重新准备全文/);
   } finally {
     await vite.close();
   }

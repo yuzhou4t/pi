@@ -52,6 +52,12 @@ const BUNDLED_SKILL_PACKAGES = Object.freeze({
     skillName: "git-closeout",
     description: "审查任务变更、验证证据和暂存范围；仅在受控 Git 收尾事务可用时，经明确确认完成本地提交。",
   }),
+  "@pi-agent/review-agent-runs": Object.freeze({
+    version: "1.0.0",
+    directory: "review-agent-runs",
+    skillName: "review-agent-runs",
+    description: "低频只读复盘历史 Agent 运行，归纳重复问题与改进，并比较闭环是否变好。",
+  }),
 });
 const DEFAULT_RUNTIME_CAPABILITIES = Object.freeze([
   "project_read",
@@ -122,6 +128,23 @@ const REVIEWED_SKILL_RUNTIME_CONTRACTS = Object.freeze({
         label: "经确认后创建本地提交；默认不推送",
         kind: "git_write",
         confirmationRequired: true,
+      }),
+    ]),
+  }),
+  "@pi-agent/review-agent-runs": Object.freeze({
+    requiredRuntimeCapabilities: Object.freeze(["project_read"]),
+    effectScopes: Object.freeze([
+      Object.freeze({
+        id: "agent_run_history_review",
+        label: "只读回顾历史 Agent 运行与验证证据",
+        kind: "project_read",
+        confirmationRequired: false,
+      }),
+      Object.freeze({
+        id: "conversation_retrospective_report",
+        label: "在 Agent 对话中输出复盘与前后对比报告",
+        kind: "conversation",
+        confirmationRequired: false,
       }),
     ]),
   }),

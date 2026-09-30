@@ -42,6 +42,10 @@ export function mapVenueSearchConversation(body) {
         count: venue.count ?? 0,
       })),
       venueSuccessCount: turn.search?.venue_success_count ?? 0,
+      venueReachedCount: turn.search?.venue_reached_count
+        ?? (turn.search?.venues ?? []).filter((venue) => venue.status !== "failed").length,
+      venueMatchedCount: turn.search?.venue_matched_count
+        ?? (turn.search?.venues ?? []).filter((venue) => venue.status === "success").length,
       venueFailedIds: turn.search?.venue_failed_ids ?? [],
       totalFound: turn.search?.total_found ?? 0,
       answer: turn.answer ?? "",

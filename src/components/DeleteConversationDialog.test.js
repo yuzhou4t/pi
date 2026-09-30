@@ -57,6 +57,23 @@ test("delete conversation dialog stays absent without a target", async () => {
   );
 });
 
+test("delete conversation dialog uses Worker task scope and copy", async () => {
+  await withViteModule("/src/components/DeleteConversationDialog.jsx", ({ DeleteConversationDialog }) => {
+    const html = renderToStaticMarkup(React.createElement(DeleteConversationDialog, {
+      conversation: {
+        id: "worker-task-1",
+        title: "查看邮箱",
+        scope: "worker",
+      },
+      onClose() {},
+      onConfirm() {},
+    }));
+    assert.match(html, /删除 Worker 任务/);
+    assert.match(html, /任务资料、草稿和未交付预览/);
+    assert.match(html, />删除任务</);
+  });
+});
+
 test("standalone deletion names the private draft scope without implying a bound project", async () => {
   await withViteModule(
     "/src/components/DeleteConversationDialog.jsx",

@@ -12,9 +12,15 @@ import { ProviderMenu } from "./ProviderMenu.jsx";
 
 function venueCoverage(turn) {
   const failed = turn.venues.filter((venue) => venue.status === "failed");
-  const base = `覆盖 ${turn.venueSuccessCount}/${turn.venues.length} 个注册刊物 · 命中 ${turn.totalFound} 篇`;
-  if (failed.length === 0) return base;
-  return `${base} · ${failed.map((venue) => venue.shortName).join("、")}暂不可用`;
+  const reached = turn.venueReachedCount
+    ?? turn.venues.filter((venue) => venue.status !== "failed").length;
+  const matched = turn.venueMatchedCount
+    ?? turn.venues.filter((venue) => venue.status === "success").length;
+  const empty = Math.max(0, reached - matched);
+  const base = `已检索 ${reached}/${turn.venues.length} 个来源 · ${matched} 个有命中 · 共 ${turn.totalFound} 篇`;
+  const emptyText = empty > 0 ? ` · ${empty} 个无匹配` : "";
+  if (failed.length === 0) return `${base}${emptyText}`;
+  return `${base}${emptyText} · ${failed.map((venue) => venue.shortName).join("、")}检索失败`;
 }
 
 function topicPhaseLabel(progress) {

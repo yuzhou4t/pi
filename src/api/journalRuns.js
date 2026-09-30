@@ -637,6 +637,33 @@ export function mapJournalRun(run) {
           })),
         }
       : null,
+    recommendationRotation: run.recommendation_rotation
+      && typeof run.recommendation_rotation === "object"
+      ? {
+          cycle: Number.isInteger(run.recommendation_rotation.cycle)
+            ? run.recommendation_rotation.cycle
+            : 0,
+          retiredPaperIds: run.recommendation_rotation.retired_paper_ids ?? [],
+          lastBatchPaperIds: run.recommendation_rotation.last_batch_paper_ids ?? [],
+          lastBatchCount: Number.isInteger(run.recommendation_rotation.last_batch_count)
+            ? run.recommendation_rotation.last_batch_count
+            : 0,
+          lastAddedClassicCount: Number.isInteger(
+            run.recommendation_rotation.last_added_classic_count,
+          )
+            ? run.recommendation_rotation.last_added_classic_count
+            : 0,
+          lastRotatedAt: run.recommendation_rotation.last_rotated_at ?? null,
+          hasMore: run.recommendation_rotation.recent_classics_exhausted !== true,
+          lastRefillPagesFetched: Number.isInteger(
+            run.recommendation_rotation.last_refill_pages_fetched,
+          )
+            ? run.recommendation_rotation.last_refill_pages_fetched
+            : 0,
+          languageArtifact: run.recommendation_rotation.language_artifact ?? null,
+          lastError: run.recommendation_rotation.last_error ?? null,
+        }
+      : null,
     weeklyRecommendation: run.weekly_recommendation && typeof run.weekly_recommendation === "object"
       ? {
           weekKey: run.weekly_recommendation.week_key ?? null,
@@ -1010,6 +1037,21 @@ export async function refreshJournalCandidates({ runId, signal } = {}) {
   );
   const body = await jsonResponse(response, "本地期刊服务返回了无法解析的结果");
   if (!response.ok) throw requestError(response, body, "无法刷新本月推荐");
+  return mapJournalRun(body);
+}
+
+export async function rotateJournalRecommendations({ runId, signal } = {}) {
+  const response = await fetch(
+    `/api/v1/journal-runs/${encodeURIComponent(runId)}/rotate-recommendations`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ schema_version: 1 }),
+      signal,
+    },
+  );
+  const body = await jsonResponse(response, "本地期刊服务返回了无法解析的结果");
+  if (!response.ok) throw requestError(response, body, "无法更换推荐");
   return mapJournalRun(body);
 }
 
