@@ -4645,3 +4645,22 @@ test("pending Workspace writes keep exact diff confirmation in Changes and a com
   assert.match(source, /api\.cancelWorkspaceWrite\(\{/);
   assert.match(source, /writeId: write\.id/);
 });
+
+test("retired repairs neither reopen verification attention nor offer resume", async () => {
+  await withLiveWorkbench(({ LiveProjectWorkbench, verificationAttention }) => {
+    const snapshot = conversation({
+      activeArtifactId: "run_result",
+      operations: [{
+        id: "retired-repair", type: "verification_repair", status: "legacy_superseded",
+        legacyStatus: "interrupted", commandId: "legacy-command",
+      }],
+      verificationCommand: { id: "legacy-command", status: "legacy_superseded" },
+      verificationRuns: [],
+    });
+    assert.equal(verificationAttention(snapshot), null);
+    const html = renderToStaticMarkup(React.createElement(LiveProjectWorkbench, {
+      project, conversation: snapshot,
+    }));
+    assert.doesNotMatch(html, /修复与复测尚未完成|继续修复并复测/);
+  }, { exposeArtifact: true });
+});
