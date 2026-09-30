@@ -282,6 +282,7 @@ const APPLY_UNDO_STATUSES = new Set([
   "blocked",
 ]);
 const CONVERSATION_OPERATION_STATUSES = new Set([
+  "legacy_superseded",
   "running",
   "completed",
   "failed",
@@ -1138,6 +1139,11 @@ function publicConversationOperation(operation) {
     status: CONVERSATION_OPERATION_STATUSES.has(operation.status)
       ? operation.status
       : "failed",
+    legacyStatus: compactText(operation.legacyStatus, 80) || null,
+    blockedReason: compactText(operation.blockedReason, 120) || null,
+    supersededAt: typeof operation.supersededAt === "string"
+      ? operation.supersededAt
+      : null,
     turnId: compactText(operation.turnId, 180) || null,
     targetAssistantMessageId: compactText(
       operation.targetAssistantMessageId,
@@ -10260,6 +10266,33 @@ function createProjectWorkServiceRuntime({
     });
   }
 
+  function supersedeLegacyVerificationRepairs(
+    operations,
+    verifications,
+    completedAt,
+    options,
+  ) {
+    const chain = legacyVerificationChain(verifications, options);
+    const retiredIds = new Set(chain.records.filter(chain.isLegacy)
+      .flatMap((verification) => [verification.id, verification.commandId])
+      .filter(Boolean));
+    return (operations ?? []).map((operation) => {
+      if (
+        operation.type !== "verification_repair"
+        || !["running", "interrupted"].includes(operation.status)
+        || !retiredIds.has(operation.commandId)
+      ) return operation;
+      return {
+        ...operation,
+        legacyStatus: operation.legacyStatus || operation.status,
+        status: "legacy_superseded",
+        blockedReason: "legacy_workspace_migration",
+        supersededAt: operation.supersededAt ?? completedAt,
+        completedAt: operation.completedAt ?? completedAt,
+      };
+    });
+  }
+
   function legacyVerificationNormalizationRequired(conversation) {
     if (
       workspaceRuntimeMode !== "workspace-v2"
@@ -10272,6 +10305,13 @@ function createProjectWorkServiceRuntime({
     const chain = legacyVerificationChain(conversation.verifications);
     const hasLegacyChain = chain.records.some(chain.isLegacy);
     if (!hasLegacyChain) return false;
+    if (supersedeLegacyVerificationRepairs(
+      conversation.operations,
+      conversation.verifications,
+      null,
+    ).some((operation, index) => operation !== conversation.operations[index])) {
+      return true;
+    }
     if (chain.records.some((verification) => (
       chain.isLegacy(verification)
       && verification.status !== "legacy_superseded"
@@ -10312,19 +10352,27 @@ function createProjectWorkServiceRuntime({
       const recomputeStatus = ["verification_failed", "interrupted"].includes(
         current.status,
       );
-      const next = { ...current, verifications };
+      const operations = supersedeLegacyVerificationRepairs(
+        current.operations, verifications, normalizedAt,
+      );
+      const supersededOperationCount = operations.filter(
+        (operation, index) => operation !== current.operations[index],
+      ).length;
+      const next = { ...current, verifications, operations };
       const status = recomputeStatus
         ? stableStatusAfterOperation(next, "idle")
         : current.status;
       normalization = {
         normalizedAt,
         supersededCount,
+        supersededOperationCount,
         previousStatus: current.status,
         status,
         clearedLastError: clearLastError,
       };
       return {
         verifications,
+        operations,
         status,
         ...(clearLastError ? { lastError: null } : {}),
       };
@@ -10512,6 +10560,10 @@ function createProjectWorkServiceRuntime({
                 ? "awaiting_user"
                 : "awaiting_confirmation",
               activeChangeSet,
+              operations: supersedeLegacyVerificationRepairs(
+                current.operations, current.verifications, settledAt,
+                { legacyOverlay: sourceRuntimeMode !== "workspace-v2" },
+              ),
               verifications: supersedeLegacyVerifications(
                 current.verifications,
                 settledAt,
@@ -10569,8 +10621,12 @@ function createProjectWorkServiceRuntime({
               settledAt,
               { legacyOverlay: sourceRuntimeMode !== "workspace-v2" },
             );
+            const nextOperations = supersedeLegacyVerificationRepairs(
+              current.operations, nextVerifications, settledAt,
+            );
             const directConversation = {
               ...current,
+              operations: nextOperations,
               runtimeMode: "workspace-v2",
               workspaceId: selectedWorkspace.id,
               workspace: {
@@ -10609,6 +10665,7 @@ function createProjectWorkServiceRuntime({
                 truncated: false,
               },
               verifications: nextVerifications,
+              operations: nextOperations,
               status: stableStatusAfterOperation(
                 directConversation,
                 "idle",
@@ -10671,6 +10728,10 @@ function createProjectWorkServiceRuntime({
         const blocked = await updateConversation(conversationId, (current) => ({
           status: "recovery_blocked",
           lastError: safeError,
+          operations: supersedeLegacyVerificationRepairs(
+            current.operations, current.verifications, blockedAt,
+            { legacyOverlay: sourceRuntimeMode !== "workspace-v2" },
+          ),
           verifications: supersedeLegacyVerifications(
             current.verifications,
             blockedAt,

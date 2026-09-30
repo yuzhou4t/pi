@@ -3446,3 +3446,20 @@ test("legacy archive API maps safe summaries and sends an exact cleanup binding"
     }],
   });
 });
+
+test("turn history preserves retired repair provenance", async () => {
+  const page = await fetchProjectWorkConversationTurns({
+    conversationId: "legacy-repair-history",
+    fetchImpl: async () => jsonResponse({
+      turns: [{ id: "turn-1", turnSeq: 1, operations: [{
+        id: "retired-repair", type: "verification_repair", status: "legacy_superseded",
+        legacy_status: "interrupted", blocked_reason: "legacy_workspace_migration",
+        superseded_at: "2026-09-30T00:00:00.000Z", commandId: "legacy-command",
+      }] }],
+    }),
+  });
+  assert.equal(page.turns[0].operations[0].status, "legacy_superseded");
+  assert.equal(page.turns[0].operations[0].legacyStatus, "interrupted");
+  assert.equal(page.turns[0].operations[0].blockedReason, "legacy_workspace_migration");
+  assert.equal(page.turns[0].operations[0].supersededAt, "2026-09-30T00:00:00.000Z");
+});
